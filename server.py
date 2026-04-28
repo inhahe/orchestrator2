@@ -989,32 +989,80 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 def _try_shutdown_old_server(port: int) -> None:
-    """Send POST /api/shutdown to an existing server on *port*.
+    """Shut down an existing server on *port*.
 
-    Best-effort — if the old server isn't ours, the request will just
-    404 or fail, which is fine.
+    Tries the graceful ``/api/shutdown`` endpoint first.  If that fails
+    (e.g. old server is running code without the endpoint), falls back
+    to killing the process that owns the port via ``taskkill`` on
+    Windows or ``fuser`` on Linux/macOS.
     """
     import urllib.request
     import urllib.error
+    import time as _time
 
+    # --- Attempt 1: HTTP graceful shutdown ---
     url = f"http://localhost:{port}/api/shutdown"
     try:
         req = urllib.request.Request(url, method="POST", data=b"")
         urllib.request.urlopen(req, timeout=3)
         print(f"Shut down old server on port {port}.")
-    except (urllib.error.URLError, OSError, Exception):
-        # Old server isn't ours or isn't responding — no problem.
+        _time.sleep(1.5)
+        return
+    except Exception:
         pass
 
-    # Give it a moment to actually exit.
-    import time as _time
-    _time.sleep(1)
+    # --- Attempt 2: kill the process holding the port ---
+    import subprocess
+    if sys.platform == "win32":
+        try:
+            # netstat -ano finds PIDs listening on the port.
+            out = subprocess.check_output(
+                ["netstat", "-ano", "-p", "TCP"],
+                text=True, timeout=5,
+            )
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and f":{port}" in parts[1] and parts[3] == "LISTENING":
+                    pid = parts[4]
+                    subprocess.call(
+                        ["taskkill", "/F", "/PID", pid],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                    )
+                    print(f"Killed old process {pid} on port {port}.")
+                    _time.sleep(1)
+                    return
+        except Exception:
+            pass
+    else:
+        try:
+            subprocess.call(
+                ["fuser", "-k", f"{port}/tcp"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            print(f"Killed old process on port {port}.")
+            _time.sleep(1)
+        except Exception:
+            pass
 
 
 def _bind_port(host: str, port: int) -> tuple[_socket.socket, int]:
-    """Try to bind *port*; on failure, let the OS pick a free one."""
+    """Try to bind *port*; on failure, let the OS pick a free one.
+
+    On Windows, ``SO_REUSEADDR`` silently allows multiple processes to
+    bind the same port — the OS then routes connections unpredictably.
+    We use ``SO_EXCLUSIVEADDRUSE`` instead so the bind properly fails
+    when the port is already occupied.  On other platforms, the standard
+    ``SO_REUSEADDR`` is used to allow reusing TIME_WAIT addresses.
+    """
     sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    if sys.platform == "win32":
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_EXCLUSIVEADDRUSE, 1)  # type: ignore[attr-defined]
+    else:
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
     try:
         sock.bind((host, port))
     except OSError:
@@ -1045,13 +1093,7 @@ def main() -> None:
     if config.detach:
         sock, actual_port = _bind_port("0.0.0.0", config.port)
         if actual_port != config.port:
-            # Port is in use — try to shut down an old orchestrator2 on it.
-            _try_shutdown_old_server(config.port)
-            # Retry the preferred port now that the old server may be gone.
-            sock.close()
-            sock, actual_port = _bind_port("0.0.0.0", config.port)
-            if actual_port != config.port:
-                print(f"Port {config.port} in use — using {actual_port} instead.")
+            print(f"Port {config.port} in use — using {actual_port} instead.")
         sock.close()  # release for the child to rebind
 
         # Rebuild argv: drop --detach, --open, override --port with actual.

@@ -125,6 +125,9 @@ class SDKBridge:
         # Session resume / continue logic.
         # Always prefer an explicit session id (from cwd lookup or --resume)
         # over the SDK's global continue_conversation, which ignores cwd.
+        # IMPORTANT: if no session is found for this cwd, we must NOT let the
+        # SDK fall through to its default continue_conversation=True behavior,
+        # which resumes the globally most recent session regardless of cwd.
         rid = resume_id or self._initial_resume_id
         if rid:
             kwargs["resume"] = rid
@@ -132,6 +135,10 @@ class SDKBridge:
         elif not self.config.no_continue and self.state.session_id:
             kwargs["resume"] = self.state.session_id
             self.state.expected_resume_sid = self.state.session_id
+        else:
+            # No session to resume — start fresh.  Explicitly disable the
+            # SDK's global continue so it doesn't pick a random session.
+            kwargs["continue_conversation"] = False
 
         # Effort override.
         if self.state.effort:
