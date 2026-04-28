@@ -153,11 +153,6 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/help` | Show all commands |
 | `/status` | Session info, cost, and usage |
 | `/debug` | Internal state diagnostics |
-| `/tools` | List active tools and background tasks |
-| `/tasks` | List non-Bash tools this turn |
-| `/bg` | List background tasks |
-| `/show tN\|bN\|kN` | Inspect tool, background task, or thinking block by tag |
-| `/todos` | Show Claude's TodoWrite plan |
 
 ### Model & Behavior
 

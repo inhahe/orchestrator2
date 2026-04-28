@@ -450,8 +450,7 @@ const Chat = (() => {
   function _replayHistory(messages) {
     if (!messages || !messages.length) return;
 
-    // Disable tool-collapse during history replay — processing hundreds
-    // of tool blocks through the collapse DOM logic freezes the browser.
+    // Disable tool-collapse during history replay.
     const savedCollapse = _collapseTools;
     _collapseTools = false;
 
@@ -461,31 +460,48 @@ const Chat = (() => {
     sep.textContent = `--- Session history (${messages.length} messages) ---`;
     elMessages.appendChild(sep);
 
-    for (const m of messages) {
-      const type = m.type || m.role;
-      if (type === 'user' || type === 'human') {
-        _addUserMessage(m.content || m.text || '');
-      } else if (type === 'assistant') {
-        _addAssistantText({ content: m.content || m.text || '', delta: false });
-      } else if (type === 'tool_use') {
-        _addToolUse(m);
-      } else if (type === 'tool_result') {
-        _addToolResult(m);
-      } else if (type === 'thinking') {
-        _addThinking(m);
-      } else if (type === 'system' || type === 'system_msg') {
-        _addSystemMsg(m);
+    // Render in batches via setTimeout so the browser stays responsive
+    // and WebSocket messages (status ticker, etc.) can still be processed.
+    const BATCH = 50;
+    let idx = 0;
+
+    function _renderBatch() {
+      const end = Math.min(idx + BATCH, messages.length);
+      for (; idx < end; idx++) {
+        const m = messages[idx];
+        const type = m.type || m.role;
+        if (type === 'user' || type === 'human') {
+          _addUserMessage(m.content || m.text || '');
+        } else if (type === 'assistant') {
+          _addAssistantText({ content: m.content || m.text || '', delta: false });
+        } else if (type === 'tool_use') {
+          _addToolUse(m);
+        } else if (type === 'tool_result') {
+          _addToolResult(m);
+        } else if (type === 'thinking') {
+          _addThinking(m);
+        } else if (type === 'system' || type === 'system_msg') {
+          _addSystemMsg(m);
+        }
+      }
+
+      if (idx < messages.length) {
+        // Yield to the event loop, then continue.
+        setTimeout(_renderBatch, 0);
+      } else {
+        // Done — add end separator and restore state.
+        const endSep = document.createElement('div');
+        endSep.className = 'msg msg-system';
+        endSep.textContent = '--- End of history ---';
+        elMessages.appendChild(endSep);
+
+        _collapseTools = savedCollapse;
+        _resetToolRun();
+        _scrollToBottom();
       }
     }
 
-    const endSep = document.createElement('div');
-    endSep.className = 'msg msg-system';
-    endSep.textContent = '--- End of history ---';
-    elMessages.appendChild(endSep);
-
-    _collapseTools = savedCollapse;
-    _resetToolRun();
-    _scrollToBottom();
+    _renderBatch();
   }
 
   // --- Bell ---

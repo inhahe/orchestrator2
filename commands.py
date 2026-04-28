@@ -34,13 +34,6 @@ from session import (
     render_session_markdown,
     write_session_title,
 )
-from tool_manager import (
-    get_active_tools_summary,
-    get_bg_tasks_summary,
-    get_tasks_summary,
-    get_todos,
-    get_tool_detail,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -138,24 +131,6 @@ def classify(line: str) -> tuple[str, str]:
 
     if cmd == "export":
         return "export", arg
-    if cmd == "tools":
-        return "tools", ""
-    if cmd in ("tasks", "task"):
-        return "tasks", ""
-    if cmd in ("bg", "background", "bgtasks"):
-        if arg.strip():
-            first_word = arg.strip().split()[0]
-            return "error", (
-                f"/bg lists bg tasks — use `/show b{first_word}` for detail."
-            )
-        return "bg", ""
-    if cmd in ("todos", "todo", "plan"):
-        return "todos", ""
-    if cmd == "show":
-        return "show", arg
-    if cmd in ("think", "thinking", "thought"):
-        hint = arg.strip().split()[0] if arg.strip() else "N"
-        return "error", f"/think is removed — use `/show k{hint}` instead."
     if cmd == "btw":
         if not arg:
             return "error", "usage: /btw <question>"
@@ -200,11 +175,6 @@ _IMMEDIATE_HANDLERS: dict[str, str] = {
     "clear-screen":    "_cmd_clear_screen",
     "rename":          "_cmd_rename",
     "export":          "_cmd_export",
-    "tools":           "_cmd_tools",
-    "tasks":           "_cmd_tasks",
-    "bg":              "_cmd_bg",
-    "show":            "_cmd_show",
-    "todos":           "_cmd_todos",
     "collapse":        "_cmd_collapse",
     "collapse-threshold": "_cmd_collapse_threshold",
     "autocompact":     "_cmd_autocompact",
@@ -254,20 +224,17 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         "  /interrupt  /i                  stop the current turn",
         f"  /effort <level>                 one of {', '.join(EFFORT_CHOICES)}",
         "  /thinking [on|off|toggle]       enable/disable extended thinking",
-        "  /model <name>                   e.g. claude-opus-4-6",
-        "  /connect                        reconnect to the CLI",
+        "  /model [name]                   show/set model; no arg lists available",
+        "  /connect                        reconnect to the SDK",
         "  /rename <name>                  set a custom session title",
         "  /export [path]                  save conversation as markdown",
-        "  /tools                          list active tools and bg tasks",
-        "  /tasks                          list non-Bash tools this turn",
-        "  /bg                             list background tasks",
-        "  /show [tN|bN|kN ...]            inspect tool/bg/thinking by tag",
         "  /btw <question>                 side question (separate context)",
+        "  /collapse [on|off]              toggle tool collapsing",
+        "  /collapse-threshold N           tools shown before collapsing",
         "  /autocompact [on|off|N]         auto-compact threshold",
         "  /max-context [off|N]            cap context tokens",
         "  /bell [all|none|EVENTS]         view/change bell events",
         "  /queue [N|drop N|clear]         manage queued prompts",
-        "  /todos  /plan                   show Claude's TodoWrite plan",
         "  /quit  /exit                    graceful exit",
         "  /quit! /exit!                   force exit",
         "",
@@ -371,38 +338,6 @@ def _cmd_export(payload: str, state: State, config: Config) -> CommandResult:
         return CommandResult(messages=[_msg(f"Export write failed: {e}", level="error")])
     size = out_path.stat().st_size
     return CommandResult(messages=[_msg(f"Exported → {out_path.resolve()} ({size} bytes)")])
-
-
-def _cmd_tools(_payload: str, state: State, _config: Config) -> CommandResult:
-    data = get_active_tools_summary(state)
-    return CommandResult(messages=[_data_msg(data, label="tools")])
-
-
-def _cmd_tasks(_payload: str, state: State, _config: Config) -> CommandResult:
-    data = get_tasks_summary(state)
-    if not data:
-        return CommandResult(messages=[_msg(
-            "No tasks this turn. /tools shows in-flight state; /show N expands any completed tool.",
-            level="info",
-        )])
-    return CommandResult(messages=[_data_msg(data, label="tasks")])
-
-
-def _cmd_bg(_payload: str, state: State, _config: Config) -> CommandResult:
-    data = get_bg_tasks_summary(state)
-    return CommandResult(messages=[_data_msg(data, label="bg_tasks")])
-
-
-def _cmd_show(payload: str, state: State, _config: Config) -> CommandResult:
-    data = get_tool_detail(state, payload)
-    return CommandResult(messages=[_data_msg(data, label="show")])
-
-
-def _cmd_todos(_payload: str, state: State, _config: Config) -> CommandResult:
-    data = get_todos(state)
-    if not data:
-        return CommandResult(messages=[_msg("No todos yet (Claude hasn't called TodoWrite).")])
-    return CommandResult(messages=[_data_msg(data, label="todos")])
 
 
 def _cmd_collapse(payload: str, state: State, _config: Config) -> CommandResult:

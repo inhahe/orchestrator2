@@ -412,49 +412,21 @@ def list_sessions_for_project(project_dir: Path) -> list[dict[str, Any]]:
 def render_session_history(
     jsonl: Path,
     *,
-    show_tool_output: bool = False,
+    max_history: int = 200,
 ) -> tuple[int, list[dict[str, Any]], list[str]]:
     """Build structured history for the frontend.
 
-    Returns ``(message_count, messages, orphan_bg_tool_ids)``.
+    Returns ``(message_count, messages, orphan_ids)``.
 
-    Messages are dicts with a ``type`` key the frontend can route.
-    Orphan bg tool ids are background-Bash that started but never got a
-    matching completion notification.
-
-    **Tool-block contract** (applies to both history and live messages):
-
-    ``tool_use`` message fields:
-        - ``tool_use_id``  — links to the matching ``tool_result``
-        - ``name``         — tool name (``"Bash"``, ``"Read"``, etc.)
-        - ``input``        — full input dict (``command``, ``file_path``, …)
-        - ``status``       — ``"running"`` (live) | ``"complete"`` | ``"error"``
-        - ``result``       — present only when status != ``"running"``;
-                             holds ``{content, is_error, size_hint}``
-        - ``is_history``   — ``True`` for replayed transcript records
-
-    For live execution the backend sends ``tool_use`` with
-    ``status="running"`` first, then a separate ``tool_result`` message
-    when it finishes.  The frontend updates the existing block in-place.
-
-    For history replay (this function) we do a **two-pass** approach:
-    first collect all tool_results keyed by tool_use_id, then emit
-    tool_use blocks with the result already attached and the correct
-    status.  This lets the frontend render every historical tool block
-    as already-complete with the right ✓/✗ indicator and expandable
-    output.
+    Reads the JSONL, keeps the last *max_history* records, and emits
+    structured messages the frontend can render.  tool_use and
+    tool_result are emitted as separate messages — the frontend pairs
+    them by ``tool_use_id``.
     """
     rendered = 0
-    bg_started: dict[str, str] = {}
-    notif_re = re.compile(
-        r"<task-notification>.*?<tool-use-id>([^<]+)</tool-use-id>",
-        re.DOTALL,
-    )
 
-    # --- First pass: slurp records and index tool_results by tool_use_id ---
+    # --- Read and truncate ---
     records: list[dict[str, Any]] = []
-    tool_results_by_id: dict[str, dict[str, Any]] = {}
-
     try:
         f = jsonl.open(encoding="utf-8", errors="replace")
     except OSError as e:
@@ -478,33 +450,22 @@ def render_session_history(
                 continue
             records.append(rec)
 
-            # Index tool_result blocks from user messages so we can
-            # pair them with their tool_use in the second pass.
-            if rec.get("type") == "user":
-                msg = rec.get("message")
-                if isinstance(msg, dict):
-                    content = msg.get("content")
-                    if isinstance(content, list):
-                        for block in content:
-                            if (
-                                isinstance(block, dict)
-                                and block.get("type") == "tool_result"
-                                and block.get("tool_use_id")
-                            ):
-                                inner = block.get("content")
-                                text = (
-                                    inner if isinstance(inner, str)
-                                    else _extract_text(inner)
-                                )
-                                text = (text or "").strip()
-                                tool_results_by_id[block["tool_use_id"]] = {
-                                    "content": text,
-                                    "is_error": bool(block.get("is_error")),
-                                    "size_hint": _humanize_size(text),
-                                }
+    total_records = len(records)
+    if max_history and total_records > max_history:
+        records = records[-max_history:]
+        truncated = total_records - max_history
+    else:
+        truncated = 0
 
-    # --- Second pass: emit structured messages with results attached ---
+    # --- Emit structured messages ---
     messages: list[dict[str, Any]] = []
+
+    if truncated:
+        messages.append({
+            "type": "system",
+            "content": f"({truncated} older messages not shown)",
+            "is_history": True,
+        })
 
     for rec in records:
         t = rec.get("type")
@@ -529,19 +490,12 @@ def render_session_history(
                         "is_history": True,
                     })
                     rendered += 1
-                if text.startswith("<task-notification"):
-                    m = notif_re.search(text)
-                    if m:
-                        bg_started.pop(m.group(1), None)
 
             elif isinstance(content, list):
                 for block in content:
                     if not isinstance(block, dict):
                         continue
                     bt = block.get("type")
-                    # tool_result blocks are NOT emitted separately —
-                    # they're already attached to their tool_use above.
-                    # Only emit standalone text blocks.
                     if bt == "text" and isinstance(block.get("text"), str):
                         text = block["text"].strip()
                         if text:
@@ -551,6 +505,21 @@ def render_session_history(
                                 "is_history": True,
                             })
                             rendered += 1
+                    elif bt == "tool_result" and block.get("tool_use_id"):
+                        inner = block.get("content")
+                        text = (
+                            inner if isinstance(inner, str)
+                            else _extract_text(inner)
+                        )
+                        text = (text or "").strip()
+                        messages.append({
+                            "type": "tool_result",
+                            "tool_use_id": block["tool_use_id"],
+                            "content": text,
+                            "is_error": bool(block.get("is_error")),
+                            "size_hint": _humanize_size(text),
+                            "is_history": True,
+                        })
 
         # --- Assistant messages ---
         elif t == "assistant" and isinstance(msg, dict):
@@ -572,36 +541,15 @@ def render_session_history(
                 elif bt == "tool_use":
                     name = block.get("name", "?")
                     inp = block.get("input") or {}
-                    tool_use_id = block.get("id")
-                    # Pair with the indexed result (if any).
-                    result_info = tool_results_by_id.get(tool_use_id)
-                    if result_info:
-                        status = "error" if result_info["is_error"] else "complete"
-                    else:
-                        status = "complete"  # transcript is finished
-                    tool_msg: dict[str, Any] = {
+                    messages.append({
                         "type": "tool_use",
                         "name": name,
                         "input": inp,
-                        "tool_use_id": tool_use_id,
-                        "status": status,
+                        "tool_use_id": block.get("id"),
+                        "status": "complete",
                         "header": format_tool_header(name, inp),
                         "is_history": True,
-                    }
-                    if result_info:
-                        tool_msg["result"] = result_info
-                    messages.append(tool_msg)
-                    # Track bg Bash starts for orphan detection.
-                    if (
-                        name == "Bash"
-                        and isinstance(inp, dict)
-                        and inp.get("run_in_background")
-                    ):
-                        tid = block.get("id")
-                        if tid:
-                            cmd = (inp.get("command") or "").splitlines()
-                            head = (cmd[0] if cmd else "")[:60]
-                            bg_started[tid] = head
+                    })
                 elif bt == "thinking":
                     thinking_text = (block.get("thinking") or "").strip()
                     if thinking_text:
@@ -612,8 +560,7 @@ def render_session_history(
                         })
             rendered += 1
 
-    orphan_cmds = [f"{tid[:8]}: {cmd}" for tid, cmd in bg_started.items()]
-    return rendered, messages, orphan_cmds
+    return rendered, messages, []
 
 
 # ---------------------------------------------------------------------------

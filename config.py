@@ -47,10 +47,10 @@ SHORT_OUTPUT_TOOLS = frozenset({
 SLASH_COMMANDS = [
     "/help", "/status", "/debug", "/cost", "/cwd", "/clear", "/cls",
     "/interrupt", "/i", "/compact", "/effort", "/thinking", "/model",
-    "/connect", "/reconnect", "/rename", "/export", "/models",
-    "/tools", "/tasks", "/bg", "/background", "/show", "/btw",
+    "/connect", "/reconnect", "/rename", "/export", "/models", "/btw",
     "/autocompact", "/max-context", "/bell",
-    "/queue", "/todos", "/plan", "/quit", "/exit",
+    "/collapse", "/collapse-threshold",
+    "/queue", "/quit", "/exit",
     "/quit!", "/exit!",
 ]
 
