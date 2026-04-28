@@ -47,8 +47,8 @@ SHORT_OUTPUT_TOOLS = frozenset({
 SLASH_COMMANDS = [
     "/help", "/status", "/debug", "/cost", "/cwd", "/clear", "/cls",
     "/interrupt", "/i", "/compact", "/effort", "/thinking", "/model",
-    "/connect", "/reconnect", "/rename", "/export", "/models", "/btw",
-    "/autocompact", "/max-context", "/bell",
+    "/connect", "/reconnect", "/resume", "/rename", "/export", "/models",
+    "/btw", "/autocompact", "/max-context", "/bell",
     "/collapse", "/collapse-threshold",
     "/queue", "/quit", "/exit",
     "/quit!", "/exit!",
@@ -264,6 +264,8 @@ class Config:
     # Server
     port: int = DEFAULT_PORT
     open_browser: bool = False
+    detach: bool = False               # re-launch headless and exit terminal
+    config_dir: str | None = None      # CLAUDE_CONFIG_DIR override
 
 
 def config_to_dict(config: Config) -> dict:
@@ -515,6 +517,17 @@ def parse_args(argv: list[str] | None = None) -> Config:
         help="Reconnect and auto-continue on CLI crash.",
     )
 
+    # -- Config directory --
+    ap.add_argument(
+        "--config-dir",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Override CLAUDE_CONFIG_DIR (where sessions and credentials are stored). "
+            "Use this to run an instance under a different Claude account."
+        ),
+    )
+
     # -- Debug --
     ap.add_argument(
         "--debug",
@@ -527,12 +540,20 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--port",
         type=int,
         default=DEFAULT_PORT,
-        help=f"HTTP server port. Default: {DEFAULT_PORT}.",
+        help=f"HTTP server port. Default: {DEFAULT_PORT}. Auto-selects a free port if in use.",
     )
     ap.add_argument(
         "--open",
         action="store_true",
         help="Open the browser automatically after starting.",
+    )
+    ap.add_argument(
+        "--detach",
+        action="store_true",
+        help=(
+            "Launch the server in the background and exit the terminal. "
+            "Implies --open."
+        ),
     )
 
     args = ap.parse_args(argv)
@@ -589,5 +610,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         auto_reconnect=args.auto_reconnect,
         debug=args.debug,
         port=args.port,
-        open_browser=args.open,
+        open_browser=args.open or args.detach,
+        detach=args.detach,
+        config_dir=args.config_dir,
     )

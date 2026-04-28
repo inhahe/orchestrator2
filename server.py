@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import os
+import socket as _socket
 import sys
 import time
 from pathlib import Path
@@ -98,6 +99,11 @@ _ws_lock = asyncio.Lock()
 
 # Background tasks for periodic updates.
 _ticker_task: asyncio.Task | None = None
+
+# Auto-shutdown: when all tabs close, shut down after a grace period.
+_shutdown_timer: asyncio.Task | None = None
+_has_had_clients: bool = False          # True once the first tab connects
+_SHUTDOWN_GRACE_SECONDS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +718,49 @@ async def settings_page():
 
 
 # ---------------------------------------------------------------------------
+# Auto-shutdown — exit when all browser tabs have closed
+# ---------------------------------------------------------------------------
+
+def _cancel_shutdown_timer() -> None:
+    global _shutdown_timer
+    if _shutdown_timer is not None and not _shutdown_timer.done():
+        _shutdown_timer.cancel()
+        _shutdown_timer = None
+
+
+def _maybe_start_shutdown_timer() -> None:
+    global _shutdown_timer
+    if _ws_clients:
+        return  # still have connected tabs
+    if not _has_had_clients:
+        return  # never had a tab yet (startup / picker mode)
+    if config is None or not config.open_browser:
+        return  # only auto-shutdown when launched with --open
+    _cancel_shutdown_timer()
+    _shutdown_timer = asyncio.create_task(
+        _shutdown_after_grace(), name="shutdown-timer"
+    )
+
+
+async def _shutdown_after_grace() -> None:
+    """Wait for the grace period, then exit if no tabs reconnected."""
+    await asyncio.sleep(_SHUTDOWN_GRACE_SECONDS)
+    if not _ws_clients:
+        log.info(
+            "no browser tabs connected for %ds — shutting down",
+            _SHUTDOWN_GRACE_SECONDS,
+        )
+        # Let the bridge clean up, then hard-exit.  os._exit avoids
+        # blocking on uvicorn's graceful-shutdown timeout.
+        if bridge:
+            try:
+                await bridge.stop()
+            except Exception:
+                pass
+        os._exit(0)
+
+
+# ---------------------------------------------------------------------------
 # WebSocket endpoint — main real-time channel
 # ---------------------------------------------------------------------------
 
@@ -720,6 +769,9 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     """Handle one WebSocket client connection."""
     await ws.accept()
 
+    global _has_had_clients
+    _cancel_shutdown_timer()
+    _has_had_clients = True
     async with _ws_lock:
         _ws_clients.add(ws)
 
@@ -746,6 +798,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     finally:
         async with _ws_lock:
             _ws_clients.discard(ws)
+        _maybe_start_shutdown_timer()
 
 
 async def _send_initial_state(ws: WebSocket) -> None:
@@ -836,6 +889,22 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
                                    "data": {"message": f"Switch failed: {err}"}})
             return
 
+        if kind == "resume-pick":
+            # Open the session picker in the browser.
+            await send_to(ws, {"type": "navigate", "url": "/?resume"})
+            return
+
+        if kind == "resume":
+            await send_to(ws, {"type": "system_msg", "subtype": "info",
+                               "data": {"message": f"Resuming {payload} ..."}})
+            ok, err = await _reconfigure(resume=payload)
+            if ok:
+                await _send_initial_state(ws)
+            else:
+                await send_to(ws, {"type": "system_msg", "subtype": "error",
+                                   "data": {"message": f"Resume failed: {err}"}})
+            return
+
         # Try immediate command.
         result = try_immediate_command(kind, payload, state, config)
         if result is not None:
@@ -895,33 +964,138 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _bind_port(host: str, port: int) -> tuple[_socket.socket, int]:
+    """Try to bind *port*; on failure, let the OS pick a free one."""
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port))
+    except OSError:
+        sock.bind((host, 0))
+    actual = sock.getsockname()[1]
+    sock.set_inheritable(True)
+    return sock, actual
+
+
 def main() -> None:
     """Launch the server."""
     global config
 
     # Parse args early so we can get the port and store for startup().
     config = parse_args()
-    port = config.port
+
+    # Set CLAUDE_CONFIG_DIR before any SDK or session code runs.
+    if config.config_dir:
+        os.environ["CLAUDE_CONFIG_DIR"] = str(Path(config.config_dir).resolve())
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    url = f"http://localhost:{port}"
-    print(f"orchestrator2 starting on {url}")
+    # --detach: validate everything here (errors visible in terminal),
+    # then respawn headless and exit.
+    if config.detach:
+        sock, actual_port = _bind_port("0.0.0.0", config.port)
+        if actual_port != config.port:
+            print(f"Port {config.port} in use — using {actual_port} instead.")
+        sock.close()  # release for the child to rebind
+
+        # Rebuild argv: drop --detach, override --port with actual.
+        child_argv = [sys.executable, sys.argv[0]]
+        i = 1
+        while i < len(sys.argv):
+            a = sys.argv[i]
+            if a == "--detach":
+                i += 1
+                continue
+            if a == "--port":
+                i += 2  # skip --port and its value
+                continue
+            if a.startswith("--port="):
+                i += 1
+                continue
+            child_argv.append(a)
+            i += 1
+        child_argv.extend(["--port", str(actual_port)])
+
+        import subprocess
+        import tempfile
+
+        # Send child stderr to a temp file so we can check for
+        # immediate crashes without broken-pipe issues.
+        err_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".log", delete=False,
+        )
+        err_path = err_file.name
+
+        kwargs: dict[str, Any] = {}
+        if sys.platform == "win32":
+            # CREATE_NO_WINDOW gives the child a hidden console that
+            # the Claude CLI subprocess inherits (no blank terminal).
+            # CREATE_NEW_PROCESS_GROUP prevents Ctrl+C from the parent
+            # console propagating to the child.
+            # Do NOT combine with DETACHED_PROCESS — they conflict and
+            # cause the CLI to allocate a visible console then crash.
+            kwargs["creationflags"] = (
+                subprocess.CREATE_NO_WINDOW
+                | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            kwargs["start_new_session"] = True
+
+        proc = subprocess.Popen(
+            child_argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=err_file,
+            close_fds=True,
+            **kwargs,
+        )
+        err_file.close()
+
+        # Give the child a moment to crash on startup.
+        import time as _time
+        _time.sleep(2)
+        rc = proc.poll()
+        if rc is not None:
+            err = Path(err_path).read_text(errors="replace").strip()
+            print(f"Failed to start (exit {rc}):", file=sys.stderr)
+            if err:
+                for line in err.splitlines()[-20:]:
+                    print(f"  {line}", file=sys.stderr)
+            try:
+                os.unlink(err_path)
+            except OSError:
+                pass
+            sys.exit(rc or 1)
+
+        # Still running → success.
+        print(f"orchestrator2 launched on http://localhost:{actual_port}")
+        sys.exit(0)
+
+    # Bind the socket ourselves so we know the actual port before
+    # uvicorn starts (needed for --open and the startup message).
+    sock, actual_port = _bind_port("0.0.0.0", config.port)
+
+    if actual_port != config.port:
+        print(f"Port {config.port} in use — using {actual_port} instead.")
+        config = dataclasses.replace(config, port=actual_port)
+
+    url = f"http://localhost:{actual_port}"
+    msg = f"orchestrator2 starting on {url}"
+    if config.config_dir:
+        msg += f"  (config-dir: {config.config_dir})"
+    print(msg)
 
     # Open browser after a short delay (uvicorn.run blocks, so use a timer).
     if config.open_browser:
         import threading
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
 
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port,
-        log_level="info",
-    )
+    uvi_config = uvicorn.Config(app, host="0.0.0.0", port=actual_port, log_level="info")
+    server = uvicorn.Server(uvi_config)
+    server.run(sockets=[sock])
 
 
 if __name__ == "__main__":

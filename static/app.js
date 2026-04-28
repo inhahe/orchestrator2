@@ -207,6 +207,12 @@ const App = (() => {
       return;
     }
 
+    // Server-initiated page navigation (e.g. /resume opening the picker).
+    if (type === 'navigate') {
+      window.location.href = msg.url;
+      return;
+    }
+
     // Everything else → chat rendering.
     Chat.handleMessage(msg);
   }

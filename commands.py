@@ -57,7 +57,7 @@ class CommandResult:
 
 def _msg(text: str, *, level: str = "info") -> dict[str, Any]:
     """Helper: build a simple system message dict."""
-    return {"type": "system", "subtype": level, "content": text}
+    return {"type": "system_msg", "subtype": level, "data": {"message": text}}
 
 
 def _data_msg(data: Any, *, label: str = "data") -> dict[str, Any]:
@@ -159,6 +159,8 @@ def classify(line: str) -> tuple[str, str]:
         return "status", ""
     if cmd in ("connect", "reconnect"):
         return "connect", ""
+    if cmd == "resume":
+        return ("resume", arg) if arg else ("resume-pick", "")
 
     return "error", f"unknown command /{cmd} (try /help)"
 
@@ -226,6 +228,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         "  /thinking [on|off|toggle]       enable/disable extended thinking",
         "  /model [name]                   show/set model; no arg lists available",
         "  /connect                        reconnect to the SDK",
+        "  /resume [id|title]              resume a session (or open picker)",
         "  /rename <name>                  set a custom session title",
         "  /export [path]                  save conversation as markdown",
         "  /btw <question>                 side question (separate context)",

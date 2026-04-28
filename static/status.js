@@ -89,11 +89,14 @@ const Status = (() => {
     if (title) {
       elSession.textContent = title;
       elSession.title = sid || '';
+      document.title = 'orchestrator2 - ' + title;
     } else if (sid) {
       elSession.textContent = sid.substring(0, 8);
       elSession.title = sid;
+      document.title = 'orchestrator2';
     } else {
       elSession.textContent = '--';
+      document.title = 'orchestrator2';
     }
 
     // Turns — "turns" label then number.

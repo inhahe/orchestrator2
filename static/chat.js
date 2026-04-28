@@ -407,7 +407,7 @@ const Chat = (() => {
     ]);
     if (_silent.has(subtype) && !data.message) return;
 
-    let text = data.message || data.content || '';
+    let text = data.message || data.content || msg.content || '';
     if (data.error) text = `API retry: ${data.error}`;
 
     // Don't render empty system messages (they show as blank dark rectangles).

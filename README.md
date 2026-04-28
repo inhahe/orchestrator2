@@ -17,6 +17,25 @@ To run from a different directory (e.g. via a launcher script):
 python server.py --cwd "%cd%" --open
 ```
 
+## Running Multiple Instances
+
+Just run `orch.bat` (or `python server.py`) from each project directory. If port 8420 is already in use, the server automatically picks a free port:
+
+```
+C:\project-a> orch
+orchestrator2 starting on http://localhost:8420
+
+C:\project-b> orch
+Port 8420 in use — using 52314 instead.
+orchestrator2 starting on http://localhost:52314
+```
+
+To use a different Claude account, pass `--config-dir` to point at an alternate `CLAUDE_CONFIG_DIR`:
+
+```bash
+orch --config-dir "C:\Users\me\.claude-alt"
+```
+
 ## Features
 
 - **Live WebSocket UI** -- real-time streaming of assistant messages, tool calls, and results
@@ -124,8 +143,10 @@ Valid events: `turn-done`, `waiting`, `done`, `stalled`, `api-stall`, `api-ok`, 
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--port N` | 8420 | HTTP server port |
+| `--port N` | 8420 | HTTP server port (auto-selects a free port if in use) |
 | `--open` | off | Open browser automatically on startup |
+| `--detach` | off | Launch the server in the background and exit the terminal (implies `--open`) |
+| `--config-dir PATH` | -- | Override `CLAUDE_CONFIG_DIR` (session/credential storage). Use to run under a different Claude account |
 | `--debug` | off | Print extra diagnostic messages |
 
 ## Slash Commands
@@ -142,6 +163,7 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/rename [name]` | Set a custom session title |
 | `/export [path]` | Save conversation as markdown |
 | `/connect` | Reconnect to the SDK |
+| `/resume [id\|title]` | Resume a specific session, or open the session picker |
 | `/quit`, `/exit`, `/q` | Graceful exit |
 | `/quit!`, `/exit!`, `/q!` | Force exit |
 | `/interrupt`, `/i` | Stop the current turn |
