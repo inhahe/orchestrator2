@@ -234,6 +234,12 @@ class SDKBridge:
     async def reconnect(self) -> None:
         """Disconnect and reconnect with current session ID."""
         sid = self.state.session_id
+        # Purge stale bg tasks — old CLI subprocess is dead.
+        n_stale = len(self.state.background_tasks)
+        if n_stale:
+            self.state.background_tasks.clear()
+            self.state.completed_panel_bg.clear()
+            log.info("cleared %d stale bg task(s) on reconnect", n_stale)
         await self.broadcast({
             "type": "system_msg",
             "subtype": "reconnecting",
@@ -423,13 +429,44 @@ class SDKBridge:
                 ring_bell(state, "requires-action")
                 data = {"state": "requires_action"}
 
+        elif subtype == "task_updated":
+            # Patch-based status update — surface terminal states as completions.
+            # No typed subclass — fields are in msg.data.
+            d = msg.data if isinstance(msg.data, dict) else {}
+            task_id = d.get("task_id") or ""
+            patch = d.get("patch") if isinstance(d.get("patch"), dict) else {}
+            status = patch.get("status")
+            if status in ("completed", "failed", "stopped", "cancelled"):
+                summary = patch.get("summary")
+                entry = complete_bg_task(state, task_id, status, summary=summary)
+                if entry:
+                    data = {
+                        "task_id": task_id,
+                        "seq": entry.get("seq"),
+                        "name": entry.get("name"),
+                        "status": status,
+                        "summary": summary,
+                        "command": self._bg_task_command(entry),
+                    }
+                    await self.broadcast({"type": "bg_complete", **data})
+                    ring_bell(state, "bg-done")
+                    if not state.background_tasks:
+                        self.event_queue.put_nowait(("wakeup", "bg-all-done"))
+
         # Rate limit info (may be on any system message).
         rate_info = getattr(msg, "rate_limit_info", None)
         if rate_info is not None:
             apply_rate_limit_info(state, rate_info)
 
         # High-frequency / noisy subtypes — suppress from the frontend.
-        if subtype in ("task_progress", "hook_started", "hook_ended"):
+        if subtype in ("hook_started", "hook_ended"):
+            return
+
+        # Track progress timestamps for stale detection.
+        if subtype == "task_progress":
+            task_id = getattr(msg, "task_id", None) or ""
+            if task_id and task_id in state.background_tasks:
+                state.background_tasks[task_id]["last_progress_at"] = time.monotonic()
             return
 
         await self.broadcast({

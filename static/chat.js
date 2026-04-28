@@ -40,6 +40,21 @@ const Chat = (() => {
     _toolRunElements = [];
   }
 
+  // --- Thinking-block collapsing ---
+  // Same pattern as tool collapsing: consecutive thinking blocks beyond
+  // _collapseThreshold are grouped behind a toggle.
+  let _consecutiveThinkingCount = 0;
+  let _thinkingGroupContainer = null;
+  let _thinkingGroupToggle = null;
+  let _thinkingRunElements = [];
+
+  function _resetThinkingRun() {
+    _consecutiveThinkingCount = 0;
+    _thinkingGroupContainer = null;
+    _thinkingGroupToggle = null;
+    _thinkingRunElements = [];
+  }
+
   function _trackToolBlock(el) {
     if (!_collapseTools) {
       elMessages.appendChild(el);
@@ -96,6 +111,54 @@ const Chat = (() => {
     _toolGroupToggle.textContent = `\u22EF show ${n} tool${n !== 1 ? 's' : ''}`;
   }
 
+  function _trackThinkingBlock(el) {
+    if (!_collapseTools) {
+      elMessages.appendChild(el);
+      return;
+    }
+    _consecutiveThinkingCount++;
+
+    if (_consecutiveThinkingCount <= _collapseThreshold) {
+      _thinkingRunElements.push(el);
+      elMessages.appendChild(el);
+      return;
+    }
+
+    if (!_thinkingGroupContainer) {
+      _thinkingGroupContainer = document.createElement('div');
+      _thinkingGroupContainer.className = 'tool-collapse-group collapsed';
+
+      _thinkingGroupToggle = document.createElement('div');
+      _thinkingGroupToggle.className = 'tool-collapse-toggle';
+
+      const container = _thinkingGroupContainer;
+      const toggle = _thinkingGroupToggle;
+      toggle.addEventListener('click', () => {
+        container.classList.toggle('collapsed');
+        if (container.classList.contains('collapsed')) {
+          const n = container.children.length;
+          toggle.textContent = `\u22EF show ${n} thinking block${n !== 1 ? 's' : ''}`;
+          _scrollToBottom();
+        } else {
+          toggle.textContent = `\u22EF collapse`;
+          toggle.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      });
+
+      const firstEl = _thinkingRunElements[0];
+      firstEl.parentNode.insertBefore(_thinkingGroupToggle, firstEl);
+      for (const prev of _thinkingRunElements) {
+        _thinkingGroupContainer.appendChild(prev);
+      }
+      _thinkingRunElements = [];
+      elMessages.appendChild(_thinkingGroupContainer);
+    }
+
+    _thinkingGroupContainer.appendChild(el);
+    const n = _thinkingGroupContainer.children.length;
+    _thinkingGroupToggle.textContent = `\u22EF show ${n} thinking block${n !== 1 ? 's' : ''}`;
+  }
+
   function init() {
     elMessages = document.getElementById('messages');
 
@@ -113,6 +176,7 @@ const Chat = (() => {
     _streamingText = '';
     _toolBlocks.clear();
     _resetToolRun();
+    _resetThinkingRun();
   }
 
   // --- Scrolling ---
@@ -152,6 +216,7 @@ const Chat = (() => {
   function _addUserMessage(content) {
     _flushStreaming();
     _resetToolRun();
+    _resetThinkingRun();
     const el = document.createElement('div');
     el.className = 'msg msg-user';
     el.innerHTML = `<div class="msg-label">You</div>
@@ -169,6 +234,7 @@ const Chat = (() => {
 
   function _addAssistantText(msg) {
     _resetToolRun();
+    _resetThinkingRun();
     if (msg.delta) {
       // Streaming delta — append to current element.
       // Use plain text during streaming (fast), render markdown on flush.
@@ -215,6 +281,7 @@ const Chat = (() => {
 
   function _addToolUse(msg) {
     _flushStreaming();
+    _resetThinkingRun();
     const el = document.createElement('div');
     el.className = 'msg msg-tool';
     el.dataset.toolUseId = msg.tool_use_id;
@@ -311,6 +378,7 @@ const Chat = (() => {
 
   function _addThinking(msg) {
     _flushStreaming();
+    _resetToolRun();
     const text = msg.content || '';
     const lines = text.split('\n');
     const nLines = lines.length;
@@ -342,10 +410,13 @@ const Chat = (() => {
       _scrollToBottom();
     });
 
-    elMessages.appendChild(el);
+    _trackThinkingBlock(el);
 
     // Decide summary text after insertion so we can measure width.
-    if (isSingleLine && nChars > 0) {
+    // If the element is hidden (inside a collapsed group), skip
+    // measurement and use the size-hint fallback directly.
+    const isVisible = el.offsetParent !== null;
+    if (isSingleLine && nChars > 0 && isVisible) {
       // Try fitting the full text; measure against the header's available space.
       summaryEl.textContent = text;
       if (summaryEl.scrollWidth > summaryEl.clientWidth) {
@@ -353,7 +424,7 @@ const Chat = (() => {
         summaryEl.textContent = `(${nChars} chars)`;
       }
     } else if (nChars > 0) {
-      summaryEl.textContent = `(${nChars} chars, ${nLines} lines)`;
+      summaryEl.textContent = `(${nChars} chars${nLines > 1 ? `, ${nLines} lines` : ''})`;
     }
 
     _scrollToBottom();
@@ -571,6 +642,7 @@ const Chat = (() => {
 
         _collapseTools = savedCollapse;
         _resetToolRun();
+        _resetThinkingRun();
         _scrollToBottom();
       }
     }

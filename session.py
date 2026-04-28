@@ -412,7 +412,7 @@ def list_sessions_for_project(project_dir: Path) -> list[dict[str, Any]]:
 def render_session_history(
     jsonl: Path,
     *,
-    max_history: int = 200,
+    max_history: int = 2000,
 ) -> tuple[int, list[dict[str, Any]], list[str]]:
     """Build structured history for the frontend.
 

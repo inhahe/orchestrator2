@@ -245,8 +245,8 @@ def complete_tool(
         if parent and parent.get("current_sub_id") == tool_use_id:
             parent["current_sub_id"] = None
 
-    # If this was a Task tool result, clean up leaked bg entries.
-    if active and active.get("name") == "Task":
+    # If this was a Task or Agent tool result, clean up leaked bg entries.
+    if active and active.get("name") in ("Task", "Agent"):
         leaked = [
             tid for tid, bg in state.background_tasks.items()
             if bg.get("tool_use_id") == tool_use_id
