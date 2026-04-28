@@ -75,6 +75,47 @@ def mark(key: str, *, ascii_only: bool = False) -> str:
     return a if ascii_only else u
 
 
+def extract_context_tokens(
+    usage: dict[str, Any] | None,
+    model_usage: dict[str, Any] | None,
+) -> int:
+    """Sum input + cache_read + cache_creation tokens.
+
+    The SDK may provide data in ``usage`` (snake_case or camelCase) or in
+    ``model_usage`` (keyed by model name, camelCase values).  Try all
+    shapes and return the first non-zero total found.
+    """
+    if isinstance(usage, dict) and usage:
+        # Try snake_case first (Anthropic API native).
+        total = (
+            usage.get("input_tokens", 0)
+            + usage.get("cache_read_input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0)
+        )
+        if total:
+            return total
+        # Try camelCase (CLI / SDK wrapper).
+        total = (
+            usage.get("inputTokens", 0)
+            + usage.get("cacheReadInputTokens", 0)
+            + usage.get("cacheCreationInputTokens", 0)
+        )
+        if total:
+            return total
+    if isinstance(model_usage, dict) and model_usage:
+        total = 0
+        for mu in model_usage.values():
+            if isinstance(mu, dict):
+                total += (
+                    mu.get("inputTokens", 0)
+                    + mu.get("cacheReadInputTokens", 0)
+                    + mu.get("cacheCreationInputTokens", 0)
+                )
+        if total:
+            return total
+    return 0
+
+
 def humanize_size(text: str) -> str:
     """Return a human-readable size hint like ``42 lines, 1.2k chars``."""
     lines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)

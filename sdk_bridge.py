@@ -52,7 +52,9 @@ from config import (
 from state import (
     State,
     apply_rate_limit_info,
+    extract_context_tokens,
     fmt_duration,
+    fmt_tok,
     humanize_size,
     ring_bell,
     state_to_panels_dict,
@@ -291,8 +293,15 @@ class SDKBridge:
         elif isinstance(msg, ResultMessage):
             if msg.session_id:
                 state.session_id = msg.session_id
-            if hasattr(msg, "usage") and msg.usage:
-                state.last_usage = msg.usage if isinstance(msg.usage, dict) else {}
+            raw_usage = getattr(msg, "usage", None)
+            raw_model_usage = getattr(msg, "model_usage", None)
+            if isinstance(raw_usage, dict):
+                state.last_usage = raw_usage
+            elif isinstance(raw_model_usage, dict):
+                state.last_usage = raw_model_usage
+            ctx = extract_context_tokens(raw_usage, raw_model_usage)
+            if ctx:
+                state.context_tokens = ctx
             if hasattr(msg, "total_cost_usd"):
                 state.total_cost_usd += msg.total_cost_usd or 0
             subtype = getattr(msg, "subtype", None) or "unknown"
@@ -397,14 +406,15 @@ class SDKBridge:
         elif subtype == "compact_boundary":
             meta = getattr(msg, "compact_metadata", None) or {}
             trigger = meta.get("trigger", "sdk")
-            pre_tokens = meta.get("pre_tokens", 0)
+            pre_tokens = meta.get("pre_tokens", 0) or state.context_tokens
             state.compact_during_last_turn = True
             state.last_compact_trigger = trigger
             # Reset context tokens — the post-compact size is much smaller.
             state.context_tokens = 0
             # Broadcast a visible message matching the TUI's format.
+            tok_str = fmt_tok(pre_tokens) if pre_tokens else "?"
             data = {
-                "message": f"[compacted -- {trigger} -- was ~{pre_tokens} tok]",
+                "message": f"[compacted -- {trigger} -- was ~{tok_str} tok]",
             }
 
         elif subtype == "session_state_changed":
@@ -609,12 +619,16 @@ class SDKBridge:
                         state.turns += 1
                         if hasattr(msg, "total_cost_usd") and msg.total_cost_usd:
                             state.total_cost_usd += msg.total_cost_usd
-                        if hasattr(msg, "usage"):
-                            usage = msg.usage if isinstance(msg.usage, dict) else {}
-                            state.last_usage = usage
-                            input_tokens = usage.get("input_tokens", 0)
-                            if input_tokens:
-                                state.context_tokens = input_tokens
+                        # Extract context tokens from usage / model_usage.
+                        raw_usage = getattr(msg, "usage", None)
+                        raw_model_usage = getattr(msg, "model_usage", None)
+                        if isinstance(raw_usage, dict):
+                            state.last_usage = raw_usage
+                        elif isinstance(raw_model_usage, dict):
+                            state.last_usage = raw_model_usage
+                        ctx = extract_context_tokens(raw_usage, raw_model_usage)
+                        if ctx:
+                            state.context_tokens = ctx
 
                     subtype = getattr(msg, "subtype", None) or "unknown"
                     state.last_result_subtype = subtype
@@ -876,7 +890,7 @@ class SDKBridge:
             state.last_compact_turn = state.turns
             await self.broadcast({
                 "type": "system_msg", "subtype": "info",
-                "data": {"message": f"Auto-compacting (ctx {state.context_tokens} >= {compact_at})..."},
+                "data": {"message": f"Auto-compacting (ctx {fmt_tok(state.context_tokens)} >= {fmt_tok(compact_at)})..."},
             })
             return "/compact"
 
