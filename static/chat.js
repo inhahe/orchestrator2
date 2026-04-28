@@ -72,6 +72,7 @@ const Chat = (() => {
         if (container.classList.contains('collapsed')) {
           const n = container.children.length;
           toggle.textContent = `\u22EF show ${n} tool${n !== 1 ? 's' : ''}`;
+          _scrollToBottom();
         } else {
           toggle.textContent = `\u22EF collapse`;
           // Scroll the expanded group into view.
@@ -249,6 +250,7 @@ const Chat = (() => {
         detail._diffWired = true;
         detail.querySelectorAll('.diff-viewer').forEach(dv => Diff.syncScroll(dv));
       }
+      _scrollToBottom();
     });
 
     _trackToolBlock(el);
@@ -337,6 +339,7 @@ const Chat = (() => {
     header.addEventListener('click', () => {
       body.classList.toggle('open');
       icon.classList.toggle('open');
+      _scrollToBottom();
     });
 
     elMessages.appendChild(el);
@@ -383,6 +386,7 @@ const Chat = (() => {
       header.addEventListener('click', () => {
         detail.classList.toggle('open');
         expandIcon.classList.toggle('open');
+        _scrollToBottom();
       });
     } else {
       el.className = 'msg msg-system';
@@ -435,6 +439,7 @@ const Chat = (() => {
       header.addEventListener('click', () => {
         detail.classList.toggle('open');
         expandIcon.classList.toggle('open');
+        _scrollToBottom();
       });
     } else {
       el.className = 'msg msg-system';
