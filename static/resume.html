@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Resume Session - orchestrator2</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      overflow: auto;
+      display: flex; flex-direction: column;
+      height: 100vh; margin: 0;
+      background: var(--bg); color: var(--text);
+      font-family: var(--font-sans);
+    }
+
+    /* ── Header ── */
+    .picker-header {
+      padding: 20px 28px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-status);
+      flex-shrink: 0;
+    }
+    .picker-header h1 {
+      margin: 0 0 4px; font-size: 20px;
+      color: var(--text-bright);
+    }
+    .picker-header .subtitle {
+      font-size: 13px; color: var(--text-dim); margin: 0;
+    }
+    .picker-header .subtitle code { color: var(--accent); font-size: 12px; }
+
+    /* ── Search bar ── */
+    .search-bar {
+      padding: 12px 28px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-panel);
+      flex-shrink: 0;
+    }
+    .search-bar input {
+      width: 100%; max-width: 600px;
+      padding: 8px 14px; border-radius: var(--radius);
+      background: var(--bg-input); color: var(--text);
+      border: 1px solid var(--border);
+      font-size: 14px; font-family: var(--font-sans);
+      outline: none;
+    }
+    .search-bar input:focus { border-color: var(--accent); }
+    .search-bar input::placeholder { color: var(--text-muted); }
+
+    /* ── Two-panel layout ── */
+    .picker-body {
+      display: flex; flex: 1; overflow: hidden;
+    }
+
+    /* ── Left panel — projects ── */
+    .project-list {
+      width: 360px; min-width: 280px; max-width: 440px;
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      background: var(--bg-panel);
+      flex-shrink: 0;
+    }
+    .project-item {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      transition: background 0.1s;
+    }
+    .project-item:hover { background: var(--bg-tool-hover); }
+    .project-item.active { background: var(--bg-tool); border-left: 3px solid var(--accent); }
+    .project-item .proj-cwd {
+      font-size: 13px; color: var(--text-bright);
+      font-family: var(--font-mono); font-size: 12px;
+      word-break: break-all;
+      line-height: 1.4;
+    }
+    .project-item .proj-meta {
+      font-size: 11px; color: var(--text-muted);
+      margin-top: 4px;
+      display: flex; gap: 12px;
+    }
+    .project-item .proj-meta span { white-space: nowrap; }
+
+    /* ── Right panel — sessions ── */
+    .session-list {
+      flex: 1; overflow-y: auto;
+      background: var(--bg-chat);
+    }
+    .session-list .empty-state {
+      padding: 60px 24px;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 14px;
+    }
+    .session-list .empty-state .arrow {
+      font-size: 28px; color: var(--text-dim);
+      margin-bottom: 12px;
+    }
+
+    .session-item {
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      transition: background 0.1s;
+      display: flex; align-items: flex-start; gap: 14px;
+    }
+    .session-item:hover { background: var(--bg-tool-hover); }
+    .session-item:active { background: var(--bg-tool); }
+
+    .session-item .sess-id {
+      font-family: var(--font-mono); font-size: 11px;
+      color: var(--accent); white-space: nowrap;
+      padding: 2px 6px; border-radius: 3px;
+      background: var(--bg-tool);
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    .session-item .sess-body { flex: 1; min-width: 0; }
+
+    .session-item .sess-title {
+      font-size: 14px; color: var(--text-bright);
+      font-weight: 500;
+      margin-bottom: 4px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .session-item .sess-msg {
+      font-size: 12px; color: var(--text-dim);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      line-height: 1.4;
+    }
+    .session-item .sess-meta {
+      font-size: 11px; color: var(--text-muted);
+      margin-top: 6px;
+      display: flex; gap: 14px; flex-wrap: wrap;
+    }
+    .session-item .sess-meta span { white-space: nowrap; }
+    .session-item .sess-meta .age { color: var(--text-dim); }
+
+    /* ── Loading / error ── */
+    .loading {
+      padding: 40px; text-align: center;
+      color: var(--text-muted); font-size: 14px;
+    }
+    .loading .spinner {
+      display: inline-block; width: 20px; height: 20px;
+      border: 2px solid var(--border); border-top-color: var(--accent);
+      border-radius: 50%; animation: spin 0.8s linear infinite;
+      margin-bottom: 8px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .error-msg {
+      padding: 16px 24px; margin: 16px;
+      background: var(--bg-tool); border: 1px solid var(--red-dim);
+      border-radius: var(--radius);
+      color: var(--red); font-size: 13px;
+    }
+
+    /* ── Resume button overlay ── */
+    .resume-bar {
+      padding: 12px 28px;
+      border-top: 1px solid var(--border);
+      background: var(--bg-status);
+      display: none; align-items: center; gap: 16px;
+      flex-shrink: 0;
+    }
+    .resume-bar.visible { display: flex; }
+    .resume-bar .selected-info {
+      flex: 1; font-size: 13px; color: var(--text-dim);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .resume-bar .selected-info strong { color: var(--text-bright); }
+    .resume-bar button {
+      padding: 8px 24px; border: none; border-radius: var(--radius);
+      font-size: 14px; font-weight: 500; cursor: pointer;
+      transition: background 0.15s;
+    }
+    .resume-bar .btn-resume {
+      background: var(--accent-dim); color: var(--text-bright);
+    }
+    .resume-bar .btn-resume:hover { background: var(--accent); }
+    .resume-bar .btn-resume:disabled {
+      opacity: 0.5; cursor: not-allowed;
+    }
+    .resume-bar .btn-cancel {
+      background: var(--bg-tool); color: var(--text-dim);
+      border: 1px solid var(--border);
+    }
+    .resume-bar .btn-cancel:hover { background: var(--bg-tool-hover); }
+
+    /* Keyboard hint */
+    .kbd-hint {
+      font-size: 11px; color: var(--text-muted);
+      padding: 4px 0;
+    }
+    kbd {
+      display: inline-block; padding: 1px 5px;
+      background: var(--bg-tool); border: 1px solid var(--border);
+      border-radius: 3px; font-family: var(--font-mono); font-size: 10px;
+    }
+
+    /* No-projects state */
+    .no-projects {
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; height: 100%;
+      color: var(--text-muted); text-align: center;
+      padding: 40px;
+    }
+    .no-projects .icon { font-size: 48px; margin-bottom: 16px; opacity: 0.4; }
+    .no-projects p { font-size: 14px; max-width: 400px; line-height: 1.6; }
+    .no-projects code { color: var(--accent); font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="picker-header">
+    <h1>Resume Session</h1>
+    <p class="subtitle">Select a session to resume &mdash; <code>--resume</code> picker</p>
+  </div>
+
+  <div class="search-bar">
+    <input type="text" id="search" placeholder="Filter projects and sessions..." autofocus>
+  </div>
+
+  <div class="picker-body" id="picker-body">
+    <!-- Filled by JS -->
+    <div class="loading" id="loading-state">
+      <div class="spinner"></div><br>
+      Loading sessions...
+    </div>
+  </div>
+
+  <div class="resume-bar" id="resume-bar">
+    <span class="selected-info" id="selected-info"></span>
+    <span class="kbd-hint"><kbd>Enter</kbd> to resume, <kbd>Esc</kbd> to cancel</span>
+    <button class="btn-cancel" id="btn-cancel">Cancel</button>
+    <button class="btn-resume" id="btn-resume">Resume Session</button>
+  </div>
+
+  <script>
+    let allProjects = [];
+    let selectedProjectIdx = -1;
+    let selectedSessionIdx = -1;
+    let selectedSessionId = null;
+    let resuming = false;
+
+    // ── Load data ──
+    async function load() {
+      try {
+        const resp = await fetch('/api/sessions');
+        const data = await resp.json();
+        allProjects = data.projects || [];
+        render();
+      } catch (err) {
+        document.getElementById('picker-body').innerHTML =
+          `<div class="error-msg">Failed to load sessions: ${esc(err.message)}</div>`;
+      }
+    }
+
+    // ── Render ──
+    function render() {
+      const filter = (document.getElementById('search').value || '').toLowerCase().trim();
+      const body = document.getElementById('picker-body');
+
+      // Filter projects.
+      const filtered = allProjects.filter(p => {
+        if (!filter) return true;
+        if ((p.cwd || '').toLowerCase().includes(filter)) return true;
+        if (p.project_slug.toLowerCase().includes(filter)) return true;
+        // Check if any session matches.
+        return p.sessions.some(s =>
+          (s.title || '').toLowerCase().includes(filter) ||
+          (s.first_user_msg || '').toLowerCase().includes(filter) ||
+          (s.last_user_msg || '').toLowerCase().includes(filter) ||
+          s.session_id.toLowerCase().includes(filter)
+        );
+      });
+
+      if (filtered.length === 0) {
+        body.innerHTML = `
+          <div class="no-projects">
+            <div class="icon">&#128193;</div>
+            <p>${filter
+              ? 'No projects or sessions match your filter.'
+              : 'No sessions found.<br>Start a new session first, then use <code>--resume</code> to return to it.'
+            }</p>
+          </div>`;
+        return;
+      }
+
+      // Build left panel (projects).
+      let projHtml = '';
+      filtered.forEach((p, i) => {
+        const active = i === selectedProjectIdx ? ' active' : '';
+        const cwd = p.cwd || p.project_slug;
+        // Shorten the cwd for display.
+        const displayCwd = shortenPath(cwd);
+        const sessCount = p.session_count;
+        const age = p.age || '?';
+        projHtml += `
+          <div class="project-item${active}" data-idx="${i}"
+               title="${esc(cwd)}">
+            <div class="proj-cwd">${esc(displayCwd)}</div>
+            <div class="proj-meta">
+              <span>${sessCount} session${sessCount !== 1 ? 's' : ''}</span>
+              <span>${esc(age)}</span>
+            </div>
+          </div>`;
+      });
+
+      // Build right panel (sessions for selected project).
+      let sessHtml = '';
+      if (selectedProjectIdx >= 0 && selectedProjectIdx < filtered.length) {
+        const proj = filtered[selectedProjectIdx];
+        let sessions = proj.sessions;
+
+        // Apply search filter within sessions too.
+        if (filter) {
+          sessions = sessions.filter(s =>
+            (s.title || '').toLowerCase().includes(filter) ||
+            (s.first_user_msg || '').toLowerCase().includes(filter) ||
+            (s.last_user_msg || '').toLowerCase().includes(filter) ||
+            s.session_id.toLowerCase().includes(filter)
+          );
+        }
+
+        if (sessions.length === 0) {
+          sessHtml = `<div class="empty-state">No matching sessions in this project.</div>`;
+        } else {
+          sessions.forEach((s, i) => {
+            const active = s.session_id === selectedSessionId ? ' style="background:var(--bg-tool);"' : '';
+            const title = s.title || s.first_user_msg || '(untitled)';
+            const lastMsg = s.last_user_msg && s.last_user_msg !== s.first_user_msg
+              ? s.last_user_msg : '';
+            sessHtml += `
+              <div class="session-item" data-session-id="${esc(s.session_id)}"
+                   data-idx="${i}"${active}>
+                <span class="sess-id">${esc(s.session_id.substring(0, 8))}</span>
+                <div class="sess-body">
+                  <div class="sess-title">${esc(title)}</div>
+                  ${lastMsg ? `<div class="sess-msg">Last: ${esc(lastMsg)}</div>` : ''}
+                  <div class="sess-meta">
+                    <span class="age">${esc(s.age)}</span>
+                    <span>${s.msg_count} msg${s.msg_count !== 1 ? 's' : ''}</span>
+                    <span>${esc(s.size)}</span>
+                  </div>
+                </div>
+              </div>`;
+          });
+        }
+      } else {
+        sessHtml = `
+          <div class="empty-state">
+            <div class="arrow">&larr;</div>
+            Select a project to see its sessions.
+          </div>`;
+      }
+
+      body.innerHTML = `
+        <div class="project-list" id="project-list">${projHtml}</div>
+        <div class="session-list" id="session-list">${sessHtml}</div>`;
+
+      // Bind project clicks.
+      body.querySelectorAll('.project-item').forEach(el => {
+        el.addEventListener('click', () => {
+          selectedProjectIdx = parseInt(el.dataset.idx);
+          selectedSessionIdx = -1;
+          selectedSessionId = null;
+          updateResumeBar();
+          render();
+        });
+      });
+
+      // Bind session clicks.
+      body.querySelectorAll('.session-item').forEach(el => {
+        el.addEventListener('click', () => {
+          selectedSessionId = el.dataset.sessionId;
+          selectedSessionIdx = parseInt(el.dataset.idx);
+          updateResumeBar();
+          render();
+        });
+        el.addEventListener('dblclick', () => {
+          selectedSessionId = el.dataset.sessionId;
+          doResume();
+        });
+      });
+    }
+
+    // ── Resume bar ──
+    function updateResumeBar() {
+      const bar = document.getElementById('resume-bar');
+      const info = document.getElementById('selected-info');
+      if (selectedSessionId) {
+        bar.classList.add('visible');
+        // Find the session data.
+        const proj = getFilteredProjects()[selectedProjectIdx];
+        const sess = proj ? proj.sessions.find(s => s.session_id === selectedSessionId) : null;
+        const title = sess ? (sess.title || sess.first_user_msg || '(untitled)') : selectedSessionId;
+        info.innerHTML = `<strong>${esc(selectedSessionId.substring(0, 8))}</strong> &mdash; ${esc(title)}`;
+      } else {
+        bar.classList.remove('visible');
+      }
+    }
+
+    function getFilteredProjects() {
+      const filter = (document.getElementById('search').value || '').toLowerCase().trim();
+      return allProjects.filter(p => {
+        if (!filter) return true;
+        if ((p.cwd || '').toLowerCase().includes(filter)) return true;
+        if (p.project_slug.toLowerCase().includes(filter)) return true;
+        return p.sessions.some(s =>
+          (s.title || '').toLowerCase().includes(filter) ||
+          (s.first_user_msg || '').toLowerCase().includes(filter) ||
+          (s.last_user_msg || '').toLowerCase().includes(filter) ||
+          s.session_id.toLowerCase().includes(filter)
+        );
+      });
+    }
+
+    // ── Resume action ──
+    async function doResume() {
+      if (!selectedSessionId || resuming) return;
+      resuming = true;
+      const btn = document.getElementById('btn-resume');
+      btn.disabled = true;
+      btn.textContent = 'Resuming...';
+
+      try {
+        const resp = await fetch('/api/resume', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({session_id: selectedSessionId}),
+        });
+        const result = await resp.json();
+        if (result.ok) {
+          // Redirect to main chat UI.
+          window.location.href = '/';
+        } else {
+          alert('Failed to resume: ' + (result.error || 'unknown error'));
+          resuming = false;
+          btn.disabled = false;
+          btn.textContent = 'Resume Session';
+        }
+      } catch (err) {
+        alert('Network error: ' + err.message);
+        resuming = false;
+        btn.disabled = false;
+        btn.textContent = 'Resume Session';
+      }
+    }
+
+    // ── Helpers ──
+    function shortenPath(p) {
+      if (!p) return '?';
+      // On Windows, show drive + last 2-3 path components.
+      const parts = p.replace(/\\/g, '/').split('/').filter(Boolean);
+      if (parts.length <= 3) return p;
+      // Keep drive letter (if any) + last 2 parts.
+      const hasDrive = /^[a-zA-Z]:/.test(parts[0]);
+      if (hasDrive) {
+        return parts[0] + '/.../' + parts.slice(-2).join('/');
+      }
+      return '.../' + parts.slice(-2).join('/');
+    }
+
+    function esc(s) {
+      if (!s) return '';
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    // ── Keyboard navigation ──
+    document.addEventListener('keydown', (e) => {
+      const filtered = getFilteredProjects();
+
+      if (e.key === 'Escape') {
+        if (selectedSessionId) {
+          // Deselect session.
+          selectedSessionId = null;
+          selectedSessionIdx = -1;
+          updateResumeBar();
+          render();
+        } else if (selectedProjectIdx >= 0) {
+          // Deselect project.
+          selectedProjectIdx = -1;
+          updateResumeBar();
+          render();
+        }
+        return;
+      }
+
+      if (e.key === 'Enter' && selectedSessionId) {
+        e.preventDefault();
+        doResume();
+        return;
+      }
+
+      // Arrow keys — only when search is not focused or it is and we want
+      // to navigate.
+      const searchFocused = document.activeElement === document.getElementById('search');
+
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const delta = e.key === 'ArrowDown' ? 1 : -1;
+
+        if (selectedProjectIdx < 0 || !selectedSessionId) {
+          // Navigate projects.
+          const newIdx = selectedProjectIdx + delta;
+          if (newIdx >= 0 && newIdx < filtered.length) {
+            selectedProjectIdx = newIdx;
+            selectedSessionIdx = -1;
+            selectedSessionId = null;
+            updateResumeBar();
+            render();
+            // Scroll project into view.
+            const el = document.querySelector(`.project-item[data-idx="${newIdx}"]`);
+            if (el) el.scrollIntoView({block: 'nearest'});
+          }
+        } else {
+          // Navigate sessions within selected project.
+          const proj = filtered[selectedProjectIdx];
+          if (!proj) return;
+          const sessions = getFilteredSessions(proj);
+          const newIdx = selectedSessionIdx + delta;
+          if (newIdx >= 0 && newIdx < sessions.length) {
+            selectedSessionIdx = newIdx;
+            selectedSessionId = sessions[newIdx].session_id;
+            updateResumeBar();
+            render();
+            const el = document.querySelector(`.session-item[data-idx="${newIdx}"]`);
+            if (el) el.scrollIntoView({block: 'nearest'});
+          }
+        }
+        return;
+      }
+
+      if (e.key === 'ArrowRight' && selectedProjectIdx >= 0 && !selectedSessionId) {
+        // Enter sessions panel.
+        e.preventDefault();
+        const proj = filtered[selectedProjectIdx];
+        if (proj) {
+          const sessions = getFilteredSessions(proj);
+          if (sessions.length > 0) {
+            selectedSessionIdx = 0;
+            selectedSessionId = sessions[0].session_id;
+            updateResumeBar();
+            render();
+          }
+        }
+        return;
+      }
+
+      if (e.key === 'ArrowLeft' && selectedSessionId) {
+        // Back to projects.
+        e.preventDefault();
+        selectedSessionId = null;
+        selectedSessionIdx = -1;
+        updateResumeBar();
+        render();
+        return;
+      }
+    });
+
+    function getFilteredSessions(proj) {
+      const filter = (document.getElementById('search').value || '').toLowerCase().trim();
+      if (!filter) return proj.sessions;
+      return proj.sessions.filter(s =>
+        (s.title || '').toLowerCase().includes(filter) ||
+        (s.first_user_msg || '').toLowerCase().includes(filter) ||
+        (s.last_user_msg || '').toLowerCase().includes(filter) ||
+        s.session_id.toLowerCase().includes(filter)
+      );
+    }
+
+    // ── Event bindings ──
+    document.getElementById('search').addEventListener('input', () => {
+      // Reset selection when filter changes.
+      selectedProjectIdx = -1;
+      selectedSessionIdx = -1;
+      selectedSessionId = null;
+      updateResumeBar();
+      render();
+    });
+
+    document.getElementById('btn-resume').addEventListener('click', doResume);
+    document.getElementById('btn-cancel').addEventListener('click', () => {
+      selectedSessionId = null;
+      selectedSessionIdx = -1;
+      updateResumeBar();
+      render();
+    });
+
+    // ── Init ──
+    load();
+  </script>
+</body>
+</html>

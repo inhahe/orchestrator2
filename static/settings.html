@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Theme Settings - orchestrator2</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <style>
+    body { overflow: auto; padding: 16px 24px; }
+    h1 { margin-bottom: 8px; font-size: 22px; color: var(--text-bright); }
+    .subtitle { color: var(--text-dim); font-size: 13px; margin-bottom: 20px; }
+    .subtitle a { color: var(--accent); text-decoration: none; }
+    .subtitle a:hover { text-decoration: underline; }
+
+    /* Top controls */
+    .top-controls {
+      display: flex; align-items: center; gap: 12px;
+      margin-bottom: 20px; flex-wrap: wrap;
+    }
+    .top-controls select, .top-controls button {
+      padding: 6px 14px; border-radius: var(--radius);
+      font-size: 13px; cursor: pointer;
+    }
+    .top-controls select {
+      background: var(--bg-tool); color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .top-controls button {
+      background: var(--accent-dim); color: var(--text-bright); border: none;
+    }
+    .top-controls button:hover { background: var(--accent); }
+    .top-controls button.danger { background: var(--red-dim); }
+    .top-controls button.danger:hover { background: var(--red); }
+
+    /* Saved swatches bar */
+    .saved-bar {
+      display: flex; align-items: center; gap: 6px;
+      margin-bottom: 20px; flex-wrap: wrap;
+      padding: 8px 12px;
+      background: var(--bg-tool); border-radius: var(--radius);
+      border: 1px solid var(--border);
+    }
+    .saved-bar .label { font-size: 11px; color: var(--text-muted); margin-right: 4px; }
+    .swatch {
+      width: 22px; height: 22px; border-radius: 4px;
+      border: 2px solid var(--border); cursor: pointer;
+      transition: transform 0.1s;
+    }
+    .swatch:hover { transform: scale(1.2); border-color: var(--text-dim); }
+    .swatch.remove-mode { border-color: var(--red); }
+
+    /* Token groups */
+    .group { margin-bottom: 24px; }
+    .group-title {
+      font-size: 14px; font-weight: 600; color: var(--text);
+      margin-bottom: 8px; padding-bottom: 4px;
+      border-bottom: 1px solid var(--border);
+    }
+    .token-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 6px;
+    }
+    .token-row {
+      display: flex; align-items: center; gap: 8px;
+      padding: 5px 8px; border-radius: var(--radius);
+      font-size: 12px; font-family: var(--font-mono);
+    }
+    .token-row:hover { background: var(--bg-tool-hover); }
+    .token-row .color-input {
+      width: 32px; height: 24px; border: 1px solid var(--border);
+      border-radius: 4px; cursor: pointer; padding: 0;
+      background: none;
+    }
+    .token-row .color-input::-webkit-color-swatch-wrapper { padding: 1px; }
+    .token-row .color-input::-webkit-color-swatch { border: none; border-radius: 3px; }
+    .token-row .token-name {
+      width: 180px; flex-shrink: 0;
+      color: var(--text-dim);
+    }
+    .token-row .token-name.modified { color: var(--accent); font-weight: 600; }
+    .token-row .hex-input {
+      width: 85px; padding: 2px 6px;
+      background: var(--bg-chat); color: var(--text);
+      border: 1px solid var(--border); border-radius: 4px;
+      font-family: var(--font-mono); font-size: 11px;
+    }
+    .token-row .hex-input:focus { border-color: var(--accent); outline: none; }
+    .token-row .token-desc {
+      flex: 1; color: var(--text-muted); font-size: 11px;
+      font-family: var(--font-sans);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .token-row .reset-btn {
+      background: none; border: none; color: var(--text-muted);
+      cursor: pointer; font-size: 14px; padding: 0 4px;
+      visibility: hidden;
+    }
+    .token-row:hover .reset-btn.visible { visibility: visible; }
+    .token-row .reset-btn:hover { color: var(--red); }
+    .token-row .save-swatch-btn {
+      background: none; border: none; color: var(--text-muted);
+      cursor: pointer; font-size: 12px; padding: 0 4px;
+      title: "Save to palette";
+    }
+    .token-row .save-swatch-btn:hover { color: var(--accent); }
+
+    /* Status toast */
+    #toast {
+      position: fixed; bottom: 20px; right: 20px;
+      padding: 8px 16px; border-radius: var(--radius);
+      background: var(--accent-dim); color: var(--text-bright);
+      font-size: 13px; opacity: 0; transition: opacity 0.3s;
+      z-index: 500; pointer-events: none;
+    }
+    #toast.show { opacity: 1; }
+
+    /* Live preview box */
+    .preview-box {
+      display: flex; flex-wrap: wrap; gap: 8px;
+      margin-bottom: 16px; padding: 12px;
+      background: var(--bg-chat); border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+    .preview-item {
+      padding: 6px 12px; border-radius: 4px; font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Theme Settings</h1>
+  <p class="subtitle"><a href="/">&larr; Back to chat</a> &nbsp;|&nbsp; Edit colours below or in <code>theme.conf</code></p>
+
+  <!-- Live preview -->
+  <div class="preview-box" id="preview">
+    <div class="preview-item" style="background:var(--bg-msg-user); border-left:3px solid var(--user-border); color:var(--user-label);">User msg</div>
+    <div class="preview-item" style="background:var(--bg-tool); color:var(--tool-name);">Tool name</div>
+    <div class="preview-item" style="background:var(--bg-tool); color:var(--icon-running);">&#9654; Running</div>
+    <div class="preview-item" style="background:var(--bg-tool); color:var(--icon-complete);">&#10003; Done</div>
+    <div class="preview-item" style="background:var(--bg-tool); color:var(--icon-error);">&#10007; Error</div>
+    <div class="preview-item" style="color:var(--thinking-color);">Thinking...</div>
+    <div class="preview-item" style="color:var(--system-warning);">Warning</div>
+    <div class="preview-item" style="color:var(--system-done);">Complete</div>
+    <div class="preview-item" style="color:var(--system-waiting);">Waiting</div>
+    <div class="preview-item" style="background:var(--send-btn-bg); color:var(--text-bright); border-radius:4px;">Send</div>
+  </div>
+
+  <!-- Preset / reset controls -->
+  <div class="top-controls">
+    <label style="font-size:12px; color:var(--text-dim);">Preset:</label>
+    <select id="preset-select"></select>
+    <button id="apply-preset-btn">Apply Preset</button>
+    <button id="reset-btn" class="danger">Reset All</button>
+  </div>
+
+  <!-- Saved colour swatches -->
+  <div class="saved-bar" id="saved-bar">
+    <span class="label">Saved colours:</span>
+    <span id="saved-swatches"></span>
+  </div>
+
+  <!-- Token groups -->
+  <div id="token-groups"></div>
+
+  <div id="toast"></div>
+
+  <script>
+    let themeData = null;
+    let debounceTimers = {};
+
+    async function load() {
+      const resp = await fetch('/api/theme');
+      themeData = await resp.json();
+      renderPresets(themeData.presets);
+      renderSaved(themeData.saved_colors);
+      renderGroups(themeData.groups);
+    }
+
+    function renderPresets(presets) {
+      const sel = document.getElementById('preset-select');
+      sel.innerHTML = '';
+      for (const p of presets) {
+        const opt = document.createElement('option');
+        opt.value = p;
+        opt.textContent = p.charAt(0).toUpperCase() + p.slice(1).replace(/-/g, ' ');
+        sel.appendChild(opt);
+      }
+    }
+
+    function renderSaved(colors) {
+      const container = document.getElementById('saved-swatches');
+      if (!colors || colors.length === 0) {
+        container.innerHTML = '<span style="font-size:11px; color:var(--text-muted);">none (click + next to a colour to save)</span>';
+        return;
+      }
+      let html = '';
+      for (const c of colors) {
+        html += `<div class="swatch" style="background:${esc(c)};" data-color="${esc(c)}"
+                      title="${esc(c)} (click to copy, right-click to remove)"></div>`;
+      }
+      container.innerHTML = html;
+
+      container.querySelectorAll('.swatch').forEach(el => {
+        el.addEventListener('click', () => {
+          navigator.clipboard.writeText(el.dataset.color);
+          toast('Copied ' + el.dataset.color);
+        });
+        el.addEventListener('contextmenu', async (e) => {
+          e.preventDefault();
+          await fetch('/api/theme/saved-colors', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({action: 'remove', color: el.dataset.color}),
+          });
+          const resp = await fetch('/api/theme');
+          const data = await resp.json();
+          renderSaved(data.saved_colors);
+          toast('Removed ' + el.dataset.color);
+        });
+      });
+    }
+
+    function renderGroups(groups) {
+      const container = document.getElementById('token-groups');
+      let html = '';
+      for (const g of groups) {
+        html += `<div class="group"><div class="group-title">${esc(g.group)}</div><div class="token-grid">`;
+        for (const t of g.tokens) {
+          const modified = !t.is_default;
+          const isHex = t.value.startsWith('#');
+          const colorVal = isHex ? t.value : '#888888';
+          const rawDisplay = t.raw.startsWith('$') ? t.raw : t.value;
+
+          html += `<div class="token-row" data-name="${esc(t.name)}">
+            <input type="color" class="color-input" value="${esc(colorVal)}"
+                   data-name="${esc(t.name)}" ${isHex ? '' : 'disabled'}>
+            <span class="token-name ${modified ? 'modified' : ''}">${esc(t.name)}</span>
+            <input type="text" class="hex-input" value="${esc(rawDisplay)}"
+                   data-name="${esc(t.name)}" placeholder="${esc(t.default)}">
+            <span class="token-desc" title="${esc(t.description)}">${esc(t.description)}</span>
+            <button class="save-swatch-btn" data-name="${esc(t.name)}" title="Save to palette">+</button>
+            <button class="reset-btn ${modified ? 'visible' : ''}" data-name="${esc(t.name)}" title="Reset to default">&circlearrowleft;</button>
+          </div>`;
+        }
+        html += '</div></div>';
+      }
+      container.innerHTML = html;
+
+      // Bind events.
+      container.querySelectorAll('.color-input').forEach(el => {
+        el.addEventListener('input', (e) => {
+          const name = el.dataset.name;
+          const hexInput = container.querySelector(`.hex-input[data-name="${name}"]`);
+          if (hexInput) hexInput.value = e.target.value;
+          debouncedUpdate(name, e.target.value);
+        });
+      });
+
+      container.querySelectorAll('.hex-input').forEach(el => {
+        el.addEventListener('change', (e) => {
+          const name = el.dataset.name;
+          const val = e.target.value.trim();
+          const colorInput = container.querySelector(`.color-input[data-name="${name}"]`);
+          if (colorInput && val.startsWith('#') && (val.length === 4 || val.length === 7)) {
+            colorInput.value = val;
+          }
+          debouncedUpdate(name, val);
+        });
+      });
+
+      container.querySelectorAll('.reset-btn').forEach(el => {
+        el.addEventListener('click', async () => {
+          const name = el.dataset.name;
+          const tok = findToken(name);
+          if (tok) {
+            await updateToken(name, tok.default);
+          }
+        });
+      });
+
+      container.querySelectorAll('.save-swatch-btn').forEach(el => {
+        el.addEventListener('click', async () => {
+          const name = el.dataset.name;
+          const tok = findToken(name);
+          if (tok && tok.value.startsWith('#')) {
+            await fetch('/api/theme/saved-colors', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({action: 'add', color: tok.value}),
+            });
+            const resp = await fetch('/api/theme');
+            const data = await resp.json();
+            renderSaved(data.saved_colors);
+            toast('Saved ' + tok.value);
+          }
+        });
+      });
+    }
+
+    function findToken(name) {
+      if (!themeData) return null;
+      for (const g of themeData.groups) {
+        for (const t of g.tokens) {
+          if (t.name === name) return t;
+        }
+      }
+      return null;
+    }
+
+    function debouncedUpdate(name, value) {
+      clearTimeout(debounceTimers[name]);
+      debounceTimers[name] = setTimeout(() => updateToken(name, value), 300);
+    }
+
+    async function updateToken(name, value) {
+      const resp = await fetch('/api/theme', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({tokens: {[name]: value}}),
+      });
+      const result = await resp.json();
+      if (result.ok) {
+        // Apply CSS live.
+        applyCss(result.css);
+        toast('Updated ' + name);
+        // Reload full data to refresh modified flags.
+        const full = await fetch('/api/theme');
+        themeData = await full.json();
+        renderGroups(themeData.groups);
+      } else {
+        toast('Error: ' + (result.errors || []).join(', '));
+      }
+    }
+
+    function applyCss(css) {
+      let el = document.getElementById('theme-overrides');
+      if (!el) {
+        el = document.createElement('style');
+        el.id = 'theme-overrides';
+        document.head.appendChild(el);
+      }
+      el.textContent = css;
+    }
+
+    document.getElementById('apply-preset-btn').addEventListener('click', async () => {
+      const name = document.getElementById('preset-select').value;
+      const resp = await fetch('/api/theme/preset', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name}),
+      });
+      const result = await resp.json();
+      if (result.ok) {
+        applyCss(result.css);
+        themeData = {groups: result.groups, presets: themeData.presets, saved_colors: themeData.saved_colors};
+        renderGroups(result.groups);
+        toast('Applied preset: ' + name);
+      }
+    });
+
+    document.getElementById('reset-btn').addEventListener('click', async () => {
+      if (!confirm('Reset all colours to defaults?')) return;
+      const resp = await fetch('/api/theme/reset', {method: 'POST'});
+      const result = await resp.json();
+      applyCss('');
+      themeData = {groups: result.groups, presets: themeData.presets, saved_colors: themeData.saved_colors};
+      renderGroups(result.groups);
+      toast('Reset to defaults');
+    });
+
+    function toast(msg) {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.classList.add('show');
+      setTimeout(() => el.classList.remove('show'), 1500);
+    }
+
+    function esc(s) {
+      if (!s) return '';
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    load();
+  </script>
+</body>
+</html>

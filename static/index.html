@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>orchestrator2</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <!-- Status bar is inside #input-bar below, not a top header -->
+
+  <!-- ===== Main layout: panels + chat ===== -->
+  <div id="main-container">
+    <!-- Left sidebar panels -->
+    <aside id="sidebar">
+      <!-- Active tools panel -->
+      <section id="panel-tools" class="panel">
+        <h3 class="panel-title" data-panel="tools">
+          <span class="panel-icon">&#9881;</span> Tools
+          <span id="panel-tools-count" class="panel-count">0</span>
+        </h3>
+        <div id="panel-tools-body" class="panel-body"></div>
+      </section>
+
+      <!-- Background tasks panel -->
+      <section id="panel-bg" class="panel">
+        <h3 class="panel-title" data-panel="bg">
+          <span class="panel-icon">&#9654;</span> Background
+          <span id="panel-bg-count" class="panel-count">0</span>
+        </h3>
+        <div id="panel-bg-body" class="panel-body"></div>
+      </section>
+
+      <!-- Pending queue panel -->
+      <section id="panel-queue" class="panel hidden">
+        <h3 class="panel-title" data-panel="queue">
+          <span class="panel-icon">&#128203;</span> Pending
+          <span id="panel-queue-count" class="panel-count">0</span>
+        </h3>
+        <div id="panel-queue-body" class="panel-body"></div>
+      </section>
+
+      <!-- Todos panel -->
+      <section id="panel-todos" class="panel">
+        <h3 class="panel-title" data-panel="todos">
+          <span class="panel-icon">&#9745;</span> Plan
+          <span id="panel-todos-count" class="panel-count">0</span>
+        </h3>
+        <div id="panel-todos-body" class="panel-body"></div>
+      </section>
+    </aside>
+    <div id="sidebar-resize"></div>
+
+    <!-- Chat / output area -->
+    <main id="chat-area">
+      <div id="messages"></div>
+    </main>
+  </div>
+
+  <!-- ===== Input bar (bottom) ===== -->
+  <footer id="input-bar">
+    <div id="status-bar">
+      <span id="status-indicator" class="indicator idle"></span>
+      <span id="status-state" class="status-field status-state-text" title="Current state">idle</span>
+      <span class="status-sep">|</span>
+      <span class="status-label">session</span>
+      <span id="status-session" class="status-field" title="Session">--</span>
+      <span class="status-sep">|</span>
+      <span id="status-turns" class="status-field" title="Turns">turns 0</span>
+      <span class="status-sep">|</span>
+      <span class="status-label">plan</span>
+      <span id="status-plan" class="status-field" title="Plan">--</span>
+      <span class="status-sep">|</span>
+      <span class="status-label">model</span>
+      <span id="status-model" class="status-field" title="Model">--</span>
+      <span class="status-sep">|</span>
+      <span class="status-label">effort</span>
+      <span id="status-effort" class="status-field" title="Effort">--</span>
+      <span class="status-sep">|</span>
+      <span class="status-label">thinking</span>
+      <span id="status-thinking" class="status-field" title="Thinking">--</span>
+      <span class="status-sep">|</span>
+      <span class="status-label">ctx</span>
+      <span id="status-context" class="status-field" title="Context tokens">--</span>
+      <span class="status-sep">|</span>
+      <span class="status-label">rate</span>
+      <span id="status-ratelimit" class="status-field" title="Rate limits">--</span>
+      <span class="status-sep">|</span>
+      <label class="status-checkbox" title="Auto-collapse consecutive tool calls">
+        <input type="checkbox" id="collapse-tools-check" checked>
+        <span class="status-label">collapse</span>
+      </label>
+    </div>
+    <div id="input-wrap">
+      <textarea id="input-box" rows="1"
+                placeholder="Message Claude... (Enter to send, Shift+Enter for newline)"
+                autocomplete="off" spellcheck="true"></textarea>
+      <button id="send-btn" title="Send (Enter)">&#9654;</button>
+      <button id="interrupt-btn" title="Interrupt (Ctrl+C)" class="hidden">&#9632;</button>
+    </div>
+    <div id="input-hint" class="hidden"></div>
+  </footer>
+
+  <!-- ===== Detail modal (click-to-expand) ===== -->
+  <div id="detail-modal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content">
+      <div class="modal-header">
+        <span id="modal-title">Detail</span>
+        <button id="modal-close">&times;</button>
+      </div>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- JS modules -->
+  <script src="/static/diff.js"></script>
+  <script src="/static/status.js"></script>
+  <script src="/static/panels.js"></script>
+  <script src="/static/commands.js"></script>
+  <script src="/static/chat.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

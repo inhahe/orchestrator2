@@ -1,0 +1,4 @@
+claude-agent-sdk>=0.1.59
+fastapi>=0.115
+uvicorn>=0.34
+websockets>=15.0
