@@ -379,6 +379,12 @@ async def _reconfigure(
         bridge._initial_resume_id = new_resume
     elif cwd:
         os.chdir(new_cwd)
+        # Seed session from the new cwd (continue most recent).
+        if not config.no_continue:
+            recent = find_most_recent_session_for_cwd(new_cwd)
+            if recent is not None:
+                state.session_id = recent.stem
+                state.session_title = read_session_title(recent.stem)
 
     _picker_mode = False
     await bridge.start()
@@ -817,6 +823,17 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             await bridge.stop()
             await send_to(ws, {"type": "system_msg", "subtype": "shutdown",
                                "data": {"message": "Shutting down."}})
+            return
+
+        if kind == "switch-cwd":
+            await send_to(ws, {"type": "system_msg", "subtype": "info",
+                               "data": {"message": f"Switching to {payload} ..."}})
+            ok, err = await _reconfigure(cwd=payload)
+            if ok:
+                await _send_initial_state(ws)
+            else:
+                await send_to(ws, {"type": "system_msg", "subtype": "error",
+                                   "data": {"message": f"Switch failed: {err}"}})
             return
 
         # Try immediate command.

@@ -227,7 +227,6 @@ def complete_tool(
         and active.get("first_shown_at") is not None
         and not active.get("parent_id")
         and state.panel_grace > 0
-        and state.show_tasks_panel
     ):
         shown_for = time.monotonic() - active["first_shown_at"]
         if shown_for < state.panel_grace:
@@ -346,7 +345,6 @@ def complete_bg_task(
     if (
         entry.get("first_shown_at") is not None
         and state.panel_grace > 0
-        and state.show_bg_panel
     ):
         grace_end = entry["first_shown_at"] + state.panel_grace
         state.completed_panel_bg[task_id] = {

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -46,11 +47,18 @@ SHORT_OUTPUT_TOOLS = frozenset({
 SLASH_COMMANDS = [
     "/help", "/status", "/debug", "/cost", "/cwd", "/clear", "/cls",
     "/interrupt", "/i", "/compact", "/effort", "/thinking", "/model",
-    "/connect", "/reconnect", "/rename", "/export",
+    "/connect", "/reconnect", "/rename", "/export", "/models",
     "/tools", "/tasks", "/bg", "/background", "/show", "/btw",
     "/autocompact", "/max-context", "/bell",
     "/queue", "/todos", "/plan", "/quit", "/exit",
     "/quit!", "/exit!",
+]
+
+# Known models — (id, description).  Used in --help and /model.
+KNOWN_MODELS = [
+    ("claude-opus-4-6", "Opus 4.6 — 1M context, max capability"),
+    ("claude-sonnet-4-6", "Sonnet 4.6 — 200k context, fast"),
+    ("claude-haiku-3-5", "Haiku 3.5 — 200k context, fastest"),
 ]
 
 # Terminal bell event system.
@@ -233,7 +241,7 @@ class Config:
     show_full_commands: bool = False
     show_tool_output: bool = False
     show_tool_everything: bool = False
-    inline_all_tools: bool = False
+    inline_all_tools: bool = True
     show_tasks: str = "compact"        # "off"|"compact"|"full"|"full+output"
     show_edits: str = "compact"        # "off"|"compact"|"full"
     ascii_only: bool = False
@@ -241,9 +249,6 @@ class Config:
     collapse_threshold: int = 3        # tools shown before collapsing
 
     # Panels
-    tasks_panel: bool = False
-    bg_panel: bool = True
-    todos_panel: bool = False
     panel_delay: float = 0.0
     panel_grace: float = 10.0
 
@@ -323,10 +328,16 @@ def parse_args(argv: list[str] | None = None) -> Config:
             "effort parameter; the model uses its own default."
         ),
     )
+    _model_names = ", ".join(m for m, _ in KNOWN_MODELS)
     ap.add_argument(
         "--model",
         default=None,
-        help='e.g. "claude-opus-4-6", "claude-sonnet-4-6".',
+        help=f"Model to use. Available: {_model_names}.",
+    )
+    ap.add_argument(
+        "--list-models",
+        action="store_true",
+        help="List available models and exit.",
     )
     ap.add_argument(
         "--cwd",
@@ -377,39 +388,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
             "Cap context window at ~N tokens via rolling-window trim. "
             "0 = disabled."
         ),
-    )
-
-    # -- Auto-continue --
-    ap.add_argument(
-        "--auto-continue",
-        action="store_true",
-        help="Enable autonomous continue after each turn.",
-    )
-    ap.add_argument(
-        "--continue-prompt",
-        default=None,
-        metavar="TEXT",
-        help="Override the auto-continue prompt text.",
-    )
-    ap.add_argument(
-        "--continue-response-delay",
-        type=float,
-        default=CONTINUE_RESPONSE_DELAY_SECONDS,
-        help=f"Seconds to wait before auto-continuing. Default {CONTINUE_RESPONSE_DELAY_SECONDS}.",
-    )
-    ap.add_argument(
-        "--continue-burst-limit",
-        type=int,
-        default=CONTINUE_BURST_LIMIT,
-        metavar="N",
-        help=f"Safety brake: treat as [WAITING] after N fast turns. Default {CONTINUE_BURST_LIMIT}.",
-    )
-    ap.add_argument(
-        "--continue-burst-window",
-        type=float,
-        default=CONTINUE_BURST_WINDOW_SECONDS,
-        metavar="SECONDS",
-        help=f"Time window for burst-limit. Default {CONTINUE_BURST_WINDOW_SECONDS}.",
     )
 
     # -- Tools & permissions --
@@ -470,11 +448,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         help="Convenience: --show-full-commands AND --show-tool-output.",
     )
     ap.add_argument(
-        "--inline-all-tools",
-        action="store_true",
-        help="Render every tool inline with [#N] tags.",
-    )
-    ap.add_argument(
         "--show-tasks",
         choices=("off", "compact", "full", "full+output"),
         default="compact",
@@ -502,40 +475,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--collapse-threshold",
         type=int, default=3, metavar="N",
         help="Number of tool calls to show before collapsing (default: 3).",
-    )
-
-    # -- Panels --
-    ap.add_argument(
-        "--tasks-panel",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Show live tasks panel in toolbar.",
-    )
-    ap.add_argument(
-        "--bg-panel",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Show background-tasks panel. Default: on.",
-    )
-    ap.add_argument(
-        "--todos-panel",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Show TodoWrite plan panel.",
-    )
-    ap.add_argument(
-        "--panel-delay",
-        type=float,
-        default=0.0,
-        metavar="SECS",
-        help="Seconds before a tool appears in panels. Default: 0.",
-    )
-    ap.add_argument(
-        "--panel-grace",
-        type=float,
-        default=10.0,
-        metavar="SECS",
-        help="Minimum seconds a completed task stays in panel. Default: 10.",
     )
 
     # -- Bell --
@@ -568,17 +507,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         default="https://status.claude.com/api/v2/summary.json",
         help="Anthropic Statuspage.io summary feed.",
     )
-    ap.add_argument(
-        "--status-poll-interval",
-        type=float,
-        default=30.0,
-        help="Status feed poll interval (seconds). Default: 30.",
-    )
-    ap.add_argument(
-        "--no-status-poll",
-        action="store_true",
-        help="Don't poll the status page when API-stalled.",
-    )
 
     # -- Resilience --
     ap.add_argument(
@@ -609,6 +537,13 @@ def parse_args(argv: list[str] | None = None) -> Config:
 
     args = ap.parse_args(argv)
 
+    # --list-models: print available models and exit.
+    if args.list_models:
+        print("Available models:")
+        for model_id, desc in KNOWN_MODELS:
+            print(f"  {model_id:25s} {desc}")
+        raise SystemExit(0)
+
     # --show-tool-everything is a convenience that flips both detail flags.
     if args.show_tool_everything:
         args.show_full_commands = True
@@ -624,7 +559,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         no_continue=args.no_continue,
         resume=args.resume,
         no_replay=args.no_replay,
-        cwd=args.cwd,
+        cwd=str(Path(args.cwd).resolve()),
         model=args.model,
         effort=args.effort,
         no_thinking=args.no_thinking,
@@ -636,31 +571,18 @@ def parse_args(argv: list[str] | None = None) -> Config:
         auto_compact=not args.no_compact,
         compact_cooldown_turns=args.compact_cooldown_turns,
         max_context_tokens=args.max_context_tokens,
-        auto_continue=args.auto_continue,
-        continue_prompt=args.continue_prompt,
-        continue_response_delay=args.continue_response_delay,
-        continue_burst_limit=args.continue_burst_limit,
-        continue_burst_window=args.continue_burst_window,
         api_stall_limit=args.api_stall_limit,
         api_stall_window=args.api_stall_window,
         status_url=args.status_url,
-        status_poll_interval=args.status_poll_interval,
-        no_status_poll=args.no_status_poll,
         show_thinking=args.show_thinking,
         show_full_commands=args.show_full_commands,
         show_tool_output=args.show_tool_output,
         show_tool_everything=args.show_tool_everything,
-        inline_all_tools=args.inline_all_tools,
         show_tasks=args.show_tasks,
         show_edits=args.show_edits,
         ascii_only=args.ascii_only,
         collapse_tools=args.collapse_tools,
         collapse_threshold=max(1, args.collapse_threshold),
-        tasks_panel=args.tasks_panel,
-        bg_panel=args.bg_panel,
-        todos_panel=args.todos_panel,
-        panel_delay=args.panel_delay,
-        panel_grace=args.panel_grace,
         bell_on=args.bell_on,
         append_system_prompt=args.append_system_prompt,
         mcp_config=args.mcp_config,

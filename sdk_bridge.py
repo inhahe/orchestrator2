@@ -175,7 +175,8 @@ class SDKBridge:
         self.client = ClaudeSDKClient(options=options)
 
         self.state.connecting = True
-        self.state.connect_started_at = time.monotonic()
+        started = time.monotonic()
+        self.state.connect_started_at = started
         await self.broadcast({"type": "status_update",
                               "status": state_to_status_dict(self.state, self.config)})
 
@@ -185,7 +186,7 @@ class SDKBridge:
             self.state.connecting = False
             self.state.connect_started_at = None
 
-        elapsed = time.monotonic() - (self.state.connect_started_at or time.monotonic())
+        elapsed = time.monotonic() - started
         await self.broadcast({
             "type": "system_msg",
             "subtype": "connected",

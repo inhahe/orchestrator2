@@ -450,6 +450,11 @@ const Chat = (() => {
   function _replayHistory(messages) {
     if (!messages || !messages.length) return;
 
+    // Disable tool-collapse during history replay — processing hundreds
+    // of tool blocks through the collapse DOM logic freezes the browser.
+    const savedCollapse = _collapseTools;
+    _collapseTools = false;
+
     // Add history separator.
     const sep = document.createElement('div');
     sep.className = 'msg msg-system';
@@ -478,6 +483,8 @@ const Chat = (() => {
     endSep.textContent = '--- End of history ---';
     elMessages.appendChild(endSep);
 
+    _collapseTools = savedCollapse;
+    _resetToolRun();
     _scrollToBottom();
   }
 

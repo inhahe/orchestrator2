@@ -16,6 +16,7 @@ from typing import Any
 from config import (
     BELL_EVENT_NAMES,
     EFFORT_CHOICES,
+    KNOWN_MODELS,
     SLASH_COMMANDS,
     Config,
     _parse_bell_spec,
@@ -119,7 +120,7 @@ def classify(line: str) -> tuple[str, str]:
             return "effort", val
         return "error", f"effort must be one of {', '.join(EFFORT_CHOICES)}"
 
-    if cmd == "model":
+    if cmd in ("model", "models"):
         return ("model", arg) if arg else ("model-show", "")
 
     if cmd == "rename":
@@ -175,7 +176,11 @@ def classify(line: str) -> tuple[str, str]:
         return "clear-context", ""
     if cmd == "cls":
         return "clear-screen", ""
-    if cmd in ("cost", "cwd"):
+    if cmd == "cost":
+        return "status", ""
+    if cmd == "cwd":
+        if arg:
+            return "switch-cwd", arg
         return "status", ""
     if cmd in ("connect", "reconnect"):
         return "connect", ""
@@ -242,7 +247,8 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
     lines = [
         "Commands:",
         "  /help                           this help",
-        "  /status  /cost  /cwd            session info, cost, usage",
+        "  /status  /cost                  session info, cost, usage",
+        "  /cwd [path]                     show or switch working directory",
         "  /clear                          start a fresh session (wipes context)",
         "  /cls                            clear the output area",
         "  /interrupt  /i                  stop the current turn",
@@ -299,7 +305,6 @@ def _cmd_debug(_payload: str, state: State, _config: Config) -> CommandResult:
         "queued_prompts": len(state.queued_prompts),
         "pending_bell": state.pending_bell,
         "rate_limit_status": state.rate_limit_status,
-        "show_bg_panel": state.show_bg_panel,
         "inline_all_tools": state.inline_all_tools,
         "panel_delay": state.panel_delay,
     }
@@ -584,13 +589,6 @@ def _cmd_effort_show(_payload: str, state: State, _config: Config) -> CommandRes
     return CommandResult(messages=[_data_msg(data, label="effort")])
 
 
-_KNOWN_MODELS = [
-    ("claude-opus-4-6", "Opus 4.6 — 1M context, max capability"),
-    ("claude-sonnet-4-6", "Sonnet 4.6 — 200k context, fast"),
-    ("claude-haiku-3-5", "Haiku 3.5 — 200k context, fastest"),
-]
-
-
 def _cmd_model_show(_payload: str, state: State, _config: Config) -> CommandResult:
     pinned = state.model
     active = state.active_model
@@ -600,6 +598,6 @@ def _cmd_model_show(_payload: str, state: State, _config: Config) -> CommandResu
         current = f"{active} (CLI-picked)"
     else:
         current = "(auto — no AssistantMessage received yet)"
-    models = [{"id": m, "description": d} for m, d in _KNOWN_MODELS]
+    models = [{"id": m, "description": d} for m, d in KNOWN_MODELS]
     data = {"current": current, "models": models}
     return CommandResult(messages=[_data_msg(data, label="model")])

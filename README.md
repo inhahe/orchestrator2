@@ -11,14 +11,19 @@ python server.py
 
 Opens at `http://localhost:8420`. Add `--open` to launch the browser automatically.
 
+To run from a different directory (e.g. via a launcher script):
+
+```bash
+python server.py --cwd "%cd%" --open
+```
+
 ## Features
 
 - **Live WebSocket UI** -- real-time streaming of assistant messages, tool calls, and results
 - **Side-by-side diff viewer** -- UltraCompare-style edit comparisons with configurable colors
-- **Tool collapse** -- consecutive tool calls auto-collapse behind a toggle (configurable threshold)
+- **Tool collapse** -- consecutive tool calls auto-collapse behind a toggle (configurable threshold, persisted across sessions)
 - **Sidebar panels** -- live views of active tools, background tasks, pending queue, and TodoWrite plan
 - **Draggable sidebar** -- resize handle with width persisted across sessions
-- **Auto-continue** -- autonomous multi-turn execution with burst safety brake
 - **Auto-compact** -- automatic context compaction when token usage gets high
 - **Background tasks** -- track and inspect agent-spawned background work
 - **Pending queue** -- type messages while Claude is busy; they queue and execute in order
@@ -26,6 +31,7 @@ Opens at `http://localhost:8420`. Add `--open` to launch the browser automatical
 - **Permission dialogs** -- allow/deny tool execution from the browser
 - **Session resume** -- automatically continues the most recent session for the working directory
 - **Session picker** -- interactive session selection with `--resume`
+- **Switch projects** -- change working directory and session with `/cwd <path>`
 - **Multi-tab support** -- multiple browser tabs receive synchronized updates
 - **Bell notifications** -- configurable audible alerts for key events
 - **API stall detection** -- monitors retry patterns and polls Anthropic's status page
@@ -42,15 +48,16 @@ Opens at `http://localhost:8420`. Add `--open` to launch the browser automatical
 | `--no-continue` | off | Start a fresh session instead of resuming the most recent one |
 | `--no-replay` | off | When resuming, don't replay prior messages into backscroll |
 | `--resume [SESSION_ID]` | -- | Resume a specific session by ID, or omit the ID for a picker |
+| `--cwd PATH` | `.` | Working directory Claude operates in |
 
 ### Model & Effort
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model` | auto | Model name (e.g. `claude-opus-4-6`, `claude-sonnet-4-6`) |
-| `--effort` | auto | Thinking effort: `auto`, `low`, `medium`, `high`, `max` |
+| `--model NAME` | auto | Model to use (see `--list-models` for available models) |
+| `--list-models` | -- | List available models and exit |
+| `--effort LEVEL` | auto | Thinking effort: `auto`, `low`, `medium`, `high`, `max` |
 | `--no-thinking` | off | Disable extended thinking entirely |
-| `--cwd` | `.` | Working directory Claude operates in |
 
 ### Context & Compaction
 
@@ -61,16 +68,6 @@ Opens at `http://localhost:8420`. Add `--open` to launch the browser automatical
 | `--compact-at N` | auto | Token threshold for auto-compact (default: 950k for 1M-context models, 160k otherwise) |
 | `--compact-cooldown-turns N` | 3 | Skip compact check for N turns after compacting |
 | `--max-context-tokens N` | 0 | Cap context via rolling-window trim (0 = disabled) |
-
-### Auto-Continue
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--auto-continue` | off | Enable autonomous continue after each turn |
-| `--continue-prompt TEXT` | built-in | Override the auto-continue prompt text |
-| `--continue-response-delay N` | 2.0 | Seconds to wait before auto-continuing |
-| `--continue-burst-limit N` | 3 | Safety brake: pause after N fast turns without a sentinel |
-| `--continue-burst-window N` | 180.0 | Time window (seconds) for burst detection |
 
 ### Tools & Permissions
 
@@ -95,22 +92,11 @@ Opens at `http://localhost:8420`. Add `--open` to launch the browser automatical
 | `--show-full-commands` | off | Display Bash command body inline |
 | `--show-tool-output` | off | Print full tool result content inline |
 | `--show-tool-everything` | off | Shorthand for `--show-full-commands` + `--show-tool-output` |
-| `--inline-all-tools` | off | Render every tool inline with `[#N]` tags |
 | `--show-tasks` | `compact` | Non-Bash tool display: `off`, `compact`, `full`, `full+output` |
 | `--show-edits` | `compact` | Edit tool display: `off`, `compact`, `full` |
 | `--ascii-only` | off | Use ASCII markers instead of Unicode |
 | `--collapse-tools` / `--no-collapse-tools` | on | Auto-collapse consecutive tool calls |
 | `--collapse-threshold N` | 3 | Number of tools shown before collapsing |
-
-### Panels
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--tasks-panel` / `--no-tasks-panel` | off | Show live tools panel in sidebar |
-| `--bg-panel` / `--no-bg-panel` | on | Show background tasks panel |
-| `--todos-panel` / `--no-todos-panel` | off | Show TodoWrite plan panel |
-| `--panel-delay N` | 0.0 | Seconds before a tool appears in panels |
-| `--panel-grace N` | 10.0 | Seconds a completed task stays visible in panels |
 
 ### Bell Notifications
 
@@ -127,8 +113,6 @@ Valid events: `turn-done`, `waiting`, `done`, `stalled`, `api-stall`, `api-ok`, 
 | `--api-stall-limit N` | 5 | Enter stall state after N retries in window (0 = disable) |
 | `--api-stall-window N` | 60.0 | Sliding window (seconds) for stall detection |
 | `--status-url URL` | Anthropic statuspage | Status feed URL to poll during stalls |
-| `--status-poll-interval N` | 30.0 | Status feed poll interval (seconds) |
-| `--no-status-poll` | off | Don't poll status page when stalled |
 
 ### Resilience
 
@@ -154,6 +138,7 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 |---------|-------------|
 | `/clear` | Start a fresh session (wipes context) |
 | `/cls` | Clear the chat output area |
+| `/cwd [path]` | Show current working directory, or switch to a new one and reconnect |
 | `/rename [name]` | Set a custom session title |
 | `/export [path]` | Save conversation as markdown |
 | `/connect` | Reconnect to the SDK |
@@ -178,7 +163,9 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 
 | Command | Description |
 |---------|-------------|
-| `/model [name]` | Show or set model |
+| `/model` | List available models and show current |
+| `/model <name>` | Switch to a different model |
+| `/models` | Alias for `/model` |
 | `/effort [level]` | Show or set effort (`auto`/`low`/`medium`/`high`/`max`) |
 | `/thinking [on\|off]` | Toggle extended thinking |
 | `/btw <question>` | Side question in separate context |
@@ -258,7 +245,7 @@ There are 70+ configurable tokens organized into groups:
 ## Architecture
 
 ```
-server.py          Starlette/FastAPI app, WebSocket, startup/shutdown
+server.py          FastAPI app, WebSocket, startup/shutdown
 sdk_bridge.py      SDK connection, worker loop, message dispatcher, auto-continue
 state.py           Mutable session state, status/panel serializers
 config.py          Config dataclass, argparse, constants

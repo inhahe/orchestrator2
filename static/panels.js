@@ -165,10 +165,15 @@ const Panels = (() => {
 
   // ----- Pending prompt queue panel -----
 
+  let _queueEditing = false;  // true while user is editing a queue item
+
   function _renderQueue(queue) {
     const n = queue.length;
     elQueueCount.textContent = n;
     elQueueCount.classList.toggle('active', n > 0);
+
+    // Don't clobber the DOM while the user is editing a queue item.
+    if (_queueEditing) return;
 
     // Show/hide the entire panel section based on whether there are items.
     elQueueSection.classList.toggle('hidden', n === 0);
@@ -224,6 +229,10 @@ const Panels = (() => {
     }
   }
 
+  function _exitEditing() {
+    _queueEditing = false;
+  }
+
   function _startEditQueueItem(index) {
     const item = elQueueBody.querySelector(`.queue-item[data-index="${index}"]`);
     if (!item) return;
@@ -231,6 +240,8 @@ const Panels = (() => {
     const actionsEl = item.querySelector('.queue-item-actions');
     // Find the full text from the title attribute.
     const fullText = textEl.title || textEl.textContent;
+
+    _queueEditing = true;
 
     // Replace with a textarea + save/cancel.
     const original = item.innerHTML;
@@ -247,7 +258,7 @@ const Panels = (() => {
 
     item.querySelector('.queue-save-btn').addEventListener('click', async () => {
       const newText = textarea.value.trim();
-      if (!newText) return;
+      if (!newText) { _exitEditing(); return; }
       try {
         const resp = await fetch('/api/queue/edit', {
           method: 'POST',
@@ -259,9 +270,11 @@ const Panels = (() => {
       } catch (err) {
         console.error('queue edit error:', err);
       }
+      _exitEditing();
     });
 
     item.querySelector('.queue-cancel-btn').addEventListener('click', () => {
+      _exitEditing();
       item.innerHTML = original;
       // Re-bind the buttons since we replaced innerHTML.
       _rebindQueueItem(item, index);

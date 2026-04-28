@@ -288,13 +288,10 @@ class State:
     # Display settings (runtime-mutable)
     collapse_tools: bool = True
     collapse_threshold: int = 3
-    inline_all_tools: bool = False
+    inline_all_tools: bool = True
     show_edits: str = "compact"
     show_thinking: bool = False
     thinking_enabled: bool = True
-    show_tasks_panel: bool = False
-    show_bg_panel: bool = True
-    show_todos_panel: bool = False
     show_tasks: str = "compact"
     panel_delay: float = 0.0
     panel_grace: float = 10.0
@@ -337,9 +334,6 @@ def init_state_from_config(config: Config) -> State:
         show_edits=config.show_edits,
         show_thinking=config.show_thinking,
         thinking_enabled=not config.no_thinking,
-        show_tasks_panel=config.tasks_panel,
-        show_bg_panel=config.bg_panel,
-        show_todos_panel=config.todos_panel,
         show_tasks=config.show_tasks,
         panel_delay=config.panel_delay,
         panel_grace=config.panel_grace,
@@ -613,7 +607,4 @@ def state_to_panels_dict(state: State) -> dict[str, Any]:
         "completed_bg": completed_bg_list,
         "todos": todos_list,
         "queued_prompts": queue_list,
-        "show_tasks_panel": state.show_tasks_panel,
-        "show_bg_panel": state.show_bg_panel,
-        "show_todos_panel": state.show_todos_panel,
     }
