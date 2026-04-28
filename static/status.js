@@ -10,6 +10,7 @@ const Status = (() => {
   let elModel, elEffort, elThinking;
   let elContext, elRateLimit;
   let elCollapseCheck;
+  let elCollapseThreshold;
 
   // CSS class → colour mapping for the state text.
   const _stateColors = {
@@ -34,11 +35,36 @@ const Status = (() => {
     elRateLimit = document.getElementById('status-ratelimit');
     elCollapseCheck = document.getElementById('collapse-tools-check');
     if (elCollapseCheck) {
+      // Restore persisted value.
+      const savedCollapse = localStorage.getItem('collapse-tools');
+      if (savedCollapse !== null) {
+        const on = savedCollapse === 'true';
+        elCollapseCheck.checked = on;
+        Chat.setCollapseTools(on);
+      }
       elCollapseCheck.addEventListener('change', () => {
         const on = elCollapseCheck.checked;
         Chat.setCollapseTools(on);
-        // Notify backend so it persists for the session.
+        localStorage.setItem('collapse-tools', String(on));
         App.send({ type: 'message', text: `/collapse ${on ? 'on' : 'off'}` });
+      });
+    }
+    elCollapseThreshold = document.getElementById('collapse-threshold-select');
+    if (elCollapseThreshold) {
+      // Restore persisted value.
+      const savedThreshold = localStorage.getItem('collapse-threshold');
+      if (savedThreshold !== null) {
+        const n = parseInt(savedThreshold, 10);
+        if (n >= 1) {
+          elCollapseThreshold.value = String(n);
+          Chat.setCollapseThreshold(n);
+        }
+      }
+      elCollapseThreshold.addEventListener('change', () => {
+        const val = parseInt(elCollapseThreshold.value, 10);
+        Chat.setCollapseThreshold(val);
+        localStorage.setItem('collapse-threshold', String(val));
+        App.send({ type: 'message', text: `/collapse-threshold ${val}` });
       });
     }
   }
@@ -110,10 +136,18 @@ const Status = (() => {
     // Rate limits.
     _updateRateLimits(status.rate_limits);
 
-    // Collapse-tools setting — sync from backend.
+    // Collapse-tools settings — localStorage takes precedence over backend.
     if (status.collapse_tools != null) {
-      Chat.setCollapseTools(status.collapse_tools);
-      if (elCollapseCheck) elCollapseCheck.checked = status.collapse_tools;
+      const saved = localStorage.getItem('collapse-tools');
+      const val = saved !== null ? (saved === 'true') : status.collapse_tools;
+      Chat.setCollapseTools(val);
+      if (elCollapseCheck) elCollapseCheck.checked = val;
+    }
+    if (status.collapse_threshold != null) {
+      const saved = localStorage.getItem('collapse-threshold');
+      const val = saved !== null ? parseInt(saved, 10) : status.collapse_threshold;
+      Chat.setCollapseThreshold(val);
+      if (elCollapseThreshold) elCollapseThreshold.value = String(val);
     }
   }
 

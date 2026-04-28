@@ -88,8 +88,17 @@
       <span class="status-sep">|</span>
       <label class="status-checkbox" title="Auto-collapse consecutive tool calls">
         <input type="checkbox" id="collapse-tools-check" checked>
-        <span class="status-label">collapse</span>
+        <span class="status-label">collapse consecutive tools</span>
       </label>
+      <span class="status-sep">|</span>
+      <span class="status-label">after</span>
+      <select id="collapse-threshold-select" class="status-select" title="Number of tools to show before collapsing">
+        <option value="1">1</option>
+        <option value="2">2</option>
+        <option value="3" selected>3</option>
+        <option value="5">5</option>
+        <option value="10">10</option>
+      </select>
     </div>
     <div id="input-wrap">
       <textarea id="input-box" rows="1"

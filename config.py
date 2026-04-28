@@ -238,6 +238,7 @@ class Config:
     show_edits: str = "compact"        # "off"|"compact"|"full"
     ascii_only: bool = False
     collapse_tools: bool = True        # auto-collapse long tool runs
+    collapse_threshold: int = 3        # tools shown before collapsing
 
     # Panels
     tasks_panel: bool = False
@@ -497,6 +498,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
         default=True,
         help="Auto-collapse long runs of consecutive tool calls.",
     )
+    ap.add_argument(
+        "--collapse-threshold",
+        type=int, default=3, metavar="N",
+        help="Number of tool calls to show before collapsing (default: 3).",
+    )
 
     # -- Panels --
     ap.add_argument(
@@ -649,6 +655,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         show_edits=args.show_edits,
         ascii_only=args.ascii_only,
         collapse_tools=args.collapse_tools,
+        collapse_threshold=max(1, args.collapse_threshold),
         tasks_panel=args.tasks_panel,
         bg_panel=args.bg_panel,
         todos_panel=args.todos_panel,

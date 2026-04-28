@@ -183,12 +183,8 @@ const Panels = (() => {
     for (let i = n - 1; i >= 0; i--) {
       const item = queue[i];
       const text = item.text || '';
-      const preview = text.length > 500 ? text.substring(0, 499) + '\u2026' : text;
-      const lines = text.split('\n').length;
-      const lineHint = lines > 1 ? ` (${lines} lines)` : '';
-
       html += `<div class="queue-item" data-index="${item.index}">
-        <div class="queue-item-text" title="${_esc(text)}">${_esc(preview)}${_esc(lineHint)}</div>
+        <div class="queue-item-text" title="${_esc(text)}">${_esc(text)}</div>
         <div class="queue-item-actions">
           <button class="queue-edit-btn" data-index="${item.index}" title="Edit">\u270E</button>
           <button class="queue-delete-btn" data-index="${item.index}" title="Delete">\u2715</button>

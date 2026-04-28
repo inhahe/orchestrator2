@@ -23,11 +23,11 @@ const Chat = (() => {
   const _toolBlocks = new Map();
 
   // --- Tool-block collapsing ---
-  // Track consecutive tool blocks.  When more than _COLLAPSE_THRESHOLD
+  // Track consecutive tool blocks.  When more than _collapseThreshold
   // appear in a row (without intervening assistant text or user messages),
   // ALL of them are collapsed behind a "show N tools" toggle.
   let _collapseTools = true;          // toggled via /collapse or checkbox
-  const _COLLAPSE_THRESHOLD = 3;
+  let _collapseThreshold = 3;         // configurable via dropdown
   let _consecutiveToolCount = 0;
   let _toolGroupContainer = null;  // wrapper div for collapsible group
   let _toolGroupToggle = null;     // the "show N more" element
@@ -47,7 +47,7 @@ const Chat = (() => {
     }
     _consecutiveToolCount++;
 
-    if (_consecutiveToolCount <= _COLLAPSE_THRESHOLD) {
+    if (_consecutiveToolCount <= _collapseThreshold) {
       // Below threshold: append normally but track the elements.
       _toolRunElements.push(el);
       elMessages.appendChild(el);
@@ -708,6 +708,8 @@ const Chat = (() => {
 
   function setCollapseTools(v) { _collapseTools = !!v; }
   function getCollapseTools() { return _collapseTools; }
+  function setCollapseThreshold(n) { _collapseThreshold = Math.max(1, parseInt(n, 10) || 3); }
+  function getCollapseThreshold() { return _collapseThreshold; }
 
-  return { init, clear, handleMessage, setCollapseTools, getCollapseTools };
+  return { init, clear, handleMessage, setCollapseTools, getCollapseTools, setCollapseThreshold, getCollapseThreshold };
 })();

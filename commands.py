@@ -161,6 +161,8 @@ def classify(line: str) -> tuple[str, str]:
         return "btw", arg
     if cmd in ("collapse", "collapse-tools"):
         return "collapse", arg
+    if cmd in ("collapse-threshold",):
+        return "collapse-threshold", arg
     if cmd in ("autocompact", "auto-compact"):
         return "autocompact", arg
     if cmd in ("max-context", "maxcontext", "max-ctx"):
@@ -199,6 +201,7 @@ _IMMEDIATE_HANDLERS: dict[str, str] = {
     "show":            "_cmd_show",
     "todos":           "_cmd_todos",
     "collapse":        "_cmd_collapse",
+    "collapse-threshold": "_cmd_collapse_threshold",
     "autocompact":     "_cmd_autocompact",
     "max-context":     "_cmd_max_context",
     "bell":            "_cmd_bell",
@@ -415,6 +418,23 @@ def _cmd_collapse(payload: str, state: State, _config: Config) -> CommandResult:
             state_updates={"collapse_tools": False},
         )
     return CommandResult(messages=[_msg("Usage: /collapse [on|off]", level="error")])
+
+
+def _cmd_collapse_threshold(payload: str, state: State, _config: Config) -> CommandResult:
+    p = payload.strip()
+    if not p:
+        return CommandResult(messages=[_msg(f"collapse-threshold: {state.collapse_threshold}")])
+    try:
+        n = int(p)
+    except ValueError:
+        return CommandResult(messages=[_msg("Usage: /collapse-threshold <N>", level="error")])
+    if n < 1:
+        return CommandResult(messages=[_msg("Threshold must be at least 1.", level="error")])
+    state.collapse_threshold = n
+    return CommandResult(
+        messages=[_msg(f"collapse-threshold → {n}")],
+        state_updates={"collapse_threshold": n},
+    )
 
 
 def _cmd_autocompact(payload: str, state: State, config: Config) -> CommandResult:
