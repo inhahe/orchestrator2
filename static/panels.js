@@ -183,9 +183,9 @@ const Panels = (() => {
       return;
     }
 
-    // Render newest-first (stack order).
+    // Render in queue order (first-in at top, next to execute).
     let html = '';
-    for (let i = n - 1; i >= 0; i--) {
+    for (let i = 0; i < n; i++) {
       const item = queue[i];
       const text = item.text || '';
       html += `<div class="queue-item" data-index="${item.index}">
