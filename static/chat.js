@@ -156,6 +156,11 @@ const Chat = (() => {
     el.innerHTML = `<div class="msg-label">You</div>
                     <div class="msg-content">${_esc(content)}</div>`;
     elMessages.appendChild(el);
+    // Force scroll — the user's own message should always be visible.
+    // (The normal _autoScroll flag may be false due to the input textarea
+    // expanding on paste, which shifts the layout and trips the scroll
+    // listener before the message is appended.)
+    _autoScroll = true;
     _scrollToBottom();
   }
 
