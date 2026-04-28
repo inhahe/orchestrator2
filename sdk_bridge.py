@@ -123,11 +123,15 @@ class SDKBridge:
         }
 
         # Session resume / continue logic.
+        # Always prefer an explicit session id (from cwd lookup or --resume)
+        # over the SDK's global continue_conversation, which ignores cwd.
         rid = resume_id or self._initial_resume_id
         if rid:
             kwargs["resume"] = rid
-        elif not self.config.no_continue:
-            kwargs["continue_conversation"] = True
+            self.state.expected_resume_sid = rid
+        elif not self.config.no_continue and self.state.session_id:
+            kwargs["resume"] = self.state.session_id
+            self.state.expected_resume_sid = self.state.session_id
 
         # Effort override.
         if self.state.effort:
@@ -171,6 +175,11 @@ class SDKBridge:
     async def connect(self, resume_id: str | None = None) -> None:
         """Create SDK client, connect, and start the message dispatcher."""
         options = self._make_options(resume_id)
+        log.info(
+            "connect: resume=%s, cwd=%s",
+            getattr(options, 'resume', None),
+            getattr(options, 'cwd', None),
+        )
         self._initial_resume_id = None  # one-time use
         self.client = ClaudeSDKClient(options=options)
 

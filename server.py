@@ -221,6 +221,7 @@ async def lifespan(app: FastAPI):
         if recent is not None:
             state.session_id = recent.stem
             state.session_title = read_session_title(recent.stem)
+            bridge._initial_resume_id = recent.stem
 
     # If --resume was passed without an argument, defer SDK start until the
     # user picks a session from the graphical picker.
@@ -391,6 +392,7 @@ async def _reconfigure(
             if recent is not None:
                 state.session_id = recent.stem
                 state.session_title = read_session_title(recent.stem)
+                bridge._initial_resume_id = recent.stem
 
     _picker_mode = False
     await bridge.start()
@@ -455,6 +457,24 @@ async def serve_static(path: str):
 # ---------------------------------------------------------------------------
 # REST endpoints
 # ---------------------------------------------------------------------------
+
+@app.post("/api/shutdown")
+async def api_shutdown() -> dict[str, Any]:
+    """Gracefully shut down the server.
+
+    Used by ``--detach`` when a new server needs to take over the port
+    occupied by an old instance, and for manual cleanup.
+    """
+    log.info("shutdown requested via /api/shutdown")
+    if bridge:
+        try:
+            await bridge.stop()
+        except Exception:
+            pass
+    # Schedule a hard exit after a short delay so the response gets sent.
+    asyncio.get_event_loop().call_later(0.5, lambda: os._exit(0))
+    return {"ok": True, "message": "shutting down"}
+
 
 @app.get("/api/status")
 async def api_status() -> dict[str, Any]:
@@ -734,8 +754,8 @@ def _maybe_start_shutdown_timer() -> None:
         return  # still have connected tabs
     if not _has_had_clients:
         return  # never had a tab yet (startup / picker mode)
-    if config is None or not config.open_browser:
-        return  # only auto-shutdown when launched with --open
+    if config is None or not config.auto_shutdown:
+        return  # only auto-shutdown when enabled (--open, --detach, --auto-shutdown)
     _cancel_shutdown_timer()
     _shutdown_timer = asyncio.create_task(
         _shutdown_after_grace(), name="shutdown-timer"
@@ -827,6 +847,10 @@ async def _send_initial_state(ws: WebSocket) -> None:
         "type": "completion_list",
         "commands": get_command_completions(),
     })
+
+    # Clear any stale chat content from a previous session (e.g. browser
+    # tab reconnecting after the server restarted with a different cwd).
+    await send_to(ws, {"type": "clear_screen"})
 
     # Session history (if continuing a session).
     if state.session_id:
@@ -964,6 +988,29 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _try_shutdown_old_server(port: int) -> None:
+    """Send POST /api/shutdown to an existing server on *port*.
+
+    Best-effort — if the old server isn't ours, the request will just
+    404 or fail, which is fine.
+    """
+    import urllib.request
+    import urllib.error
+
+    url = f"http://localhost:{port}/api/shutdown"
+    try:
+        req = urllib.request.Request(url, method="POST", data=b"")
+        urllib.request.urlopen(req, timeout=3)
+        print(f"Shut down old server on port {port}.")
+    except (urllib.error.URLError, OSError, Exception):
+        # Old server isn't ours or isn't responding — no problem.
+        pass
+
+    # Give it a moment to actually exit.
+    import time as _time
+    _time.sleep(1)
+
+
 def _bind_port(host: str, port: int) -> tuple[_socket.socket, int]:
     """Try to bind *port*; on failure, let the OS pick a free one."""
     sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
@@ -998,15 +1045,24 @@ def main() -> None:
     if config.detach:
         sock, actual_port = _bind_port("0.0.0.0", config.port)
         if actual_port != config.port:
-            print(f"Port {config.port} in use — using {actual_port} instead.")
+            # Port is in use — try to shut down an old orchestrator2 on it.
+            _try_shutdown_old_server(config.port)
+            # Retry the preferred port now that the old server may be gone.
+            sock.close()
+            sock, actual_port = _bind_port("0.0.0.0", config.port)
+            if actual_port != config.port:
+                print(f"Port {config.port} in use — using {actual_port} instead.")
         sock.close()  # release for the child to rebind
 
-        # Rebuild argv: drop --detach, override --port with actual.
+        # Rebuild argv: drop --detach, --open, override --port with actual.
+        # --open is stripped because the PARENT opens the browser (the child
+        # runs with CREATE_NO_WINDOW and webbrowser.open() doesn't reliably
+        # work from a hidden-console process on Windows).
         child_argv = [sys.executable, sys.argv[0]]
         i = 1
         while i < len(sys.argv):
             a = sys.argv[i]
-            if a == "--detach":
+            if a in ("--detach", "--open", "--auto-shutdown"):
                 i += 1
                 continue
             if a == "--port":
@@ -1017,7 +1073,7 @@ def main() -> None:
                 continue
             child_argv.append(a)
             i += 1
-        child_argv.extend(["--port", str(actual_port)])
+        child_argv.extend(["--port", str(actual_port), "--auto-shutdown"])
 
         import subprocess
         import tempfile
@@ -1070,8 +1126,15 @@ def main() -> None:
                 pass
             sys.exit(rc or 1)
 
-        # Still running → success.
-        print(f"orchestrator2 launched on http://localhost:{actual_port}")
+        # Still running → success.  Open the browser from the parent
+        # (which has a visible console).  The child's CREATE_NO_WINDOW
+        # environment makes webbrowser.open() unreliable on Windows.
+        url = f"http://localhost:{actual_port}"
+        print(f"orchestrator2 launched on {url}")
+
+        if config.open_browser:
+            webbrowser.open(f"{url}?t={int(time.time())}")
+
         sys.exit(0)
 
     # Bind the socket ourselves so we know the actual port before
@@ -1089,9 +1152,13 @@ def main() -> None:
     print(msg)
 
     # Open browser after a short delay (uvicorn.run blocks, so use a timer).
+    # The cache-buster query param forces the browser to do a fresh
+    # navigation instead of just focusing an existing tab with the same
+    # URL (which would show stale content from a previous session).
     if config.open_browser:
         import threading
-        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+        open_url = f"{url}?t={int(time.time())}"
+        threading.Timer(1.0, lambda: webbrowser.open(open_url)).start()
 
     uvi_config = uvicorn.Config(app, host="0.0.0.0", port=actual_port, log_level="info")
     server = uvicorn.Server(uvi_config)

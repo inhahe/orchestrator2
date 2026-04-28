@@ -14,12 +14,13 @@ const Status = (() => {
 
   // CSS class → colour mapping for the state text.
   const _stateColors = {
-    working:    'var(--indicator-working)',
-    connecting: 'var(--indicator-connecting)',
-    error:      'var(--system-error)',
-    'bg-wait':  'var(--indicator-bg-wait)',
-    waiting:    'var(--system-waiting)',
-    done:       'var(--system-done)',
+    working:      'var(--indicator-working)',
+    connecting:   'var(--indicator-connecting)',
+    reconnecting: 'var(--system-warning)',
+    error:        'var(--system-error)',
+    'bg-wait':    'var(--indicator-bg-wait)',
+    waiting:      'var(--system-waiting)',
+    done:         'var(--system-done)',
   };
 
   function init() {
@@ -72,13 +73,11 @@ const Status = (() => {
   function update(status) {
     if (!status) return;
 
-    // Indicator dot.
+    // Indicator dot + state text.
     const cls = status.busy_class || 'idle';
-    elIndicator.className = 'indicator ' + cls;
-    elIndicator.title = status.busy_label || 'idle';
-
-    // State text (working, idle, rate-limited, etc.).
     const stateLabel = status.busy_label || 'idle';
+    elIndicator.className = 'indicator ' + cls;
+    elIndicator.title = stateLabel;
     elState.textContent = stateLabel;
     elState.title = stateLabel;
     elState.style.color = _stateColors[cls] || '';

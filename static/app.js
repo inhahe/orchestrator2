@@ -10,6 +10,7 @@ const App = (() => {
   let wsUrl = null;
   let reconnectTimer = null;
   let reconnectDelay = 1000;
+  let reconnectAttempt = 0;
   let _isBusy = false;
   const MAX_RECONNECT_DELAY = 30000;
 
@@ -99,7 +100,7 @@ const App = (() => {
     ws.onopen = () => {
       console.log('WebSocket connected');
       reconnectDelay = 1000;
-      _showConnectionStatus('connected');
+      reconnectAttempt = 0;
     };
 
     ws.onclose = (e) => {
@@ -126,6 +127,7 @@ const App = (() => {
 
   function _scheduleReconnect() {
     if (reconnectTimer) return;
+    reconnectAttempt++;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       _connect();
@@ -134,13 +136,11 @@ const App = (() => {
   }
 
   function _showConnectionStatus(status) {
-    // Brief system message in chat.
     if (status === 'disconnected') {
-      Chat.handleMessage({
-        type: 'system_msg',
-        subtype: 'warning',
-        data: { message: 'Disconnected from server — reconnecting...' }
-      });
+      const label = reconnectAttempt > 1
+        ? `reconnecting (${reconnectAttempt})`
+        : 'reconnecting';
+      Status.update({ busy_label: label, busy_class: 'reconnecting' });
     }
   }
 

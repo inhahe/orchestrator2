@@ -265,6 +265,7 @@ class Config:
     port: int = DEFAULT_PORT
     open_browser: bool = False
     detach: bool = False               # re-launch headless and exit terminal
+    auto_shutdown: bool = False        # shut down when all browser tabs close
     config_dir: str | None = None      # CLAUDE_CONFIG_DIR override
 
 
@@ -555,6 +556,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
             "Implies --open."
         ),
     )
+    ap.add_argument(
+        "--auto-shutdown",
+        action="store_true",
+        help="Shut down when all browser tabs close (auto-set by --detach).",
+    )
 
     args = ap.parse_args(argv)
 
@@ -612,5 +618,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         port=args.port,
         open_browser=args.open or args.detach,
         detach=args.detach,
+        auto_shutdown=args.auto_shutdown or args.open or args.detach,
         config_dir=args.config_dir,
     )

@@ -19,13 +19,24 @@ python server.py --cwd "%cd%" --open
 
 ## Running Multiple Instances
 
-Just run `orch.bat` (or `python server.py`) from each project directory. If port 8420 is already in use, the server automatically picks a free port:
+Just run `orch.bat` (or `python server.py`) from each project directory. With `--detach`, each launch shuts down any previous server on the default port and takes it over:
 
 ```
 C:\project-a> orch
-orchestrator2 starting on http://localhost:8420
+orchestrator2 launched on http://localhost:8420
 
 C:\project-b> orch
+Shut down old server on port 8420.
+orchestrator2 launched on http://localhost:8420
+```
+
+Without `--detach`, if port 8420 is already in use the server picks a free port:
+
+```
+C:\project-a> python server.py --open
+orchestrator2 starting on http://localhost:8420
+
+C:\project-b> python server.py --open
 Port 8420 in use — using 52314 instead.
 orchestrator2 starting on http://localhost:52314
 ```
