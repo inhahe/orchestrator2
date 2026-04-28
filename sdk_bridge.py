@@ -367,6 +367,7 @@ class SDKBridge:
                     "name": entry.get("name"),
                     "status": status,
                     "summary": summary,
+                    "command": self._bg_task_command(entry),
                 }
                 await self.broadcast({"type": "bg_complete", **data})
                 ring_bell(state, "bg-done")
@@ -382,11 +383,14 @@ class SDKBridge:
             seq = register_bg_task(
                 state, task_id, task_type, name, tool_use_id=tool_use_id,
             )
+            # Look up the Bash command from the linked tool use.
+            entry = state.background_tasks.get(task_id) or {}
             data = {
                 "task_id": task_id,
                 "seq": seq,
                 "name": name,
                 "task_type": task_type,
+                "command": self._bg_task_command(entry),
             }
             await self.broadcast({"type": "bg_started", **data})
 
@@ -444,6 +448,20 @@ class SDKBridge:
         if allowed:
             return PermissionResultAllow()
         return PermissionResultDeny(message="User denied")
+
+    def _bg_task_command(self, entry: dict) -> str | None:
+        """Look up the Bash command for a background task via its tool_use_id."""
+        tuid = entry.get("tool_use_id")
+        if not tuid:
+            return None
+        # Check active tools first, then history.
+        tool = self.state.active_tools.get(tuid)
+        if tool:
+            return (tool.get("input") or {}).get("command")
+        for h in self.state.tool_history:
+            if h.get("tool_use_id") == tuid:
+                return (h.get("input") or {}).get("command")
+        return None
 
     def resolve_permission(self, allow: bool) -> None:
         """Called by the WS handler when the user responds to a permission prompt."""

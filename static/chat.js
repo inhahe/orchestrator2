@@ -360,8 +360,36 @@ const Chat = (() => {
 
   function _addBgStarted(msg) {
     const el = document.createElement('div');
-    el.className = 'msg msg-system';
-    el.textContent = `\u25B6 Background task started: ${msg.name || msg.task_type || 'unknown'}`;
+    const name = _esc(msg.name || msg.task_type || 'unknown');
+    const cmd = msg.command;
+
+    if (cmd) {
+      // Expandable: click to show the full command.
+      el.className = 'msg msg-tool';
+      el.innerHTML = `
+        <div class="tool-header">
+          <span class="tool-status-icon running">\u25B6</span>
+          <span class="tool-name">Background task started</span>
+          <span class="tool-summary">${name}</span>
+          <span class="tool-expand-icon">\u25B8</span>
+        </div>
+        <div class="tool-detail">
+          <div class="detail-label">Command</div>
+          <pre>${_esc(cmd)}</pre>
+        </div>`;
+      const header = el.querySelector('.tool-header');
+      const detail = el.querySelector('.tool-detail');
+      const expandIcon = el.querySelector('.tool-expand-icon');
+      header.addEventListener('click', () => {
+        detail.classList.toggle('open');
+        expandIcon.classList.toggle('open');
+      });
+    } else {
+      el.className = 'msg msg-system';
+      el.textContent = `\u25B6 Background task started: ${name}`;
+    }
+
+    if (msg.task_id) el.dataset.bgTaskId = msg.task_id;
     elMessages.appendChild(el);
     _scrollToBottom();
   }
@@ -370,14 +398,50 @@ const Chat = (() => {
     const el = document.createElement('div');
     const isErr = msg.status === 'error' || msg.status === 'failed';
     const name = _esc(msg.name || 'unknown');
-    const summary = msg.summary ? ` — ${_esc(msg.summary)}` : '';
-    if (isErr) {
-      el.className = 'msg msg-system';
-      el.innerHTML = `\u2717 Background task <span style="color:var(--red)">failed</span>: ${name}${summary}`;
+    const cmd = msg.command;
+    const summary = msg.summary || '';
+    const icon = isErr ? '\u2717' : '\u2713';
+    const statusCls = isErr ? 'error' : 'complete';
+    const label = isErr ? 'Background task failed' : 'Background task completed';
+
+    if (cmd || summary) {
+      // Expandable: click to show command and/or output.
+      el.className = 'msg msg-tool';
+      let detailHtml = '';
+      if (cmd) {
+        detailHtml += `<div class="detail-label">Command</div>
+                       <pre>${_esc(cmd)}</pre>`;
+      }
+      if (summary) {
+        detailHtml += `<div class="detail-label">Output</div>
+                       <pre>${_esc(summary)}</pre>`;
+      }
+      const summaryText = summary
+        ? ` — ${_esc(summary.length > 120 ? summary.slice(0, 120) + '\u2026' : summary)}`
+        : '';
+      el.innerHTML = `
+        <div class="tool-header">
+          <span class="tool-status-icon ${statusCls}">${icon}</span>
+          <span class="tool-name">${label}</span>
+          <span class="tool-summary">${name}${summaryText}</span>
+          <span class="tool-expand-icon">\u25B8</span>
+        </div>
+        <div class="tool-detail">
+          ${detailHtml}
+        </div>`;
+      const header = el.querySelector('.tool-header');
+      const detail = el.querySelector('.tool-detail');
+      const expandIcon = el.querySelector('.tool-expand-icon');
+      header.addEventListener('click', () => {
+        detail.classList.toggle('open');
+        expandIcon.classList.toggle('open');
+      });
     } else {
       el.className = 'msg msg-system';
-      el.innerHTML = `\u2713 Background task completed: ${name}${summary}`;
+      el.innerHTML = `${icon} ${label}: ${name}`;
+      if (isErr) el.style.color = 'var(--red)';
     }
+
     elMessages.appendChild(el);
     _scrollToBottom();
   }
