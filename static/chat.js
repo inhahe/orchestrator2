@@ -92,10 +92,10 @@ const Chat = (() => {
         container.classList.toggle('collapsed');
         if (container.classList.contains('collapsed')) {
           const n = container.children.length;
-          toggle.textContent = `\u22EF show ${n} tool${n !== 1 ? 's' : ''}`;
+          toggle.textContent = `\u25B8 show ${n} tool${n !== 1 ? 's' : ''}`;
           _scrollToBottom();
         } else {
-          toggle.textContent = `\u22EF collapse`;
+          toggle.textContent = `\u25BE collapse`;
           // Scroll the expanded group into view.
           toggle.scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
@@ -114,7 +114,7 @@ const Chat = (() => {
 
     _toolGroupContainer.appendChild(el);
     const n = _toolGroupContainer.children.length;
-    _toolGroupToggle.textContent = `\u22EF show ${n} tool${n !== 1 ? 's' : ''}`;
+    _toolGroupToggle.textContent = `\u25B8 show ${n} tool${n !== 1 ? 's' : ''}`;
   }
 
   function _trackThinkingBlock(el) {
@@ -143,10 +143,10 @@ const Chat = (() => {
         container.classList.toggle('collapsed');
         if (container.classList.contains('collapsed')) {
           const n = container.children.length;
-          toggle.textContent = `\u22EF show ${n} thinking block${n !== 1 ? 's' : ''}`;
+          toggle.textContent = `\u25B8 show ${n} thinking block${n !== 1 ? 's' : ''}`;
           _scrollToBottom();
         } else {
-          toggle.textContent = `\u22EF collapse`;
+          toggle.textContent = `\u25BE collapse`;
           toggle.scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
       });
@@ -162,7 +162,7 @@ const Chat = (() => {
 
     _thinkingGroupContainer.appendChild(el);
     const n = _thinkingGroupContainer.children.length;
-    _thinkingGroupToggle.textContent = `\u22EF show ${n} thinking block${n !== 1 ? 's' : ''}`;
+    _thinkingGroupToggle.textContent = `\u25B8 show ${n} thinking block${n !== 1 ? 's' : ''}`;
   }
 
   function init() {
@@ -454,20 +454,21 @@ const Chat = (() => {
     const name = _esc(msg.name || msg.task_type || 'unknown');
     const cmd = msg.command;
 
+    el.className = 'msg msg-tool';
+    let detailHtml = '';
     if (cmd) {
-      // Expandable: click to show the full command.
-      el.className = 'msg msg-tool';
-      el.innerHTML = `
-        <div class="tool-header">
-          <span class="tool-status-icon running">\u25B6</span>
-          <span class="tool-name">Background task started</span>
-          <span class="tool-summary">${name}</span>
-          <span class="tool-expand-icon">\u25B8</span>
-        </div>
-        <div class="tool-detail">
-          <div class="detail-label">Command</div>
-          <pre>${_esc(cmd)}</pre>
-        </div>`;
+      detailHtml = `<div class="detail-label">Command</div>
+                    <pre>${_esc(cmd)}</pre>`;
+    }
+    el.innerHTML = `
+      <div class="tool-header">
+        <span class="tool-status-icon running">\u25B6</span>
+        <span class="tool-name">Background task started</span>
+        <span class="tool-summary">${name}</span>
+        ${detailHtml ? '<span class="tool-expand-icon">\u25B8</span>' : ''}
+      </div>
+      ${detailHtml ? `<div class="tool-detail">${detailHtml}</div>` : ''}`;
+    if (detailHtml) {
       const header = el.querySelector('.tool-header');
       const detail = el.querySelector('.tool-detail');
       const expandIcon = el.querySelector('.tool-expand-icon');
@@ -476,9 +477,6 @@ const Chat = (() => {
         expandIcon.classList.toggle('open');
         _scrollToBottom();
       });
-    } else {
-      el.className = 'msg msg-system';
-      el.textContent = `\u25B6 Background task started: ${name}`;
     }
 
     if (msg.task_id) el.dataset.bgTaskId = msg.task_id;
@@ -496,31 +494,28 @@ const Chat = (() => {
     const statusCls = isErr ? 'error' : 'complete';
     const label = isErr ? 'Background task failed' : 'Background task completed';
 
-    if (cmd || summary) {
-      // Expandable: click to show command and/or output.
-      el.className = 'msg msg-tool';
-      let detailHtml = '';
-      if (cmd) {
-        detailHtml += `<div class="detail-label">Command</div>
-                       <pre>${_esc(cmd)}</pre>`;
-      }
-      if (summary) {
-        detailHtml += `<div class="detail-label">Output</div>
-                       <pre>${_esc(summary)}</pre>`;
-      }
-      const summaryText = summary
-        ? ` — ${_esc(summary.length > 120 ? summary.slice(0, 120) + '\u2026' : summary)}`
-        : '';
-      el.innerHTML = `
-        <div class="tool-header">
-          <span class="tool-status-icon ${statusCls}">${icon}</span>
-          <span class="tool-name">${label}</span>
-          <span class="tool-summary">${name}${summaryText}</span>
-          <span class="tool-expand-icon">\u25B8</span>
-        </div>
-        <div class="tool-detail">
-          ${detailHtml}
-        </div>`;
+    el.className = 'msg msg-tool';
+    let detailHtml = '';
+    if (cmd) {
+      detailHtml += `<div class="detail-label">Command</div>
+                     <pre>${_esc(cmd)}</pre>`;
+    }
+    if (summary) {
+      detailHtml += `<div class="detail-label">Output</div>
+                     <pre>${_esc(summary)}</pre>`;
+    }
+    const summaryText = summary
+      ? ` \u2014 ${_esc(summary.length > 120 ? summary.slice(0, 120) + '\u2026' : summary)}`
+      : '';
+    el.innerHTML = `
+      <div class="tool-header">
+        <span class="tool-status-icon ${statusCls}">${icon}</span>
+        <span class="tool-name">${label}</span>
+        <span class="tool-summary">${name}${summaryText}</span>
+        ${detailHtml ? '<span class="tool-expand-icon">\u25B8</span>' : ''}
+      </div>
+      ${detailHtml ? `<div class="tool-detail">${detailHtml}</div>` : ''}`;
+    if (detailHtml) {
       const header = el.querySelector('.tool-header');
       const detail = el.querySelector('.tool-detail');
       const expandIcon = el.querySelector('.tool-expand-icon');
@@ -529,11 +524,8 @@ const Chat = (() => {
         expandIcon.classList.toggle('open');
         _scrollToBottom();
       });
-    } else {
-      el.className = 'msg msg-system';
-      el.innerHTML = `${icon} ${label}: ${name}`;
-      if (isErr) el.style.color = 'var(--red)';
     }
+    if (isErr) el.style.borderColor = 'var(--red)';
 
     elMessages.appendChild(el);
     _scrollToBottom();

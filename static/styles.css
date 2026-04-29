@@ -313,6 +313,7 @@ html, body {
   color: var(--text);
   font-family: var(--font-sans);
   line-height: 1.4;
+  white-space: pre-wrap;
   word-break: break-word;
   overflow: hidden;
   display: -webkit-box;
@@ -698,16 +699,20 @@ html, body {
 /* Consecutive tool-block collapsing */
 .tool-collapse-group.collapsed { display: none; }
 .tool-collapse-toggle {
-  padding: 4px 10px;
-  font-size: 11px;
-  color: var(--text-muted);
+  padding: 6px 10px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--tool-name);
   cursor: pointer;
   border-radius: var(--radius);
   margin: 2px 0;
+  background: var(--bg-tool);
+  border: 1px solid var(--border);
+  user-select: none;
 }
 .tool-collapse-toggle:hover {
-  color: var(--text);
-  background: var(--bg-tool);
+  background: var(--bg-tool-hover);
 }
 
 /* --- Thinking blocks --- */
