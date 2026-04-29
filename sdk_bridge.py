@@ -13,6 +13,7 @@ import asyncio
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Any, Callable, Awaitable
 
 from claude_agent_sdk import (
@@ -83,6 +84,40 @@ log = logging.getLogger(__name__)
 
 # Broadcaster type: async function that sends a dict to all WS clients.
 Broadcaster = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+def _build_graphify_prompt(args: str) -> str:
+    """Construct a prompt that tells Claude to run the graphify pipeline."""
+    # Load the skill file from the installed graphify package.
+    # Prefer platform-specific variant (skill-windows.md) when available.
+    try:
+        import graphify
+        pkg_dir = Path(graphify.__path__[0])
+        import sys
+        if sys.platform == "win32":
+            skill_path = pkg_dir / "skill-windows.md"
+            if not skill_path.exists():
+                skill_path = pkg_dir / "skill.md"
+        else:
+            skill_path = pkg_dir / "skill.md"
+        skill_text = skill_path.read_text(encoding="utf-8")
+    except Exception:
+        skill_text = None
+
+    path_arg = args.strip() or "."
+    if skill_text:
+        return (
+            f"The user typed `/graphify {path_arg}`. Follow the graphify "
+            f"skill instructions below to build a knowledge graph.\n\n"
+            f"{skill_text}"
+        )
+    # Fallback if skill.md can't be loaded.
+    return (
+        f"Run the graphify pipeline on `{path_arg}`. graphify is installed "
+        f"as a Python package (graphifyy). Run:\n\n"
+        f"  python -m graphify --help\n\n"
+        f"Then follow the appropriate steps to build a knowledge graph."
+    )
 
 
 class SDKBridge:
@@ -865,7 +900,6 @@ class SDKBridge:
                 # Side question — for now, queue as regular message.
                 # Full /btw implementation would run in a separate context.
                 state.queued_prompts.append(payload)
-
         if quit_requested:
             return None
 

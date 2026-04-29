@@ -48,7 +48,7 @@ SLASH_COMMANDS = [
     "/help", "/status", "/debug", "/cost", "/cwd", "/clear", "/cls",
     "/interrupt", "/i", "/compact", "/effort", "/thinking", "/model",
     "/connect", "/reconnect", "/resume", "/rename", "/export", "/models",
-    "/btw", "/autocompact", "/max-context", "/bell",
+    "/btw", "/graphify", "/autocompact", "/max-context", "/bell",
     "/collapse", "/collapse-threshold",
     "/queue", "/quit", "/exit",
     "/quit!", "/exit!",
@@ -245,7 +245,7 @@ class Config:
     show_tasks: str = "compact"        # "off"|"compact"|"full"|"full+output"
     show_edits: str = "compact"        # "off"|"compact"|"full"
     ascii_only: bool = False
-    collapse_tools: bool = True        # auto-collapse long tool runs
+    collapse_tools: bool = True        # auto-collapse consecutive tool/thinking blocks
     collapse_threshold: int = 3        # tools shown before collapsing
 
     # Panels
@@ -472,12 +472,12 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--collapse-tools",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Auto-collapse long runs of consecutive tool calls.",
+        help="Auto-collapse consecutive tool/thinking blocks.",
     )
     ap.add_argument(
         "--collapse-threshold",
         type=int, default=3, metavar="N",
-        help="Number of tool calls to show before collapsing (default: 3).",
+        help="Number of blocks to show before collapsing (default: 3).",
     )
 
     # -- Bell --

@@ -147,6 +147,8 @@ def classify(line: str) -> tuple[str, str]:
         return "bell", arg
     if cmd == "queue":
         return "queue", arg
+    if cmd == "graphify":
+        return "graphify", arg
     if cmd == "clear":
         return "clear-context", ""
     if cmd == "cls":
@@ -232,8 +234,9 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         "  /rename <name>                  set a custom session title",
         "  /export [path]                  save conversation as markdown",
         "  /btw <question>                 side question (separate context)",
-        "  /collapse [on|off]              toggle tool collapsing",
-        "  /collapse-threshold N           tools shown before collapsing",
+        "  /graphify [path] [flags]        build a knowledge graph (graphify)",
+        "  /collapse [on|off]              toggle collapsing of repeated blocks",
+        "  /collapse-threshold N           blocks shown before collapsing",
         "  /autocompact [on|off|N]         auto-compact threshold",
         "  /max-context [off|N]            cap context tokens",
         "  /bell [all|none|EVENTS]         view/change bell events",
@@ -242,6 +245,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         "  /quit! /exit!                   force exit",
         "",
         "Input: Enter submits.  Shift+Enter for newline.  Ctrl+C: interrupt/clear.",
+        "       Ctrl+Up/Down: prompt history.",
     ]
     return CommandResult(messages=[_msg("\n".join(lines))])
 
@@ -347,17 +351,17 @@ def _cmd_collapse(payload: str, state: State, _config: Config) -> CommandResult:
     p = payload.strip().lower()
     if not p:
         label = "ON" if state.collapse_tools else "OFF"
-        return CommandResult(messages=[_msg(f"collapse-tools: {label}")])
+        return CommandResult(messages=[_msg(f"collapse repeats: {label}")])
     if p in ("on", "true", "enable", "1"):
         state.collapse_tools = True
         return CommandResult(
-            messages=[_msg("collapse-tools ON")],
+            messages=[_msg("collapse repeats ON")],
             state_updates={"collapse_tools": True},
         )
     if p in ("off", "false", "disable", "0"):
         state.collapse_tools = False
         return CommandResult(
-            messages=[_msg("collapse-tools OFF")],
+            messages=[_msg("collapse repeats OFF")],
             state_updates={"collapse_tools": False},
         )
     return CommandResult(messages=[_msg("Usage: /collapse [on|off]", level="error")])

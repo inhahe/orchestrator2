@@ -40,13 +40,14 @@ orch --config-dir "C:\Users\me\.claude-alt"
 
 - **Live WebSocket UI** -- real-time streaming of assistant messages, tool calls, and results
 - **Side-by-side diff viewer** -- UltraCompare-style edit comparisons with configurable colors
-- **Tool collapse** -- consecutive tool calls auto-collapse behind a toggle (configurable threshold, persisted across sessions)
+- **Block collapse** -- consecutive tool calls or thinking blocks auto-collapse behind a toggle (configurable threshold, persisted across sessions)
 - **Sidebar panels** -- live views of active tools, background tasks, pending queue, and TodoWrite plan
 - **Draggable sidebar** -- resize handle with width persisted across sessions
 - **Auto-compact** -- automatic context compaction when token usage gets high
 - **Background tasks** -- track and inspect agent-spawned background work
 - **Pending queue** -- type messages while Claude is busy; they queue and execute in order
 - **Queue management** -- edit or delete queued prompts from the sidebar
+- **Prompt history** -- Ctrl+Up/Down to recall previous prompts (persisted across sessions)
 - **Permission dialogs** -- allow/deny tool execution from the browser
 - **Session resume** -- automatically continues the most recent session for the working directory
 - **Session picker** -- interactive session selection with `--resume`
@@ -114,8 +115,8 @@ orch --config-dir "C:\Users\me\.claude-alt"
 | `--show-tasks` | `compact` | Non-Bash tool display: `off`, `compact`, `full`, `full+output` |
 | `--show-edits` | `compact` | Edit tool display: `off`, `compact`, `full` |
 | `--ascii-only` | off | Use ASCII markers instead of Unicode |
-| `--collapse-tools` / `--no-collapse-tools` | on | Auto-collapse consecutive tool calls |
-| `--collapse-threshold N` | 3 | Number of tools shown before collapsing |
+| `--collapse-tools` / `--no-collapse-tools` | on | Auto-collapse consecutive tool/thinking blocks |
+| `--collapse-threshold N` | 3 | Number of blocks shown before collapsing |
 
 ### Bell Notifications
 
@@ -186,13 +187,14 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/effort [level]` | Show or set effort (`auto`/`low`/`medium`/`high`/`max`) |
 | `/thinking [on\|off]` | Toggle extended thinking |
 | `/btw <question>` | Side question in separate context |
+| `/graphify [path] [flags]` | Build a knowledge graph ([graphify](https://github.com/safishamsi/graphify)) |
 
 ### Display
 
 | Command | Description |
 |---------|-------------|
-| `/collapse [on\|off]` | Toggle tool collapsing |
-| `/collapse-threshold N` | Set number of tools before collapsing |
+| `/collapse [on\|off]` | Toggle collapsing of repeated blocks |
+| `/collapse-threshold N` | Set number of blocks before collapsing |
 | `/autocompact [on\|off\|N]` | Control auto-compact |
 | `/max-context [off\|N]` | Cap context tokens |
 | `/bell [all\|none\|EVENTS]` | Configure bell notifications |

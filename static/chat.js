@@ -22,6 +22,12 @@ const Chat = (() => {
   // Map tool_use_id → DOM element for pairing results.
   const _toolBlocks = new Map();
 
+  // --- Replay gating ---
+  // While history replay is in progress (batched via setTimeout), queue
+  // incoming real-time messages so they don't get interleaved mid-history.
+  let _replayInProgress = false;
+  let _pendingMessages = [];
+
   // --- Tool-block collapsing ---
   // Track consecutive tool blocks.  When more than _collapseThreshold
   // appear in a row (without intervening assistant text or user messages),
@@ -190,6 +196,17 @@ const Chat = (() => {
   // --- Message dispatch ---
 
   function handleMessage(msg) {
+    // Queue real-time messages while history replay is still rendering
+    // (batched via setTimeout) so they don't get interleaved mid-history.
+    if (_replayInProgress && msg.type !== 'history') {
+      _pendingMessages.push(msg);
+      return;
+    }
+
+    _dispatchMessage(msg);
+  }
+
+  function _dispatchMessage(msg) {
     switch (msg.type) {
       case 'user_message':    _addUserMessage(msg.content); break;
       case 'assistant_text':  _addAssistantText(msg); break;
@@ -595,6 +612,8 @@ const Chat = (() => {
   function _replayHistory(messages) {
     if (!messages || !messages.length) return;
 
+    _replayInProgress = true;
+
     // Disable tool-collapse during history replay.
     const savedCollapse = _collapseTools;
     _collapseTools = false;
@@ -643,6 +662,15 @@ const Chat = (() => {
         _collapseTools = savedCollapse;
         _resetToolRun();
         _resetThinkingRun();
+
+        // Flush messages that arrived during replay.
+        _replayInProgress = false;
+        const pending = _pendingMessages;
+        _pendingMessages = [];
+        for (const m of pending) {
+          _dispatchMessage(m);
+        }
+
         _scrollToBottom();
       }
     }

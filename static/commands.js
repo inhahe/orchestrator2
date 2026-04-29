@@ -11,6 +11,12 @@ const Commands = (() => {
   let acIndex = -1;
   let acFiltered = [];
 
+  // --- Prompt history (Ctrl+Up / Ctrl+Down) ---
+  const MAX_HISTORY = 200;
+  let _promptHistory = [];   // oldest first
+  let _historyIndex = -1;    // -1 = not navigating
+  let _savedInput = '';       // current input saved when navigation starts
+
   function init() {
     elInput        = document.getElementById('input-box');
     elSendBtn      = document.getElementById('send-btn');
@@ -24,6 +30,12 @@ const Commands = (() => {
     acDropdown.className = 'hidden';
     elInputWrap.style.position = 'relative';
     elInputWrap.appendChild(acDropdown);
+
+    // Load prompt history from localStorage.
+    try {
+      const saved = localStorage.getItem('prompt-history');
+      if (saved) _promptHistory = JSON.parse(saved);
+    } catch (_) {}
 
     // Event listeners.
     elInput.addEventListener('keydown', _onKeyDown);
@@ -77,7 +89,14 @@ const Commands = (() => {
       if (e.key === 'Tab' || e.key === 'Enter') {
         if (acFiltered.length > 0 && acIndex >= 0) {
           e.preventDefault();
-          _acceptAc(acFiltered[acIndex]);
+          const selected = acFiltered[acIndex];
+          if (e.key === 'Enter' && elInput.value.trim() === selected) {
+            // Command already fully typed — send it.
+            _hideAc();
+            _send();
+          } else {
+            _acceptAc(selected);
+          }
           return;
         }
       }
@@ -105,6 +124,13 @@ const Commands = (() => {
       return;
     }
 
+    // Ctrl+Up / Ctrl+Down: prompt history navigation.
+    if (e.ctrlKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+      e.preventDefault();
+      _navigateHistory(e.key === 'ArrowUp' ? -1 : 1);
+      return;
+    }
+
     // Ctrl+C: interrupt if busy, clear input if not.
     if (e.key === 'c' && e.ctrlKey) {
       if (!elInterruptBtn.classList.contains('hidden')) {
@@ -115,9 +141,10 @@ const Commands = (() => {
   }
 
   function _onInput() {
-    // Auto-resize textarea.
-    elInput.style.height = 'auto';
-    elInput.style.height = Math.min(elInput.scrollHeight, 200) + 'px';
+    _autoResize();
+
+    // Reset history navigation when the user types.
+    _historyIndex = -1;
 
     // Live autocomplete while typing a slash command.
     const val = elInput.value;
@@ -128,11 +155,63 @@ const Commands = (() => {
     }
   }
 
+  // ----- Prompt history -----
+
+  function _navigateHistory(dir) {
+    if (_promptHistory.length === 0) return;
+
+    if (_historyIndex === -1) {
+      // Starting navigation — save current input.
+      _savedInput = elInput.value;
+      if (dir === -1) {
+        _historyIndex = _promptHistory.length - 1;
+      } else {
+        return;  // already at the end, nothing to do
+      }
+    } else {
+      _historyIndex += dir;
+    }
+
+    if (_historyIndex < 0) {
+      _historyIndex = 0;
+      return;
+    }
+    if (_historyIndex >= _promptHistory.length) {
+      // Past the end — restore saved input.
+      _historyIndex = -1;
+      elInput.value = _savedInput;
+      _autoResize();
+      return;
+    }
+
+    elInput.value = _promptHistory[_historyIndex];
+    _autoResize();
+  }
+
+  function _pushHistory(text) {
+    // Don't duplicate the last entry.
+    if (_promptHistory.length > 0 && _promptHistory[_promptHistory.length - 1] === text) return;
+    _promptHistory.push(text);
+    if (_promptHistory.length > MAX_HISTORY) {
+      _promptHistory = _promptHistory.slice(-MAX_HISTORY);
+    }
+    try {
+      localStorage.setItem('prompt-history', JSON.stringify(_promptHistory));
+    } catch (_) {}
+  }
+
+  function _autoResize() {
+    elInput.style.height = 'auto';
+    elInput.style.height = Math.min(elInput.scrollHeight, 200) + 'px';
+  }
+
   // ----- Send / Interrupt -----
 
   function _send() {
     const text = elInput.value.trim();
     if (!text) return;
+    _pushHistory(text);
+    _historyIndex = -1;
     elInput.value = '';
     elInput.style.height = 'auto';
     _hideAc();

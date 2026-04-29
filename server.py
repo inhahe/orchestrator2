@@ -76,7 +76,7 @@ from theme import (
     remove_saved_color,
     PRESET_THEMES,
 )
-from sdk_bridge import SDKBridge
+from sdk_bridge import SDKBridge, _build_graphify_prompt
 
 log = logging.getLogger("orchestrator2")
 
@@ -943,6 +943,20 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
                 })
             if result.forward_to_sdk and result.forward_payload:
                 bridge.event_queue.put_nowait(("message", result.forward_payload))
+            return
+
+        # /graphify — build the prompt here so we can give feedback and
+        # route as a plain message (handled everywhere in the bridge).
+        if kind == "graphify":
+            path_arg = payload.strip() or "."
+            await broadcast({"type": "system_msg", "subtype": "info",
+                             "data": {"message": f"/graphify {path_arg} — loading skill..."}})
+            prompt = _build_graphify_prompt(payload)
+            if state.busy:
+                state.queued_prompts.append(prompt)
+                await _broadcast_queue_update()
+            else:
+                bridge.event_queue.put_nowait(("message", prompt))
             return
 
         # User messages while busy go to the pending queue (displayed
