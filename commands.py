@@ -240,7 +240,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         "  /autocompact [on|off|N]         auto-compact threshold",
         "  /max-context [off|N]            cap context tokens",
         "  /bell [all|none|EVENTS]         view/change bell events",
-        "  /queue [N|drop N|clear]         manage queued prompts",
+        "  /queue [N|send|drop N|clear]    manage queued prompts",
         "  /quit  /exit                    graceful exit",
         "  /quit! /exit!                   force exit",
         "",
@@ -486,6 +486,21 @@ def _cmd_queue(payload: str, state: State, _config: Config) -> CommandResult:
         return CommandResult(messages=[_data_msg(items, label="queue")])
 
     parts = payload.split()
+    if parts[0].lower() in ("send", "next"):
+        if not q:
+            return CommandResult(messages=[_msg("Queue is empty", level="error")])
+        if state.busy:
+            return CommandResult(messages=[_msg(
+                "Claude is working — queued prompts will send after the current turn",
+                level="warning",
+            )])
+        prompt = q.popleft()
+        first = prompt.splitlines()[0][:80] if prompt else ""
+        return CommandResult(
+            messages=[_msg(f"Sending: {first}")],
+            forward_to_sdk=True,
+            forward_payload=prompt,
+        )
     if parts[0].lower() == "clear":
         n = len(q)
         q.clear()
@@ -507,7 +522,7 @@ def _cmd_queue(payload: str, state: State, _config: Config) -> CommandResult:
     try:
         idx = int(parts[0]) - 1
     except ValueError:
-        return CommandResult(messages=[_msg("Usage: /queue [N|drop N|clear]", level="error")])
+        return CommandResult(messages=[_msg("Usage: /queue [N|send|drop N|clear]", level="error")])
     if idx < 0 or idx >= len(q):
         return CommandResult(messages=[_msg(
             f"/queue {idx + 1} — out of range (queue has {len(q)})",

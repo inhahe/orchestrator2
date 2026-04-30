@@ -198,7 +198,7 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/autocompact [on\|off\|N]` | Control auto-compact |
 | `/max-context [off\|N]` | Cap context tokens |
 | `/bell [all\|none\|EVENTS]` | Configure bell notifications |
-| `/queue [N\|drop N\|clear]` | Manage queued prompts |
+| `/queue [N\|send\|drop N\|clear]` | Manage queued prompts |
 
 ## Theme System
 

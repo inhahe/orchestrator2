@@ -176,6 +176,7 @@ const App = (() => {
         _isBusy = msg.status.busy_class === 'working' ||
                   msg.status.busy_class === 'connecting';
         Commands.setBusy(_isBusy);
+        Panels.setBusy(_isBusy);
       }
       if (msg.panels) {
         Panels.update(msg.panels);

@@ -340,6 +340,11 @@ html, body {
   border-radius: 3px;
 }
 .queue-item-actions button:hover { color: var(--text-bright); background: var(--bg-tool); }
+.queue-send-btn:hover:not(:disabled) { color: var(--green) !important; }
+.queue-send-btn:disabled, .queue-send-btn.disabled {
+  opacity: 0.25;
+  cursor: default;
+}
 .queue-delete-btn:hover { color: var(--red) !important; }
 
 .queue-edit-textarea {

@@ -640,6 +640,35 @@ async def api_queue_delete(body: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "removed": _truncate(removed, 80)}
 
 
+@app.post("/api/queue/send")
+async def api_queue_send(body: dict[str, Any]) -> dict[str, Any]:
+    """Send a queued prompt by index.
+
+    If idle, pops the prompt and puts it on the event queue so the bridge
+    picks it up immediately.  If busy, moves it to the front of the queue
+    so it executes next when the current turn ends.
+    """
+    if state is None or bridge is None:
+        return {"ok": False, "error": "not ready"}
+    idx = body.get("index")
+    if not isinstance(idx, int) or idx < 0 or idx >= len(state.queued_prompts):
+        return {"ok": False, "error": f"invalid index: {idx}"}
+    prompt = state.queued_prompts[idx]
+    if state.busy:
+        if idx == 0:
+            # Already first in line — nothing to do.
+            return {"ok": True, "already_next": True}
+        # Move to front so it's the next prompt after the current turn.
+        del state.queued_prompts[idx]
+        state.queued_prompts.appendleft(prompt)
+        await _broadcast_queue_update()
+        return {"ok": True, "moved_to_front": True}
+    del state.queued_prompts[idx]
+    bridge.event_queue.put_nowait(("message", prompt))
+    await _broadcast_queue_update()
+    return {"ok": True, "sent": _truncate(prompt, 80)}
+
+
 @app.post("/api/queue/edit")
 async def api_queue_edit(body: dict[str, Any]) -> dict[str, Any]:
     """Edit a pending prompt by index."""

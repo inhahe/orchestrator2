@@ -10,6 +10,7 @@ const Panels = (() => {
   let elBgBody, elBgCount;
   let elQueueSection, elQueueBody, elQueueCount;
   let elTodosBody, elTodosCount;
+  let _busy = false;
 
   function init() {
     elToolsBody  = document.getElementById('panel-tools-body');
@@ -188,15 +189,28 @@ const Panels = (() => {
     for (let i = 0; i < n; i++) {
       const item = queue[i];
       const text = item.text || '';
+      const sendDisabled = _busy && i === 0;
+      const disabledAttr = sendDisabled ? ' disabled' : '';
+      const disabledCls = sendDisabled ? ' disabled' : '';
+      const sendTitle = sendDisabled ? 'Will send after current turn' : 'Send now';
       html += `<div class="queue-item" data-index="${item.index}">
         <div class="queue-item-text" title="${_esc(text)}">${_esc(text)}</div>
         <div class="queue-item-actions">
+          <button class="queue-send-btn${disabledCls}" data-index="${item.index}" title="${sendTitle}"${disabledAttr}>\u25B6</button>
           <button class="queue-edit-btn" data-index="${item.index}" title="Edit">\u270E</button>
           <button class="queue-delete-btn" data-index="${item.index}" title="Delete">\u2715</button>
         </div>
       </div>`;
     }
     elQueueBody.innerHTML = html;
+
+    // Bind send buttons.
+    elQueueBody.querySelectorAll('.queue-send-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        _sendQueueItem(parseInt(btn.dataset.index));
+      });
+    });
 
     // Bind delete buttons.
     elQueueBody.querySelectorAll('.queue-delete-btn').forEach(btn => {
@@ -213,6 +227,20 @@ const Panels = (() => {
         _startEditQueueItem(parseInt(btn.dataset.index));
       });
     });
+  }
+
+  async function _sendQueueItem(index) {
+    try {
+      const resp = await fetch('/api/queue/send', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({index}),
+      });
+      const result = await resp.json();
+      if (!result.ok) console.warn('queue send failed:', result.error);
+    } catch (err) {
+      console.error('queue send error:', err);
+    }
   }
 
   async function _deleteQueueItem(index) {
@@ -293,8 +321,15 @@ const Panels = (() => {
   }
 
   function _rebindQueueItem(item, index) {
+    const sendBtn = item.querySelector('.queue-send-btn');
     const editBtn = item.querySelector('.queue-edit-btn');
     const deleteBtn = item.querySelector('.queue-delete-btn');
+    if (sendBtn) {
+      sendBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        _sendQueueItem(index);
+      });
+    }
     if (editBtn) {
       editBtn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -345,5 +380,14 @@ const Panels = (() => {
             .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
-  return { init, update, updateQueue };
+  function setBusy(busy) {
+    _busy = busy;
+    // Update send-button state on existing queue items.
+    elQueueBody.querySelectorAll('.queue-send-btn').forEach((btn, i) => {
+      btn.disabled = _busy && i === 0;
+      btn.classList.toggle('disabled', _busy && i === 0);
+    });
+  }
+
+  return { init, update, updateQueue, setBusy };
 })();
