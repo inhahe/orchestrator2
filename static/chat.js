@@ -451,7 +451,7 @@ const Chat = (() => {
 
   function _addBgStarted(msg) {
     const el = document.createElement('div');
-    const name = _esc(msg.name || msg.task_type || 'unknown');
+    const name = _esc(msg.name || msg.task_type || '');
     const cmd = msg.command;
 
     el.className = 'msg msg-tool';
@@ -487,7 +487,7 @@ const Chat = (() => {
   function _addBgComplete(msg) {
     const el = document.createElement('div');
     const isErr = msg.status === 'error' || msg.status === 'failed';
-    const name = _esc(msg.name || 'unknown');
+    const name = msg.name ? _esc(msg.name) : '';
     const cmd = msg.command;
     const summary = msg.summary || '';
     const icon = isErr ? '\u2717' : '\u2713';
@@ -504,14 +504,17 @@ const Chat = (() => {
       detailHtml += `<div class="detail-label">Output</div>
                      <pre>${_esc(summary)}</pre>`;
     }
-    const summaryText = summary
-      ? ` \u2014 ${_esc(summary.length > 120 ? summary.slice(0, 120) + '\u2026' : summary)}`
+    const summaryClean = summary
+      ? _esc(summary.length > 120 ? summary.slice(0, 120) + '\u2026' : summary)
       : '';
+    const displayText = name && summaryClean
+      ? `${name} \u2014 ${summaryClean}`
+      : name || summaryClean || '';
     el.innerHTML = `
       <div class="tool-header">
         <span class="tool-status-icon ${statusCls}">${icon}</span>
         <span class="tool-name">${label}</span>
-        <span class="tool-summary">${name}${summaryText}</span>
+        <span class="tool-summary">${displayText}</span>
         ${detailHtml ? '<span class="tool-expand-icon">\u25B8</span>' : ''}
       </div>
       ${detailHtml ? `<div class="tool-detail">${detailHtml}</div>` : ''}`;
