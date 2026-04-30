@@ -181,6 +181,12 @@ const Panels = (() => {
         // The item was sent or deleted — close the editor.
         _editingIndex = -1;
         _editingOriginalText = '';
+        // Clear server-side editing lock too.
+        fetch('/api/queue/editing', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({index: null}),
+        }).catch(() => {});
         // Flash a notice so the user knows why the editor closed.
         const item = elQueueBody.querySelector('.queue-item-editing');
         if (item) {
@@ -221,7 +227,23 @@ const Panels = (() => {
         </div>
       </div>`;
     }
+    // Merge button (only when 2+ items).
+    if (n >= 2) {
+      html += `<div class="queue-merge-row">
+        <button class="queue-merge-btn" title="Combine all prompts into one">Merge all</button>
+      </div>`;
+    }
+
     elQueueBody.innerHTML = html;
+
+    // Bind merge button.
+    const mergeBtn = elQueueBody.querySelector('.queue-merge-btn');
+    if (mergeBtn) {
+      mergeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        _mergeQueue();
+      });
+    }
 
     // Bind send buttons.
     elQueueBody.querySelectorAll('.queue-send-btn').forEach(btn => {
@@ -246,6 +268,19 @@ const Panels = (() => {
         _startEditQueueItem(parseInt(btn.dataset.index));
       });
     });
+  }
+
+  async function _mergeQueue() {
+    try {
+      const resp = await fetch('/api/queue/merge', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+      });
+      const result = await resp.json();
+      if (!result.ok) console.warn('queue merge failed:', result.error);
+    } catch (err) {
+      console.error('queue merge error:', err);
+    }
   }
 
   async function _sendQueueItem(index) {
@@ -279,6 +314,20 @@ const Panels = (() => {
   function _exitEditing() {
     _editingIndex = -1;
     _editingOriginalText = '';
+    // Tell the server we're done editing so it can send the prompt.
+    fetch('/api/queue/editing', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({index: null}),
+    }).catch(() => {});
+  }
+
+  function _notifyEditingStart(index) {
+    fetch('/api/queue/editing', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({index}),
+    }).catch(() => {});
   }
 
   function _startEditQueueItem(index) {
@@ -291,6 +340,7 @@ const Panels = (() => {
     _editingIndex = index;
     _editingOriginalText = fullText;
     item.classList.add('queue-item-editing');
+    _notifyEditingStart(index);
 
     // Replace with a textarea + save/cancel.
     const original = item.innerHTML;

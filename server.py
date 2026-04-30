@@ -685,6 +685,39 @@ async def api_queue_edit(body: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True}
 
 
+@app.post("/api/queue/editing")
+async def api_queue_editing(body: dict[str, Any]) -> dict[str, Any]:
+    """Notify the server that the user is editing (or finished editing) a queue item.
+
+    While a queue item is being edited, the bridge will hold off on
+    sending it so the user can finish their edit first.
+    """
+    if state is None or bridge is None:
+        return {"ok": False, "error": "not ready"}
+    idx = body.get("index")  # int to start editing, None to stop
+    if idx is not None and not isinstance(idx, int):
+        return {"ok": False, "error": "index must be int or null"}
+    state.queue_editing_index = idx
+    if idx is None and state.queued_prompts and not state.busy:
+        # Edit finished and bridge is idle — wake it up to send the prompt.
+        bridge.event_queue.put_nowait(("wakeup", "queue-edit-done"))
+    return {"ok": True}
+
+
+@app.post("/api/queue/merge")
+async def api_queue_merge() -> dict[str, Any]:
+    """Merge all queued prompts into one, separated by newlines."""
+    if state is None:
+        return {"ok": False, "error": "not ready"}
+    if len(state.queued_prompts) < 2:
+        return {"ok": False, "error": "need at least 2 prompts to merge"}
+    merged = "\n".join(state.queued_prompts)
+    state.queued_prompts.clear()
+    state.queued_prompts.append(merged)
+    await _broadcast_queue_update()
+    return {"ok": True, "count": 1}
+
+
 # ---------------------------------------------------------------------------
 # Theme / settings API
 # ---------------------------------------------------------------------------

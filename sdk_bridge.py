@@ -922,7 +922,12 @@ class SDKBridge:
 
         # --- Queued user prompts ---
         if state.queued_prompts:
+            if state.queue_editing_index == 0:
+                # First prompt is being edited in the UI — wait for the
+                # user to finish before sending it.
+                return await self._await_next_prompt()
             prompt = state.queued_prompts.popleft()
+            state.queue_editing_index = None  # clear stale editing state
             # Echo to chat now that the prompt is being processed.
             await self.broadcast({
                 "type": "user_message",
@@ -1057,6 +1062,15 @@ class SDKBridge:
                 await self._clear_context()
                 continue
             if kind == "wakeup":
+                # Queue edit finished — send the first queued prompt.
+                if payload == "queue-edit-done" and self.state.queued_prompts:
+                    prompt = self.state.queued_prompts.popleft()
+                    self.state.needs_user_attention = None
+                    await self.broadcast({
+                        "type": "user_message",
+                        "content": prompt,
+                    })
+                    return prompt
                 # Check if we should auto-resume.
                 auto_continue = getattr(
                     self.state, "_auto_continue", self.config.auto_continue

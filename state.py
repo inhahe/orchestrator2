@@ -289,6 +289,7 @@ class State:
 
     # Queued user prompts (typed while busy)
     queued_prompts: deque[str] = field(default_factory=deque)
+    queue_editing_index: int | None = None  # index being edited in the UI
 
     # Background tasks (bg shells + Task subagents)
     background_tasks: dict[str, dict[str, Any]] = field(default_factory=dict)

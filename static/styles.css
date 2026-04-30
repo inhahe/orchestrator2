@@ -368,6 +368,25 @@ html, body {
   padding: 4px 0;
 }
 
+.queue-merge-row {
+  padding: 4px 0 2px;
+  text-align: right;
+}
+.queue-merge-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 3px;
+}
+.queue-merge-btn:hover {
+  color: var(--text-bright);
+  border-color: var(--accent-dim);
+  background: var(--bg-tool);
+}
+
 .queue-edit-controls {
   display: flex;
   gap: 4px;
