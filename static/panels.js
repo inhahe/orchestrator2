@@ -166,15 +166,34 @@ const Panels = (() => {
 
   // ----- Pending prompt queue panel -----
 
-  let _queueEditing = false;  // true while user is editing a queue item
+  let _editingIndex = -1;         // index being edited, or -1
+  let _editingOriginalText = '';  // original text for matching after queue shifts
 
   function _renderQueue(queue) {
     const n = queue.length;
     elQueueCount.textContent = n;
     elQueueCount.classList.toggle('active', n > 0);
 
-    // Don't clobber the DOM while the user is editing a queue item.
-    if (_queueEditing) return;
+    // If the user is editing an item, check whether it's still in the queue.
+    if (_editingIndex >= 0) {
+      const newIdx = queue.findIndex(q => q.text === _editingOriginalText);
+      if (newIdx < 0) {
+        // The item was sent or deleted — close the editor.
+        _editingIndex = -1;
+        _editingOriginalText = '';
+        // Flash a notice so the user knows why the editor closed.
+        const item = elQueueBody.querySelector('.queue-item-editing');
+        if (item) {
+          item.innerHTML = '<div class="queue-sent-notice">Prompt was already sent</div>';
+          setTimeout(() => _renderQueue(queue), 1500);
+          return;
+        }
+      } else {
+        // Still in queue — update tracked index in case it shifted.
+        _editingIndex = newIdx;
+        return;  // don't clobber the editor DOM
+      }
+    }
 
     // Show/hide the entire panel section based on whether there are items.
     elQueueSection.classList.toggle('hidden', n === 0);
@@ -258,18 +277,20 @@ const Panels = (() => {
   }
 
   function _exitEditing() {
-    _queueEditing = false;
+    _editingIndex = -1;
+    _editingOriginalText = '';
   }
 
   function _startEditQueueItem(index) {
     const item = elQueueBody.querySelector(`.queue-item[data-index="${index}"]`);
     if (!item) return;
     const textEl = item.querySelector('.queue-item-text');
-    const actionsEl = item.querySelector('.queue-item-actions');
     // Find the full text from the title attribute.
     const fullText = textEl.title || textEl.textContent;
 
-    _queueEditing = true;
+    _editingIndex = index;
+    _editingOriginalText = fullText;
+    item.classList.add('queue-item-editing');
 
     // Replace with a textarea + save/cancel.
     const original = item.innerHTML;
@@ -287,11 +308,13 @@ const Panels = (() => {
     item.querySelector('.queue-save-btn').addEventListener('click', async () => {
       const newText = textarea.value.trim();
       if (!newText) { _exitEditing(); return; }
+      // Use _editingIndex which tracks shifts from queue updates.
+      const currentIndex = _editingIndex;
       try {
         const resp = await fetch('/api/queue/edit', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({index, text: newText}),
+          body: JSON.stringify({index: currentIndex, text: newText}),
         });
         const result = await resp.json();
         if (!result.ok) console.warn('queue edit failed:', result.error);
@@ -304,6 +327,7 @@ const Panels = (() => {
     item.querySelector('.queue-cancel-btn').addEventListener('click', () => {
       _exitEditing();
       item.innerHTML = original;
+      item.classList.remove('queue-item-editing');
       // Re-bind the buttons since we replaced innerHTML.
       _rebindQueueItem(item, index);
     });

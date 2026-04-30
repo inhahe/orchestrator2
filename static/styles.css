@@ -361,6 +361,12 @@ html, body {
   outline: none;
 }
 .queue-edit-textarea:focus { border-color: var(--accent); }
+.queue-sent-notice {
+  color: var(--yellow);
+  font-size: 11px;
+  font-style: italic;
+  padding: 4px 0;
+}
 
 .queue-edit-controls {
   display: flex;
