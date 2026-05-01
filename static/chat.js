@@ -911,5 +911,10 @@ const Chat = (() => {
   function setCollapseThreshold(n) { _collapseThreshold = Math.max(1, parseInt(n, 10) || 3); }
   function getCollapseThreshold() { return _collapseThreshold; }
 
-  return { init, clear, handleMessage, setCollapseTools, getCollapseTools, setCollapseThreshold, getCollapseThreshold };
+  function forceScrollToBottom() {
+    _autoScroll = true;
+    elMessages.scrollTop = elMessages.scrollHeight;
+  }
+
+  return { init, clear, handleMessage, setCollapseTools, getCollapseTools, setCollapseThreshold, getCollapseThreshold, forceScrollToBottom };
 })();

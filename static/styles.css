@@ -425,6 +425,15 @@ html, body {
 }
 .queue-edit-controls button:hover { color: var(--text-bright); border-color: var(--accent); }
 
+.queue-saving-indicator {
+  width: 100%;
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1;
+  letter-spacing: 2px;
+  padding-top: 2px;
+}
+
 /* ===================================================================
    Chat / messages area
    =================================================================== */

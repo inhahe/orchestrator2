@@ -50,16 +50,22 @@ const Commands = (() => {
       }
     });
 
-    // Global Ctrl+C: interrupt even when input isn't focused.
+    // Global keyboard shortcuts (work regardless of focus).
     document.addEventListener('keydown', (e) => {
+      // Ctrl+C: interrupt (unless text is selected or input is focused).
       if (e.key === 'c' && e.ctrlKey && !e.shiftKey) {
-        // Don't intercept if user is selecting text or in an input/textarea.
         if (document.activeElement === elInput) return;  // handled by _onKeyDown
         if (window.getSelection().toString()) return;    // let them copy
         if (!elInterruptBtn.classList.contains('hidden')) {
           e.preventDefault();
           _interrupt();
         }
+      }
+
+      // Ctrl+End: scroll chat to bottom and re-enable auto-scroll.
+      if (e.key === 'End' && e.ctrlKey) {
+        e.preventDefault();
+        Chat.forceScrollToBottom();
       }
     });
   }

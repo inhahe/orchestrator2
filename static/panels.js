@@ -370,13 +370,32 @@ const Panels = (() => {
       textEl.title = newText;
       textEl.textContent = newText;
       item.innerHTML = '';
+      item.style.flexWrap = 'wrap';
       item.appendChild(textEl);
+
+      // Animated dots indicator while the edit API call is in flight.
+      const indicator = document.createElement('div');
+      indicator.className = 'queue-saving-indicator';
+      indicator.textContent = '.';
+      item.appendChild(indicator);
+      let dotCount = 1;
+      const dotInterval = setInterval(() => {
+        if (!indicator.isConnected) { clearInterval(dotInterval); return; }
+        dotCount = (dotCount % 3) + 1;
+        indicator.textContent = '.'.repeat(dotCount);
+      }, 350);
+
       // Fire API call in the background — server broadcast will re-render.
       fetch('/api/queue/edit', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({index: currentIndex, text: newText}),
-      }).catch(err => console.error('queue edit error:', err));
+      }).catch(err => {
+        console.error('queue edit error:', err);
+      }).finally(() => {
+        clearInterval(dotInterval);
+        if (indicator.isConnected) indicator.remove();
+      });
     });
 
     item.querySelector('.queue-cancel-btn').addEventListener('click', () => {
