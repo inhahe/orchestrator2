@@ -319,6 +319,8 @@ html, body {
   display: -webkit-box;
   -webkit-line-clamp: 10;
   -webkit-box-orient: vertical;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .queue-item-actions {
