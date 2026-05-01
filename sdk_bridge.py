@@ -409,15 +409,27 @@ class SDKBridge:
             task_id = getattr(msg, "task_id", None) or ""
             status = getattr(msg, "status", None) or "completed"
             summary = getattr(msg, "summary", None)
+            # The SDK stores actual task output in a file.
+            output_file = getattr(msg, "output_file", None)
+            output = None
+            if output_file:
+                try:
+                    output = Path(output_file).read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
             entry = complete_bg_task(state, task_id, status, summary=summary)
             if entry:
+                cmd = self._bg_task_command(entry)
+                # Use output_file content as the display output.  Fall back
+                # to summary, but skip it if it's just the command repeated.
+                display_output = output or (summary if summary != cmd else None)
                 data = {
                     "task_id": task_id,
                     "seq": entry.get("seq"),
                     "name": entry.get("name"),
                     "status": status,
-                    "summary": summary,
-                    "command": self._bg_task_command(entry),
+                    "summary": display_output,
+                    "command": cmd,
                 }
                 await self.broadcast({"type": "bg_complete", **data})
                 ring_bell(state, "bg-done")
@@ -473,15 +485,26 @@ class SDKBridge:
             status = patch.get("status")
             if status in ("completed", "failed", "stopped", "cancelled"):
                 summary = patch.get("summary")
+                output_file = patch.get("output_file") or d.get("output_file")
+                output = None
+                if output_file:
+                    try:
+                        output = Path(output_file).read_text(
+                            encoding="utf-8", errors="replace",
+                        )
+                    except Exception:
+                        pass
                 entry = complete_bg_task(state, task_id, status, summary=summary)
                 if entry:
+                    cmd = self._bg_task_command(entry)
+                    display_output = output or (summary if summary != cmd else None)
                     data = {
                         "task_id": task_id,
                         "seq": entry.get("seq"),
                         "name": entry.get("name"),
                         "status": status,
-                        "summary": summary,
-                        "command": self._bg_task_command(entry),
+                        "summary": display_output,
+                        "command": cmd,
                     }
                     await self.broadcast({"type": "bg_complete", **data})
                     ring_bell(state, "bg-done")

@@ -500,17 +500,20 @@ const Chat = (() => {
     const label = isErr ? 'Background task failed' : 'Background task completed';
 
     el.className = 'msg msg-tool';
+    // Don't show summary as "Output" if it's just the command repeated.
+    const hasRealOutput = summary && summary !== cmd;
     let detailHtml = '';
     if (cmd) {
       detailHtml += `<div class="detail-label">Command</div>
                      <pre>${_esc(cmd)}</pre>`;
     }
-    if (summary) {
+    if (hasRealOutput) {
       detailHtml += `<div class="detail-label">Output</div>
                      <pre>${_esc(summary)}</pre>`;
     }
-    const summaryClean = summary
-      ? _esc(summary.length > 120 ? summary.slice(0, 120) + '\u2026' : summary)
+    const summaryForDisplay = hasRealOutput ? summary : '';
+    const summaryClean = summaryForDisplay
+      ? _esc(summaryForDisplay.length > 120 ? summaryForDisplay.slice(0, 120) + '\u2026' : summaryForDisplay)
       : '';
     const displayText = name && summaryClean
       ? `${name} \u2014 ${summaryClean}`

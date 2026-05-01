@@ -360,6 +360,9 @@ const Panels = (() => {
       if (!newText) { _exitEditing(); return; }
       // Use _editingIndex which tracks shifts from queue updates.
       const currentIndex = _editingIndex;
+      // Update the tracked text so the queue_update from the server
+      // doesn't think the item was sent (old text won't match).
+      _editingOriginalText = newText;
       try {
         const resp = await fetch('/api/queue/edit', {
           method: 'POST',
