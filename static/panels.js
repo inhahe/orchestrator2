@@ -311,15 +311,17 @@ const Panels = (() => {
     }
   }
 
-  function _exitEditing() {
+  function _exitEditing(notifyServer = true) {
     _editingIndex = -1;
     _editingOriginalText = '';
-    // Tell the server we're done editing so it can send the prompt.
-    fetch('/api/queue/editing', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({index: null}),
-    }).catch(() => {});
+    if (notifyServer) {
+      // Tell the server we're done editing so it can send the prompt.
+      fetch('/api/queue/editing', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({index: null}),
+      }).catch(() => {});
+    }
   }
 
   function _notifyEditingStart(index) {
@@ -355,26 +357,26 @@ const Panels = (() => {
     textarea.focus();
     textarea.setSelectionRange(textarea.value.length, textarea.value.length);
 
-    item.querySelector('.queue-save-btn').addEventListener('click', async () => {
+    item.querySelector('.queue-save-btn').addEventListener('click', () => {
       const newText = textarea.value.trim();
       if (!newText) { _exitEditing(); return; }
-      // Use _editingIndex which tracks shifts from queue updates.
       const currentIndex = _editingIndex;
-      // Update the tracked text so the queue_update from the server
-      // doesn't think the item was sent (old text won't match).
-      _editingOriginalText = newText;
-      try {
-        const resp = await fetch('/api/queue/edit', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({index: currentIndex, text: newText}),
-        });
-        const result = await resp.json();
-        if (!result.ok) console.warn('queue edit failed:', result.error);
-      } catch (err) {
-        console.error('queue edit error:', err);
-      }
-      _exitEditing();
+      // Close editor and show the new text immediately (optimistic).
+      // Don't notify server here — /api/queue/edit handles the lock.
+      _exitEditing(false);
+      item.classList.remove('queue-item-editing');
+      const textEl = document.createElement('div');
+      textEl.className = 'queue-item-text';
+      textEl.title = newText;
+      textEl.textContent = newText;
+      item.innerHTML = '';
+      item.appendChild(textEl);
+      // Fire API call in the background — server broadcast will re-render.
+      fetch('/api/queue/edit', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({index: currentIndex, text: newText}),
+      }).catch(err => console.error('queue edit error:', err));
     });
 
     item.querySelector('.queue-cancel-btn').addEventListener('click', () => {
@@ -436,17 +438,47 @@ const Panels = (() => {
     let html = '';
     for (const t of todos) {
       const status = t.status || 'pending';
-      let check;
-      if (status === 'completed') check = '\u2611';
-      else if (status === 'in_progress') check = '\u25B6';
-      else check = '\u2610';
+      let mark;
+      if (status === 'completed') mark = '\u2713';       // ✓
+      else if (status === 'in_progress') mark = '\u25B6'; // ▶
+      else mark = '\u2022';                               // •
 
       html += `<div class="todo-item ${status}">
-        <span class="todo-check">${check}</span>
+        <span class="todo-check">${mark}</span>
         <span class="todo-text">${_esc(t.content || '')}</span>
       </div>`;
     }
+
+    // Show "Clear done" button when any items are completed.
+    const done = todos.length - pending.length;
+    if (done > 0) {
+      html += `<div class="todo-clear-row">
+        <button class="todo-clear-btn" title="Clear completed items">Clear done</button>
+      </div>`;
+    }
+
     elTodosBody.innerHTML = html;
+
+    const clearBtn = elTodosBody.querySelector('.todo-clear-btn');
+    if (clearBtn) {
+      clearBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        _clearTodos();
+      });
+    }
+  }
+
+  async function _clearTodos() {
+    try {
+      const resp = await fetch('/api/todos/clear', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+      });
+      const result = await resp.json();
+      if (!result.ok) console.warn('todo clear failed:', result.error);
+    } catch (err) {
+      console.error('todo clear error:', err);
+    }
   }
 
   // ----- Helpers -----

@@ -288,6 +288,25 @@ html, body {
 .todo-item.in_progress .todo-check { color: var(--todo-in-progress); }
 .todo-item.completed .todo-check { color: var(--todo-completed); }
 
+.todo-clear-row {
+  padding: 4px 6px 2px;
+  text-align: right;
+}
+.todo-clear-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 3px;
+}
+.todo-clear-btn:hover {
+  color: var(--text-bright);
+  border-color: var(--accent-dim);
+  background: var(--bg-tool);
+}
+
 .panel-empty {
   padding: 8px;
   color: var(--text-muted);

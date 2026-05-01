@@ -671,8 +671,12 @@ async def api_queue_send(body: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/api/queue/edit")
 async def api_queue_edit(body: dict[str, Any]) -> dict[str, Any]:
-    """Edit a pending prompt by index."""
-    if state is None:
+    """Edit a pending prompt by index.
+
+    Also clears the editing lock atomically so the bridge doesn't send
+    the old text before the update arrives.
+    """
+    if state is None or bridge is None:
         return {"ok": False, "error": "not ready"}
     idx = body.get("index")
     text = (body.get("text") or "").strip()
@@ -680,8 +684,13 @@ async def api_queue_edit(body: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "error": f"invalid index: {idx}"}
     if not text:
         return {"ok": False, "error": "text cannot be empty"}
+    # Update text and clear editing lock in one step.
     state.queued_prompts[idx] = text
+    state.queue_editing_index = None
     await _broadcast_queue_update()
+    # Wake the bridge if idle so it can send the (now updated) prompt.
+    if state.queued_prompts and not state.busy:
+        bridge.event_queue.put_nowait(("wakeup", "queue-edit-done"))
     return {"ok": True}
 
 
@@ -716,6 +725,28 @@ async def api_queue_merge() -> dict[str, Any]:
     state.queued_prompts.append(merged)
     await _broadcast_queue_update()
     return {"ok": True, "count": 1}
+
+
+# ---------------------------------------------------------------------------
+# Todos (plan) API
+# ---------------------------------------------------------------------------
+
+@app.post("/api/todos/clear")
+async def api_todos_clear() -> dict[str, Any]:
+    """Remove completed items from the plan panel."""
+    if state is None:
+        return {"ok": False, "error": "not ready"}
+    state.current_todos = [
+        t for t in state.current_todos
+        if t.get("status") != "completed"
+    ]
+    panels = state_to_panels_dict(state)
+    await broadcast({
+        "type": "status_update",
+        "status": state_to_status_dict(state, config),
+        "panels": panels,
+    })
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
