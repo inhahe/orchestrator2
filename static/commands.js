@@ -49,6 +49,19 @@ const Commands = (() => {
         _hideAc();
       }
     });
+
+    // Global Ctrl+C: interrupt even when input isn't focused.
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'c' && e.ctrlKey && !e.shiftKey) {
+        // Don't intercept if user is selecting text or in an input/textarea.
+        if (document.activeElement === elInput) return;  // handled by _onKeyDown
+        if (window.getSelection().toString()) return;    // let them copy
+        if (!elInterruptBtn.classList.contains('hidden')) {
+          e.preventDefault();
+          _interrupt();
+        }
+      }
+    });
   }
 
   function setCommands(cmds) {
@@ -131,8 +144,11 @@ const Commands = (() => {
       return;
     }
 
-    // Ctrl+C: interrupt if busy, clear input if not.
+    // Ctrl+C: interrupt if busy — but only when nothing is selected,
+    // so the user can still copy text normally.
     if (e.key === 'c' && e.ctrlKey) {
+      if (window.getSelection().toString()) return;
+      if (elInput.selectionStart !== elInput.selectionEnd) return;
       if (!elInterruptBtn.classList.contains('hidden')) {
         e.preventDefault();
         _interrupt();

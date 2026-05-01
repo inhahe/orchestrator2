@@ -517,7 +517,7 @@ class SDKBridge:
             apply_rate_limit_info(state, rate_info)
 
         # High-frequency / noisy subtypes — suppress from the frontend.
-        if subtype in ("hook_started", "hook_ended"):
+        if subtype in ("hook_started", "hook_ended", "task_output"):
             return
 
         # Track progress timestamps for stale detection.
