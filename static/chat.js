@@ -114,7 +114,10 @@ const Chat = (() => {
 
     _toolGroupContainer.appendChild(el);
     const n = _toolGroupContainer.children.length;
-    _toolGroupToggle.textContent = `\u25B8 show ${n} tool${n !== 1 ? 's' : ''}`;
+    if (_toolGroupContainer.classList.contains('collapsed')) {
+      _toolGroupToggle.textContent = `\u25B8 show ${n} tool${n !== 1 ? 's' : ''}`;
+    }
+    // If expanded, leave the toggle text as "▾ collapse".
   }
 
   function _trackThinkingBlock(el) {
@@ -162,7 +165,9 @@ const Chat = (() => {
 
     _thinkingGroupContainer.appendChild(el);
     const n = _thinkingGroupContainer.children.length;
-    _thinkingGroupToggle.textContent = `\u25B8 show ${n} thinking block${n !== 1 ? 's' : ''}`;
+    if (_thinkingGroupContainer.classList.contains('collapsed')) {
+      _thinkingGroupToggle.textContent = `\u25B8 show ${n} thinking block${n !== 1 ? 's' : ''}`;
+    }
   }
 
   function init() {
