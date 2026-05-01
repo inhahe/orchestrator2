@@ -856,9 +856,6 @@ html, body {
   border-top: 1px solid var(--border);
   padding: 6px 16px 8px;
   flex-shrink: 0;
-  /* Align with the chat pane, not the screen edge.
-     Sidebar is 260px + 1px border. */
-  margin-left: 324px;  /* sidebar width + resize handle */
 }
 
 #input-wrap {
@@ -1008,6 +1005,5 @@ html, body {
   #sidebar { width: 100% !important; max-width: 100%; border-bottom: 1px solid var(--border); }
   #sidebar-resize { display: none; }
   #main-container { flex-direction: column; }
-  #input-bar { margin-left: 0 !important; }
   .modal-content { left: 5%; right: 5%; top: 5%; bottom: 5%; }
 }

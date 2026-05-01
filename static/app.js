@@ -43,7 +43,6 @@ const App = (() => {
   function _initSidebarResize() {
     const sidebar = document.getElementById('sidebar');
     const handle = document.getElementById('sidebar-resize');
-    const inputBar = document.getElementById('input-bar');
     if (!sidebar || !handle) return;
 
     // Restore persisted width.
@@ -52,7 +51,6 @@ const App = (() => {
       const w = parseInt(saved, 10);
       if (w >= 180 && w <= 600) {
         sidebar.style.width = w + 'px';
-        inputBar.style.marginLeft = (w + 4) + 'px';  // +4 for handle
       }
     }
 
@@ -75,7 +73,6 @@ const App = (() => {
       const delta = e.clientX - startX;
       let newW = Math.max(180, Math.min(600, startW + delta));
       sidebar.style.width = newW + 'px';
-      inputBar.style.marginLeft = (newW + 4) + 'px';
     });
 
     document.addEventListener('mouseup', () => {

@@ -54,11 +54,9 @@
     <!-- Chat / output area -->
     <main id="chat-area">
       <div id="messages"></div>
-    </main>
-  </div>
 
-  <!-- ===== Input bar (bottom) ===== -->
-  <footer id="input-bar">
+      <!-- Input bar (inside chat-area so it aligns naturally) -->
+      <div id="input-bar">
     <div id="status-bar">
       <span id="status-indicator" class="indicator idle"></span>
       <span id="status-state" class="status-field status-state-text" title="Current state">idle</span>
@@ -101,14 +99,16 @@
       </select>
     </div>
     <div id="input-wrap">
+      <button id="send-btn" title="Send (Enter)">&#9654;</button>
+      <button id="interrupt-btn" title="Interrupt (Ctrl+C)" class="hidden">&#9632;</button>
       <textarea id="input-box" rows="1"
                 placeholder="Message Claude... (Enter to send, Shift+Enter for newline)"
                 autocomplete="off" spellcheck="true"></textarea>
-      <button id="send-btn" title="Send (Enter)">&#9654;</button>
-      <button id="interrupt-btn" title="Interrupt (Ctrl+C)" class="hidden">&#9632;</button>
     </div>
     <div id="input-hint" class="hidden"></div>
-  </footer>
+      </div>
+    </main>
+  </div>
 
   <!-- ===== Detail modal (click-to-expand) ===== -->
   <div id="detail-modal" class="modal hidden">
