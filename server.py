@@ -1052,10 +1052,11 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
                 bridge.event_queue.put_nowait(("message", prompt))
             return
 
-        # User messages while busy go to the pending queue (displayed
-        # in the queue panel).  The bridge's _between_turns() drains
-        # state.queued_prompts between turns.
-        if kind == "message" and state.busy:
+        # User messages while busy or connecting go to the pending queue
+        # (displayed in the queue panel).  The bridge's _between_turns()
+        # drains state.queued_prompts between turns; worker_loop() also
+        # checks queued_prompts after the initial connect completes.
+        if kind == "message" and (state.busy or state.connecting):
             state.queued_prompts.append(payload)
             await _broadcast_queue_update()
             return

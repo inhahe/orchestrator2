@@ -84,19 +84,10 @@
       <span class="status-label">rate</span>
       <span id="status-ratelimit" class="status-field" title="Rate limits">--</span>
       <span class="status-sep">|</span>
-      <label class="status-checkbox" title="Auto-collapse consecutive tool/thinking blocks">
+      <label class="status-checkbox" title="Auto-collapse tools, thinking, and activity between messages">
         <input type="checkbox" id="collapse-tools-check" checked>
-        <span class="status-label">collapse repeats</span>
+        <span class="status-label">collapse activity</span>
       </label>
-      <span class="status-sep">-</span>
-      <span class="status-label">after</span>
-      <select id="collapse-threshold-select" class="status-select" title="Number of blocks to show before collapsing">
-        <option value="1">1</option>
-        <option value="2">2</option>
-        <option value="3" selected>3</option>
-        <option value="5">5</option>
-        <option value="10">10</option>
-      </select>
     </div>
     <div id="input-wrap">
       <button id="send-btn" title="Send (Enter)">&#9654;</button>

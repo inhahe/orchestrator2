@@ -138,23 +138,6 @@ html, body {
   accent-color: var(--accent);
 }
 
-.status-select {
-  background: #0d1117;
-  color: var(--text-bright);
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  font-size: 10px;
-  padding: 0 2px;
-  cursor: pointer;
-  outline: none;
-}
-.status-select option {
-  background: #0d1117;
-  color: var(--text-bright);
-}
-.status-select:focus {
-  border-color: var(--accent);
-}
 
 .status-state-text {
   font-weight: 600;
@@ -772,6 +755,30 @@ html, body {
   user-select: none;
 }
 .tool-collapse-toggle:hover {
+  background: var(--bg-tool-hover);
+}
+
+/* Activity-group collapsing (wraps all non-text items between messages) */
+.activity-group.collapsed .activity-group-content { display: none; }
+/* When an activity group is expanded, flatten inner per-type collapse
+   groups so the user doesn't face a second level of expand/collapse. */
+.activity-group:not(.collapsed) .tool-collapse-group.collapsed { display: block; }
+.activity-group:not(.collapsed) .tool-collapse-toggle { display: none; }
+.activity-group-toggle {
+  padding: 6px 10px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--purple);
+  cursor: pointer;
+  border-radius: var(--radius);
+  margin: 2px 0;
+  background: var(--bg-tool);
+  border: 1px solid var(--border);
+  user-select: none;
+}
+.activity-group-toggle:hover {
+  color: var(--text);
   background: var(--bg-tool-hover);
 }
 

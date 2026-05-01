@@ -33,7 +33,7 @@ const Chat = (() => {
   // appear in a row (without intervening assistant text or user messages),
   // ALL of them are collapsed behind a "show N tools" toggle.
   let _collapseTools = true;          // toggled via /collapse or checkbox
-  let _collapseThreshold = 3;         // configurable via dropdown
+  let _collapseThreshold = 1;         // collapse immediately (all wrapped by activity groups)
   let _consecutiveToolCount = 0;
   let _toolGroupContainer = null;  // wrapper div for collapsible group
   let _toolGroupToggle = null;     // the "show N more" element
@@ -170,6 +170,98 @@ const Chat = (() => {
     }
   }
 
+  // --- Activity-group collapsing ---
+  // Wraps all non-text elements (tools, thinking, turn markers, system msgs)
+  // between Claude's text messages into a single collapsible summary line.
+  // Triggered when a new assistant text or user message arrives.
+
+  function _collapseActivity() {
+    if (!_collapseTools) return;
+
+    const children = Array.from(elMessages.children);
+    if (children.length === 0) return;
+
+    // Find the last boundary: user message, assistant text, existing
+    // activity group, or explicit boundary marker (history separators).
+    let boundaryIdx = -1;
+    for (let i = children.length - 1; i >= 0; i--) {
+      const el = children[i];
+      if (el.classList.contains('msg-user') ||
+          el.classList.contains('msg-assistant') ||
+          el.classList.contains('activity-group') ||
+          el.classList.contains('activity-boundary')) {
+        boundaryIdx = i;
+        break;
+      }
+    }
+
+    // Collect activity elements after the boundary.
+    const activityEls = children.slice(boundaryIdx + 1);
+    if (activityEls.length < 2) return;
+
+    // Count items for summary.
+    const counts = _countActivityItems(activityEls);
+    const summary = _activitySummary(counts);
+    if (!summary) return;
+
+    // Create collapsible group.
+    const group = document.createElement('div');
+    group.className = 'activity-group collapsed';
+
+    const toggle = document.createElement('div');
+    toggle.className = 'activity-group-toggle';
+    toggle.textContent = '\u25B6 ' + summary;
+
+    const content = document.createElement('div');
+    content.className = 'activity-group-content';
+
+    // Insert before the first activity element, then move them all inside.
+    activityEls[0].parentNode.insertBefore(group, activityEls[0]);
+    for (const el of activityEls) {
+      content.appendChild(el);
+    }
+    group.appendChild(toggle);
+    group.appendChild(content);
+
+    toggle.addEventListener('click', () => {
+      group.classList.toggle('collapsed');
+      if (group.classList.contains('collapsed')) {
+        toggle.textContent = '\u25B6 ' + summary;
+        _scrollToBottom();
+      } else {
+        toggle.textContent = '\u25BC ' + summary;
+        toggle.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    });
+  }
+
+  function _countActivityItems(elements) {
+    let tools = 0, thinking = 0, turns = 0, system = 0;
+    for (const el of elements) {
+      if (el.classList.contains('tool-collapse-toggle')) continue;
+      if (el.classList.contains('tool-collapse-group')) {
+        for (const child of el.children) {
+          if (child.classList.contains('msg-thinking')) thinking++;
+          else if (child.classList.contains('msg-tool')) tools++;
+        }
+      } else if (el.classList.contains('msg-tool'))     tools++;
+        else if (el.classList.contains('msg-thinking'))  thinking++;
+        else if (el.classList.contains('msg-turn-end'))  turns++;
+        else if (el.classList.contains('msg-system') ||
+                 el.classList.contains('msg-command'))    system++;
+    }
+    return { tools, thinking, turns, system };
+  }
+
+  function _activitySummary(counts) {
+    const parts = [];
+    if (counts.tools)    parts.push(`${counts.tools} tool${counts.tools !== 1 ? 's' : ''}`);
+    if (counts.thinking) parts.push(`${counts.thinking} thinking`);
+    if (counts.turns)    parts.push(`${counts.turns} turn${counts.turns !== 1 ? 's' : ''}`);
+    if (counts.system)   parts.push(`${counts.system} system`);
+    return parts.join(', ');
+  }
+
   function init() {
     elMessages = document.getElementById('messages');
 
@@ -237,6 +329,7 @@ const Chat = (() => {
 
   function _addUserMessage(content) {
     _flushStreaming();
+    _collapseActivity();
     _resetToolRun();
     _resetThinkingRun();
     const el = document.createElement('div');
@@ -261,6 +354,7 @@ const Chat = (() => {
       // Streaming delta — append to current element.
       // Use plain text during streaming (fast), render markdown on flush.
       if (!_streamingEl) {
+        _collapseActivity();
         _streamingEl = document.createElement('div');
         _streamingEl.className = 'msg msg-assistant';
         _streamingEl.innerHTML = '<div class="msg-content"></div>';
@@ -272,6 +366,7 @@ const Chat = (() => {
     } else {
       // Non-delta: full text block (history or async).
       _flushStreaming();
+      _collapseActivity();
       if (!msg.content) return;  // skip empty blocks
       const el = document.createElement('div');
       el.className = 'msg msg-assistant';
@@ -617,13 +712,10 @@ const Chat = (() => {
 
     _replayInProgress = true;
 
-    // Disable tool-collapse during history replay.
-    const savedCollapse = _collapseTools;
-    _collapseTools = false;
-
-    // Add history separator.
+    // Add history separator (marked as boundary so activity-collapse
+    // doesn't swallow it into a group).
     const sep = document.createElement('div');
-    sep.className = 'msg msg-system';
+    sep.className = 'msg msg-system activity-boundary';
     sep.textContent = `--- Session history (${messages.length} messages) ---`;
     elMessages.appendChild(sep);
 
@@ -658,11 +750,10 @@ const Chat = (() => {
       } else {
         // Done — add end separator and restore state.
         const endSep = document.createElement('div');
-        endSep.className = 'msg msg-system';
+        endSep.className = 'msg msg-system activity-boundary';
         endSep.textContent = '--- End of history ---';
         elMessages.appendChild(endSep);
 
-        _collapseTools = savedCollapse;
         _resetToolRun();
         _resetThinkingRun();
 

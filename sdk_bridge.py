@@ -433,8 +433,13 @@ class SDKBridge:
                 }
                 await self.broadcast({"type": "bg_complete", **data})
                 ring_bell(state, "bg-done")
-                # If no more bg tasks, queue a wakeup.
+                # If no more bg tasks, update status immediately and queue a wakeup.
                 if not state.background_tasks:
+                    await self.broadcast({
+                        "type": "status_update",
+                        "status": state_to_status_dict(state, self.config),
+                        "panels": state_to_panels_dict(state),
+                    })
                     self.event_queue.put_nowait(("wakeup", "bg-all-done"))
 
         elif subtype == "task_started":
@@ -509,6 +514,11 @@ class SDKBridge:
                     await self.broadcast({"type": "bg_complete", **data})
                     ring_bell(state, "bg-done")
                     if not state.background_tasks:
+                        await self.broadcast({
+                            "type": "status_update",
+                            "status": state_to_status_dict(state, self.config),
+                            "panels": state_to_panels_dict(state),
+                        })
                         self.event_queue.put_nowait(("wakeup", "bg-all-done"))
 
         # Rate limit info (may be on any system message).
@@ -809,9 +819,20 @@ class SDKBridge:
                         })
 
         # --- Initial prompt ---
+        # Messages sent during connect go to state.queued_prompts (so
+        # they appear in the queue panel).  Check those first.
         next_prompt: str | None = None
         if config.initial_prompt:
             next_prompt = config.initial_prompt
+        elif state.queued_prompts:
+            next_prompt = state.queued_prompts.popleft()
+            state.queue_editing_index = None
+            await self.broadcast({"type": "user_message", "content": next_prompt})
+            await self.broadcast({
+                "type": "queue_update",
+                "queue": [{"index": i, "text": t}
+                          for i, t in enumerate(state.queued_prompts)],
+            })
         else:
             # Wait for first user input.
             kind, payload = await self.event_queue.get()

@@ -10,7 +10,6 @@ const Status = (() => {
   let elModel, elEffort, elThinking;
   let elContext, elRateLimit;
   let elCollapseCheck;
-  let elCollapseThreshold;
 
   // CSS class → colour mapping for the state text.
   const _stateColors = {
@@ -48,24 +47,6 @@ const Status = (() => {
         Chat.setCollapseTools(on);
         localStorage.setItem('collapse-tools', String(on));
         App.send({ type: 'message', text: `/collapse ${on ? 'on' : 'off'}` });
-      });
-    }
-    elCollapseThreshold = document.getElementById('collapse-threshold-select');
-    if (elCollapseThreshold) {
-      // Restore persisted value.
-      const savedThreshold = localStorage.getItem('collapse-threshold');
-      if (savedThreshold !== null) {
-        const n = parseInt(savedThreshold, 10);
-        if (n >= 1) {
-          elCollapseThreshold.value = String(n);
-          Chat.setCollapseThreshold(n);
-        }
-      }
-      elCollapseThreshold.addEventListener('change', () => {
-        const val = parseInt(elCollapseThreshold.value, 10);
-        Chat.setCollapseThreshold(val);
-        localStorage.setItem('collapse-threshold', String(val));
-        App.send({ type: 'message', text: `/collapse-threshold ${val}` });
       });
     }
   }
@@ -144,12 +125,6 @@ const Status = (() => {
       const val = saved !== null ? (saved === 'true') : status.collapse_tools;
       Chat.setCollapseTools(val);
       if (elCollapseCheck) elCollapseCheck.checked = val;
-    }
-    if (status.collapse_threshold != null) {
-      const saved = localStorage.getItem('collapse-threshold');
-      const val = saved !== null ? parseInt(saved, 10) : status.collapse_threshold;
-      Chat.setCollapseThreshold(val);
-      if (elCollapseThreshold) elCollapseThreshold.value = String(val);
     }
   }
 
