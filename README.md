@@ -40,7 +40,7 @@ orch --config-dir "C:\Users\me\.claude-alt"
 
 - **Live WebSocket UI** -- real-time streaming of assistant messages, tool calls, and results
 - **Side-by-side diff viewer** -- UltraCompare-style edit comparisons with configurable colors
-- **Block collapse** -- consecutive tool calls or thinking blocks auto-collapse behind a toggle (configurable threshold, persisted across sessions)
+- **Activity collapse** -- all non-text activity (tools, thinking, turn markers) between Claude's messages auto-collapses into a single expandable summary line; click to expand and see all individual blocks
 - **Sidebar panels** -- live views of active tools, background tasks, pending queue, and TodoWrite plan
 - **Draggable sidebar** -- resize handle with width persisted across sessions
 - **Auto-compact** -- automatic context compaction when token usage gets high
@@ -115,8 +115,7 @@ orch --config-dir "C:\Users\me\.claude-alt"
 | `--show-tasks` | `compact` | Non-Bash tool display: `off`, `compact`, `full`, `full+output` |
 | `--show-edits` | `compact` | Edit tool display: `off`, `compact`, `full` |
 | `--ascii-only` | off | Use ASCII markers instead of Unicode |
-| `--collapse-tools` / `--no-collapse-tools` | on | Auto-collapse consecutive tool/thinking blocks |
-| `--collapse-threshold N` | 3 | Number of blocks shown before collapsing |
+| `--collapse-tools` / `--no-collapse-tools` | on | Auto-collapse activity between messages |
 
 ### Bell Notifications
 
@@ -160,6 +159,7 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 |---------|-------------|
 | `/clear` | Start a fresh session (wipes context) |
 | `/cls` | Clear the chat output area |
+| `/history [N]` | Clear output and replay session history (last N records; default 2000) |
 | `/cwd [path]` | Show current working directory, or switch to a new one and reconnect |
 | `/rename [name]` | Set a custom session title |
 | `/export [path]` | Save conversation as markdown |
@@ -193,8 +193,7 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 
 | Command | Description |
 |---------|-------------|
-| `/collapse [on\|off]` | Toggle collapsing of repeated blocks |
-| `/collapse-threshold N` | Set number of blocks before collapsing |
+| `/collapse [on\|off]` | Toggle activity collapsing (tools, thinking, turn markers between messages) |
 | `/autocompact [on\|off\|N]` | Control auto-compact |
 | `/max-context [off\|N]` | Cap context tokens |
 | `/bell [all\|none\|EVENTS]` | Configure bell notifications |

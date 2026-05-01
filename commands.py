@@ -31,6 +31,7 @@ from state import (
 from session import (
     find_session_dir,
     read_session_title,
+    render_session_history,
     render_session_markdown,
     write_session_title,
 )
@@ -149,6 +150,8 @@ def classify(line: str) -> tuple[str, str]:
         return "queue", arg
     if cmd == "graphify":
         return "graphify", arg
+    if cmd == "history":
+        return "history", arg
     if cmd == "clear":
         return "clear-context", ""
     if cmd == "cls":
@@ -185,6 +188,7 @@ _IMMEDIATE_HANDLERS: dict[str, str] = {
     "max-context":     "_cmd_max_context",
     "bell":            "_cmd_bell",
     "queue":           "_cmd_queue",
+    "history":         "_cmd_history",
     "effort-show":     "_cmd_effort_show",
     "model-show":      "_cmd_model_show",
 }
@@ -225,6 +229,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         "  /cwd [path]                     show or switch working directory",
         "  /clear                          start a fresh session (wipes context)",
         "  /cls                            clear the output area",
+        "  /history [N]                    replay session history (last N records)",
         "  /interrupt  /i                  stop the current turn",
         f"  /effort <level>                 one of {', '.join(EFFORT_CHOICES)}",
         "  /thinking [on|off|toggle]       enable/disable extended thinking",
@@ -287,6 +292,41 @@ def _cmd_debug(_payload: str, state: State, _config: Config) -> CommandResult:
 
 def _cmd_clear_screen(_payload: str, _state: State, _config: Config) -> CommandResult:
     return CommandResult(messages=[{"type": "clear_screen"}])
+
+
+def _cmd_history(payload: str, state: State, _config: Config) -> CommandResult:
+    sid = state.session_id
+    if not sid:
+        return CommandResult(messages=[_msg("No active session.", level="warning")])
+    session_dir = find_session_dir(sid)
+    if session_dir is None:
+        return CommandResult(messages=[_msg(f"Session {sid[:8]} not found on disk.", level="error")])
+    jsonl = session_dir / f"{sid}.jsonl"
+    if not jsonl.exists():
+        return CommandResult(messages=[_msg(f"Session file not found.", level="error")])
+
+    # Parse optional record limit.
+    limit = 2000
+    p = payload.strip()
+    if p:
+        try:
+            limit = int(p)
+        except ValueError:
+            return CommandResult(messages=[_msg("Usage: /history [N]", level="error")])
+        if limit <= 0:
+            return CommandResult(messages=[_msg("N must be positive.", level="error")])
+
+    try:
+        _count, history_msgs, _orphans = render_session_history(jsonl, max_history=limit)
+    except Exception as e:
+        return CommandResult(messages=[_msg(f"History load failed: {e}", level="error")])
+
+    msgs: list[dict[str, Any]] = [{"type": "clear_screen"}]
+    if history_msgs:
+        msgs.append({"type": "history", "messages": history_msgs})
+    else:
+        msgs.append(_msg("No history to display."))
+    return CommandResult(messages=msgs)
 
 
 def _cmd_rename(payload: str, state: State, _config: Config) -> CommandResult:
