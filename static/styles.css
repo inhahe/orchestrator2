@@ -536,6 +536,20 @@ html, body {
   border-top: 1px solid var(--border);
   margin: 8px 0;
 }
+.md-table {
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 13px;
+}
+.md-table th, .md-table td {
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  text-align: left;
+}
+.md-table th {
+  background: var(--bg-tool);
+  font-weight: 600;
+}
 .msg-assistant a {
   color: var(--blue);
   text-decoration: underline;

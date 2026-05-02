@@ -24,8 +24,10 @@ WebSocket protocol:
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
+import logging.handlers
 import os
 import socket as _socket
 import sys
@@ -214,8 +216,16 @@ async def lifespan(app: FastAPI):
     # (before the SDK's init message arrives).  Same approach as the TUI
     # orchestrator's pre-connect seeding.
     if config.resume and config.resume != _PICKER_SENTINEL:
-        state.session_id = config.resume
-        state.session_title = read_session_title(config.resume)
+        # Resolve the resume value to a real session UUID — it might be a
+        # title/name rather than an ID (e.g. ``--resume fastpyb``).
+        _resolved_resume = config.resume
+        if not find_session_dir(config.resume):
+            _match = _find_session_by_name(config.resume)
+            if _match:
+                _resolved_resume = _match
+                config = dataclasses.replace(config, resume=_match)
+        state.session_id = _resolved_resume
+        state.session_title = read_session_title(_resolved_resume)
     elif not config.no_continue:
         recent = find_most_recent_session_for_cwd(config.cwd)
         if recent is not None:
@@ -1180,6 +1190,39 @@ def _bind_port(host: str, port: int) -> tuple[_socket.socket, int]:
     return sock, actual
 
 
+def _setup_file_logging(log_path: str, fmt: str) -> None:
+    """Attach a file handler to the root logger and wire up crash logging.
+
+    - Appends to *log_path* (created if missing).
+    - Installs ``sys.excepthook`` so uncaught exceptions are logged to
+      the file before the process dies.
+    - Registers an ``atexit`` handler that logs a clean-shutdown line.
+    """
+    path = Path(log_path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    handler = logging.FileHandler(str(path), encoding="utf-8")
+    handler.setFormatter(logging.Formatter(fmt))
+    logging.getLogger().addHandler(handler)
+
+    _flog = logging.getLogger("orchestrator2")
+    _flog.info("--- log file opened: %s (pid %d) ---", path, os.getpid())
+
+    # Log uncaught exceptions so they survive a closed terminal.
+    _original_excepthook = sys.excepthook
+
+    def _excepthook(exc_type: type, exc_value: BaseException, exc_tb: Any) -> None:
+        _flog.critical(
+            "Uncaught exception — process terminating",
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+        _original_excepthook(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _excepthook
+
+    atexit.register(lambda: _flog.info("--- server shut down (pid %d) ---", os.getpid()))
+
+
 def main() -> None:
     """Launch the server."""
     global config
@@ -1191,10 +1234,11 @@ def main() -> None:
     if config.config_dir:
         os.environ["CLAUDE_CONFIG_DIR"] = str(Path(config.config_dir).resolve())
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    )
+    log_fmt = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+    logging.basicConfig(level=logging.INFO, format=log_fmt)
+
+    if config.log_file:
+        _setup_file_logging(config.log_file, log_fmt)
 
     # --detach: validate everything here (errors visible in terminal),
     # then respawn headless and exit.

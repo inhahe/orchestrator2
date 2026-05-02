@@ -974,12 +974,42 @@ const Chat = (() => {
         continue;
       }
 
+      // --- Table ---
+      if (/^\|/.test(line) && i + 1 < lines.length &&
+          /^\|[\s:|-]+$/.test(lines[i + 1]) && lines[i + 1].includes('---')) {
+        const headerCells = _tableCells(line);
+        i += 2;  // skip header + separator
+        const rows = [];
+        while (i < lines.length && /^\|/.test(lines[i])) {
+          rows.push(_tableCells(lines[i]));
+          i++;
+        }
+        let html = '<table class="md-table"><thead><tr>';
+        for (const h of headerCells) html += `<th>${_inlineMd(h)}</th>`;
+        html += '</tr></thead><tbody>';
+        for (const row of rows) {
+          html += '<tr>';
+          for (const c of row) html += `<td>${_inlineMd(c)}</td>`;
+          html += '</tr>';
+        }
+        html += '</tbody></table>';
+        out.push(html);
+        continue;
+      }
+
       // --- Regular paragraph line ---
       out.push(_inlineMd(line));
       i++;
     }
 
     return out.join('\n');
+  }
+
+  /** Split a markdown table row into trimmed cell values. */
+  function _tableCells(line) {
+    const cells = line.split('|').slice(1);  // drop leading empty
+    if (cells.length && cells[cells.length - 1].trim() === '') cells.pop();
+    return cells.map(c => c.trim());
   }
 
   /** Inline markdown: bold, italic, inline code, links. */

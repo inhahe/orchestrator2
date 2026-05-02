@@ -260,6 +260,7 @@ class Config:
     mcp_config: str | None = None
     auto_reconnect: bool = False
     debug: bool = False
+    log_file: str | None = None         # path to a persistent log file
 
     # Server
     port: int = DEFAULT_PORT
@@ -535,6 +536,12 @@ def parse_args(argv: list[str] | None = None) -> Config:
         action="store_true",
         help="Print extra diagnostic messages.",
     )
+    ap.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="Write all log output to PATH (appends). Useful for diagnosing crashes when the terminal closes.",
+    )
 
     # -- Server --
     ap.add_argument(
@@ -615,6 +622,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         mcp_config=args.mcp_config,
         auto_reconnect=args.auto_reconnect,
         debug=args.debug,
+        log_file=args.log_file,
         port=args.port,
         open_browser=args.open or args.detach,
         detach=args.detach,
