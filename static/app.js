@@ -12,6 +12,7 @@ const App = (() => {
   let reconnectDelay = 1000;
   let reconnectAttempt = 0;
   let _isBusy = false;
+  let _serverShutdown = false;
   const MAX_RECONNECT_DELAY = 30000;
 
   function init() {
@@ -123,6 +124,7 @@ const App = (() => {
   }
 
   function _scheduleReconnect() {
+    if (_serverShutdown) return;
     if (reconnectTimer) return;
     reconnectAttempt++;
     reconnectTimer = setTimeout(() => {
@@ -208,6 +210,25 @@ const App = (() => {
     // Server-initiated page navigation (e.g. /resume opening the picker).
     if (type === 'navigate') {
       window.location.href = msg.url;
+      return;
+    }
+
+    // Server is shutting down — show permanent status and stop reconnecting.
+    if (type === 'server_shutdown') {
+      _serverShutdown = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      Status.update({
+        busy_label: 'server stopped',
+        busy_class: 'shutdown',
+      });
+      Chat.handleMessage({
+        type: 'system_msg',
+        subtype: 'info',
+        data: { message: msg.reason || 'Server shut down.' },
+      });
       return;
     }
 

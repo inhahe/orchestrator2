@@ -132,6 +132,11 @@ async def broadcast(msg: dict[str, Any]) -> None:
                 _ws_clients.discard(ws)
 
 
+async def _broadcast_shutdown(reason: str) -> None:
+    """Tell every connected browser tab the server is about to exit."""
+    await broadcast({"type": "server_shutdown", "reason": reason})
+
+
 async def send_to(ws: WebSocket, msg: dict[str, Any]) -> None:
     """Send *msg* as JSON to a single WebSocket client."""
     try:
@@ -247,6 +252,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # --- Shutdown ---
+    await _broadcast_shutdown("Server shutting down.")
     if bridge:
         await bridge.stop()
     if _ticker_task and not _ticker_task.done():
@@ -1354,7 +1360,13 @@ def main() -> None:
         open_url = f"{url}?t={int(time.time())}"
         threading.Timer(1.0, lambda: webbrowser.open(open_url)).start()
 
-    uvi_config = uvicorn.Config(app, host="0.0.0.0", port=actual_port, log_level="info")
+    # Generous ping timeout: the default (20s) is too aggressive for a
+    # localhost server under heavy CPU/IO load — the browser can't respond
+    # in time, the connection drops, and auto-shutdown fires.
+    uvi_config = uvicorn.Config(
+        app, host="0.0.0.0", port=actual_port, log_level="info",
+        ws_ping_interval=60, ws_ping_timeout=120,
+    )
     server = uvicorn.Server(uvi_config)
     server.run(sockets=[sock])
 

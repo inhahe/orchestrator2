@@ -16,6 +16,7 @@ const Status = (() => {
     working:      'var(--indicator-working)',
     connecting:   'var(--indicator-connecting)',
     reconnecting: 'var(--system-warning)',
+    shutdown:     'var(--system-error)',
     error:        'var(--system-error)',
     'bg-wait':    'var(--indicator-bg-wait)',
     waiting:      'var(--system-waiting)',

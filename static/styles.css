@@ -155,6 +155,7 @@ html, body {
 .indicator.waiting   { background: var(--indicator-waiting); }
 .indicator.done      { background: var(--indicator-done); }
 .indicator.error     { background: var(--indicator-error); }
+.indicator.shutdown  { background: var(--indicator-error); }
 .indicator.connecting { background: var(--indicator-connecting); animation: pulse 1.2s infinite; }
 .indicator.bg-wait   { background: var(--indicator-bg-wait); animation: pulse 1.2s infinite; }
 
