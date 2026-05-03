@@ -789,34 +789,59 @@ class SDKBridge:
         state = self.state
         config = self.config
 
-        # --- Connect ---
-        try:
-            await self.connect()
-        except Exception as exc:
-            log.error("SDK connect failed: %s", exc)
-            await self.broadcast({
-                "type": "system_msg",
-                "subtype": "error",
-                "data": {"message": f"SDK connection failed: {exc}. Send a message to retry."},
-            })
-            # Wait for user input, then retry connect.
-            while not self.stop_event.is_set():
-                kind, payload = await self.event_queue.get()
-                if kind in ("quit", "force-quit"):
-                    return
-                if kind == "message":
-                    try:
-                        await self.connect()
-                        # Connection succeeded — push the message back and fall through.
-                        self.event_queue.put_nowait((kind, payload))
-                        break
-                    except Exception as exc2:
-                        log.error("SDK reconnect failed: %s", exc2)
-                        await self.broadcast({
-                            "type": "system_msg",
-                            "subtype": "error",
-                            "data": {"message": f"SDK reconnect failed: {exc2}"},
-                        })
+        # --- Connect (with auto-retry) ---
+        _connect_delay = 2.0
+        _MAX_CONNECT_DELAY = 30.0
+        _MAX_CONNECT_ATTEMPTS = 10
+        _connect_attempt = 0
+        while not self.stop_event.is_set():
+            try:
+                await self.connect()
+                if _connect_attempt:
+                    log.info("SDK connected after %d retries", _connect_attempt)
+                    await self.broadcast({
+                        "type": "system_msg",
+                        "subtype": "info",
+                        "data": {"message": "SDK connected."},
+                    })
+                break
+            except Exception as exc:
+                _connect_attempt += 1
+                log.error("SDK connect failed (attempt %d): %s", _connect_attempt, exc)
+
+                if _connect_attempt >= _MAX_CONNECT_ATTEMPTS:
+                    await self.broadcast({
+                        "type": "system_msg",
+                        "subtype": "error",
+                        "data": {"message": f"SDK connection failed after {_connect_attempt} attempts: {exc}. Send a message to retry."},
+                    })
+                    # Fall back to manual retry.
+                    while not self.stop_event.is_set():
+                        kind, payload = await self.event_queue.get()
+                        if kind in ("quit", "force-quit"):
+                            return
+                        if kind == "message":
+                            _connect_attempt = 0
+                            _connect_delay = 2.0
+                            self.event_queue.put_nowait((kind, payload))
+                            break  # restart auto-retry loop
+                    continue
+
+                await self.broadcast({
+                    "type": "system_msg",
+                    "subtype": "error",
+                    "data": {"message": f"SDK connection failed (attempt {_connect_attempt}/{_MAX_CONNECT_ATTEMPTS}), retrying in {_connect_delay:.0f}s\u2026"},
+                })
+                # Drain any user messages that arrived during the wait
+                # so they're not lost.
+                try:
+                    await asyncio.wait_for(
+                        self.stop_event.wait(), timeout=_connect_delay,
+                    )
+                    return  # stop_event was set
+                except asyncio.TimeoutError:
+                    pass
+                _connect_delay = min(_connect_delay * 2, _MAX_CONNECT_DELAY)
 
         # --- Initial prompt ---
         # Messages sent during connect go to state.queued_prompts (so
