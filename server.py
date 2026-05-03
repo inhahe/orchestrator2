@@ -1360,12 +1360,14 @@ def main() -> None:
         open_url = f"{url}?t={int(time.time())}"
         threading.Timer(1.0, lambda: webbrowser.open(open_url)).start()
 
-    # Generous ping timeout: the default (20s) is too aggressive for a
-    # localhost server under heavy CPU/IO load — the browser can't respond
-    # in time, the connection drops, and auto-shutdown fires.
+    # Disable WebSocket keepalive pings.  The default (20s ping, 20s
+    # timeout) is far too aggressive for a localhost server under heavy
+    # CPU/IO load — the browser can't respond in time, the connection
+    # drops, and auto-shutdown fires.  Keepalive pings exist to detect
+    # dead connections through NATs/proxies; localhost doesn't need them.
     uvi_config = uvicorn.Config(
         app, host="0.0.0.0", port=actual_port, log_level="info",
-        ws_ping_interval=60, ws_ping_timeout=120,
+        ws_ping_interval=None, ws_ping_timeout=None,
     )
     server = uvicorn.Server(uvi_config)
     server.run(sockets=[sock])
