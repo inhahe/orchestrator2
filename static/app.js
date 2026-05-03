@@ -14,6 +14,7 @@ const App = (() => {
   let _isBusy = false;
   let _serverShutdown = false;
   const MAX_RECONNECT_DELAY = 30000;
+  const MAX_RECONNECT_ATTEMPTS = 20;
 
   function init() {
     // Init all modules.
@@ -127,6 +128,18 @@ const App = (() => {
     if (_serverShutdown) return;
     if (reconnectTimer) return;
     reconnectAttempt++;
+
+    if (reconnectAttempt > MAX_RECONNECT_ATTEMPTS) {
+      _serverShutdown = true;
+      Status.update({ busy_label: 'server stopped', busy_class: 'shutdown' });
+      Chat.handleMessage({
+        type: 'system_msg',
+        subtype: 'error',
+        data: { message: 'Lost connection to server (not running).' },
+      });
+      return;
+    }
+
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       _connect();
@@ -135,9 +148,10 @@ const App = (() => {
   }
 
   function _showConnectionStatus(status) {
+    if (_serverShutdown) return;
     if (status === 'disconnected') {
       const label = reconnectAttempt > 1
-        ? `reconnecting (${reconnectAttempt})`
+        ? `reconnecting (${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS})`
         : 'reconnecting';
       Status.update({ busy_label: label, busy_class: 'reconnecting' });
     }
