@@ -47,8 +47,8 @@ const Panels = (() => {
     }
 
     // Merge running + grace-period completed bg tasks.
-    if (panels.bg_tasks != null || panels.completed_bg != null) {
-      const running = (panels.bg_tasks || []).map(t => ({
+    if (panels.background_tasks != null || panels.completed_bg != null) {
+      const running = (panels.background_tasks || []).map(t => ({
         ...t, status: 'running', elapsed: _elapsed(t.started_at)
       }));
       const grace = (panels.completed_bg || []).map(t => ({
