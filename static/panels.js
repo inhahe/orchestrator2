@@ -144,7 +144,7 @@ const Panels = (() => {
       const isRunning = t.status === 'running';
       const icon = isRunning ? '\u25B6' : '\u2713';
       const cls = isRunning ? 'running' : 'complete';
-      const name = t.name || '(unnamed)';
+      const name = t.name || t.command || '(unnamed)';
       const dur = t.elapsed || t.duration || '';
 
       html += `<div class="panel-item ${cls}" data-bg-id="${_esc(t.task_id || '')}"

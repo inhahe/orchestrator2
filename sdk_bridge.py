@@ -452,12 +452,16 @@ class SDKBridge:
             )
             # Look up the Bash command from the linked tool use.
             entry = state.background_tasks.get(task_id) or {}
+            cmd = self._bg_task_command(entry)
+            # Store command on the entry for panel display.
+            if cmd:
+                entry["command"] = cmd
             data = {
                 "task_id": task_id,
                 "seq": seq,
                 "name": name,
                 "task_type": task_type,
-                "command": self._bg_task_command(entry),
+                "command": cmd,
             }
             await self.broadcast({"type": "bg_started", **data})
 

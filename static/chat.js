@@ -632,6 +632,7 @@ const Chat = (() => {
       });
     }
     if (isErr) el.style.borderColor = 'var(--red)';
+    if (msg.task_id) el.dataset.bgTaskId = msg.task_id;
 
     elMessages.appendChild(el);
     _scrollToBottom();

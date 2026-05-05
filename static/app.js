@@ -307,8 +307,17 @@ const App = (() => {
   }
 
   function showBgDetail(taskId) {
-    // Send /show command.
-    send({ type: 'message', text: `/show b${taskId}` });
+    // Find the bg task element in chat (prefer bg_complete over bg_started).
+    const all = document.querySelectorAll(`[data-bg-task-id="${taskId}"]`);
+    const el = all.length > 0 ? all[all.length - 1] : null;
+    if (el) {
+      const detail = el.querySelector('.tool-detail');
+      if (detail) {
+        detail.classList.add('open');
+        el.querySelector('.tool-expand-icon')?.classList.add('open');
+      }
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
   }
 
   function openModal(title, content) {

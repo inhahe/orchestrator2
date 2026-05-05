@@ -588,6 +588,7 @@ def state_to_panels_dict(state: State) -> dict[str, Any]:
             "task_type": info.get("task_type"),
             "started_at": info.get("started_at"),
             "tool_use_id": info.get("tool_use_id"),
+            "command": info.get("command"),
         })
 
     # Completed tools still in grace period
