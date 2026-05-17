@@ -67,6 +67,7 @@ from session import (
     read_session_title,
     render_session_history,
     trim_session,
+    write_session_title,
     project_dir_for_cwd,
 )
 from tool_manager import (
@@ -366,6 +367,16 @@ class SDKBridge:
             if sid:
                 state.session_id = sid
                 state.session_title = read_session_title(sid)
+                # Apply a pending rename (from /rename before first turn).
+                if state.pending_rename:
+                    title = state.pending_rename
+                    state.pending_rename = None
+                    try:
+                        write_session_title(sid, title)
+                        state.session_title = title
+                        log.info("applied pending rename: %s → '%s'", sid[:8], title)
+                    except (OSError, ValueError) as exc:
+                        log.warning("pending rename failed: %s", exc)
                 # Warn if the SDK silently started a fresh session
                 # instead of resuming the one we asked for.
                 expected = state.expected_resume_sid

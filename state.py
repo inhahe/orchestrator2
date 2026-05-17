@@ -253,6 +253,7 @@ class State:
     # Session identity
     session_id: str | None = None
     session_title: str | None = None
+    pending_rename: str | None = None   # title to apply once session_id arrives
     init_seen: bool = False
     expected_resume_sid: str | None = None
 

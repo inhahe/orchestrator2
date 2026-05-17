@@ -331,17 +331,24 @@ def _cmd_history(payload: str, state: State, _config: Config) -> CommandResult:
 
 def _cmd_rename(payload: str, state: State, _config: Config) -> CommandResult:
     sid = state.session_id
-    if not sid:
-        return CommandResult(messages=[_msg(
-            "No active session yet — run /rename after the first turn.",
-            level="warning",
-        )])
     new_title = payload.strip()
     if not new_title:
-        current = read_session_title(sid)
-        if current:
-            return CommandResult(messages=[_msg(f"Current title: {current}")])
+        if state.pending_rename:
+            return CommandResult(messages=[_msg(f"Pending title: {state.pending_rename} (waiting for session)")])
+        if sid:
+            current = read_session_title(sid)
+            if current:
+                return CommandResult(messages=[_msg(f"Current title: {current}")])
         return CommandResult(messages=[_msg("No title set. Usage: /rename <name>", level="warning")])
+    if not sid:
+        # No session yet — stash the title and apply it once the
+        # session_id arrives (handled in sdk_bridge init).
+        state.pending_rename = new_title
+        state.session_title = new_title
+        return CommandResult(
+            messages=[_msg(f"Title '{new_title}' will be applied when the session starts.")],
+            state_updates={"session_title": new_title},
+        )
     try:
         write_session_title(sid, new_title)
     except (OSError, ValueError) as e:
