@@ -52,69 +52,90 @@ const Status = (() => {
     }
   }
 
+  // Change-detection cache: skip DOM writes when values haven't changed.
+  let _prev = {};
+
+  function _set(el, prop, val) {
+    // Only touch the DOM if the value actually changed.
+    if (el[prop] !== val) el[prop] = val;
+  }
+
   function update(status) {
     if (!status) return;
 
     // Indicator dot + state text.
     const cls = status.busy_class || 'idle';
     const stateLabel = status.busy_label || 'idle';
-    elIndicator.className = 'indicator ' + cls;
-    elIndicator.title = stateLabel;
-    elState.textContent = stateLabel;
+    const indicatorCls = 'indicator ' + cls;
+    if (_prev.indicatorCls !== indicatorCls) {
+      elIndicator.className = indicatorCls;
+      _prev.indicatorCls = indicatorCls;
+    }
+    _set(elIndicator, 'title', stateLabel);
+    _set(elState, 'textContent', stateLabel);
     elState.title = stateLabel;
-    elState.style.color = _stateColors[cls] || '';
+    const stateColor = _stateColors[cls] || '';
+    if (_prev.stateColor !== stateColor) {
+      elState.style.color = stateColor;
+      _prev.stateColor = stateColor;
+    }
 
     // Session.
     const sid = status.session_id;
     const title = status.session_title;
-    if (title) {
-      elSession.textContent = title;
-      elSession.title = sid || '';
-      document.title = 'orchestrator2 - ' + title;
-    } else if (sid) {
-      elSession.textContent = sid.substring(0, 8);
-      elSession.title = sid;
-      document.title = 'orchestrator2';
-    } else {
-      elSession.textContent = '--';
-      document.title = 'orchestrator2';
+    const sessionKey = (title || '') + '|' + (sid || '');
+    if (_prev.sessionKey !== sessionKey) {
+      if (title) {
+        elSession.textContent = title;
+        elSession.title = sid || '';
+        document.title = 'orchestrator2 - ' + title;
+      } else if (sid) {
+        elSession.textContent = sid.substring(0, 8);
+        elSession.title = sid;
+        document.title = 'orchestrator2';
+      } else {
+        elSession.textContent = '--';
+        document.title = 'orchestrator2';
+      }
+      _prev.sessionKey = sessionKey;
     }
 
-    // Turns — "turns" label then number.
+    // Turns.
     const turns = status.turns ?? 0;
-    elTurns.innerHTML = '<span class="status-label">turns </span>' + turns;
+    if (_prev.turns !== turns) {
+      elTurns.innerHTML = '<span class="status-label">turns </span>' + turns;
+      _prev.turns = turns;
+    }
 
     // Plan / cost.
-    if (status.plan_field) {
-      elPlan.textContent = status.plan_field;
-    } else {
-      elPlan.textContent = '--';
-    }
+    const plan = status.plan_field || '--';
+    _set(elPlan, 'textContent', plan);
 
     // Model.
     if (status.model) {
-      let m = status.model;
-      // Shorten common prefixes (backend already strips "claude-",
-      // but guard against double-prefix).
-      m = m.replace('claude-', '').replace('claude_', '');
-      elModel.textContent = m;
+      let m = status.model.replace('claude-', '').replace('claude_', '');
+      _set(elModel, 'textContent', m);
       elModel.title = status.model;
     } else {
-      elModel.textContent = '--';
+      _set(elModel, 'textContent', '--');
     }
 
     // Effort.
-    elEffort.textContent = status.effort || 'auto';
+    _set(elEffort, 'textContent', status.effort || 'auto');
 
     // Thinking.
-    elThinking.textContent = status.thinking || '--';
+    _set(elThinking, 'textContent', status.thinking || '--');
 
     // Context tokens.
     if (status.context_tokens != null && status.context_tokens > 0) {
-      elContext.textContent = _fmtTok(status.context_tokens);
-      elContext.title = status.context_tokens.toLocaleString() + ' tokens';
+      const ctxText = _fmtTok(status.context_tokens);
+      if (_prev.ctxText !== ctxText) {
+        elContext.textContent = ctxText;
+        elContext.title = status.context_tokens.toLocaleString() + ' tokens';
+        _prev.ctxText = ctxText;
+      }
     } else {
-      elContext.textContent = '--';
+      _set(elContext, 'textContent', '--');
     }
 
     // Rate limits.
@@ -126,6 +147,12 @@ const Status = (() => {
       const val = saved !== null ? (saved === 'true') : status.collapse_tools;
       Chat.setCollapseTools(val);
       if (elCollapseCheck) elCollapseCheck.checked = val;
+    }
+
+    // DOM trim limit (0 = never trim).
+    if (status.max_dom_messages != null && _prev.maxDom !== status.max_dom_messages) {
+      Chat.setMaxDomMessages(status.max_dom_messages);
+      _prev.maxDom = status.max_dom_messages;
     }
   }
 

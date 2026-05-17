@@ -330,6 +330,7 @@ class State:
     # Display settings (runtime-mutable)
     collapse_tools: bool = True
     collapse_threshold: int = 3
+    max_dom_messages: int = 2000       # 0 = never trim
     inline_all_tools: bool = True
     show_edits: str = "compact"
     show_thinking: bool = False
@@ -372,6 +373,7 @@ def init_state_from_config(config: Config) -> State:
         subscription_plan=detect_subscription_plan() if sub else None,
         collapse_tools=config.collapse_tools,
         collapse_threshold=config.collapse_threshold,
+        max_dom_messages=config.max_dom_messages,
         inline_all_tools=config.inline_all_tools,
         show_edits=config.show_edits,
         show_thinking=config.show_thinking,
@@ -555,6 +557,7 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         "queued_count": len(state.queued_prompts),
         "collapse_tools": state.collapse_tools,
         "collapse_threshold": state.collapse_threshold,
+        "max_dom_messages": state.max_dom_messages,
     }
 
 

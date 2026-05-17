@@ -247,6 +247,7 @@ class Config:
     ascii_only: bool = False
     collapse_tools: bool = True        # auto-collapse consecutive tool/thinking blocks
     collapse_threshold: int = 3        # tools shown before collapsing
+    max_dom_messages: int = 2000       # 0 = never trim old messages from the DOM
 
     # Panels
     panel_delay: float = 0.0
@@ -480,6 +481,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
         type=int, default=3, metavar="N",
         help="Number of blocks to show before collapsing (default: 3).",
     )
+    ap.add_argument(
+        "--max-dom-messages",
+        type=int, default=2000, metavar="N",
+        help="Max DOM elements in the chat backscroll before trimming old ones. 0 = never trim. Default: 2000.",
+    )
 
     # -- Bell --
     ap.add_argument(
@@ -617,6 +623,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         ascii_only=args.ascii_only,
         collapse_tools=args.collapse_tools,
         collapse_threshold=max(1, args.collapse_threshold),
+        max_dom_messages=max(0, args.max_dom_messages),
         bell_on=args.bell_on,
         append_system_prompt=args.append_system_prompt,
         mcp_config=args.mcp_config,

@@ -178,25 +178,32 @@ const Chat = (() => {
   function _collapseActivity() {
     if (!_collapseTools) return;
 
-    const children = Array.from(elMessages.children);
-    if (children.length === 0) return;
+    const kids = elMessages.children;
+    if (kids.length === 0) return;
 
-    // Find the last boundary: user message, assistant text, existing
-    // activity group, or explicit boundary marker (history separators).
-    let boundaryIdx = -1;
-    for (let i = children.length - 1; i >= 0; i--) {
-      const el = children[i];
+    // Walk backwards from the end to find the last boundary — only the
+    // tail matters, so we never touch the rest of the (potentially huge)
+    // DOM list.
+    let boundaryNode = null;
+    for (let i = kids.length - 1; i >= 0; i--) {
+      const el = kids[i];
       if (el.classList.contains('msg-user') ||
           el.classList.contains('msg-assistant') ||
           el.classList.contains('activity-group') ||
           el.classList.contains('activity-boundary')) {
-        boundaryIdx = i;
+        boundaryNode = el;
         break;
       }
     }
 
-    // Collect activity elements after the boundary.
-    const activityEls = children.slice(boundaryIdx + 1);
+    // Collect activity elements after the boundary using DOM siblings
+    // (avoids copying the entire children list).
+    const start = boundaryNode ? boundaryNode.nextElementSibling : kids[0];
+    if (!start) return;
+    const activityEls = [];
+    for (let el = start; el; el = el.nextElementSibling) {
+      activityEls.push(el);
+    }
     if (activityEls.length < 2) return;
 
     // Count items for summary.
@@ -266,10 +273,16 @@ const Chat = (() => {
     elMessages = document.getElementById('messages');
 
     // Auto-scroll tracking: only scroll if user is near bottom.
+    // Throttled to avoid layout thrashing on every pixel of scroll.
+    let _scrollThrottle = null;
     elMessages.addEventListener('scroll', () => {
-      const threshold = 80;
-      const atBottom = (elMessages.scrollHeight - elMessages.scrollTop - elMessages.clientHeight) < threshold;
-      _autoScroll = atBottom;
+      if (_scrollThrottle) return;
+      _scrollThrottle = setTimeout(() => {
+        _scrollThrottle = null;
+        const threshold = 80;
+        const atBottom = (elMessages.scrollHeight - elMessages.scrollTop - elMessages.clientHeight) < threshold;
+        _autoScroll = atBottom;
+      }, 60);
     });
   }
 
@@ -288,6 +301,33 @@ const Chat = (() => {
     if (_autoScroll) {
       elMessages.scrollTop = elMessages.scrollHeight;
     }
+    _maybeTrimOldMessages();
+  }
+
+  // --- DOM trimming ---
+  // Remove oldest messages when the container exceeds a threshold to
+  // prevent unbounded DOM growth from degrading performance.
+  // 0 = never trim.  Configurable via --max-dom-messages.
+  let _maxDomChildren = 2000;
+  const _TRIM_BATCH = 400;    // remove this many at a time
+  let _trimPending = false;
+
+  function setMaxDomMessages(n) { _maxDomChildren = n; }
+
+  function _maybeTrimOldMessages() {
+    if (_trimPending) return;
+    if (_maxDomChildren === 0) return;  // trimming disabled
+    if (elMessages.children.length <= _maxDomChildren) return;
+    _trimPending = true;
+    requestAnimationFrame(() => {
+      _trimPending = false;
+      const n = elMessages.children.length;
+      if (n <= _maxDomChildren) return;
+      const remove = Math.min(n - _maxDomChildren + _TRIM_BATCH, n - 1);
+      for (let i = 0; i < remove; i++) {
+        elMessages.removeChild(elMessages.firstChild);
+      }
+    });
   }
 
   // --- Message dispatch ---
@@ -1038,5 +1078,5 @@ const Chat = (() => {
     elMessages.scrollTop = elMessages.scrollHeight;
   }
 
-  return { init, clear, handleMessage, setCollapseTools, getCollapseTools, setCollapseThreshold, getCollapseThreshold, forceScrollToBottom };
+  return { init, clear, handleMessage, setCollapseTools, getCollapseTools, setCollapseThreshold, getCollapseThreshold, setMaxDomMessages, forceScrollToBottom };
 })();
