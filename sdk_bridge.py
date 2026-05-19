@@ -349,6 +349,10 @@ class SDKBridge:
             subtype = getattr(msg, "subtype", None) or "unknown"
             state.last_result_subtype = subtype
 
+        else:
+            # RateLimitEvent (top-level message, NOT a SystemMessage).
+            self._handle_unknown_message(msg)
+
     # ------------------------------------------------------------------
     # System message handling (shared by turn + async paths)
     # ------------------------------------------------------------------
@@ -541,6 +545,13 @@ class SDKBridge:
         if rate_info is not None:
             apply_rate_limit_info(state, rate_info)
 
+        # rate_limit_event subtype: info is inside msg.data, not a top-level attr.
+        if subtype == "rate_limit_event":
+            d = getattr(msg, "data", None)
+            if isinstance(d, dict):
+                info = d.get("rate_limit_info") or d
+                apply_rate_limit_info(state, info)
+
         # High-frequency / noisy subtypes — suppress from the frontend.
         if subtype in ("hook_started", "hook_ended", "task_output"):
             return
@@ -597,6 +608,20 @@ class SDKBridge:
         """Called by the WS handler when the user responds to a permission prompt."""
         if self._pending_permission and not self._pending_permission.done():
             self._pending_permission.set_result(allow)
+
+    def _handle_unknown_message(self, msg: Any) -> None:
+        """Handle SDK messages that aren't SystemMessage/AssistantMessage/etc.
+
+        The SDK sends ``RateLimitEvent`` as a top-level message type (NOT a
+        SystemMessage subclass).  Detect it by class name so we don't need
+        an import that may not exist in every SDK version.
+        """
+        cls_name = type(msg).__name__
+        if cls_name == "RateLimitEvent":
+            info = getattr(msg, "rate_limit_info", None)
+            if info is not None:
+                apply_rate_limit_info(self.state, info)
+                log.debug("RateLimitEvent: status=%s", getattr(info, "status", "?"))
 
     # ------------------------------------------------------------------
     # run_turn() — process one complete turn
@@ -770,6 +795,10 @@ class SDKBridge:
                         "turns": state.turns,
                     })
                     break
+
+                # ---- Unknown (e.g. RateLimitEvent) ----
+                else:
+                    self._handle_unknown_message(msg)
 
                 # Check for interrupt.
                 if self.interrupt_event.is_set():

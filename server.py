@@ -107,6 +107,11 @@ _shutdown_timer: asyncio.Task | None = None
 _has_had_clients: bool = False          # True once the first tab connects
 _SHUTDOWN_GRACE_SECONDS = 30
 
+# Signalled by the lifespan once the server is fully initialised and ready
+# to serve requests.  The browser-open thread waits on this before opening.
+import threading as _threading
+_server_ready = _threading.Event()
+
 
 # ---------------------------------------------------------------------------
 # Broadcaster — sends a dict to all connected clients
@@ -249,6 +254,7 @@ async def lifespan(app: FastAPI):
         await bridge.start()
         log.info("server started on port %s, cwd=%s", config.port, config.cwd)
 
+    _server_ready.set()
     yield
 
     # --- Shutdown ---
@@ -1351,14 +1357,16 @@ def main() -> None:
         msg += f"  (config-dir: {config.config_dir})"
     print(msg)
 
-    # Open browser after a short delay (uvicorn.run blocks, so use a timer).
+    # Open browser once the server is fully initialised (lifespan done).
     # The cache-buster query param forces the browser to do a fresh
     # navigation instead of just focusing an existing tab with the same
     # URL (which would show stale content from a previous session).
     if config.open_browser:
-        import threading
         open_url = f"{url}?t={int(time.time())}"
-        threading.Timer(1.0, lambda: webbrowser.open(open_url)).start()
+        def _open_when_ready():
+            _server_ready.wait(timeout=30)
+            webbrowser.open(open_url)
+        _threading.Thread(target=_open_when_ready, daemon=True).start()
 
     # Disable WebSocket keepalive pings.  The default (20s ping, 20s
     # timeout) is far too aggressive for a localhost server under heavy

@@ -690,7 +690,7 @@ const Chat = (() => {
     _resetToolRun();
     const el = document.createElement('div');
     el.className = 'msg-turn-end';
-    el.textContent = `Turn ${msg.turns || '?'} completed (${msg.duration || '?'}) — ${msg.subtype || ''}`;
+    el.textContent = `Turn ${msg.turns ?? '?'} completed (${msg.duration || '?'}) — ${msg.subtype || ''}`;
     elMessages.appendChild(el);
     _scrollToBottom();
   }

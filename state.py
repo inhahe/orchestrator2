@@ -75,6 +75,13 @@ def mark(key: str, *, ascii_only: bool = False) -> str:
     return a if ascii_only else u
 
 
+def _get(obj: Any, key: str, default: int = 0) -> int:
+    """Read a key from a dict or SDK object, returning *default* on miss."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
 def extract_context_tokens(
     usage: dict[str, Any] | None,
     model_usage: dict[str, Any] | None,
@@ -84,33 +91,39 @@ def extract_context_tokens(
     The SDK may provide data in ``usage`` (snake_case or camelCase) or in
     ``model_usage`` (keyed by model name, camelCase values).  Try all
     shapes and return the first non-zero total found.
+
+    Handles both plain dicts and SDK Pydantic-style objects.
     """
-    if isinstance(usage, dict) and usage:
+    if usage is not None:
         # Try snake_case first (Anthropic API native).
         total = (
-            usage.get("input_tokens", 0)
-            + usage.get("cache_read_input_tokens", 0)
-            + usage.get("cache_creation_input_tokens", 0)
+            _get(usage, "input_tokens")
+            + _get(usage, "cache_read_input_tokens")
+            + _get(usage, "cache_creation_input_tokens")
         )
         if total:
             return total
         # Try camelCase (CLI / SDK wrapper).
         total = (
-            usage.get("inputTokens", 0)
-            + usage.get("cacheReadInputTokens", 0)
-            + usage.get("cacheCreationInputTokens", 0)
+            _get(usage, "inputTokens")
+            + _get(usage, "cacheReadInputTokens")
+            + _get(usage, "cacheCreationInputTokens")
         )
         if total:
             return total
-    if isinstance(model_usage, dict) and model_usage:
+    if model_usage is not None:
+        values = (
+            model_usage.values()
+            if isinstance(model_usage, dict)
+            else []
+        )
         total = 0
-        for mu in model_usage.values():
-            if isinstance(mu, dict):
-                total += (
-                    mu.get("inputTokens", 0)
-                    + mu.get("cacheReadInputTokens", 0)
-                    + mu.get("cacheCreationInputTokens", 0)
-                )
+        for mu in values:
+            total += (
+                _get(mu, "inputTokens")
+                + _get(mu, "cacheReadInputTokens")
+                + _get(mu, "cacheCreationInputTokens")
+            )
         if total:
             return total
     return 0

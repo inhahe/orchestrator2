@@ -60,6 +60,46 @@ const Status = (() => {
     if (el[prop] !== val) el[prop] = val;
   }
 
+  // Local elapsed-time ticker for connecting/working states.
+  // The backend ticker fires every ~2s and can stall when the SDK's
+  // connect() blocks the event loop.  The frontend keeps its own 1s
+  // interval so the displayed timer never freezes.
+  let _localTimerInterval = null;
+  let _localTimerClass = null;    // busy_class being timed
+  let _localTimerStart = null;    // Date.now() when the state started
+
+  function _startLocalTimer(cls) {
+    _stopLocalTimer();
+    _localTimerClass = cls;
+    _localTimerStart = Date.now();
+    _localTimerInterval = setInterval(() => {
+      if (!_localTimerClass) return;
+      const secs = Math.round((Date.now() - _localTimerStart) / 1000);
+      const label = _localTimerClass === 'connecting'
+        ? `connecting (${secs}s)`
+        : `working (${_fmtDuration(secs)})`;
+      _set(elState, 'textContent', label);
+    }, 1000);
+  }
+
+  function _stopLocalTimer() {
+    if (_localTimerInterval) {
+      clearInterval(_localTimerInterval);
+      _localTimerInterval = null;
+    }
+    _localTimerClass = null;
+    _localTimerStart = null;
+  }
+
+  function _fmtDuration(totalSecs) {
+    if (totalSecs < 60) return `${totalSecs}s`;
+    const m = Math.floor(totalSecs / 60);
+    const s = totalSecs % 60;
+    if (m < 60) return `${m}m ${s}s`;
+    const h = Math.floor(m / 60);
+    return `${h}h ${m % 60}m ${s}s`;
+  }
+
   function update(status) {
     if (!status) return;
 
@@ -71,8 +111,18 @@ const Status = (() => {
       elIndicator.className = indicatorCls;
       _prev.indicatorCls = indicatorCls;
     }
+
+    // Start/stop local timer for connecting and working states.
+    const timedStates = ['connecting', 'working'];
+    if (timedStates.includes(cls)) {
+      if (_localTimerClass !== cls) _startLocalTimer(cls);
+      // Don't overwrite the local timer's label — it updates every 1s.
+    } else {
+      _stopLocalTimer();
+      _set(elState, 'textContent', stateLabel);
+    }
+
     _set(elIndicator, 'title', stateLabel);
-    _set(elState, 'textContent', stateLabel);
     elState.title = stateLabel;
     const stateColor = _stateColors[cls] || '';
     if (_prev.stateColor !== stateColor) {
