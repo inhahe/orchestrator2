@@ -76,10 +76,18 @@ def mark(key: str, *, ascii_only: bool = False) -> str:
 
 
 def _get(obj: Any, key: str, default: int = 0) -> int:
-    """Read a key from a dict or SDK object, returning *default* on miss."""
+    """Read an int key from a dict or SDK object.
+
+    Returns *default* on a missing key **or** an explicit ``None`` value.
+    The Anthropic usage payload sends ``null`` for cache fields when there's
+    no cache activity, so ``obj.get(key, 0)`` can return ``None`` and the
+    subsequent ``None + int`` would crash the turn.
+    """
     if isinstance(obj, dict):
-        return obj.get(key, default)
-    return getattr(obj, key, default)
+        val = obj.get(key, default)
+    else:
+        val = getattr(obj, key, default)
+    return val if isinstance(val, (int, float)) else default
 
 
 def extract_context_tokens(
