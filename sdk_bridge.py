@@ -379,7 +379,8 @@ class SDKBridge:
                         write_session_title(sid, title)
                         state.session_title = title
                         log.info("applied pending rename: %s → '%s'", sid[:8], title)
-                    except (OSError, ValueError) as exc:
+                    except Exception as exc:
+                        # Never let a rename failure kill the turn.
                         log.warning("pending rename failed: %s", exc)
                 # Warn if the SDK silently started a fresh session
                 # instead of resuming the one we asked for.
@@ -659,6 +660,7 @@ class SDKBridge:
         assistant_text = ""
         interrupted = False
         current_streaming_text = ""
+        normal_completion = False
 
         try:
             while True:
@@ -794,6 +796,7 @@ class SDKBridge:
                         "duration": fmt_duration(duration),
                         "turns": state.turns,
                     })
+                    normal_completion = True
                     break
 
                 # ---- Unknown (e.g. RateLimitEvent) ----
@@ -808,9 +811,30 @@ class SDKBridge:
                             await self.client.interrupt()
                         except Exception:
                             pass
+                    normal_completion = True  # user-initiated, not a silent drop
                     break
 
         finally:
+            # If we exit without a ResultMessage or interrupt — exception,
+            # dispatcher death, etc. — emit a synthetic turn_end so the
+            # user sees that the turn ended.  Otherwise the busy → idle
+            # transition would be silent and confusing.
+            if not normal_completion:
+                try:
+                    duration = time.monotonic() - (state.turn_started_at or time.monotonic())
+                    await self.broadcast({
+                        "type": "turn_end",
+                        "subtype": "interrupted",
+                        "duration": fmt_duration(duration),
+                        "turns": state.turns,
+                    })
+                    await self.broadcast({
+                        "type": "system_msg",
+                        "subtype": "warning",
+                        "data": {"message": "Turn ended without a result message (SDK may have disconnected or errored)."},
+                    })
+                except Exception:
+                    pass
             self.turn_active.clear()
             state.busy = False
             state.turn_started_at = None
