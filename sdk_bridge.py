@@ -321,6 +321,12 @@ class SDKBridge:
             await self._handle_system_message(msg, during_turn=False)
 
         elif isinstance(msg, AssistantMessage):
+            # The SDK can stream AssistantMessage content outside an active
+            # turn — e.g. after a ResultMessage broke run_turn early, or
+            # for a side-channel server-initiated message.  Render the
+            # full block set (text + tool uses + thinking), otherwise
+            # the UI shows narration referring to tool calls that were
+            # silently dropped.
             for block in msg.content:
                 if isinstance(block, TextBlock):
                     text = block.text.strip()
@@ -331,6 +337,46 @@ class SDKBridge:
                             "delta": False,
                             "is_async": True,
                         })
+                elif isinstance(block, ToolUseBlock):
+                    name = block.name
+                    inp = block.input if isinstance(block.input, dict) else {}
+                    is_bg = name == "Bash" and inp.get("run_in_background")
+                    seq = register_tool_use(state, block.id, name, inp)
+                    if name == "TodoWrite" and isinstance(inp.get("todos"), list):
+                        state.current_todos = inp["todos"]
+                    ws_msg = format_tool_use_msg(
+                        name, inp, block.id, seq,
+                        is_background=bool(is_bg),
+                    )
+                    await self.broadcast(ws_msg)
+                elif ThinkingBlock and isinstance(block, ThinkingBlock):
+                    thinking_text = getattr(block, "thinking", "") or ""
+                    if thinking_text.strip():
+                        seq = register_thinking(state, thinking_text)
+                        await self.broadcast({
+                            "type": "thinking",
+                            "seq": seq,
+                            "content": thinking_text,
+                        })
+
+        elif isinstance(msg, UserMessage):
+            # Tool results injected by the CLI/SDK between turns — pair
+            # them with the tool uses we registered above.
+            content = msg.content if hasattr(msg, "content") else None
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, ToolResultBlock):
+                        result_text = summarize_tool_result(block)
+                        is_err = bool(block.is_error)
+                        tool_use_id = block.tool_use_id
+                        seq, tool_name, _active = complete_tool(
+                            state, tool_use_id, result_text, is_err,
+                        )
+                        ws_msg = format_tool_result_msg(
+                            tool_use_id, seq, tool_name or "?",
+                            result_text, is_err,
+                        )
+                        await self.broadcast(ws_msg)
 
         elif isinstance(msg, ResultMessage):
             if msg.session_id:
