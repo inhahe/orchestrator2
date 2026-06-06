@@ -46,6 +46,7 @@ from config import (
     CONTINUE_PROMPT,
     DISPATCHER_DEAD,
     DONE_SENTINEL,
+    INTERRUPT_SENTINEL,
     WAITING_SENTINEL,
     Config,
     default_compact_at,
@@ -959,6 +960,28 @@ class SDKBridge:
                 if msg is DISPATCHER_DEAD:
                     raise RuntimeError("SDK dispatcher died mid-turn")
 
+                # Interrupt poke — break out, emit a synthetic turn_end
+                # so the UI shows the turn marker, and let the finally
+                # block clear ``state.busy``.  The SDK may still send a
+                # ResultMessage on its own afterwards, but we don't
+                # depend on it.
+                if msg is INTERRUPT_SENTINEL:
+                    interrupted = True
+                    normal_completion = True  # user-initiated
+                    try:
+                        duration = time.monotonic() - (
+                            state.turn_started_at or time.monotonic()
+                        )
+                    except Exception:
+                        duration = 0.0
+                    await self.broadcast({
+                        "type": "turn_end",
+                        "subtype": "interrupted",
+                        "duration": fmt_duration(duration),
+                        "turns": state.turns,
+                    })
+                    break
+
                 # ---- SystemMessage ----
                 if isinstance(msg, SystemMessage):
                     await self._handle_system_message(msg, during_turn=True)
@@ -1730,6 +1753,18 @@ class SDKBridge:
     async def interrupt(self) -> None:
         """Interrupt the current turn."""
         self.interrupt_event.set()
+        # Poke the run_turn loop awake.  Without this, an interrupt
+        # while the SDK isn't streaming leaves ``run_turn`` blocked on
+        # ``await turn_msg_queue.get()`` indefinitely — ``state.busy``
+        # never clears and the toolbar stays stuck on "working" even
+        # though the user already saw the "Turn interrupted." system
+        # message.  The sentinel lets the loop tick once and notice
+        # ``interrupt_event`` is set.
+        if self.turn_active.is_set():
+            try:
+                self.turn_msg_queue.put_nowait(INTERRUPT_SENTINEL)
+            except Exception:
+                pass
         if self.client:
             try:
                 await self.client.interrupt()

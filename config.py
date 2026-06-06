@@ -107,6 +107,14 @@ _PICKER_SENTINEL = "<picker>"
 # Sentinel pushed on turn_msg_queue when the dispatcher crashes.
 DISPATCHER_DEAD = object()
 
+# Sentinel pushed on turn_msg_queue by ``SDKBridge.interrupt()`` so the
+# run_turn loop's ``await turn_msg_queue.get()`` wakes up immediately
+# even when the SDK isn't streaming.  Without this, an interrupt can
+# leave ``state.busy=True`` forever because ``client.interrupt()``
+# alone doesn't guarantee a follow-up SDK message and the loop is
+# blocked waiting on the queue.
+INTERRUPT_SENTINEL = object()
+
 # Default server port.
 DEFAULT_PORT = 8420
 
