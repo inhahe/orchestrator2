@@ -168,11 +168,29 @@ const Panels = (() => {
 
   let _editingIndex = -1;         // index being edited, or -1
   let _editingOriginalText = '';  // original text for matching after queue shifts
+  let _lastQueueSig = null;       // signature of last-rendered queue
+
+  /** Hash the queue + busy-state into a tiny signature for change detection. */
+  function _queueSignature(queue) {
+    // Include busy because the first item's send-button enabled state
+    // depends on it.
+    return _busy + '|' + queue.map(q => q.index + ':' + (q.text || '')).join('\u0001');
+  }
 
   function _renderQueue(queue) {
     const n = queue.length;
     elQueueCount.textContent = n;
     elQueueCount.classList.toggle('active', n > 0);
+
+    // Bail out early when nothing has actually changed.  Re-running
+    // innerHTML wipes the user's text selection mid-copy — annoying
+    // because panels.update() fires on every status_update broadcast,
+    // which is many times per second while a turn is running.
+    const sig = _queueSignature(queue);
+    if (sig === _lastQueueSig && _editingIndex < 0) {
+      return;
+    }
+    _lastQueueSig = sig;
 
     // If the user is editing an item, check whether it's still in the queue.
     if (_editingIndex >= 0) {

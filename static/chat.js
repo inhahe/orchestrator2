@@ -184,11 +184,18 @@ const Chat = (() => {
     // Walk backwards from the end to find the last boundary — only the
     // tail matters, so we never touch the rest of the (potentially huge)
     // DOM list.
+    //
+    // Turn-end markers and harness-injected prompts are also boundaries
+    // so they stay visible between groups (otherwise the activity group
+    // spans across them and the summary counts a hidden "1 turn" that the
+    // user can't see in the collapsed view).
     let boundaryNode = null;
     for (let i = kids.length - 1; i >= 0; i--) {
       const el = kids[i];
       if (el.classList.contains('msg-user') ||
           el.classList.contains('msg-assistant') ||
+          el.classList.contains('msg-turn-end') ||
+          el.classList.contains('msg-injected') ||
           el.classList.contains('activity-group') ||
           el.classList.contains('activity-boundary')) {
         boundaryNode = el;
@@ -204,7 +211,23 @@ const Chat = (() => {
     for (let el = start; el; el = el.nextElementSibling) {
       activityEls.push(el);
     }
-    if (activityEls.length < 2) return;
+    if (activityEls.length === 0) return;
+
+    // Threshold: usually we don't wrap a single element (a bare tool
+    // between two real messages isn't noisy enough to need a collapse
+    // toggle).  BUT when the prior boundary is itself an auto-generated
+    // noise marker — an injected harness prompt or a turn-end divider
+    // — even a single trailing element should be collapsible, otherwise
+    // it sits stranded with no way to hide it.  This is the case the
+    // user hits post-compaction: the injected-prompt boundary cuts the
+    // wrap scope short and a single tool gets stranded without a
+    // header.
+    const noisyBoundary = boundaryNode && (
+      boundaryNode.classList.contains('msg-injected') ||
+      boundaryNode.classList.contains('msg-turn-end')
+    );
+    const minCount = noisyBoundary ? 1 : 2;
+    if (activityEls.length < minCount) return;
 
     // Count items for summary.
     const counts = _countActivityItems(activityEls);
@@ -243,7 +266,10 @@ const Chat = (() => {
   }
 
   function _countActivityItems(elements) {
-    let tools = 0, thinking = 0, turns = 0, system = 0;
+    // Note: msg-turn-end and msg-injected are activity boundaries (see
+    // _collapseActivity) so they never appear inside a group.  Don't bother
+    // counting them.
+    let tools = 0, thinking = 0, system = 0;
     for (const el of elements) {
       if (el.classList.contains('tool-collapse-toggle')) continue;
       if (el.classList.contains('tool-collapse-group')) {
@@ -253,18 +279,16 @@ const Chat = (() => {
         }
       } else if (el.classList.contains('msg-tool'))     tools++;
         else if (el.classList.contains('msg-thinking'))  thinking++;
-        else if (el.classList.contains('msg-turn-end'))  turns++;
         else if (el.classList.contains('msg-system') ||
                  el.classList.contains('msg-command'))    system++;
     }
-    return { tools, thinking, turns, system };
+    return { tools, thinking, system };
   }
 
   function _activitySummary(counts) {
     const parts = [];
     if (counts.tools)    parts.push(`${counts.tools} tool${counts.tools !== 1 ? 's' : ''}`);
     if (counts.thinking) parts.push(`${counts.thinking} thinking`);
-    if (counts.turns)    parts.push(`${counts.turns} turn${counts.turns !== 1 ? 's' : ''}`);
     if (counts.system)   parts.push(`${counts.system} system`);
     return parts.join(', ');
   }
@@ -744,6 +768,14 @@ const Chat = (() => {
   function _addTurnEnd(msg) {
     _flushStreaming();
     _resetToolRun();
+    _resetThinkingRun();
+    // Collapse any pending activity (tools, thinking) accumulated during
+    // the turn before appending the turn-end marker.  Without this, a
+    // turn that ends with tool calls (no trailing assistant text) leaves
+    // the tools uncollapsed because no later message triggers the
+    // wrap.  Doing it here also lets the marker itself act as a clean
+    // boundary between turns.
+    _collapseActivity();
     const el = document.createElement('div');
     el.className = 'msg-turn-end';
     el.textContent = `Turn ${msg.turns ?? '?'} completed (${msg.duration || '?'}) — ${msg.subtype || ''}`;
@@ -1096,9 +1128,37 @@ const Chat = (() => {
         continue;
       }
 
-      // --- Regular paragraph line ---
-      out.push(_inlineMd(line));
-      i++;
+      // --- Skip blank lines between blocks ---
+      if (!line.trim()) {
+        i++;
+        continue;
+      }
+
+      // --- Regular paragraph: collect consecutive non-block lines,
+      // join them with <br> so single newlines remain visible (Claude
+      // routinely uses single \n for line breaks; without this they
+      // collapse to spaces once markdown rendering replaces the
+      // streaming pre-wrap view).
+      {
+        const paraLines = [];
+        while (i < lines.length) {
+          const l = lines[i];
+          if (!l.trim()) break;                             // blank ends para
+          if (/^(`{3,})[\w-]*\s*$/.test(l)) break;          // fenced code
+          if (/^(#{1,4})\s+/.test(l)) break;                // heading
+          if (/^[-*_]{3,}\s*$/.test(l)) break;              // hr
+          if (/^[\s]*[-*+]\s/.test(l)) break;               // bullet
+          if (/^[\s]*\d+[.)]\s/.test(l)) break;             // ordered
+          if (/^\|/.test(l) && i + 1 < lines.length &&      // table
+              /^\|[\s:|-]+$/.test(lines[i + 1]) &&
+              lines[i + 1].includes('---')) break;
+          paraLines.push(_inlineMd(l));
+          i++;
+        }
+        if (paraLines.length) {
+          out.push(`<p class="md-p">${paraLines.join('<br>')}</p>`);
+        }
+      }
     }
 
     return out.join('\n');

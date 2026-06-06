@@ -568,6 +568,11 @@ html, body {
   padding: 1px 5px;
   color: var(--text-dim);
 }
+.md-p {
+  margin: 4px 0;
+}
+.md-p:first-child { margin-top: 0; }
+.md-p:last-child  { margin-bottom: 0; }
 .md-h { font-weight: 700; margin: 8px 0 4px; }
 .md-h1 { font-size: 1.3em; }
 .md-h2 { font-size: 1.15em; }

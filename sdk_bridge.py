@@ -1152,6 +1152,21 @@ class SDKBridge:
                 except BaseException as bx:
                     log.warning("synthetic warning broadcast failed: %r", bx)
 
+            # Push a fresh status_update so the UI reflects the new
+            # state.busy == False immediately.  Without this, the
+            # toolbar can stay stuck on "working" after an interrupt or
+            # after a turn that completed via the synthetic-turn_end
+            # path — the frontend only refreshes its busy-class from
+            # status_update messages, not from turn_end.
+            try:
+                await self.broadcast({
+                    "type": "status_update",
+                    "status": state_to_status_dict(state, self.config),
+                    "panels": state_to_panels_dict(state),
+                })
+            except BaseException as bx:
+                log.warning("post-turn status_update broadcast failed: %r", bx)
+
         # Flush bell.
         if state.pending_bell:
             await self.broadcast({"type": "bell", "event": state.pending_bell})
