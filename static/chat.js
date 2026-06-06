@@ -1042,8 +1042,17 @@ const Chat = (() => {
     if (!raw) return '';
     const text = _esc(raw);
     const lines = text.split('\n');
+    // Each entry: {html, block}.  We track block-ness so the final join
+    // can emit '\n' ONLY between adjacent text entries.  The container
+    // uses white-space: pre-wrap, so a literal '\n' renders as a line
+    // break — which is what we want for text-to-text (matching the
+    // streaming view), but would double-up against the block element's
+    // own margin if emitted around block elements.
     const out = [];
     let i = 0;
+
+    function pushBlock(html) { out.push({ html, block: true }); }
+    function pushText(html)  { out.push({ html, block: false }); }
 
     while (i < lines.length) {
       const line = lines[i];
@@ -1062,7 +1071,7 @@ const Chat = (() => {
         i++;  // skip closing fence
         const langAttr = lang ? ` data-lang="${lang}"` : '';
         const langLabel = lang ? `<span class="code-lang">${lang}</span>` : '';
-        out.push(`<div class="code-block"${langAttr}>${langLabel}<pre><code>${codeLines.join('\n')}</code></pre></div>`);
+        pushBlock(`<div class="code-block"${langAttr}>${langLabel}<pre><code>${codeLines.join('\n')}</code></pre></div>`);
         continue;
       }
 
@@ -1071,14 +1080,14 @@ const Chat = (() => {
       if (headingMatch) {
         const level = headingMatch[1].length;
         const content = _inlineMd(headingMatch[2]);
-        out.push(`<div class="md-h md-h${level}">${content}</div>`);
+        pushBlock(`<div class="md-h md-h${level}">${content}</div>`);
         i++;
         continue;
       }
 
       // --- Horizontal rule ---
       if (/^[-*_]{3,}\s*$/.test(line)) {
-        out.push('<hr class="md-hr">');
+        pushBlock('<hr class="md-hr">');
         i++;
         continue;
       }
@@ -1090,7 +1099,7 @@ const Chat = (() => {
           items.push(_inlineMd(lines[i].replace(/^[\s]*[-*+]\s/, '')));
           i++;
         }
-        out.push('<ul class="md-list">' + items.map(t => `<li>${t}</li>`).join('') + '</ul>');
+        pushBlock('<ul class="md-list">' + items.map(t => `<li>${t}</li>`).join('') + '</ul>');
         continue;
       }
 
@@ -1101,7 +1110,7 @@ const Chat = (() => {
           items.push(_inlineMd(lines[i].replace(/^[\s]*\d+[.)]\s/, '')));
           i++;
         }
-        out.push('<ol class="md-list">' + items.map(t => `<li>${t}</li>`).join('') + '</ol>');
+        pushBlock('<ol class="md-list">' + items.map(t => `<li>${t}</li>`).join('') + '</ol>');
         continue;
       }
 
@@ -1124,22 +1133,32 @@ const Chat = (() => {
           html += '</tr>';
         }
         html += '</tbody></table>';
-        out.push(html);
+        pushBlock(html);
         continue;
       }
 
       // --- Regular line (text or blank) ---
-      // No <p> wrapping or <br> insertion.  The container keeps
-      // white-space: pre-wrap, so the trailing \n inserted by
-      // out.join('\n') at the end of this function renders single
-      // newlines AND blank lines exactly the way they did during
-      // streaming — matching pre-flush vertical extent so the message
-      // doesn't visibly shrink when markdown rendering kicks in.
-      out.push(_inlineMd(line));
+      // No <p> wrapping or <br> insertion.  Pre-wrap on the container
+      // renders the '\n' separator between adjacent text entries as a
+      // line break — matching the pre-flush streaming view exactly.
+      pushText(_inlineMd(line));
       i++;
     }
 
-    return out.join('\n');
+    // Custom join: '\n' between adjacent text entries (preserve the
+    // streaming line-break behavior), empty string around block entries
+    // (so their own margins control spacing without pre-wrap newlines
+    // adding a second gap on top).
+    let html = '';
+    for (let k = 0; k < out.length; k++) {
+      const cur = out[k];
+      if (k > 0) {
+        const prev = out[k - 1];
+        if (!prev.block && !cur.block) html += '\n';
+      }
+      html += cur.html;
+    }
+    return html;
   }
 
   /** Split a markdown table row into trimmed cell values. */
