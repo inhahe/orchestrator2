@@ -466,6 +466,54 @@ html, body {
   white-space: pre-wrap;
 }
 
+/* Synthetic prompts the CLI harness injects (autonomous-loop ticks,
+   /loop reschedules, system reminders, post-compact nudges).
+   Collapsed by default — these tend to be long and repetitive.
+   Header shows a single-line summary; click to expand the full body. */
+.msg-injected {
+  background: var(--bg-msg-user);
+  border-left: 3px dashed var(--user-border);
+  align-self: flex-start;
+  max-width: 90%;
+  opacity: 0.75;
+  padding: 0;
+}
+.injected-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 11px;
+}
+.injected-header:hover { background: var(--bg-tool-hover); }
+.injected-label {
+  font-weight: 600;
+  font-style: italic;
+  color: var(--user-label);
+  flex-shrink: 0;
+}
+.injected-summary {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+.injected-size {
+  color: var(--text-muted);
+  font-size: 10px;
+  flex-shrink: 0;
+}
+.injected-body {
+  display: none;
+  padding: 8px 12px;
+  font-size: 12px;
+  white-space: pre-wrap;
+  border-top: 1px solid var(--bg-tool-hover);
+}
+.injected-body.open { display: block; }
+
 .msg-assistant {
   align-self: flex-start;
   max-width: 95%;

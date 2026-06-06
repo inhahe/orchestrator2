@@ -346,6 +346,7 @@ const Chat = (() => {
   function _dispatchMessage(msg) {
     switch (msg.type) {
       case 'user_message':    _addUserMessage(msg.content); break;
+      case 'injected_prompt': _addInjectedPrompt(msg); break;
       case 'assistant_text':  _addAssistantText(msg); break;
       case 'tool_use':        _addToolUse(msg); break;
       case 'tool_result':     _addToolResult(msg); break;
@@ -382,6 +383,61 @@ const Chat = (() => {
     // expanding on paste, which shifts the layout and trips the scroll
     // listener before the message is appended.)
     _autoScroll = true;
+    _scrollToBottom();
+  }
+
+  // --- Injected prompts (synthetic prompts from the CLI harness) ---
+  //
+  // Collapsed by default — these are typically long, frequent and
+  // repetitive (autonomous-loop ticks, /loop reschedules, post-compact
+  // nudges, system reminders).  Header shows a one-line summary; click
+  // to expand the full body.
+
+  function _addInjectedPrompt(msg) {
+    const text = (msg && msg.content) || '';
+    if (!text) return;
+    _flushStreaming();
+    _resetToolRun();
+    _resetThinkingRun();
+
+    const lines = text.split('\n');
+    const nLines = lines.length;
+    const nChars = text.length;
+
+    // One-line summary: first non-empty line, truncated.
+    let firstLine = '';
+    for (const l of lines) {
+      const t = l.trim();
+      if (t) { firstLine = t; break; }
+    }
+    if (firstLine.length > 120) firstLine = firstLine.slice(0, 117) + '...';
+    const sizeHint = nLines > 1
+      ? `(${nChars} chars, ${nLines} lines)`
+      : `(${nChars} chars)`;
+
+    const el = document.createElement('div');
+    el.className = 'msg msg-injected';
+    el.innerHTML = `
+      <div class="injected-header">
+        <span class="injected-label">Injected (harness)</span>
+        <span class="injected-summary"></span>
+        <span class="injected-size">${sizeHint}</span>
+        <span class="tool-expand-icon">\u25B8</span>
+      </div>
+      <div class="injected-body">${_esc(text)}</div>`;
+
+    el.querySelector('.injected-summary').textContent = firstLine;
+
+    const header = el.querySelector('.injected-header');
+    const body = el.querySelector('.injected-body');
+    const icon = el.querySelector('.tool-expand-icon');
+    header.addEventListener('click', () => {
+      body.classList.toggle('open');
+      icon.classList.toggle('open');
+      _scrollToBottom();
+    });
+
+    elMessages.appendChild(el);
     _scrollToBottom();
   }
 
@@ -772,6 +828,8 @@ const Chat = (() => {
         const type = m.type || m.role;
         if (type === 'user' || type === 'human') {
           _addUserMessage(m.content || m.text || '');
+        } else if (type === 'injected_prompt') {
+          _addInjectedPrompt({ content: m.content || m.text || '' });
         } else if (type === 'assistant') {
           _addAssistantText({ content: m.content || m.text || '', delta: false });
         } else if (type === 'tool_use') {

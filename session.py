@@ -474,9 +474,9 @@ def render_session_history(
         # --- User messages ---
         if t == "user" and isinstance(msg, dict):
             content = msg.get("content")
+            has_perm_mode = "permissionMode" in rec
             if isinstance(content, str) and content.strip():
                 text = content.strip()
-                has_perm_mode = "permissionMode" in rec
                 looks_synthetic = (
                     text.startswith("<bash")
                     or text.startswith("<tool")
@@ -490,6 +490,16 @@ def render_session_history(
                         "is_history": True,
                     })
                     rendered += 1
+                elif not looks_synthetic:
+                    # No permissionMode + not an XML wrapper → harness
+                    # injected this prompt (autonomous-loop tick,
+                    # /loop reschedule, post-compact nudge, etc.).
+                    messages.append({
+                        "type": "injected_prompt",
+                        "content": text,
+                        "is_history": True,
+                    })
+                    rendered += 1
 
             elif isinstance(content, list):
                 for block in content:
@@ -499,8 +509,11 @@ def render_session_history(
                     if bt == "text" and isinstance(block.get("text"), str):
                         text = block["text"].strip()
                         if text:
+                            # Same disambiguation as the str path: user-typed
+                            # messages have permissionMode set on the record.
+                            msg_type = "user" if has_perm_mode else "injected_prompt"
                             messages.append({
-                                "type": "user",
+                                "type": msg_type,
                                 "content": text,
                                 "is_history": True,
                             })

@@ -391,9 +391,26 @@ class SDKBridge:
                         })
 
         elif isinstance(msg, UserMessage):
-            # Tool results injected by the CLI/SDK between turns — pair
-            # them with the tool uses we registered above.
+            # A UserMessage between turns is either:
+            #   (a) tool-result echoes from a ghost turn's in-flight tools, or
+            #   (b) a synthetic prompt the CLI injected to the model
+            #       (autonomous-loop tick, /loop reschedule, system
+            #        reminder, post-compact nudge, etc.) — the user
+            #        never typed it but it's part of the conversation.
+            # We surface (b) as ``injected_prompt`` so the user can see
+            # what the harness is feeding into Claude.
             content = msg.content if hasattr(msg, "content") else None
+
+            injected = self._extract_injected_text(msg)
+            if injected is not None:
+                log.warning(
+                    "async injected prompt: %r (truncated)",
+                    injected[:120],
+                )
+                await self._begin_ghost_turn_if_needed()
+                await self._broadcast_injected_prompt(injected, during_turn=False)
+                return
+
             # Diagnostic: tool results between turns means the SDK is
             # still actively processing a prior turn that we marked done.
             try:
@@ -452,6 +469,52 @@ class SDKBridge:
         else:
             # RateLimitEvent (top-level message, NOT a SystemMessage).
             self._handle_unknown_message(msg)
+
+    # ------------------------------------------------------------------
+    # Injected-prompt extraction
+    # ------------------------------------------------------------------
+
+    def _extract_injected_text(self, msg: Any) -> str | None:
+        """Pull synthetic prompt text out of a ``UserMessage``.
+
+        The bundled Claude Code CLI can inject prompts to the model
+        that the human user never typed — autonomous-loop ticks,
+        ``/loop`` reschedules, post-compact continuation nudges,
+        ``[WAITING]`` follow-ups, system reminders, etc.  They arrive
+        as ``UserMessage`` content that is either a bare string or a
+        list containing one or more ``TextBlock``s (distinguished from
+        the tool-result case where the list contains ``ToolResultBlock``s).
+
+        Returns the concatenated injected text, or ``None`` if this
+        ``UserMessage`` is just tool-results / has no surfaceable text.
+        """
+        content = getattr(msg, "content", None)
+        if isinstance(content, str):
+            text = content.strip()
+            return text or None
+        if isinstance(content, list):
+            # Only treat it as injected if there's NO ToolResultBlock —
+            # mixed payloads are tool-result echoes, which we render
+            # via the tool pane, not as injected prompts.
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, ToolResultBlock):
+                    return None  # tool-result message, not injected
+                if isinstance(block, TextBlock):
+                    t = (block.text or "").strip()
+                    if t:
+                        parts.append(t)
+            if parts:
+                return "\n".join(parts)
+        return None
+
+    async def _broadcast_injected_prompt(self, text: str, *, during_turn: bool) -> None:
+        """Surface a synthetic user prompt to the frontend."""
+        await self.broadcast({
+            "type": "injected_prompt",
+            "content": text,
+            "during_turn": during_turn,
+        })
 
     # ------------------------------------------------------------------
     # Ghost-turn helpers
@@ -908,10 +971,19 @@ class SDKBridge:
                                     "content": thinking_text,
                                 })
 
-                # ---- UserMessage (tool results injected by CLI) ----
+                # ---- UserMessage (tool results OR injected prompts) ----
                 elif isinstance(msg, UserMessage):
                     content = msg.content if hasattr(msg, "content") else None
-                    if isinstance(content, list):
+
+                    # Synthetic prompts the harness fed to Claude
+                    # (autonomous-loop ticks, /loop reschedules, system
+                    # reminders) — surface them so the user can see
+                    # what's actually entering the conversation.
+                    injected = self._extract_injected_text(msg)
+                    if injected is not None:
+                        log.info("injected prompt during turn: %r", injected[:120])
+                        await self._broadcast_injected_prompt(injected, during_turn=True)
+                    elif isinstance(content, list):
                         for block in content:
                             if isinstance(block, ToolResultBlock):
                                 result_text = summarize_tool_result(block)
@@ -926,13 +998,6 @@ class SDKBridge:
                                     result_text, is_err,
                                 )
                                 await self.broadcast(ws_msg)
-                    elif isinstance(content, str):
-                        # CLI notice (e.g. task notification XML).
-                        await self.broadcast({
-                            "type": "system_msg",
-                            "subtype": "notice",
-                            "data": {"content": content[:500]},
-                        })
 
                 # ---- ResultMessage (end of turn) ----
                 elif isinstance(msg, ResultMessage):
