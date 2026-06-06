@@ -40,10 +40,11 @@ orch --config-dir "C:\Users\me\.claude-alt"
 
 - **Live WebSocket UI** -- real-time streaming of assistant messages, tool calls, and results
 - **Side-by-side diff viewer** -- UltraCompare-style edit comparisons with configurable colors
-- **Activity collapse** -- all non-text activity (tools, thinking, turn markers) between Claude's messages auto-collapses into a single expandable summary line; click to expand and see all individual blocks
+- **Two-layer activity collapse** -- every tool call, tool result, and thinking block renders as its own one-line collapsed row with a summary (path, command, pattern, item count, etc.); click any row to expand the full details (diff, output, command body, thinking text). Once Claude speaks again after a run of activity, the whole run between the two messages auto-collapses into a single grouped summary line ("N tools") that can also be expanded to reveal the individual rows underneath
 - **Sidebar panels** -- live views of active tools, background tasks, pending queue, and TodoWrite plan
 - **Draggable sidebar** -- resize handle with width persisted across sessions
 - **Auto-compact** -- automatic context compaction when token usage gets high
+- **Readable post-compact summary** -- after a compact, the harness-injected summary that becomes the new conversation's starting context is shown as a collapsed box you can click to expand and read in full (Claude Code hides this prompt from the user)
 - **Background tasks** -- track and inspect agent-spawned background work
 - **Pending queue** -- type messages while Claude is busy; they queue and execute in order
 - **Queue management** -- edit or delete queued prompts from the sidebar
