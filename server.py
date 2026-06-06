@@ -1084,6 +1084,17 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             return
 
         # Everything else (commands, messages while idle) → event queue.
+        # For a plain user-typed ``message`` kind, capture the
+        # ``client_echoed`` flag from the wire payload so the worker_loop
+        # initial-prompt fallback can decide whether the backend needs
+        # to broadcast a ``user_message`` itself.  The frontend echoes
+        # optimistically only when its ``_isBusy=false`` at send time;
+        # when busy/connecting (real or stale-true) it skips the echo
+        # and expects the backend to handle it.
+        if kind == "message":
+            state.initial_prompt_client_echoed = bool(
+                msg.get("client_echoed", False)
+            )
         bridge.event_queue.put_nowait((kind, payload))
 
         # The frontend shows user messages optimistically (app.js send()),

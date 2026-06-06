@@ -313,6 +313,16 @@ class State:
     queued_prompts: deque[str] = field(default_factory=deque)
     queue_editing_index: int | None = None  # index being edited in the UI
 
+    # Echo flag for the FIRST user-typed prompt of the session when it
+    # arrives on the event_queue (idle path) instead of queued_prompts.
+    # The frontend's ``send()`` already optimistic-echoes typed prompts
+    # when ``_isBusy=false`` and skips when busy, then sets
+    # ``client_echoed`` in the wire payload accordingly.  Without
+    # propagating this flag the worker_loop initial-prompt fallback
+    # either silently drops the echo (when ``_isBusy`` was stale-true at
+    # send time) or duplicates it (when stale-false).
+    initial_prompt_client_echoed: bool | None = None
+
     # Background tasks (bg shells + Task subagents)
     background_tasks: dict[str, dict[str, Any]] = field(default_factory=dict)
 

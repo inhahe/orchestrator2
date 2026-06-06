@@ -242,6 +242,19 @@ class SDKBridge:
             self.state.connecting = False
             self.state.connect_started_at = None
 
+        # Sync frontend now that connecting flipped to False.  Without
+        # this the browser keeps ``_isBusy=true`` (from the earlier
+        # ``connecting=True`` status_update) until some other event
+        # forces a refresh — and while ``_isBusy`` is true, ``send()``
+        # skips its optimistic echo of typed prompts.  Any prompt sent
+        # in that window otherwise lands silently on the backend with
+        # no chat echo.
+        await self.broadcast({
+            "type": "status_update",
+            "status": state_to_status_dict(self.state, self.config),
+            "panels": state_to_panels_dict(self.state),
+        })
+
         elapsed = time.monotonic() - started
         await self.broadcast({
             "type": "system_msg",
@@ -425,6 +438,33 @@ class SDKBridge:
                             "last_result_subtype=%s",
                             n_results, state.last_result_subtype,
                         )
+            except Exception:
+                pass
+            # Diagnostic: log any non-tool-result UserMessage text that
+            # failed the injected-prompt classification.  These are the
+            # candidates for autonomous-loop wakeups, ScheduleWakeup fires,
+            # or other harness-injected prompts whose prefix we don't yet
+            # match.  Without this log, missed prefixes are invisible.
+            try:
+                snippet = ""
+                if isinstance(content, str):
+                    snippet = content
+                elif isinstance(content, list):
+                    has_tool_result = any(
+                        isinstance(b, ToolResultBlock) for b in content
+                    )
+                    if not has_tool_result:
+                        parts = []
+                        for b in content:
+                            if isinstance(b, TextBlock):
+                                parts.append((b.text or "").strip())
+                        snippet = "\n".join(p for p in parts if p)
+                if snippet.strip():
+                    log.warning(
+                        "async UserMessage between turns: unclassified text "
+                        "(first 200 chars): %r",
+                        snippet[:200],
+                    )
             except Exception:
                 pass
             # Tool results arriving means the ghost turn is alive too.
@@ -989,6 +1029,28 @@ class SDKBridge:
                         log.info("injected prompt during turn: %r", injected[:120])
                         await self._broadcast_injected_prompt(injected, during_turn=True)
                     elif isinstance(content, list):
+                        # Diagnostic: log unclassified text-only UserMessages
+                        # during a turn.  Tool results are expected here, but
+                        # raw text without tool results indicates a harness-
+                        # injected prompt whose prefix we don't yet match.
+                        try:
+                            has_tool_result = any(
+                                isinstance(b, ToolResultBlock) for b in content
+                            )
+                            if not has_tool_result:
+                                parts = []
+                                for b in content:
+                                    if isinstance(b, TextBlock):
+                                        parts.append((b.text or "").strip())
+                                snippet = "\n".join(p for p in parts if p)
+                                if snippet.strip():
+                                    log.warning(
+                                        "UserMessage during turn: unclassified "
+                                        "text (first 200 chars): %r",
+                                        snippet[:200],
+                                    )
+                        except Exception:
+                            pass
                         for block in content:
                             if isinstance(block, ToolResultBlock):
                                 result_text = summarize_tool_result(block)
@@ -1003,6 +1065,14 @@ class SDKBridge:
                                     result_text, is_err,
                                 )
                                 await self.broadcast(ws_msg)
+                    elif isinstance(content, str) and content.strip():
+                        # String-typed UserMessage during a turn with text
+                        # that didn't classify as injected.
+                        log.warning(
+                            "UserMessage during turn: unclassified string "
+                            "(first 200 chars): %r",
+                            content[:200],
+                        )
 
                 # ---- ResultMessage (end of turn) ----
                 elif isinstance(msg, ResultMessage):
@@ -1267,6 +1337,26 @@ class SDKBridge:
                     break
                 if kind in ("quit", "force-quit"):
                     return
+            # Echo the first prompt to chat IF the frontend didn't.
+            # Messages that land on the event_queue (rather than
+            # ``queued_prompts``) normally rely on the frontend's
+            # optimistic echo in ``send()`` — but that echo is skipped
+            # when ``_isBusy`` is true, and ``_isBusy`` stays true from
+            # the initial ``connecting=True`` status_update until
+            # something else flips it.  A prompt the user typed during
+            # connecting can therefore arrive here with no chat echo at
+            # all, making it look like the turn started spontaneously.
+            # The frontend stamps each message with ``client_echoed`` so
+            # we can echo here only when needed (avoiding duplicates
+            # when ``_isBusy`` was correctly false at send time).
+            if next_prompt is not None and not state.initial_prompt_client_echoed:
+                await self.broadcast({
+                    "type": "user_message",
+                    "content": next_prompt,
+                })
+            # One-shot: clear so subsequent paths can't accidentally
+            # re-read this flag.
+            state.initial_prompt_client_echoed = None
 
         # --- Turn loop ---
         while next_prompt is not None and not self.stop_event.is_set():

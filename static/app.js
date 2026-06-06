@@ -159,12 +159,26 @@ const App = (() => {
 
   function send(msg) {
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(msg));
-
       // Show user message immediately (optimistic) — but only when not
       // busy.  When busy, the prompt goes to the pending queue panel
-      // and gets echoed to chat when it's actually processed.
-      if (msg.type === 'message' && msg.text && !msg.text.startsWith('/') && !_isBusy) {
+      // and gets echoed to chat by the backend when it's actually
+      // processed.  Tag the wire payload with the echo decision so the
+      // backend knows whether it needs to echo too — without this flag
+      // the backend can't tell whether a stale ``_isBusy=true`` caused
+      // us to skip the echo (in which case it must echo) or whether
+      // we already did it (in which case it must not, to avoid a
+      // duplicate).
+      const willEcho = (
+        msg.type === 'message' &&
+        msg.text &&
+        !msg.text.startsWith('/') &&
+        !_isBusy
+      );
+      if (msg.type === 'message') {
+        msg = Object.assign({}, msg, { client_echoed: !!willEcho });
+      }
+      ws.send(JSON.stringify(msg));
+      if (willEcho) {
         Chat.handleMessage({ type: 'user_message', content: msg.text });
       }
     } else {
