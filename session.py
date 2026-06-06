@@ -237,6 +237,55 @@ def write_session_title(session_id: str, title: str) -> None:
 # Session info parsing
 # ---------------------------------------------------------------------------
 
+# Content prefixes the Claude Code harness uses for synthetic prompts
+# it feeds to the model.  These are indistinguishable from user-typed
+# prompts at the JSONL field-shape level (same ``type:"user"`` record,
+# same ``permissionMode``, same queue-operation enqueue) — the only
+# reliable signal is the content itself.
+_HARNESS_INJECTED_PREFIXES = (
+    "# Autonomous loop check",
+    "# Autonomous loop tick",
+    "This session is being continued from a previous conversation",
+)
+
+# XML-wrapped CLI internals that the user shouldn't see at all.
+_XML_INTERNAL_PREFIXES = (
+    "<bash",
+    "<tool",
+    "<task-notification",
+    "<local-command",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<system-reminder>",
+)
+
+
+def _classify_user_text(text: str) -> str:
+    """Classify a ``type:"user"`` record's text payload.
+
+    Returns one of:
+
+    * ``"drop"`` — XML-wrapped CLI internal, don't surface at all.
+    * ``"injected_prompt"`` — harness-injected synthetic prompt.
+    * ``"user"`` — user-typed message.
+
+    The harness writes both kinds with the same JSONL field shape, so
+    classification has to be content-based.  Prefix matching against
+    a known-pattern list catches everything we've seen in real
+    transcripts (autonomous-loop ticks, /loop reschedules, post-compact
+    continuation summaries).  Anything not matching a known harness
+    prefix is treated as user-typed.
+    """
+    for p in _XML_INTERNAL_PREFIXES:
+        if text.startswith(p):
+            return "drop"
+    for p in _HARNESS_INJECTED_PREFIXES:
+        if text.startswith(p):
+            return "injected_prompt"
+    return "user"
+
+
 def _extract_text(content: Any) -> str:
     """Pull plain text from a message-content field (str or list)."""
     if isinstance(content, str):
@@ -451,6 +500,7 @@ def render_session_history(
             records.append(rec)
 
     total_records = len(records)
+
     if max_history and total_records > max_history:
         records = records[-max_history:]
         truncated = total_records - max_history
@@ -474,28 +524,14 @@ def render_session_history(
         # --- User messages ---
         if t == "user" and isinstance(msg, dict):
             content = msg.get("content")
-            has_perm_mode = "permissionMode" in rec
             if isinstance(content, str) and content.strip():
                 text = content.strip()
-                looks_synthetic = (
-                    text.startswith("<bash")
-                    or text.startswith("<tool")
-                    or text.startswith("<task-notification")
-                    or text.startswith("<local-command")
-                )
-                if has_perm_mode and not looks_synthetic:
+                classified = _classify_user_text(text)
+                if classified == "drop":
+                    pass  # XML wrapper / internal — don't render
+                else:
                     messages.append({
-                        "type": "user",
-                        "content": text,
-                        "is_history": True,
-                    })
-                    rendered += 1
-                elif not looks_synthetic:
-                    # No permissionMode + not an XML wrapper → harness
-                    # injected this prompt (autonomous-loop tick,
-                    # /loop reschedule, post-compact nudge, etc.).
-                    messages.append({
-                        "type": "injected_prompt",
+                        "type": classified,  # "user" or "injected_prompt"
                         "content": text,
                         "is_history": True,
                     })
@@ -509,11 +545,11 @@ def render_session_history(
                     if bt == "text" and isinstance(block.get("text"), str):
                         text = block["text"].strip()
                         if text:
-                            # Same disambiguation as the str path: user-typed
-                            # messages have permissionMode set on the record.
-                            msg_type = "user" if has_perm_mode else "injected_prompt"
+                            classified = _classify_user_text(text)
+                            if classified == "drop":
+                                continue
                             messages.append({
-                                "type": msg_type,
+                                "type": classified,
                                 "content": text,
                                 "is_history": True,
                             })

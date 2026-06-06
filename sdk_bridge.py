@@ -63,6 +63,7 @@ from state import (
     state_to_status_dict,
 )
 from session import (
+    _classify_user_text,
     find_most_recent_session_for_cwd,
     find_session_dir,
     read_session_title,
@@ -475,37 +476,41 @@ class SDKBridge:
     # ------------------------------------------------------------------
 
     def _extract_injected_text(self, msg: Any) -> str | None:
-        """Pull synthetic prompt text out of a ``UserMessage``.
+        """Pull harness-injected prompt text out of a ``UserMessage``.
 
-        The bundled Claude Code CLI can inject prompts to the model
-        that the human user never typed — autonomous-loop ticks,
-        ``/loop`` reschedules, post-compact continuation nudges,
-        ``[WAITING]`` follow-ups, system reminders, etc.  They arrive
-        as ``UserMessage`` content that is either a bare string or a
-        list containing one or more ``TextBlock``s (distinguished from
-        the tool-result case where the list contains ``ToolResultBlock``s).
+        The bundled Claude Code CLI sends synthetic prompts to the
+        model (autonomous-loop ticks, ``/loop`` reschedules,
+        post-compact continuation summaries) as ``type:"user"`` records
+        — same field shape as the user's own typed messages.  The only
+        reliable signal is the content prefix.  Use the shared
+        ``_classify_user_text`` from session.py so the live path and
+        the history-replay path agree.
 
-        Returns the concatenated injected text, or ``None`` if this
-        ``UserMessage`` is just tool-results / has no surfaceable text.
+        Returns the injected text, or ``None`` if this ``UserMessage``
+        is a tool-result echo, the user's own typed message, or has no
+        surfaceable text.
         """
         content = getattr(msg, "content", None)
         if isinstance(content, str):
             text = content.strip()
-            return text or None
+            if not text:
+                return None
+            return text if _classify_user_text(text) == "injected_prompt" else None
         if isinstance(content, list):
-            # Only treat it as injected if there's NO ToolResultBlock —
-            # mixed payloads are tool-result echoes, which we render
-            # via the tool pane, not as injected prompts.
+            # Mixed payloads containing ToolResultBlock are tool-result
+            # echoes — not injected prompts.
             parts: list[str] = []
             for block in content:
                 if isinstance(block, ToolResultBlock):
-                    return None  # tool-result message, not injected
+                    return None
                 if isinstance(block, TextBlock):
                     t = (block.text or "").strip()
                     if t:
                         parts.append(t)
-            if parts:
-                return "\n".join(parts)
+            if not parts:
+                return None
+            joined = "\n".join(parts)
+            return joined if _classify_user_text(joined) == "injected_prompt" else None
         return None
 
     async def _broadcast_injected_prompt(self, text: str, *, during_turn: bool) -> None:
@@ -1008,33 +1013,46 @@ class SDKBridge:
                     if msg.session_id:
                         state.session_id = msg.session_id
 
-                    # Book metrics (skip if this was a compact turn).
-                    if not state.compact_during_last_turn:
-                        state.turns += 1
-                        if hasattr(msg, "total_cost_usd") and msg.total_cost_usd:
-                            state.total_cost_usd += msg.total_cost_usd
-                        # Extract context tokens from usage / model_usage.
-                        raw_usage = getattr(msg, "usage", None)
-                        raw_model_usage = getattr(msg, "model_usage", None)
-                        if isinstance(raw_usage, dict):
-                            state.last_usage = raw_usage
-                        elif isinstance(raw_model_usage, dict):
-                            state.last_usage = raw_model_usage
-                        ctx = extract_context_tokens(raw_usage, raw_model_usage)
-                        if ctx:
-                            state.context_tokens = ctx
-
                     subtype = getattr(msg, "subtype", None) or "unknown"
                     state.last_result_subtype = subtype
 
-                    # Diagnostic: capture ResultMessage subtype + whether
-                    # this was a compact-induced exit.  If we ever see
-                    # subtype="compact_boundary" or compact=True here, the
-                    # turn is ending because of an internal SDK compaction
-                    # — and the SDK is likely to keep streaming after.
+                    # COMPACT-INDUCED ResultMessage — NOT end of turn.
+                    # The SDK wraps an internal context compaction with
+                    # its own ResultMessage, then keeps streaming the
+                    # actual post-compact response.  If we break here
+                    # we leak the rest into ``_handle_async_message``
+                    # and the UI shows "idle while streaming".  Reset
+                    # the compact flag and keep looping so the real
+                    # turn finishes here, not as a ghost turn.
+                    if state.compact_during_last_turn:
+                        log.warning(
+                            "run_turn: compact-induced ResultMessage "
+                            "(subtype=%s) — staying in turn, "
+                            "waiting for real ResultMessage",
+                            subtype,
+                        )
+                        state.compact_during_last_turn = False
+                        # Don't increment turns, don't broadcast
+                        # turn_end, don't break.  Just continue.
+                        continue
+
+                    # Real end of turn — book metrics.
+                    state.turns += 1
+                    if hasattr(msg, "total_cost_usd") and msg.total_cost_usd:
+                        state.total_cost_usd += msg.total_cost_usd
+                    raw_usage = getattr(msg, "usage", None)
+                    raw_model_usage = getattr(msg, "model_usage", None)
+                    if isinstance(raw_usage, dict):
+                        state.last_usage = raw_usage
+                    elif isinstance(raw_model_usage, dict):
+                        state.last_usage = raw_model_usage
+                    ctx = extract_context_tokens(raw_usage, raw_model_usage)
+                    if ctx:
+                        state.context_tokens = ctx
+
                     log.info(
-                        "run_turn ResultMessage: subtype=%s compact=%s elapsed=%.1fs",
-                        subtype, state.compact_during_last_turn,
+                        "run_turn ResultMessage: subtype=%s elapsed=%.1fs",
+                        subtype,
                         time.monotonic() - (state.turn_started_at or time.monotonic()),
                     )
 
