@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Awaitable
@@ -314,7 +315,16 @@ class SDKBridge:
     # ------------------------------------------------------------------
 
     async def _handle_async_message(self, msg: Any) -> None:
-        """Handle an SDK message that arrives between turns."""
+        """Handle an SDK message that arrives between turns.
+
+        The CLI subprocess can stream a whole turn's worth of content
+        outside any active ``run_turn`` call — most notably when we
+        ``--resume`` a session that was mid-turn when previously killed.
+        We can't drive that work from ``run_turn`` (it would inject a
+        fresh ``query()``), so we treat it as a *ghost turn*: flip
+        ``state.busy`` based on what arrives so the UI shows working,
+        and close it out cleanly when the ``ResultMessage`` lands.
+        """
         state = self.state
 
         if isinstance(msg, SystemMessage):
@@ -327,6 +337,27 @@ class SDKBridge:
             # full block set (text + tool uses + thinking), otherwise
             # the UI shows narration referring to tool calls that were
             # silently dropped.
+
+            # Diagnostic: any AssistantMessage outside a turn is suspicious
+            # (this is the "idle while streaming" symptom).  Log block
+            # types + counts so we can correlate with prior ResultMessage.
+            try:
+                _types = [type(b).__name__ for b in msg.content]
+                log.warning(
+                    "async AssistantMessage between turns: blocks=%s "
+                    "last_result_subtype=%s compact_last=%s",
+                    _types, state.last_result_subtype,
+                    state.compact_during_last_turn,
+                )
+            except Exception:
+                pass
+
+            # Ghost-turn busy flip — the SDK is actively producing,
+            # so the UI must reflect that.  Stamp turn_started_at on
+            # the first message so duration is meaningful, and push
+            # one status_update so the toolbar switches off "idle".
+            await self._begin_ghost_turn_if_needed()
+
             for block in msg.content:
                 if isinstance(block, TextBlock):
                     text = block.text.strip()
@@ -363,6 +394,23 @@ class SDKBridge:
             # Tool results injected by the CLI/SDK between turns — pair
             # them with the tool uses we registered above.
             content = msg.content if hasattr(msg, "content") else None
+            # Diagnostic: tool results between turns means the SDK is
+            # still actively processing a prior turn that we marked done.
+            try:
+                if isinstance(content, list):
+                    n_results = sum(
+                        1 for b in content if isinstance(b, ToolResultBlock)
+                    )
+                    if n_results:
+                        log.warning(
+                            "async UserMessage between turns: tool_results=%d "
+                            "last_result_subtype=%s",
+                            n_results, state.last_result_subtype,
+                        )
+            except Exception:
+                pass
+            # Tool results arriving means the ghost turn is alive too.
+            await self._begin_ghost_turn_if_needed()
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, ToolResultBlock):
@@ -395,9 +443,85 @@ class SDKBridge:
             subtype = getattr(msg, "subtype", None) or "unknown"
             state.last_result_subtype = subtype
 
+            # If this ResultMessage closes a ghost turn, mirror the
+            # cleanup that run_turn's finally block does so the UI
+            # returns to idle and the next turn can start clean.
+            if state.busy and not self.turn_active.is_set():
+                await self._end_ghost_turn(subtype)
+
         else:
             # RateLimitEvent (top-level message, NOT a SystemMessage).
             self._handle_unknown_message(msg)
+
+    # ------------------------------------------------------------------
+    # Ghost-turn helpers
+    # ------------------------------------------------------------------
+
+    async def _begin_ghost_turn_if_needed(self) -> None:
+        """Mark a ghost turn active and push a status_update once.
+
+        Called on every async assistant/user message.  Idempotent: only
+        flips state once, until ``_end_ghost_turn`` clears it.
+        """
+        state = self.state
+        if state.busy or self.turn_active.is_set():
+            return
+        state.busy = True
+        state.turn_started_at = time.monotonic()
+        # Reset compact flag — any prior compact has been absorbed by
+        # whatever turn just closed; this is a fresh stream.
+        state.compact_during_last_turn = False
+        log.warning(
+            "ghost turn begin: SDK streaming without active run_turn "
+            "(session_id=%s)", (state.session_id or "?")[:12],
+        )
+        try:
+            await self.broadcast({
+                "type": "status_update",
+                "status": state_to_status_dict(state, self.config),
+                "panels": state_to_panels_dict(state),
+            })
+        except Exception as exc:
+            log.warning("ghost-turn status_update broadcast failed: %r", exc)
+
+    async def _end_ghost_turn(self, subtype: str) -> None:
+        """Close out a ghost turn cleanly when its ResultMessage lands."""
+        state = self.state
+        was_compact = state.compact_during_last_turn
+        duration = time.monotonic() - (state.turn_started_at or time.monotonic())
+
+        # Mirror run_turn's finally cleanup.
+        state.busy = False
+        state.turn_started_at = None
+        state.active_tools.clear()
+
+        # Book the turn unless this was an internal compact event.
+        if not was_compact:
+            state.turns += 1
+        state.compact_during_last_turn = False
+
+        log.warning(
+            "ghost turn end: subtype=%s compact=%s elapsed=%.1fs turns=%d",
+            subtype, was_compact, duration, state.turns,
+        )
+
+        try:
+            await self.broadcast({
+                "type": "turn_end",
+                "subtype": subtype,
+                "duration": fmt_duration(duration),
+                "turns": state.turns,
+            })
+        except Exception as exc:
+            log.warning("ghost-turn turn_end broadcast failed: %r", exc)
+        try:
+            await self.broadcast({
+                "type": "status_update",
+                "status": state_to_status_dict(state, self.config),
+                "panels": state_to_panels_dict(state),
+            })
+        except Exception as exc:
+            log.warning("ghost-turn status_update broadcast failed: %r", exc)
 
     # ------------------------------------------------------------------
     # System message handling (shared by turn + async paths)
@@ -533,6 +657,10 @@ class SDKBridge:
             pre_tokens = meta.get("pre_tokens", 0) or state.context_tokens
             state.compact_during_last_turn = True
             state.last_compact_trigger = trigger
+            log.warning(
+                "compact_boundary received: trigger=%s pre_tokens=%s during_turn=%s",
+                trigger, pre_tokens, during_turn,
+            )
             # Reset context tokens — the post-compact size is much smaller.
             state.context_tokens = 0
             # Broadcast a visible message matching the TUI's format.
@@ -698,6 +826,14 @@ class SDKBridge:
         # Route SDK messages to turn_msg_queue.
         self.turn_active.set()
 
+        # Diagnostic: every turn entry, so we can correlate the "silent
+        # idle" symptom with the prompt that started the turn.
+        _prompt_preview = prompt_text.replace("\n", " ")[:80]
+        log.info(
+            "run_turn enter: turns=%d prompt=%r",
+            state.turns, _prompt_preview,
+        )
+
         await self.broadcast({"type": "turn_start", "prompt": prompt_text})
 
         # Send the prompt.
@@ -826,6 +962,17 @@ class SDKBridge:
                     subtype = getattr(msg, "subtype", None) or "unknown"
                     state.last_result_subtype = subtype
 
+                    # Diagnostic: capture ResultMessage subtype + whether
+                    # this was a compact-induced exit.  If we ever see
+                    # subtype="compact_boundary" or compact=True here, the
+                    # turn is ending because of an internal SDK compaction
+                    # — and the SDK is likely to keep streaming after.
+                    log.info(
+                        "run_turn ResultMessage: subtype=%s compact=%s elapsed=%.1fs",
+                        subtype, state.compact_during_last_turn,
+                        time.monotonic() - (state.turn_started_at or time.monotonic()),
+                    )
+
                     # Reload title.
                     if state.session_id:
                         state.session_title = read_session_title(state.session_id)
@@ -861,31 +1008,66 @@ class SDKBridge:
                     break
 
         finally:
-            # If we exit without a ResultMessage or interrupt — exception,
-            # dispatcher death, etc. — emit a synthetic turn_end so the
-            # user sees that the turn ended.  Otherwise the busy → idle
-            # transition would be silent and confusing.
+            # Cleanup ALWAYS runs first — even on CancelledError or any
+            # other BaseException.  Doing it before any further awaits
+            # ensures state.busy can never get stuck True when the loop
+            # has stopped.
+            exit_exc = sys.exc_info()[1]
+            self.turn_active.clear()
+            state.busy = False
+            state.turn_started_at = None
+            # Clear foreground active tools (bg tasks survive).
+            state.active_tools.clear()
+
+            # Log the exit path so we have concrete evidence when this
+            # goes wrong in production (the "turn dies silently after
+            # hours" symptom needs a paper trail).
+            if normal_completion:
+                log.info("run_turn exit: normal (turns=%d)", state.turns)
+            elif exit_exc is not None:
+                log.warning(
+                    "run_turn exit: exception %s: %s",
+                    type(exit_exc).__name__, exit_exc,
+                )
+            else:
+                log.warning("run_turn exit: silent (no exception, no ResultMessage)")
+
+            # Emit a synthetic turn_end so the user sees that the turn
+            # ended even when there was no ResultMessage.  Wrapped in
+            # BaseException so a CancelledError mid-broadcast can't
+            # also swallow the warning silently.
             if not normal_completion:
+                exc_label = (
+                    f"{type(exit_exc).__name__}: {exit_exc}"
+                    if exit_exc is not None else "no exception"
+                )
                 try:
                     duration = time.monotonic() - (state.turn_started_at or time.monotonic())
+                except Exception:
+                    duration = 0.0
+                # Broadcast each piece independently — a failure on one
+                # shouldn't take the other down with it.
+                try:
                     await self.broadcast({
                         "type": "turn_end",
                         "subtype": "interrupted",
                         "duration": fmt_duration(duration),
                         "turns": state.turns,
                     })
+                except BaseException as bx:
+                    log.warning("synthetic turn_end broadcast failed: %r", bx)
+                try:
                     await self.broadcast({
                         "type": "system_msg",
                         "subtype": "warning",
-                        "data": {"message": "Turn ended without a result message (SDK may have disconnected or errored)."},
+                        "data": {"message": (
+                            "Turn ended without a result message "
+                            f"({exc_label}). The SDK may have disconnected, "
+                            "errored, or the dispatcher died."
+                        )},
                     })
-                except Exception:
-                    pass
-            self.turn_active.clear()
-            state.busy = False
-            state.turn_started_at = None
-            # Clear foreground active tools (bg tasks survive).
-            state.active_tools.clear()
+                except BaseException as bx:
+                    log.warning("synthetic warning broadcast failed: %r", bx)
 
         # Flush bell.
         if state.pending_bell:
@@ -996,6 +1178,14 @@ class SDKBridge:
 
             try:
                 assistant_text, interrupted = await self.run_turn(next_prompt)
+            except asyncio.CancelledError:
+                # Cancellation must propagate (shutdown / reload), but
+                # log it loudly first.  Without this the worker dies
+                # silently, the dispatcher keeps consuming SDK output
+                # into _handle_async_message, and the UI is left
+                # showing "idle" while messages stream in.
+                log.warning("run_turn cancelled — worker_loop exiting")
+                raise
             except Exception as exc:
                 log.exception("run_turn failed: %s", exc)
                 await self.broadcast({
