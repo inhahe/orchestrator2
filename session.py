@@ -246,6 +246,24 @@ _HARNESS_INJECTED_PREFIXES = (
     "# Autonomous loop check",
     "# Autonomous loop tick",
     "This session is being continued from a previous conversation",
+    # Claude Code's proactive/autonomous mode: each wake-up sends a
+    # tick prompt of the form ``<tick>HH:MM:SS</tick>`` (see
+    # claude-code-mod/src/cli/print.ts:~1845).  Multiple ticks may be
+    # batched into one message, but the payload still starts with
+    # ``<tick>``.  Without this prefix the orchestrator classified
+    # them as user-typed messages, so the "claude set up an
+    # autonomous loop" wake-ups didn't render as collapsed injected
+    # boxes the way compaction prompts did.
+    "<tick>",
+    # Orchestrator's own auto-continue prompt (default CONTINUE_PROMPT
+    # from config.py).  On replay this would otherwise classify as a
+    # user message — the live path explicitly broadcasts it as an
+    # injected prompt, but the JSONL just records the text.  Match a
+    # stable enough prefix that any tweak to the wording after the
+    # first phrase still works.  Users with a custom --continue-prompt
+    # won't match this; that's an accepted tradeoff (custom prompts
+    # only show as injected on the live path, not on replay).
+    "If you need input from me before continuing, pause and include",
 )
 
 # XML-wrapped CLI internals that the user shouldn't see at all.

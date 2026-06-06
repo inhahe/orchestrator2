@@ -1512,6 +1512,15 @@ class SDKBridge:
             pass
 
         # Auto-continue.
+        # Surface the synthetic continue prompt to the frontend as an
+        # injected prompt so the user sees a collapsed box for it, the
+        # same way compaction's harness-injected prompt is rendered.
+        # Without this broadcast the auto-continue loop runs invisibly
+        # and the user only sees Claude's response with no indication
+        # of the prompt that triggered it.
+        await self._broadcast_injected_prompt(
+            state.continue_prompt, during_turn=False,
+        )
         return state.continue_prompt
 
     async def _await_next_prompt(self) -> str | None:
@@ -1552,6 +1561,13 @@ class SDKBridge:
                     and self.state.needs_user_attention not in ("waiting", "done", "burst")
                 ):
                     self.state.needs_user_attention = None
+                    # Same as the grace-window path in _between_turns:
+                    # surface the synthetic continue prompt so the user
+                    # sees a collapsed injected-prompt box for the
+                    # auto-resume turn.
+                    await self._broadcast_injected_prompt(
+                        self.state.continue_prompt, during_turn=False,
+                    )
                     return self.state.continue_prompt
                 continue
             if kind == "effort":
