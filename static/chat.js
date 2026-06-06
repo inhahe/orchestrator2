@@ -1128,37 +1128,15 @@ const Chat = (() => {
         continue;
       }
 
-      // --- Skip blank lines between blocks ---
-      if (!line.trim()) {
-        i++;
-        continue;
-      }
-
-      // --- Regular paragraph: collect consecutive non-block lines,
-      // join them with <br> so single newlines remain visible (Claude
-      // routinely uses single \n for line breaks; without this they
-      // collapse to spaces once markdown rendering replaces the
-      // streaming pre-wrap view).
-      {
-        const paraLines = [];
-        while (i < lines.length) {
-          const l = lines[i];
-          if (!l.trim()) break;                             // blank ends para
-          if (/^(`{3,})[\w-]*\s*$/.test(l)) break;          // fenced code
-          if (/^(#{1,4})\s+/.test(l)) break;                // heading
-          if (/^[-*_]{3,}\s*$/.test(l)) break;              // hr
-          if (/^[\s]*[-*+]\s/.test(l)) break;               // bullet
-          if (/^[\s]*\d+[.)]\s/.test(l)) break;             // ordered
-          if (/^\|/.test(l) && i + 1 < lines.length &&      // table
-              /^\|[\s:|-]+$/.test(lines[i + 1]) &&
-              lines[i + 1].includes('---')) break;
-          paraLines.push(_inlineMd(l));
-          i++;
-        }
-        if (paraLines.length) {
-          out.push(`<p class="md-p">${paraLines.join('<br>')}</p>`);
-        }
-      }
+      // --- Regular line (text or blank) ---
+      // No <p> wrapping or <br> insertion.  The container keeps
+      // white-space: pre-wrap, so the trailing \n inserted by
+      // out.join('\n') at the end of this function renders single
+      // newlines AND blank lines exactly the way they did during
+      // streaming — matching pre-flush vertical extent so the message
+      // doesn't visibly shrink when markdown rendering kicks in.
+      out.push(_inlineMd(line));
+      i++;
     }
 
     return out.join('\n');

@@ -524,10 +524,12 @@ html, body {
   font-family: var(--font-sans);
   color: var(--assistant-text);
 }
-/* When markdown is rendered, switch from pre-wrap to normal flow
-   so block elements (code blocks, lists, headings) lay out properly. */
+/* When markdown is rendered, keep pre-wrap so that single \n and blank
+   lines in the source remain visually present (matching what the user
+   saw during streaming).  Block elements (code, lists, tables,
+   headings) carry their own whitespace handling and are unaffected. */
 .msg-assistant .msg-content.md-rendered {
-  white-space: normal;
+  white-space: pre-wrap;
 }
 
 /* --- Markdown elements --- */
@@ -569,7 +571,16 @@ html, body {
   color: var(--text-dim);
 }
 .md-p {
-  margin: 4px 0;
+  /* Block paragraph spacing for assistant text.  Use display:block
+     explicitly to defend against the global "* { margin: 0 }" reset and
+     any browser quirks around inline-flowed <p> tags.
+     The margin matches one full line height so that flushing markdown
+     (which collapses each blank line in the source down to a single
+     paragraph break) doesn't visually shrink the message relative to
+     the streaming pre-wrap view that preceded it. */
+  display: block;
+  margin: 1.45em 0;
+  line-height: 1.45;
 }
 .md-p:first-child { margin-top: 0; }
 .md-p:last-child  { margin-bottom: 0; }
