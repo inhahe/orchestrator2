@@ -266,6 +266,20 @@ _HARNESS_INJECTED_PREFIXES = (
     "If you need input from me before continuing, pause and include",
 )
 
+# Distinctive marker substrings that, if they appear anywhere in the
+# text (not just the prefix), identify the message as harness-injected.
+# Used for ``ScheduleWakeup`` fires that resolve the
+# ``<<autonomous-loop-dynamic>>`` / ``<<autonomous-loop>>`` sentinels:
+# the runtime PREPENDS the user-supplied wakeup prompt (whatever it was)
+# and appends the autonomous-loop instructions, so the message starts
+# with the user's own text but contains these markers further down.
+# Without substring matching these wakeup fires looked like
+# user-typed messages and never rendered as collapsed injected boxes.
+_HARNESS_INJECTED_MARKERS = (
+    "# Autonomous loop check",
+    "# Autonomous loop tick",
+)
+
 # XML-wrapped CLI internals that the user shouldn't see at all.
 _XML_INTERNAL_PREFIXES = (
     "<bash",
@@ -289,17 +303,28 @@ def _classify_user_text(text: str) -> str:
     * ``"user"`` — user-typed message.
 
     The harness writes both kinds with the same JSONL field shape, so
-    classification has to be content-based.  Prefix matching against
-    a known-pattern list catches everything we've seen in real
-    transcripts (autonomous-loop ticks, /loop reschedules, post-compact
-    continuation summaries).  Anything not matching a known harness
-    prefix is treated as user-typed.
+    classification has to be content-based.  Two layers:
+
+    1. **Prefix match** against ``_HARNESS_INJECTED_PREFIXES`` — catches
+       cases where the harness owns the entire payload (post-compact
+       continuation, proactive ``<tick>``, orchestrator auto-continue).
+    2. **Substring match** against ``_HARNESS_INJECTED_MARKERS`` —
+       catches ``ScheduleWakeup`` fires that resolved the
+       ``<<autonomous-loop-dynamic>>`` sentinel.  The runtime prepends
+       the user-supplied wakeup prompt and appends the autonomous-loop
+       instructions, so the text starts with the user's own prompt but
+       contains distinctive markers further down.
+
+    Anything not matching either layer is treated as user-typed.
     """
     for p in _XML_INTERNAL_PREFIXES:
         if text.startswith(p):
             return "drop"
     for p in _HARNESS_INJECTED_PREFIXES:
         if text.startswith(p):
+            return "injected_prompt"
+    for m in _HARNESS_INJECTED_MARKERS:
+        if m in text:
             return "injected_prompt"
     return "user"
 
