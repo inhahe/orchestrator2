@@ -1138,7 +1138,18 @@ const Chat = (() => {
       // Same blank-line-tolerant scan as bullets.  Without this, each
       // item ended up in its own <ol>, which restarts the counter — so
       // every item rendered as "1.".
+      //
+      // We also preserve the FIRST item's number from the source
+      // (e.g. "2." → ``<ol start="2">``).  Numbered lists are
+      // routinely interrupted by paragraphs, sub-bullets, or block
+      // quotes between items — in those cases the scan terminates
+      // early and a fresh <ol> opens for the continuation.  Without
+      // the ``start`` attribute, item 2 would render as 1, item 3 as
+      // 1 or 2, etc.  Using the literal source number is the proper
+      // fix because it's the ground truth the model emitted.
       if (/^[\s]*\d+[.)]\s/.test(line)) {
+        const startMatch = line.match(/^[\s]*(\d+)[.)]\s/);
+        const startNum = startMatch ? parseInt(startMatch[1], 10) : 1;
         const items = [];
         while (i < lines.length) {
           if (/^[\s]*\d+[.)]\s/.test(lines[i])) {
@@ -1156,7 +1167,8 @@ const Chat = (() => {
             break;
           }
         }
-        pushBlock('<ol class="md-list">' + items.map(t => `<li>${t}</li>`).join('') + '</ol>');
+        const startAttr = startNum !== 1 ? ` start="${startNum}"` : '';
+        pushBlock(`<ol class="md-list"${startAttr}>` + items.map(t => `<li>${t}</li>`).join('') + '</ol>');
         continue;
       }
 
