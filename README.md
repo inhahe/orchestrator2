@@ -122,9 +122,18 @@ orch --config-dir "C:\Users\me\.claude-alt"
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--bell-on EVENTS` | `waiting,done,stalled,api-stall,requires-action,rate-hit,rate-reset` | Comma-separated bell events. Shortcuts: `all`, `none` |
+| `--bell EVENTS` | `waiting,done,stalled,api-stall,requires-action,rate-hit,rate-reset` | Comma- or space-separated bell events to ring on. Shortcuts: `all`, `none`. (`--bell-on` is accepted as an alias.) |
 
 Valid events: `turn-done`, `waiting`, `done`, `stalled`, `api-stall`, `api-ok`, `interrupt`, `bg-done`, `requires-action`, `rate-hit`, `rate-reset`
+
+At runtime, use the `/bell` slash command to view or change the bell events without restarting:
+
+- `/bell` — show current settings and usage
+- `/bell <e1> <e2>...` — REPLACE: ring on **only** these events (e.g. `/bell done` silences everything except `done`)
+- `/bell +<event>` — add an event to the current set
+- `/bell -<event>` — remove an event from the current set
+- `/bell all` — ring on every event
+- `/bell none` — disable the bell entirely
 
 ### API Stall Detection
 
@@ -197,7 +206,10 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/collapse [on\|off]` | Toggle activity collapsing (tools, thinking, turn markers between messages) |
 | `/autocompact [on\|off\|N]` | Control auto-compact |
 | `/max-context [off\|N]` | Cap context tokens |
-| `/bell [all\|none\|EVENTS]` | Configure bell notifications |
+| `/bell` | Show current bell events and usage |
+| `/bell <events>` | Ring on ONLY these events (replaces current set) |
+| `/bell all` / `/bell none` | Enable every event / disable the bell |
+| `/bell +<event>` / `/bell -<event>` | Add or remove a single event from the current set |
 | `/queue [N\|send\|drop N\|clear]` | Manage queued prompts |
 
 ## Theme System

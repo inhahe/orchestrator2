@@ -630,6 +630,13 @@ html, body {
   padding: 2px 12px;
   font-style: italic;
   white-space: pre-wrap;
+  /* Use a monospace font so column-aligned output (e.g. /bell usage,
+     /help fallback) lines up.  Without this, system messages inherit
+     the body's sans-serif font and any internal column alignment is
+     lost. */
+  font-family: var(--font-mono);
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
 }
 .msg-system.warning { color: var(--system-warning); }
 .msg-system.error   { color: var(--system-error); }
@@ -1070,6 +1077,11 @@ html, body {
   font-size: 12px;
   white-space: pre-wrap;
   color: var(--text-dim);
+  /* Keep glyphs strictly one-cell so column-aligned tables in /help and
+     similar content stay aligned. Cascadia Code / Fira Code ligatures
+     subtly shift width on sequences like ->, |, ==, etc. */
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
 }
 
 /* ===================================================================

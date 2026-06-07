@@ -497,13 +497,15 @@ def parse_args(argv: list[str] | None = None) -> Config:
 
     # -- Bell --
     ap.add_argument(
-        "--bell-on",
+        "--bell", "--bell-on",
+        dest="bell_on",
         default=DEFAULT_BELL_EVENTS,
         metavar="EVENTS",
         help=(
-            "Comma-separated bell events. "
+            "Comma- or space-separated bell events to ring on. "
             f"Valid: {', '.join(sorted(BELL_EVENT_NAMES))}. "
-            "Shortcuts: all, none."
+            "Shortcuts: 'all' enables every event, 'none' disables the bell. "
+            "(--bell-on is accepted as an alias for backward compatibility.)"
         ),
     )
 

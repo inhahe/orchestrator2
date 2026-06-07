@@ -222,36 +222,44 @@ def get_command_completions() -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
-    lines = [
-        "Commands:",
-        "  /help                           this help",
-        "  /status  /cost                  session info, cost, usage",
-        "  /cwd [path]                     show or switch working directory",
-        "  /clear                          start a fresh session (wipes context)",
-        "  /cls                            clear the output area",
-        "  /history [N]                    replay session history (last N records)",
-        "  /interrupt  /i                  stop the current turn",
-        f"  /effort <level>                 one of {', '.join(EFFORT_CHOICES)}",
-        "  /thinking [on|off|toggle]       enable/disable extended thinking",
-        "  /model [name]                   show/set model; no arg lists available",
-        "  /connect                        reconnect to the SDK",
-        "  /resume [id|title]              resume a session (or open picker)",
-        "  /rename <name>                  set a custom session title",
-        "  /export [path]                  save conversation as markdown",
-        "  /btw <question>                 side question (separate context)",
-        "  /graphify [path] [flags]        build a knowledge graph (graphify)",
-        "  /collapse [on|off]              toggle collapsing of repeated blocks",
-        "  /collapse-threshold N           blocks shown before collapsing",
-        "  /autocompact [on|off|N]         auto-compact threshold",
-        "  /max-context [off|N]            cap context tokens",
-        "  /bell [all|none|EVENTS]         view/change bell events",
-        "  /queue [N|send|drop N|clear]    manage queued prompts",
-        "  /quit  /exit                    graceful exit",
-        "  /quit! /exit!                   force exit",
+    rows: list[tuple[str, str]] = [
+        ("/help",                        "this help"),
+        ("/status, /cost",               "session info, cost, usage"),
+        ("/cwd [path]",                  "show or switch working directory"),
+        ("/clear",                       "start a fresh session (wipes context)"),
+        ("/cls",                         "clear the output area"),
+        ("/history [N]",                 "replay session history (last N records)"),
+        ("/interrupt, /i",               "stop the current turn"),
+        ("/effort <level>",              f"one of {', '.join(EFFORT_CHOICES)}"),
+        ("/thinking [on|off|toggle]",    "enable/disable extended thinking"),
+        ("/model [name]",                "show/set model; no arg lists available"),
+        ("/connect",                     "reconnect to the SDK"),
+        ("/resume [id|title]",           "resume a session (or open picker)"),
+        ("/rename <name>",               "set a custom session title"),
+        ("/export [path]",               "save conversation as markdown"),
+        ("/btw <question>",              "side question (separate context)"),
+        ("/graphify [path] [flags]",     "build a knowledge graph (graphify)"),
+        ("/collapse [on|off]",           "toggle collapsing of repeated blocks"),
+        ("/collapse-threshold N",        "blocks shown before collapsing"),
+        ("/autocompact [on|off|N]",      "auto-compact threshold"),
+        ("/max-context [off|N]",         "cap context tokens"),
+        ("/bell ...",                    "ring on these events (see /bell for details)"),
+        ("/queue [N|send|drop N|clear]", "manage queued prompts"),
+        ("/quit, /exit",                 "graceful exit"),
+        ("/quit!, /exit!",                "force exit"),
+    ]
+    # Pick a uniform left-column width that accommodates the widest entry
+    # plus a small gutter.  Guarantees the description column is aligned
+    # in any monospace font (ligature-free or otherwise).
+    cmd_w = max(len(cmd) for cmd, _ in rows) + 2
+    lines = ["Commands:"]
+    for cmd, desc in rows:
+        lines.append(f"  {cmd:<{cmd_w}}{desc}")
+    lines.extend([
         "",
         "Input: Enter submits.  Shift+Enter for newline.  Ctrl+C: interrupt/clear.",
         "       Ctrl+Up/Down: prompt history.",
-    ]
+    ])
     return CommandResult(messages=[{
         "type": "modal",
         "title": "Help",
@@ -492,53 +500,114 @@ def _cmd_max_context(payload: str, state: State, config: Config) -> CommandResul
 
 
 def _cmd_bell(payload: str, state: State, _config: Config) -> CommandResult:
+    """View or change which events ring the bell.
+
+    Semantics:
+      /bell                   — show current settings + usage
+      /bell all               — ring on every event
+      /bell none              — disable the bell entirely
+      /bell <e1> <e2> ...     — REPLACE: ring on ONLY these events
+      /bell +<e>              — add to current set (preserve others)
+      /bell -<e>              — remove from current set
+      Mixed +/- tokens use modify mode; bare names in mixed mode add.
+    """
     payload = (payload or "").strip()
     avail = ", ".join(sorted(BELL_EVENT_NAMES))
-    if not payload:
+
+    def _usage_message() -> str:
         if not state.bell_events:
             current = "disabled (no events)"
         else:
             current = ", ".join(sorted(state.bell_events))
-        usage = (
-            f"bell currently rings on: {current}\n"
-            f"  available events: {avail}\n"
-            f"  usage:\n"
-            f"    /bell all                   ring on every event\n"
-            f"    /bell none                  disable the bell\n"
-            f"    /bell <event> [<event>...]  add events (e.g. /bell done waiting)\n"
-            f"    /bell <event>-off           remove an event (e.g. /bell done-off)"
-        )
-        return CommandResult(messages=[_msg(usage)])
+        usage_rows = [
+            ("/bell <event> [<event>...]", "ring on ONLY these events (replaces current set)"),
+            ("/bell all",                  "ring on every event"),
+            ("/bell none",                 "disable the bell entirely"),
+            ("/bell +<event> ...",         "add events to the current set"),
+            ("/bell -<event> ...",         "remove events from the current set"),
+        ]
+        example_rows = [
+            ("/bell done",         "-- only 'done' rings, all others silenced"),
+            ("/bell done waiting", "-- only these two ring, all others silenced"),
+            ("/bell +done",        "-- add 'done' to whatever's already enabled"),
+            ("/bell -waiting",     "-- turn off 'waiting' only, leave the rest alone"),
+        ]
+        cmd_w = max(len(c) for c, _ in (usage_rows + example_rows)) + 2
+        lines = [
+            f"bell currently rings on: {current}",
+            f"  available events: {avail}",
+            "  usage:",
+        ]
+        for cmd, desc in usage_rows:
+            lines.append(f"    {cmd:<{cmd_w}}{desc}")
+        lines.append("  examples:")
+        for cmd, desc in example_rows:
+            lines.append(f"    {cmd:<{cmd_w}}{desc}")
+        return "\n".join(lines)
+
+    if not payload:
+        return CommandResult(messages=[_msg(_usage_message())])
 
     before = set(state.bell_events)
-    result = _parse_bell_spec(payload)
-    if result == "all":
+    invalid: list[str] = []
+
+    p = payload.lower()
+    if p in ("all", "*"):
         state.bell_events = set(BELL_EVENT_NAMES)
-    elif result == "none":
+    elif p in ("none", "off", "disable"):
         state.bell_events = set()
     else:
-        assert isinstance(result, dict)
-        valid = {k: v for k, v in result.items() if k in BELL_EVENT_NAMES}
-        invalid = sorted(k for k in result if k not in BELL_EVENT_NAMES)
-        if not valid:
-            invalid_str = ", ".join(invalid) if invalid else f"'{payload}'"
-            return CommandResult(messages=[_msg(
-                f"bell: unknown event(s): {invalid_str}\n"
-                f"  available: {avail}",
-                level="error",
-            )])
-        for name, enable in valid.items():
-            if enable:
-                state.bell_events.add(name)
-            else:
-                state.bell_events.discard(name)
+        # Tokenize, accepting both commas and whitespace as separators.
+        tokens = [t for t in p.replace(",", " ").split() if t]
+        has_mod_prefix = any(t.startswith(("+", "-")) for t in tokens)
+
+        if has_mod_prefix:
+            # MODIFY mode — each token operates on the current set.
+            for tok in tokens:
+                if tok.startswith("+"):
+                    name = tok[1:]
+                    op = "add"
+                elif tok.startswith("-"):
+                    name = tok[1:]
+                    op = "remove"
+                else:
+                    # Bare name in modify mode = add.
+                    name = tok
+                    op = "add"
+                if not name:
+                    invalid.append(tok)
+                    continue
+                if name not in BELL_EVENT_NAMES:
+                    invalid.append(tok)
+                    continue
+                if op == "add":
+                    state.bell_events.add(name)
+                else:
+                    state.bell_events.discard(name)
+        else:
+            # REPLACE mode — only the listed events stay on.
+            new_set: set[str] = set()
+            for tok in tokens:
+                if tok in BELL_EVENT_NAMES:
+                    new_set.add(tok)
+                else:
+                    invalid.append(tok)
+            if not new_set and invalid:
+                return CommandResult(messages=[_msg(
+                    f"bell: no valid events in '{payload}'\n"
+                    f"  unknown: {', '.join(invalid)}\n"
+                    f"  available: {avail}\n"
+                    f"  (use /bell none to disable the bell entirely)",
+                    level="error",
+                )])
+            state.bell_events = new_set
 
     after = set(state.bell_events)
     added = sorted(after - before)
     removed = sorted(before - after)
-    current_str = ", ".join(sorted(after)) or "(none — bell disabled)"
+    current_str = ", ".join(sorted(after)) or "(none -- bell disabled)"
 
-    parts = []
+    parts: list[str] = []
     if added:
         parts.append(f"added: {', '.join(added)}")
     if removed:
@@ -546,9 +615,11 @@ def _cmd_bell(payload: str, state: State, _config: Config) -> CommandResult:
     if not parts:
         parts.append("no change")
     summary = "; ".join(parts)
-    return CommandResult(messages=[_msg(
-        f"bell {summary}\n  bell now rings on: {current_str}"
-    )])
+
+    msg_lines = [f"bell {summary}", f"  bell now rings on: {current_str}"]
+    if invalid:
+        msg_lines.append(f"  ignored unknown: {', '.join(invalid)}")
+    return CommandResult(messages=[_msg("\n".join(msg_lines))])
 
 
 def _cmd_queue(payload: str, state: State, _config: Config) -> CommandResult:
