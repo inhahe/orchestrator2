@@ -1220,6 +1220,10 @@ def _setup_file_logging(log_path: str, fmt: str) -> None:
     - Installs ``sys.excepthook`` so uncaught exceptions are logged to
       the file before the process dies.
     - Registers an ``atexit`` handler that logs a clean-shutdown line.
+
+    The caller has already stamped ``%(process)d`` into the format
+    string in ``main`` so records from concurrent instances writing
+    to the same file can be disambiguated by PID.
     """
     path = Path(log_path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1229,7 +1233,7 @@ def _setup_file_logging(log_path: str, fmt: str) -> None:
     logging.getLogger().addHandler(handler)
 
     _flog = logging.getLogger("orchestrator2")
-    _flog.info("--- log file opened: %s (pid %d) ---", path, os.getpid())
+    _flog.info("--- log file opened: %s ---", path)
 
     # Log uncaught exceptions so they survive a closed terminal.
     _original_excepthook = sys.excepthook
@@ -1257,11 +1261,18 @@ def main() -> None:
     if config.config_dir:
         os.environ["CLAUDE_CONFIG_DIR"] = str(Path(config.config_dir).resolve())
 
-    log_fmt = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
-    logging.basicConfig(level=logging.INFO, format=log_fmt)
+    # Console: keep the short, PID-less format.  File: prefix every
+    # record with the PID so concurrent orchestrator2 instances
+    # writing to the same log file can be told apart.  Without the
+    # PID, interleaved records from two processes are effectively
+    # indistinguishable and bridge / dispatcher / turn diagnosis
+    # becomes nearly impossible.
+    console_fmt = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+    file_fmt = "%(asctime)s [pid %(process)d] [%(name)s] %(levelname)s: %(message)s"
+    logging.basicConfig(level=logging.INFO, format=console_fmt)
 
     if config.log_file:
-        _setup_file_logging(config.log_file, log_fmt)
+        _setup_file_logging(config.log_file, file_fmt)
 
     # --detach: validate everything here (errors visible in terminal),
     # then respawn headless and exit.
