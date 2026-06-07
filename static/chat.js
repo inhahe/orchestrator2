@@ -1093,22 +1093,54 @@ const Chat = (() => {
       }
 
       // --- Bullet list ---
+      // Spans blank lines: a blank line is only a list break if the
+      // next non-blank line isn't another bullet.  Without this, lists
+      // Claude formats with blank lines between items render as a run
+      // of single-item lists.
       if (/^[\s]*[-*+]\s/.test(line)) {
         const items = [];
-        while (i < lines.length && /^[\s]*[-*+]\s/.test(lines[i])) {
-          items.push(_inlineMd(lines[i].replace(/^[\s]*[-*+]\s/, '')));
-          i++;
+        while (i < lines.length) {
+          if (/^[\s]*[-*+]\s/.test(lines[i])) {
+            items.push(_inlineMd(lines[i].replace(/^[\s]*[-*+]\s/, '')));
+            i++;
+          } else if (lines[i].trim() === '') {
+            // Peek for another bullet after the blank run.
+            let j = i + 1;
+            while (j < lines.length && lines[j].trim() === '') j++;
+            if (j < lines.length && /^[\s]*[-*+]\s/.test(lines[j])) {
+              i = j;
+            } else {
+              break;
+            }
+          } else {
+            break;
+          }
         }
         pushBlock('<ul class="md-list">' + items.map(t => `<li>${t}</li>`).join('') + '</ul>');
         continue;
       }
 
       // --- Numbered list ---
+      // Same blank-line-tolerant scan as bullets.  Without this, each
+      // item ended up in its own <ol>, which restarts the counter — so
+      // every item rendered as "1.".
       if (/^[\s]*\d+[.)]\s/.test(line)) {
         const items = [];
-        while (i < lines.length && /^[\s]*\d+[.)]\s/.test(lines[i])) {
-          items.push(_inlineMd(lines[i].replace(/^[\s]*\d+[.)]\s/, '')));
-          i++;
+        while (i < lines.length) {
+          if (/^[\s]*\d+[.)]\s/.test(lines[i])) {
+            items.push(_inlineMd(lines[i].replace(/^[\s]*\d+[.)]\s/, '')));
+            i++;
+          } else if (lines[i].trim() === '') {
+            let j = i + 1;
+            while (j < lines.length && lines[j].trim() === '') j++;
+            if (j < lines.length && /^[\s]*\d+[.)]\s/.test(lines[j])) {
+              i = j;
+            } else {
+              break;
+            }
+          } else {
+            break;
+          }
         }
         pushBlock('<ol class="md-list">' + items.map(t => `<li>${t}</li>`).join('') + '</ol>');
         continue;
