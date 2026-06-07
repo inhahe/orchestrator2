@@ -382,6 +382,7 @@ const Chat = (() => {
       case 'bg_complete':     _addBgComplete(msg); break;
       case 'clear_screen':    clear(); break;
       case 'command_data':    _addCommandData(msg); break;
+      case 'modal':           _openModal(msg); break;
       case 'bell':            _playBell(); break;
       case 'history':         _replayHistory(msg.messages); break;
       default:
@@ -814,6 +815,19 @@ const Chat = (() => {
 
     elMessages.appendChild(el);
     _scrollToBottom();
+  }
+
+  // --- Modal (opened by backend immediate commands like /help) ---
+
+  function _openModal(msg) {
+    const title = msg.title || 'Detail';
+    const content = msg.content || '';
+    if (window.App && typeof App.openModal === 'function') {
+      App.openModal(title, content);
+    } else {
+      // Fallback: render inline as a system message so it isn't lost.
+      _addSystemMsg({ subtype: 'info', data: { message: content } });
+    }
   }
 
   // --- Command data (from immediate commands) ---

@@ -629,6 +629,7 @@ html, body {
   color: var(--system-text);
   padding: 2px 12px;
   font-style: italic;
+  white-space: pre-wrap;
 }
 .msg-system.warning { color: var(--system-warning); }
 .msg-system.error   { color: var(--system-error); }

@@ -252,7 +252,11 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         "Input: Enter submits.  Shift+Enter for newline.  Ctrl+C: interrupt/clear.",
         "       Ctrl+Up/Down: prompt history.",
     ]
-    return CommandResult(messages=[_msg("\n".join(lines))])
+    return CommandResult(messages=[{
+        "type": "modal",
+        "title": "Help",
+        "content": "\n".join(lines),
+    }])
 
 
 def _cmd_status(_payload: str, state: State, config: Config) -> CommandResult:
@@ -489,15 +493,24 @@ def _cmd_max_context(payload: str, state: State, config: Config) -> CommandResul
 
 def _cmd_bell(payload: str, state: State, _config: Config) -> CommandResult:
     payload = (payload or "").strip()
+    avail = ", ".join(sorted(BELL_EVENT_NAMES))
     if not payload:
         if not state.bell_events:
-            events_str = "disabled (no events)"
+            current = "disabled (no events)"
         else:
-            events_str = ",".join(sorted(state.bell_events))
-        avail = ", ".join(sorted(BELL_EVENT_NAMES))
-        return CommandResult(messages=[_msg(
-            f"bell: {events_str}\n  available: {avail}"
-        )])
+            current = ", ".join(sorted(state.bell_events))
+        usage = (
+            f"bell currently rings on: {current}\n"
+            f"  available events: {avail}\n"
+            f"  usage:\n"
+            f"    /bell all                   ring on every event\n"
+            f"    /bell none                  disable the bell\n"
+            f"    /bell <event> [<event>...]  add events (e.g. /bell done waiting)\n"
+            f"    /bell <event>-off           remove an event (e.g. /bell done-off)"
+        )
+        return CommandResult(messages=[_msg(usage)])
+
+    before = set(state.bell_events)
     result = _parse_bell_spec(payload)
     if result == "all":
         state.bell_events = set(BELL_EVENT_NAMES)
@@ -505,17 +518,37 @@ def _cmd_bell(payload: str, state: State, _config: Config) -> CommandResult:
         state.bell_events = set()
     else:
         assert isinstance(result, dict)
-        if not result:
+        valid = {k: v for k, v in result.items() if k in BELL_EVENT_NAMES}
+        invalid = sorted(k for k in result if k not in BELL_EVENT_NAMES)
+        if not valid:
+            invalid_str = ", ".join(invalid) if invalid else f"'{payload}'"
             return CommandResult(messages=[_msg(
-                f"No valid events in '{payload}'", level="error",
+                f"bell: unknown event(s): {invalid_str}\n"
+                f"  available: {avail}",
+                level="error",
             )])
-        for name, enable in result.items():
+        for name, enable in valid.items():
             if enable:
                 state.bell_events.add(name)
             else:
                 state.bell_events.discard(name)
-    events_str = ",".join(sorted(state.bell_events)) or "(none)"
-    return CommandResult(messages=[_msg(f"bell: {events_str}")])
+
+    after = set(state.bell_events)
+    added = sorted(after - before)
+    removed = sorted(before - after)
+    current_str = ", ".join(sorted(after)) or "(none — bell disabled)"
+
+    parts = []
+    if added:
+        parts.append(f"added: {', '.join(added)}")
+    if removed:
+        parts.append(f"removed: {', '.join(removed)}")
+    if not parts:
+        parts.append("no change")
+    summary = "; ".join(parts)
+    return CommandResult(messages=[_msg(
+        f"bell {summary}\n  bell now rings on: {current_str}"
+    )])
 
 
 def _cmd_queue(payload: str, state: State, _config: Config) -> CommandResult:
