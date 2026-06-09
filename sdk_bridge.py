@@ -720,6 +720,20 @@ class SDKBridge:
         except Exception as exc:
             log.warning("ghost-turn status_update broadcast failed: %r", exc)
 
+        # If the user queued a prompt while this ghost turn was running,
+        # server.py saw state.busy == True and routed it to
+        # state.queued_prompts rather than the event_queue.  The worker
+        # loop is parked in _await_next_prompt() blocked on event_queue
+        # and has no idea a prompt is waiting, so it would sit unsent
+        # forever.  Poke the worker with a queue-edit-done wakeup (the
+        # same path used after a queue edit) so it pops and sends the
+        # queued prompt.  Skip if the first item is being edited.
+        if state.queued_prompts and state.queue_editing_index != 0:
+            try:
+                self.event_queue.put_nowait(("wakeup", "queue-edit-done"))
+            except Exception as exc:
+                log.warning("ghost-turn queue poke failed: %r", exc)
+
     # ------------------------------------------------------------------
     # System message handling (shared by turn + async paths)
     # ------------------------------------------------------------------

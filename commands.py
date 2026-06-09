@@ -16,10 +16,10 @@ from typing import Any
 from config import (
     BELL_EVENT_NAMES,
     EFFORT_CHOICES,
-    KNOWN_MODELS,
     SLASH_COMMANDS,
     Config,
     _parse_bell_spec,
+    get_known_models,
     parse_bell_events,
 )
 from state import (
@@ -706,6 +706,6 @@ def _cmd_model_show(_payload: str, state: State, _config: Config) -> CommandResu
         current = f"{active} (CLI-picked)"
     else:
         current = "(auto — no AssistantMessage received yet)"
-    models = [{"id": m, "description": d} for m, d in KNOWN_MODELS]
+    models = [{"id": m, "description": d} for m, d in get_known_models()]
     data = {"current": current, "models": models}
     return CommandResult(messages=[_data_msg(data, label="model")])

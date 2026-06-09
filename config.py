@@ -9,6 +9,9 @@ in state.py.
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -54,7 +57,9 @@ SLASH_COMMANDS = [
     "/quit!", "/exit!",
 ]
 
-# Known models — (id, description).  Used in --help and /model.
+# Fallback model list — (id, description).  Used only when the live list
+# from the Anthropic API can't be fetched (see fetch_available_models).
+# This goes stale as new models ship, so the live list is preferred.
 KNOWN_MODELS = [
     ("claude-opus-4-6", "Opus 4.6 — 1M context, max capability"),
     ("claude-sonnet-4-6", "Sonnet 4.6 — 200k context, fast"),
@@ -147,6 +152,103 @@ def default_compact_at(model: str | None) -> int:
     if window is not None and window >= 1_000_000:
         return DEFAULT_COMPACT_THRESHOLD_1M
     return DEFAULT_COMPACT_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# Live model list (Anthropic /v1/models) with hardcoded fallback
+# ---------------------------------------------------------------------------
+
+# Cache of the live model list.  /model runs on the event loop, so it must
+# never block on a network call — it reads this cache (warmed at startup by
+# fetch_available_models) via get_known_models().  None until first fetch.
+_model_cache: list[tuple[str, str]] | None = None
+
+
+def _read_oauth_token() -> str | None:
+    """Read the Claude Code OAuth access token from credentials, if present."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    path = Path(base if base else Path.home() / ".claude") / ".credentials.json"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if isinstance(oauth, dict):
+        tok = oauth.get("accessToken")
+        if isinstance(tok, str) and tok:
+            return tok
+    return None
+
+
+def _fmt_window(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n // 1_000_000}M"
+    if n >= 1000:
+        return f"{n // 1000}k"
+    return str(n)
+
+
+def fetch_available_models(timeout: float = 6.0) -> list[tuple[str, str]] | None:
+    """Fetch the live model list from the Anthropic API (blocking).
+
+    Returns a list of ``(model_id, description)`` tuples in the order the API
+    returns them (newest first), or ``None`` when the list can't be fetched
+    (no credentials, network error, unexpected response).  On success the
+    result is cached for later non-blocking reads via ``get_known_models``.
+
+    Auth uses ``ANTHROPIC_API_KEY`` when set, otherwise the Claude Code OAuth
+    token (with the oauth beta header the subscription API expects).
+
+    This blocks on the network, so off the event loop only (startup warm or
+    the synchronous --list-models path).
+    """
+    global _model_cache
+    headers = {"anthropic-version": "2023-06-01"}
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if api_key:
+        headers["x-api-key"] = api_key
+    else:
+        token = _read_oauth_token()
+        if not token:
+            return None
+        headers["Authorization"] = f"Bearer {token}"
+        headers["anthropic-beta"] = "oauth-2025-04-20"
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/models?limit=100", headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.load(resp)
+    except Exception:
+        return None
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list):
+        return None
+    out: list[tuple[str, str]] = []
+    for m in data:
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id")
+        if not isinstance(mid, str) or not mid:
+            continue
+        name = m.get("display_name") or mid
+        window = model_context_window(mid)
+        desc = f"{name} — {_fmt_window(window)} context" if window else str(name)
+        out.append((mid, desc))
+    if not out:
+        return None
+    _model_cache = out
+    return out
+
+
+def get_known_models() -> list[tuple[str, str]]:
+    """Best available model list for display — non-blocking, event-loop safe.
+
+    Returns the cached live list when present, otherwise the hardcoded
+    ``KNOWN_MODELS`` fallback.
+    """
+    return _model_cache if _model_cache else KNOWN_MODELS
 
 
 # ---------------------------------------------------------------------------
@@ -341,11 +443,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
             "effort parameter; the model uses its own default."
         ),
     )
-    _model_names = ", ".join(m for m, _ in KNOWN_MODELS)
     ap.add_argument(
         "--model",
         default=None,
-        help=f"Model to use. Available: {_model_names}.",
+        help="Model id to use (e.g. claude-opus-4-8). "
+             "Run --list-models for the current list.",
     )
     ap.add_argument(
         "--list-models",
@@ -587,11 +689,13 @@ def parse_args(argv: list[str] | None = None) -> Config:
 
     args = ap.parse_args(argv)
 
-    # --list-models: print available models and exit.
+    # --list-models: print available models and exit.  Prefer the live list
+    # from the API; fall back to the hardcoded set if it can't be fetched.
     if args.list_models:
+        models = fetch_available_models() or KNOWN_MODELS
         print("Available models:")
-        for model_id, desc in KNOWN_MODELS:
-            print(f"  {model_id:25s} {desc}")
+        for model_id, desc in models:
+            print(f"  {model_id:28s} {desc}")
         raise SystemExit(0)
 
     # --show-tool-everything is a convenience that flips both detail flags.

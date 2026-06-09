@@ -391,6 +391,14 @@ const Panels = (() => {
       item.style.flexWrap = 'wrap';
       item.appendChild(textEl);
 
+      // This optimistic DOM has no action buttons — they're restored by the
+      // full re-render triggered by the server's queue_update broadcast.  But
+      // _renderQueue short-circuits when the queue signature is unchanged
+      // (e.g. saving without altering the text), which would leave this item
+      // permanently button-less.  Invalidate the cached signature so the next
+      // render always rebuilds and brings the buttons back.
+      _lastQueueSig = null;
+
       // Animated dots indicator while the edit API call is in flight.
       const indicator = document.createElement('div');
       indicator.className = 'queue-saving-indicator';

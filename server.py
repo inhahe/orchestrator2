@@ -46,6 +46,7 @@ from config import (
     Config,
     DEFAULT_PORT,
     _PICKER_SENTINEL,
+    fetch_available_models,
     parse_args,
 )
 from state import (
@@ -221,6 +222,13 @@ async def lifespan(app: FastAPI):
     )
 
     _ticker_task = asyncio.create_task(_status_ticker(), name="status-ticker")
+
+    # Warm the live model-list cache off the event loop so /model (which runs
+    # on the loop) can read it without blocking on a network call.  Best
+    # effort — falls back to the hardcoded list if this fails.
+    asyncio.create_task(
+        asyncio.to_thread(fetch_available_models), name="warm-model-cache",
+    )
 
     # Seed session_id early so the browser gets history on first connect
     # (before the SDK's init message arrives).  Same approach as the TUI

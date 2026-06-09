@@ -826,31 +826,8 @@ html, body {
   color: var(--diff-changed-char);
 }
 
-/* Consecutive tool-block collapsing */
-.tool-collapse-group.collapsed { display: none; }
-.tool-collapse-toggle {
-  padding: 6px 10px;
-  font-size: 12px;
-  font-family: var(--font-mono);
-  font-weight: 600;
-  color: var(--tool-name);
-  cursor: pointer;
-  border-radius: var(--radius);
-  margin: 2px 0;
-  background: var(--bg-tool);
-  border: 1px solid var(--border);
-  user-select: none;
-}
-.tool-collapse-toggle:hover {
-  background: var(--bg-tool-hover);
-}
-
 /* Activity-group collapsing (wraps all non-text items between messages) */
 .activity-group.collapsed .activity-group-content { display: none; }
-/* When an activity group is expanded, flatten inner per-type collapse
-   groups so the user doesn't face a second level of expand/collapse. */
-.activity-group:not(.collapsed) .tool-collapse-group.collapsed { display: block; }
-.activity-group:not(.collapsed) .tool-collapse-toggle { display: none; }
 .activity-group-toggle {
   padding: 6px 10px;
   font-size: 12px;

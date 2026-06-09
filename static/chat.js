@@ -18,6 +18,7 @@ const Chat = (() => {
   // Track the current streaming assistant text element.
   let _streamingEl = null;
   let _streamingText = '';
+  let _streamRenderRaf = null;   // pending requestAnimationFrame for live md render
 
   // Map tool_use_id → DOM element for pairing results.
   const _toolBlocks = new Map();
@@ -28,146 +29,21 @@ const Chat = (() => {
   let _replayInProgress = false;
   let _pendingMessages = [];
 
-  // --- Tool-block collapsing ---
-  // Track consecutive tool blocks.  When more than _collapseThreshold
-  // appear in a row (without intervening assistant text or user messages),
-  // ALL of them are collapsed behind a "show N tools" toggle.
-  let _collapseTools = true;          // toggled via /collapse or checkbox
-  let _collapseThreshold = 1;         // collapse immediately (all wrapped by activity groups)
-  let _consecutiveToolCount = 0;
-  let _toolGroupContainer = null;  // wrapper div for collapsible group
-  let _toolGroupToggle = null;     // the "show N more" element
-  let _toolRunElements = [];       // tool elements appended before threshold
-
-  function _resetToolRun() {
-    _consecutiveToolCount = 0;
-    _toolGroupContainer = null;
-    _toolGroupToggle = null;
-    _toolRunElements = [];
-  }
-
-  // --- Thinking-block collapsing ---
-  // Same pattern as tool collapsing: consecutive thinking blocks beyond
-  // _collapseThreshold are grouped behind a toggle.
-  let _consecutiveThinkingCount = 0;
-  let _thinkingGroupContainer = null;
-  let _thinkingGroupToggle = null;
-  let _thinkingRunElements = [];
-
-  function _resetThinkingRun() {
-    _consecutiveThinkingCount = 0;
-    _thinkingGroupContainer = null;
-    _thinkingGroupToggle = null;
-    _thinkingRunElements = [];
-  }
+  // --- Tool / thinking block collapsing ---
+  // Tool-use and thinking blocks are shown individually as they stream in.
+  // A run of them is wrapped into a single collapsed activity-group only
+  // when the next boundary arrives — Claude text, a user message, or the
+  // turn end (see _collapseActivity).  There is deliberately no eager
+  // "collapse as they accumulate" path: that produced a second, competing
+  // collapsed bar that grew while tools were still streaming.
+  let _collapseTools = true;          // toggled via the "collapse activity" checkbox
 
   function _trackToolBlock(el) {
-    if (!_collapseTools) {
-      elMessages.appendChild(el);
-      return;
-    }
-    _consecutiveToolCount++;
-
-    if (_consecutiveToolCount <= _collapseThreshold) {
-      // Below threshold: append normally but track the elements.
-      _toolRunElements.push(el);
-      elMessages.appendChild(el);
-      return;
-    }
-
-    // Hit the threshold: create the collapsible group and retroactively
-    // move ALL prior tool blocks from this run into it.
-    if (!_toolGroupContainer) {
-      _toolGroupContainer = document.createElement('div');
-      _toolGroupContainer.className = 'tool-collapse-group collapsed';
-
-      _toolGroupToggle = document.createElement('div');
-      _toolGroupToggle.className = 'tool-collapse-toggle';
-
-      // Capture references in closure — _resetToolRun() nulls the
-      // module-level vars before the user ever clicks.
-      const container = _toolGroupContainer;
-      const toggle = _toolGroupToggle;
-      toggle.addEventListener('click', () => {
-        container.classList.toggle('collapsed');
-        if (container.classList.contains('collapsed')) {
-          const n = container.children.length;
-          toggle.textContent = `\u25B8 show ${n} tool${n !== 1 ? 's' : ''}`;
-          _scrollToBottom();
-        } else {
-          toggle.textContent = `\u25BE collapse`;
-          // Scroll the expanded group into view.
-          toggle.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        }
-      });
-
-      // Insert toggle before the first tool element of this run,
-      // then move all prior elements into the container.
-      const firstEl = _toolRunElements[0];
-      firstEl.parentNode.insertBefore(_toolGroupToggle, firstEl);
-      for (const prev of _toolRunElements) {
-        _toolGroupContainer.appendChild(prev);
-      }
-      _toolRunElements = [];
-      elMessages.appendChild(_toolGroupContainer);
-    }
-
-    _toolGroupContainer.appendChild(el);
-    const n = _toolGroupContainer.children.length;
-    if (_toolGroupContainer.classList.contains('collapsed')) {
-      _toolGroupToggle.textContent = `\u25B8 show ${n} tool${n !== 1 ? 's' : ''}`;
-    }
-    // If expanded, leave the toggle text as "▾ collapse".
+    elMessages.appendChild(el);
   }
 
   function _trackThinkingBlock(el) {
-    if (!_collapseTools) {
-      elMessages.appendChild(el);
-      return;
-    }
-    _consecutiveThinkingCount++;
-
-    if (_consecutiveThinkingCount <= _collapseThreshold) {
-      _thinkingRunElements.push(el);
-      elMessages.appendChild(el);
-      return;
-    }
-
-    if (!_thinkingGroupContainer) {
-      _thinkingGroupContainer = document.createElement('div');
-      _thinkingGroupContainer.className = 'tool-collapse-group collapsed';
-
-      _thinkingGroupToggle = document.createElement('div');
-      _thinkingGroupToggle.className = 'tool-collapse-toggle';
-
-      const container = _thinkingGroupContainer;
-      const toggle = _thinkingGroupToggle;
-      toggle.addEventListener('click', () => {
-        container.classList.toggle('collapsed');
-        if (container.classList.contains('collapsed')) {
-          const n = container.children.length;
-          toggle.textContent = `\u25B8 show ${n} thinking block${n !== 1 ? 's' : ''}`;
-          _scrollToBottom();
-        } else {
-          toggle.textContent = `\u25BE collapse`;
-          toggle.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        }
-      });
-
-      const firstEl = _thinkingRunElements[0];
-      firstEl.parentNode.insertBefore(_thinkingGroupToggle, firstEl);
-      for (const prev of _thinkingRunElements) {
-        _thinkingGroupContainer.appendChild(prev);
-      }
-      _thinkingRunElements = [];
-      elMessages.appendChild(_thinkingGroupContainer);
-    }
-
-    _thinkingGroupContainer.appendChild(el);
-    const n = _thinkingGroupContainer.children.length;
-    if (_thinkingGroupContainer.classList.contains('collapsed')) {
-      _thinkingGroupToggle.textContent = `\u25B8 show ${n} thinking block${n !== 1 ? 's' : ''}`;
-    }
+    elMessages.appendChild(el);
   }
 
   // --- Activity-group collapsing ---
@@ -271,16 +147,10 @@ const Chat = (() => {
     // counting them.
     let tools = 0, thinking = 0, system = 0;
     for (const el of elements) {
-      if (el.classList.contains('tool-collapse-toggle')) continue;
-      if (el.classList.contains('tool-collapse-group')) {
-        for (const child of el.children) {
-          if (child.classList.contains('msg-thinking')) thinking++;
-          else if (child.classList.contains('msg-tool')) tools++;
-        }
-      } else if (el.classList.contains('msg-tool'))     tools++;
-        else if (el.classList.contains('msg-thinking'))  thinking++;
-        else if (el.classList.contains('msg-system') ||
-                 el.classList.contains('msg-command'))    system++;
+      if (el.classList.contains('msg-tool'))          tools++;
+      else if (el.classList.contains('msg-thinking'))  thinking++;
+      else if (el.classList.contains('msg-system') ||
+               el.classList.contains('msg-command'))    system++;
     }
     return { tools, thinking, system };
   }
@@ -295,6 +165,8 @@ const Chat = (() => {
 
   function init() {
     elMessages = document.getElementById('messages');
+
+    _initAudioUnlock();
 
     // Auto-scroll tracking: only scroll if user is near bottom.
     // Throttled to avoid layout thrashing on every pixel of scroll.
@@ -311,12 +183,14 @@ const Chat = (() => {
   }
 
   function clear() {
+    if (_streamRenderRaf != null) {
+      cancelAnimationFrame(_streamRenderRaf);
+      _streamRenderRaf = null;
+    }
     elMessages.innerHTML = '';
     _streamingEl = null;
     _streamingText = '';
     _toolBlocks.clear();
-    _resetToolRun();
-    _resetThinkingRun();
   }
 
   // --- Scrolling ---
@@ -396,8 +270,6 @@ const Chat = (() => {
   function _addUserMessage(content) {
     _flushStreaming();
     _collapseActivity();
-    _resetToolRun();
-    _resetThinkingRun();
     const el = document.createElement('div');
     el.className = 'msg msg-user';
     el.innerHTML = `<div class="msg-label">You</div>
@@ -422,8 +294,11 @@ const Chat = (() => {
     const text = (msg && msg.content) || '';
     if (!text) return;
     _flushStreaming();
-    _resetToolRun();
-    _resetThinkingRun();
+    // Collapse any activity that ran before this injected prompt.  The
+    // injected marker is a boundary in _collapseActivity, so a later
+    // message won't reach back past it — without collapsing here, tools
+    // that preceded the injection would be stranded uncollapsed.
+    _collapseActivity();
 
     const lines = text.split('\n');
     const nLines = lines.length;
@@ -469,21 +344,22 @@ const Chat = (() => {
   // --- Assistant text (streaming) ---
 
   function _addAssistantText(msg) {
-    _resetToolRun();
-    _resetThinkingRun();
     if (msg.delta) {
-      // Streaming delta — append to current element.
-      // Use plain text during streaming (fast), render markdown on flush.
+      // Streaming delta — append to current element and render markdown
+      // live (debounced via rAF) so bold/italic/etc. show formatted as the
+      // text arrives instead of appearing as raw "**text**" until the next
+      // scroll event flushes it.  _md() leaves any unclosed marker raw until
+      // its closer arrives, so partial markdown renders gracefully.
       if (!_streamingEl) {
         _collapseActivity();
         _streamingEl = document.createElement('div');
         _streamingEl.className = 'msg msg-assistant';
-        _streamingEl.innerHTML = '<div class="msg-content"></div>';
+        _streamingEl.innerHTML = '<div class="msg-content md-rendered"></div>';
         elMessages.appendChild(_streamingEl);
         _streamingText = '';
       }
       _streamingText += msg.content;
-      _streamingEl.querySelector('.msg-content').textContent = _streamingText;
+      _scheduleStreamRender();
     } else {
       // Non-delta: full text block (history or async).
       _flushStreaming();
@@ -497,13 +373,30 @@ const Chat = (() => {
     _scrollToBottom();
   }
 
+  // Debounced live markdown render for the in-flight streaming element.
+  // Coalesces bursts of deltas arriving in the same frame into one render.
+  function _scheduleStreamRender() {
+    if (_streamRenderRaf != null) return;
+    _streamRenderRaf = requestAnimationFrame(() => {
+      _streamRenderRaf = null;
+      if (!_streamingEl) return;
+      const content = _streamingEl.querySelector('.msg-content');
+      if (content) content.innerHTML = _md(_streamingText);
+      _scrollToBottom();
+    });
+  }
+
   function _flushStreaming() {
+    if (_streamRenderRaf != null) {
+      cancelAnimationFrame(_streamRenderRaf);
+      _streamRenderRaf = null;
+    }
     if (_streamingEl) {
       if (!_streamingText.trim()) {
         // Remove empty streaming element.
         _streamingEl.remove();
       } else {
-        // Re-render with markdown now that the full text is available.
+        // Final markdown render now that the full text is available.
         const content = _streamingEl.querySelector('.msg-content');
         if (content) {
           content.innerHTML = _md(_streamingText);
@@ -519,7 +412,6 @@ const Chat = (() => {
 
   function _addToolUse(msg) {
     _flushStreaming();
-    _resetThinkingRun();
     const el = document.createElement('div');
     el.className = 'msg msg-tool';
     el.dataset.toolUseId = msg.tool_use_id;
@@ -616,7 +508,6 @@ const Chat = (() => {
 
   function _addThinking(msg) {
     _flushStreaming();
-    _resetToolRun();
     const text = msg.content || '';
     const lines = text.split('\n');
     const nLines = lines.length;
@@ -768,8 +659,6 @@ const Chat = (() => {
 
   function _addTurnEnd(msg) {
     _flushStreaming();
-    _resetToolRun();
-    _resetThinkingRun();
     // Collapse any pending activity (tools, thinking) accumulated during
     // the turn before appending the turn-end marker.  Without this, a
     // turn that ends with tool calls (no trailing assistant text) leaves
@@ -899,9 +788,6 @@ const Chat = (() => {
         endSep.textContent = '--- End of history ---';
         elMessages.appendChild(endSep);
 
-        _resetToolRun();
-        _resetThinkingRun();
-
         // Flush messages that arrived during replay.
         _replayInProgress = false;
         const pending = _pendingMessages;
@@ -919,18 +805,57 @@ const Chat = (() => {
 
   // --- Bell ---
 
+  // Shared AudioContext.  Browsers' autoplay policy starts an AudioContext
+  // in the "suspended" state until it is resumed inside a user gesture, so a
+  // context created lazily inside _playBell() (which fires from a WS message,
+  // not a user gesture) stays silent.  We create one shared context and
+  // resume it on the first real user interaction so later bells can play.
+  let _audioCtx = null;
+
+  function _getAudioCtx() {
+    if (!_audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      try { _audioCtx = new AC(); } catch (e) { return null; }
+    }
+    return _audioCtx;
+  }
+
+  function _initAudioUnlock() {
+    const unlock = () => {
+      const ctx = _getAudioCtx();
+      if (ctx && ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+    };
+    // { once: true } per event so listeners clean themselves up after the
+    // first gesture of each type.
+    window.addEventListener('pointerdown', unlock, { once: true });
+    window.addEventListener('keydown', unlock, { once: true });
+  }
+
   function _playBell() {
     // Simple audio bell if available, otherwise just flash the title.
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.frequency.value = 800;
-      gain.gain.value = 0.1;
-      osc.start();
-      osc.stop(ctx.currentTime + 0.15);
+      const ctx = _getAudioCtx();
+      if (ctx) {
+        // Resume if the autoplay policy left it suspended; play once ready.
+        const fire = () => {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.frequency.value = 800;
+          gain.gain.value = 0.1;
+          osc.start();
+          osc.stop(ctx.currentTime + 0.15);
+        };
+        if (ctx.state === 'suspended') {
+          ctx.resume().then(fire).catch(() => {});
+        } else {
+          fire();
+        }
+      }
     } catch (e) { /* ignore */ }
 
     // Flash document title.
@@ -1243,13 +1168,11 @@ const Chat = (() => {
 
   function setCollapseTools(v) { _collapseTools = !!v; }
   function getCollapseTools() { return _collapseTools; }
-  function setCollapseThreshold(n) { _collapseThreshold = Math.max(1, parseInt(n, 10) || 3); }
-  function getCollapseThreshold() { return _collapseThreshold; }
 
   function forceScrollToBottom() {
     _autoScroll = true;
     elMessages.scrollTop = elMessages.scrollHeight;
   }
 
-  return { init, clear, handleMessage, setCollapseTools, getCollapseTools, setCollapseThreshold, getCollapseThreshold, setMaxDomMessages, forceScrollToBottom };
+  return { init, clear, handleMessage, setCollapseTools, getCollapseTools, setMaxDomMessages, forceScrollToBottom };
 })();
