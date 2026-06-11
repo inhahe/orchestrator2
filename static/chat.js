@@ -343,6 +343,20 @@ const Chat = (() => {
 
   // --- Assistant text (streaming) ---
 
+  // Signature of a tool call that Claude emitted as literal text instead of
+  // actually invoking the tool (an intermittent Anthropic-side error).  When
+  // this happens the tool never ran, so we surface a warning prompting the
+  // user to nudge Claude to retry.
+  const _TOOL_CALL_TEXT_RE = /<(?:antml:)?invoke\s+name=|<(?:antml:)?parameter\s+name=|<function_calls>/i;
+
+  function _maybeWarnToolCallText(text) {
+    if (!text || !_TOOL_CALL_TEXT_RE.test(text)) return;
+    const warn = document.createElement('div');
+    warn.className = 'msg msg-system warning';
+    warn.textContent = '\u26A0 Claude emitted a tool call as text \u2014 it didn\u2019t actually run. Nudge it to retry.';
+    elMessages.appendChild(warn);
+  }
+
   function _addAssistantText(msg) {
     if (msg.delta) {
       // Streaming delta — append to current element and render markdown
@@ -369,6 +383,7 @@ const Chat = (() => {
       el.className = 'msg msg-assistant';
       el.innerHTML = `<div class="msg-content md-rendered">${_md(msg.content)}</div>`;
       elMessages.appendChild(el);
+      _maybeWarnToolCallText(msg.content);
     }
     _scrollToBottom();
   }
@@ -402,6 +417,7 @@ const Chat = (() => {
           content.innerHTML = _md(_streamingText);
           content.classList.add('md-rendered');
         }
+        _maybeWarnToolCallText(_streamingText);
       }
     }
     _streamingEl = null;

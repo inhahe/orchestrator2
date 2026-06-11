@@ -67,18 +67,18 @@ KNOWN_MODELS = [
 ]
 
 # Terminal bell event system.
+#
+# Only events that are actually rung somewhere in the program are listed.
+# (The auto-continue loop is not wired up in the web orchestrator, so its
+# 'done'/'waiting'/'stalled' events never fire and were removed, along with
+# 'api-ok'/'rate-reset' which never had a ring site.  'api-stall' was removed
+# too: it only existed to halt that dead auto-continue loop.)
 BELL_EVENT_NAMES = frozenset({
-    "turn-done", "waiting", "done", "stalled",
-    "api-stall", "api-ok", "interrupt", "bg-done", "requires-action",
-    "rate-hit", "rate-reset",
-})
-# These events are deferred while bg tasks are still running — the bell
-# fires from bg-completion when the last task finishes.
-BELL_DEFER_WHEN_BG_RUNNING = frozenset({
-    "turn-done", "waiting", "done", "stalled",
+    "turn-done", "bg-done", "requires-action",
+    "interrupt", "rate-hit",
 })
 
-DEFAULT_BELL_EVENTS = "waiting,done,stalled,api-stall,requires-action,rate-hit,rate-reset"
+DEFAULT_BELL_EVENTS = "turn-done,bg-done,requires-action,rate-hit"
 
 # Subscription rate-limit bucket types.
 SUBSCRIPTION_RL_TYPES = frozenset(
@@ -339,9 +339,7 @@ class Config:
     continue_burst_limit: int = CONTINUE_BURST_LIMIT
     continue_burst_window: float = CONTINUE_BURST_WINDOW_SECONDS
 
-    # API stall
-    api_stall_limit: int = 5
-    api_stall_window: float = 60.0
+    # API status polling
     status_url: str = "https://status.claude.com/api/v2/summary.json"
     status_poll_interval: float = 30.0
     no_status_poll: bool = False
@@ -611,19 +609,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         ),
     )
 
-    # -- API stall --
-    ap.add_argument(
-        "--api-stall-limit",
-        type=int,
-        default=5,
-        help="Enter API-stall after N retries within window. Default: 5. 0 = disable.",
-    )
-    ap.add_argument(
-        "--api-stall-window",
-        type=float,
-        default=60.0,
-        help="Sliding window (seconds) for stall-limit. Default: 60.",
-    )
+    # -- API status --
     ap.add_argument(
         "--status-url",
         default="https://status.claude.com/api/v2/summary.json",
@@ -725,8 +711,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         auto_compact=not args.no_compact,
         compact_cooldown_turns=args.compact_cooldown_turns,
         max_context_tokens=args.max_context_tokens,
-        api_stall_limit=args.api_stall_limit,
-        api_stall_window=args.api_stall_window,
         status_url=args.status_url,
         show_thinking=args.show_thinking,
         show_full_commands=args.show_full_commands,

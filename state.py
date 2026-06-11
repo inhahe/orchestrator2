@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any
 
 from config import (
-    BELL_DEFER_WHEN_BG_RUNNING,
     CONTINUE_PROMPT,
     MARKERS,
     RL_TYPE_LABEL,
@@ -256,11 +255,9 @@ def ring_bell(state: State, event: str) -> None:
     Turn-completion events are deferred while bg tasks run.  The web
     frontend receives a ``bell`` WS message instead of ``\\a``.
     """
-    if event in BELL_DEFER_WHEN_BG_RUNNING and state.background_tasks:
-        state.pending_bell = event
+    if event not in state.bell_events:
         return
-    if event in state.bell_events:
-        state.pending_bell = event
+    state.pending_bell = event
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +299,13 @@ class State:
     last_compact_trigger: str | None = None
     compact_during_last_turn: bool = False
     last_compact_turn: int | None = None
-    needs_user_attention: str | None = None  # "waiting"/"burst"/"done"/"api-error"/None
+    # A compact-induced ResultMessage suppresses run_turn's turn_end on the
+    # assumption that a post-compact ghost turn will own it.  When no ghost
+    # turn follows (the turn genuinely ended at compaction), this holds the
+    # deferred turn_end info {"subtype", "started_at"} so it can still be
+    # emitted (by a timer, or the next turn start) instead of being lost.
+    pending_compact_turn_end: dict[str, Any] | None = None
+    needs_user_attention: str | None = None  # "waiting"/"burst"/"done"/None
     recent_turn_ends: deque[float] = field(default_factory=deque)
     turn_started_at: float | None = None
 
@@ -336,15 +339,6 @@ class State:
     # Background task history
     current_turn_bg: dict[str, dict[str, Any]] = field(default_factory=dict)
     next_bg_seq: int = 1
-
-    # API stall tracking
-    api_retry_times: deque[float] = field(
-        default_factory=lambda: deque(maxlen=100)
-    )
-    api_status_indicator: str | None = None
-    api_status_description: str | None = None
-    api_stall_source: str | None = None
-    api_stall_saw_bad: bool = False
 
     # Thinking history (ring buffer)
     thinking_history: deque[dict[str, Any]] = field(
@@ -471,13 +465,6 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         busy_class = "done"
     elif state.needs_user_attention == "burst":
         busy_label = "api error"
-        busy_class = "error"
-    elif state.needs_user_attention == "api-error":
-        label = "api error"
-        if state.api_status_description:
-            desc = state.api_status_description[:40]
-            label = f"api error ({desc})"
-        busy_label = label
         busy_class = "error"
     else:
         busy_label = "idle"

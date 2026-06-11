@@ -527,17 +527,29 @@ def _cmd_bell(payload: str, state: State, _config: Config) -> CommandResult:
             ("/bell -<event> ...",         "remove events from the current set"),
         ]
         example_rows = [
-            ("/bell done",         "-- only 'done' rings, all others silenced"),
-            ("/bell done waiting", "-- only these two ring, all others silenced"),
-            ("/bell +done",        "-- add 'done' to whatever's already enabled"),
-            ("/bell -waiting",     "-- turn off 'waiting' only, leave the rest alone"),
+            ("/bell turn-done",         "-- only 'turn-done' rings, all others silenced"),
+            ("/bell turn-done bg-done", "-- only these two ring, all others silenced"),
+            ("/bell +bg-done",          "-- add 'bg-done' to whatever's already enabled"),
+            ("/bell -bg-done",          "-- turn off 'bg-done' only, leave the rest alone"),
         ]
-        cmd_w = max(len(c) for c, _ in (usage_rows + example_rows)) + 2
+        event_rows = [
+            ("turn-done",       "a turn ended -- Claude is waiting for you"),
+            ("bg-done",         "a background task finished"),
+            ("requires-action", "the session needs action (e.g. a permission prompt or question)"),
+            ("interrupt",       "a turn was interrupted"),
+            ("rate-hit",        "a rate limit was hit"),
+        ]
+        cmd_w = max(
+            len(c) for c, _ in (usage_rows + example_rows + event_rows)
+        ) + 2
         lines = [
             f"bell currently rings on: {current}",
             f"  available events: {avail}",
-            "  usage:",
+            "  events:",
         ]
+        for name, desc in event_rows:
+            lines.append(f"    {name:<{cmd_w}}{desc}")
+        lines.append("  usage:")
         for cmd, desc in usage_rows:
             lines.append(f"    {cmd:<{cmd_w}}{desc}")
         lines.append("  examples:")

@@ -45,9 +45,7 @@ except ImportError:
 from config import (
     CONTINUE_PROMPT,
     DISPATCHER_DEAD,
-    DONE_SENTINEL,
     INTERRUPT_SENTINEL,
-    WAITING_SENTINEL,
     Config,
     default_compact_at,
     model_context_window,
@@ -158,6 +156,19 @@ class SDKBridge:
     # SDK options
     # ------------------------------------------------------------------
 
+    def _on_sdk_stderr(self, line: str) -> None:
+        """Forward the CLI subprocess's stderr to our log.
+
+        The SDK invokes this for each stderr line emitted by the underlying
+        ``claude`` CLI.  Without it, fatal subprocess errors only say
+        "Check stderr output for details" — which we can't check after the
+        fact.  Routing it here makes those details show up in orchestrator2's
+        log file.
+        """
+        line = (line or "").rstrip()
+        if line:
+            log.warning("[cli stderr] %s", line)
+
     def _make_options(self, resume_id: str | None = None) -> ClaudeAgentOptions:
         """Build ``ClaudeAgentOptions`` from config + state."""
         kwargs: dict[str, Any] = {
@@ -165,6 +176,17 @@ class SDKBridge:
             "cwd": self.config.cwd,
             "setting_sources": ["user", "project", "local"],
             "max_buffer_size": 10 * 1024 * 1024,
+            # Pipe the CLI subprocess's stderr into our log so fatal errors
+            # ("Check stderr output for details") are actually recoverable.
+            "stderr": self._on_sdk_stderr,
+            # Opt into session_state_changed events so we learn when the
+            # session blocks on a pending action (AskUserQuestion,
+            # ExitPlanMode, or — in ask mode — a tool-permission prompt) and
+            # can ring the 'requires-action' bell.  Merged onto the inherited
+            # environment by the SDK, so this adds the one var without
+            # clobbering anything.  The idle/running events it also enables
+            # are suppressed in _handle_system_message.
+            "env": {"CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1"},
         }
 
         # Session resume / continue logic.
@@ -663,6 +685,10 @@ class SDKBridge:
         state = self.state
         if state.busy or self.turn_active.is_set():
             return
+        # This ghost turn IS the post-compact continuation that the deferred
+        # turn_end was waiting for — it will book the turn and emit its own
+        # turn_end, so drop the pending one to avoid a duplicate marker.
+        self._claim_pending_compact_turn_end()
         state.busy = True
         state.turn_started_at = time.monotonic()
         # Reset compact flag — any prior compact has been absorbed by
@@ -735,6 +761,78 @@ class SDKBridge:
                 log.warning("ghost-turn queue poke failed: %r", exc)
 
     # ------------------------------------------------------------------
+    # Deferred compact turn_end helpers
+    # ------------------------------------------------------------------
+
+    def _schedule_compact_turn_end_flush(self, grace: float = 10.0) -> None:
+        """Arm a timer to flush a deferred compact turn_end.
+
+        If a post-compact ghost turn begins first it claims the pending
+        turn_end and cancels this timer; otherwise the timer fires and emits
+        the turn_end so the completed turn is still marked in the UI.
+        """
+        t = getattr(self, "_compact_turn_end_task", None)
+        if t is not None and not t.done():
+            t.cancel()
+        self._compact_turn_end_task = asyncio.create_task(
+            self._compact_turn_end_timer(grace),
+            name="compact-turn-end-flush",
+        )
+
+    def _cancel_compact_turn_end_timer(self) -> None:
+        t = getattr(self, "_compact_turn_end_task", None)
+        if t is not None and not t.done():
+            t.cancel()
+        self._compact_turn_end_task = None
+
+    async def _compact_turn_end_timer(self, grace: float) -> None:
+        try:
+            await asyncio.sleep(grace)
+        except asyncio.CancelledError:
+            return
+        await self._flush_pending_compact_turn_end()
+
+    def _claim_pending_compact_turn_end(self) -> None:
+        """A ghost turn (or other path) will own the turn_end — drop the
+        deferred one and cancel its timer so it isn't emitted twice."""
+        self.state.pending_compact_turn_end = None
+        self._cancel_compact_turn_end_timer()
+
+    async def _flush_pending_compact_turn_end(self) -> None:
+        """Emit the deferred turn_end for a compact-closed turn that had no
+        post-compact ghost-turn continuation.  Books the turn (which the
+        suppressed compact ResultMessage did not) and broadcasts the marker
+        plus a status_update so the turn counter updates."""
+        pend = self.state.pending_compact_turn_end
+        if not pend:
+            return
+        self.state.pending_compact_turn_end = None
+        self._cancel_compact_turn_end_timer()
+        state = self.state
+        state.turns += 1
+        duration = time.monotonic() - (
+            pend.get("started_at") or time.monotonic()
+        )
+        log.info(
+            "flushing deferred compact turn_end: turns=%d subtype=%s",
+            state.turns, pend.get("subtype"),
+        )
+        try:
+            await self.broadcast({
+                "type": "turn_end",
+                "subtype": pend.get("subtype") or "success",
+                "duration": fmt_duration(duration),
+                "turns": state.turns,
+            })
+            await self.broadcast({
+                "type": "status_update",
+                "status": state_to_status_dict(state, self.config),
+                "panels": state_to_panels_dict(state),
+            })
+        except Exception as exc:
+            log.warning("deferred compact turn_end broadcast failed: %r", exc)
+
+    # ------------------------------------------------------------------
     # System message handling (shared by turn + async paths)
     # ------------------------------------------------------------------
 
@@ -788,18 +886,10 @@ class SDKBridge:
             data = {"session_id": sid}
 
         elif subtype == "api_retry":
-            # Track for stall detection.
-            state.api_retry_times.append(time.monotonic())
+            # Surface the retry to the UI (no stall detection — that only
+            # existed to halt the dead auto-continue loop).
             error_info = getattr(msg, "error", None)
             data = {"error": str(error_info) if error_info else None}
-            # Check stall threshold.
-            if self.config.api_stall_limit > 0:
-                window = self.config.api_stall_window
-                cutoff = time.monotonic() - window
-                recent = sum(1 for t in state.api_retry_times if t >= cutoff)
-                if recent >= self.config.api_stall_limit:
-                    state.needs_user_attention = "api-error"
-                    ring_bell(state, "api-stall")
 
         elif subtype == "task_notification":
             # Background task completion.
@@ -830,6 +920,7 @@ class SDKBridge:
                 }
                 await self.broadcast({"type": "bg_complete", **data})
                 ring_bell(state, "bg-done")
+                await self._flush_bell()
                 # If no more bg tasks, update status immediately and queue a wakeup.
                 if not state.background_tasks:
                     await self.broadcast({
@@ -881,10 +972,20 @@ class SDKBridge:
             }
 
         elif subtype == "session_state_changed":
-            session_state = getattr(msg, "session_state", None)
+            # The session lifecycle state lives in ``msg.data['state']``
+            # (SystemMessage only carries ``subtype`` + ``data``).  Emitted
+            # only when CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS is set, which
+            # we do in _make_options.
+            d = msg.data if isinstance(msg.data, dict) else {}
+            session_state = d.get("state")
             if session_state == "requires_action":
                 ring_bell(state, "requires-action")
+                await self._flush_bell()
                 data = {"state": "requires_action"}
+            else:
+                # idle/running are lifecycle noise — orchestrator2 already
+                # tracks busy/idle itself via run_turn.  Don't surface them.
+                return
 
         elif subtype == "task_updated":
             # Patch-based status update — surface terminal states as completions.
@@ -918,6 +1019,7 @@ class SDKBridge:
                     }
                     await self.broadcast({"type": "bg_complete", **data})
                     ring_bell(state, "bg-done")
+                    await self._flush_bell()
                     if not state.background_tasks:
                         await self.broadcast({
                             "type": "status_update",
@@ -1044,6 +1146,12 @@ class SDKBridge:
                 drained += 1
             except asyncio.QueueEmpty:
                 break
+
+        # If the previous turn ended on a compaction and its turn_end is
+        # still pending (no ghost-turn continuation arrived), emit it now —
+        # before this new turn's content — so the completed turn is marked.
+        if state.pending_compact_turn_end is not None:
+            await self._flush_pending_compact_turn_end()
 
         self.interrupt_event.clear()
         state.busy = True
@@ -1280,11 +1388,22 @@ class SDKBridge:
                     if rate_info is not None:
                         apply_rate_limit_info(state, rate_info)
 
-                    # Only broadcast ``turn_end`` for *real* turn ends.
-                    # A compact-induced ResultMessage will be followed
-                    # by a ghost turn that owns the user-visible
+                    # Only broadcast ``turn_end`` immediately for *real*
+                    # (non-compact) turn ends.
+                    #
+                    # A compact-induced ResultMessage *may* be followed by a
+                    # post-compact ghost turn that owns the user-visible
                     # turn_end — broadcasting one here would produce a
-                    # premature "turn ended" marker in the UI.
+                    # premature marker.  But it may NOT be: when the SDK
+                    # auto-compacts mid-turn and the response was already
+                    # complete, run_turn consumes the whole post-compact
+                    # stream itself and exits with no ghost turn to follow.
+                    # In that case suppressing the turn_end loses it (and
+                    # never books the turn).  So instead of suppressing, we
+                    # *defer*: record the pending turn_end and let either a
+                    # ghost turn claim it (``_claim_pending_compact_turn_end``)
+                    # or a short timer / the next turn flush it
+                    # (``_flush_pending_compact_turn_end``).
                     if not was_compact:
                         duration = time.monotonic() - (
                             state.turn_started_at or time.monotonic()
@@ -1295,6 +1414,12 @@ class SDKBridge:
                             "duration": fmt_duration(duration),
                             "turns": state.turns,
                         })
+                    else:
+                        state.pending_compact_turn_end = {
+                            "subtype": subtype,
+                            "started_at": state.turn_started_at or time.monotonic(),
+                        }
+                        self._schedule_compact_turn_end_flush()
                     normal_completion = True
                     break
 
@@ -1402,12 +1527,30 @@ class SDKBridge:
             except BaseException as bx:
                 log.warning("post-turn status_update broadcast failed: %r", bx)
 
-        # Flush bell.
-        if state.pending_bell:
-            await self.broadcast({"type": "bell", "event": state.pending_bell})
-            state.pending_bell = None
+        # Flush any bell that was rung during this turn.
+        await self._flush_bell()
 
         return assistant_text, interrupted
+
+    async def _flush_bell(self) -> None:
+        """Broadcast any pending bell event to the frontend, then clear it.
+
+        ``ring_bell()`` only records ``state.pending_bell``; it never sends
+        anything itself.  Bells rung *between* turns (turn-done, bg-done,
+        requires-action, rate-hit) would
+        otherwise sit unflushed until the *next* turn ended — which never
+        happens while Claude is waiting for the user, so the user never
+        hears them.  Every async path that rings a bell must funnel through
+        here (and the status ticker flushes as a catch-all safety net).
+        """
+        if self.state.pending_bell:
+            try:
+                await self.broadcast(
+                    {"type": "bell", "event": self.state.pending_bell}
+                )
+            except Exception as exc:
+                log.warning("bell broadcast failed: %r", exc)
+            self.state.pending_bell = None
 
     # ------------------------------------------------------------------
     # worker_loop() — main turn driver
@@ -1661,10 +1804,6 @@ class SDKBridge:
             })
             return prompt
 
-        # --- API stall ---
-        if state.needs_user_attention == "api-error":
-            return await self._await_next_prompt()
-
         # --- Context trim (rolling window) ---
         max_ctx = getattr(state, "_max_context_tokens", config.max_context_tokens)
         if max_ctx > 0 and state.context_tokens > max_ctx and state.session_id:
@@ -1706,80 +1845,21 @@ class SDKBridge:
             })
             return await self._await_next_prompt()
 
-        # --- Auto-continue disabled → wait ---
-        auto_continue = getattr(state, "_auto_continue", config.auto_continue)
-        if not auto_continue:
-            ring_bell(state, "turn-done")
-            state.needs_user_attention = None
-            return await self._await_next_prompt()
-
-        # --- Auto-continue: check sentinels and burst ---
-        if DONE_SENTINEL in assistant_text:
-            state.needs_user_attention = "done"
-            ring_bell(state, "done")
-            await self.broadcast({
-                "type": "system_msg", "subtype": "done",
-                "data": {"message": "Claude finished all tasks."},
-            })
-            return await self._await_next_prompt()
-
-        if WAITING_SENTINEL in assistant_text:
-            state.needs_user_attention = "waiting"
-            ring_bell(state, "waiting")
-            await self.broadcast({
-                "type": "system_msg", "subtype": "waiting",
-                "data": {"message": "Claude is waiting for your input."},
-            })
-            return await self._await_next_prompt()
-
-        # Burst limit check.
-        burst_limit = getattr(state, "_burst_limit", config.continue_burst_limit)
-        burst_window = getattr(state, "_burst_window", config.continue_burst_window)
-        if burst_limit > 0:
-            now = time.monotonic()
-            state.recent_turn_ends.append(now)
-            cutoff = now - burst_window
-            while state.recent_turn_ends and state.recent_turn_ends[0] < cutoff:
-                state.recent_turn_ends.popleft()
-            if len(state.recent_turn_ends) >= burst_limit:
-                state.needs_user_attention = "burst"
-                ring_bell(state, "stalled")
-                await self.broadcast({
-                    "type": "system_msg", "subtype": "stalled",
-                    "data": {"message": f"Burst limit ({burst_limit} turns in {burst_window:.0f}s)"},
-                })
-                return await self._await_next_prompt()
-
-        # --- Grace window: wait for user input or auto-continue ---
+        # --- Turn ended → notify and wait for the user ---
+        # The auto-continue loop is not wired up in the web orchestrator
+        # (config.auto_continue is always False and nothing sets
+        # state._auto_continue), so every completed turn returns control to
+        # the user here.  This is the only turn-completion bell that fires.
+        ring_bell(state, "turn-done")
         state.needs_user_attention = None
-        try:
-            kind, payload = await asyncio.wait_for(
-                self.event_queue.get(),
-                timeout=config.continue_response_delay,
-            )
-            if kind == "message":
-                return payload
-            if kind in ("quit", "force-quit"):
-                return None
-            # Other command — put it back and auto-continue.
-            self.event_queue.put_nowait((kind, payload))
-        except asyncio.TimeoutError:
-            pass
-
-        # Auto-continue.
-        # Surface the synthetic continue prompt to the frontend as an
-        # injected prompt so the user sees a collapsed box for it, the
-        # same way compaction's harness-injected prompt is rendered.
-        # Without this broadcast the auto-continue loop runs invisibly
-        # and the user only sees Claude's response with no indication
-        # of the prompt that triggered it.
-        await self._broadcast_injected_prompt(
-            state.continue_prompt, during_turn=False,
-        )
-        return state.continue_prompt
+        return await self._await_next_prompt()
 
     async def _await_next_prompt(self) -> str | None:
         """Block until the user sends a message or quits."""
+        # Flush any bell rung in the between-turns decision logic
+        # (turn-done, interrupt) before we block — otherwise it would never
+        # reach the frontend while we wait here.
+        await self._flush_bell()
         while not self.stop_event.is_set():
             kind, payload = await self.event_queue.get()
 
@@ -1938,6 +2018,7 @@ class SDKBridge:
     async def stop(self) -> None:
         """Gracefully shut down."""
         self.stop_event.set()
+        self._cancel_compact_turn_end_timer()
         self.event_queue.put_nowait(("quit", ""))
         if self._worker_task and not self._worker_task.done():
             self._worker_task.cancel()

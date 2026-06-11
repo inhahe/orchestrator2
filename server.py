@@ -193,6 +193,15 @@ async def _status_ticker() -> None:
                 "status": state_to_status_dict(state, config),
                 "panels": panels,
             })
+
+            # Catch-all bell flush: bells rung from sync contexts (e.g.
+            # rate-limit hits) set state.pending_bell but have no async
+            # path to broadcast it.  Flush here so they reach the frontend
+            # within one tick instead of waiting for the next turn to end.
+            if state.pending_bell:
+                event = state.pending_bell
+                state.pending_bell = None
+                await broadcast({"type": "bell", "event": event})
         except Exception:
             log.exception("ticker error")
 
