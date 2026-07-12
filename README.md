@@ -39,23 +39,28 @@ orch --config-dir "C:\Users\me\.claude-alt"
 ## Features
 
 - **Live WebSocket UI** -- real-time streaming of assistant messages, tool calls, and results
+- **Account display** -- the status bar shows the signed-in account (the email address from `<config-dir>/.claude.json`, falling back to the config-dir name when no email is stored). Hover it to see the display name, organization, plan type, role, and the active `CLAUDE_CONFIG_DIR` — handy when running multiple accounts/config dirs side by side
 - **Side-by-side diff viewer** -- UltraCompare-style edit comparisons with configurable colors
 - **Two-layer activity collapse** -- every tool call, tool result, and thinking block renders as its own one-line collapsed row with a summary (path, command, pattern, item count, etc.); click any row to expand the full details (diff, output, command body, thinking text). Once Claude speaks again after a run of activity, the whole run between the two messages auto-collapses into a single grouped summary line ("N tools") that can also be expanded to reveal the individual rows underneath
-- **Sidebar panels** -- live views of active tools, background tasks, pending queue, and TodoWrite plan
+- **Anchored collapse (no lurch)** -- when a run of tools auto-collapses while you're following at the bottom, the text already on screen stays put instead of jerking upward. The reclaimed vertical space is held open as a temporary gap that the next streamed lines fill from the top down; once real content reaches the bottom, normal bottom-following resumes (scrolling up at any time releases the gap)
+- **Sidebar panels** -- live views of active tools, background tasks, pending queue, and TodoWrite plan. Click a tool or background task to expand its full detail (the Bash command line, or the tool's input) inline within the panel; click again to collapse. Expanded rows stay open across live updates
 - **Draggable sidebar** -- resize handle with width persisted across sessions
 - **Auto-compact** -- automatic context compaction when token usage gets high
 - **Readable post-compact summary** -- after a compact, the harness-injected summary that becomes the new conversation's starting context is shown as a collapsed box you can click to expand and read in full (Claude Code hides this prompt from the user)
 - **Background tasks** -- track and inspect agent-spawned background work
+- **Autonomous-loop heartbeat** -- honours the model's `ScheduleWakeup` tool calls: when the agent schedules a self-paced wake-up (e.g. a 60s autonomous-loop tick), the orchestrator re-injects the scheduled prompt as a fresh turn after the requested delay, even while a background task is still running. Disable with `--no-wakeup`
 - **Pending queue** -- type messages while Claude is busy; they queue and execute in order
 - **Queue management** -- edit or delete queued prompts from the sidebar
 - **Prompt history** -- Ctrl+Up/Down to recall previous prompts (persisted across sessions)
 - **Permission dialogs** -- allow/deny tool execution from the browser
+- **AskUserQuestion fallback** -- Claude's interactive multiple-choice tool (`AskUserQuestion`) has no picker widget in the web UI, so instead of silently failing, its questions and options are surfaced as a chat message and Claude is told to continue the exchange in plain text — you just type your answer
 - **Session resume** -- automatically continues the most recent session for the working directory
 - **Session picker** -- interactive session selection with `--resume`
 - **Switch projects** -- change working directory and session with `/cwd <path>`
 - **Multi-tab support** -- multiple browser tabs receive synchronized updates
 - **Bell notifications** -- configurable audible alerts for key events
 - **API stall detection** -- monitors retry patterns and polls Anthropic's status page
+- **API-error loop breaker** -- a turn that ends in an inline API error (e.g. `API Error: 400 …`) is now marked `error` in the turn marker instead of the misleading `success`, and the status bar shows `api error`. When the *same* error repeats two turns in a row — the classic "poisoned history" case where a bad block deep in the resumed conversation (e.g. an unsupported image) is re-sent every turn and never clears — the orchestrator posts a one-time recovery hint (start a fresh session, or trim the conversation) and pauses auto-continue so it won't keep hammering the failing request
 - **Theme system** -- 70+ color tokens configurable via file, presets, or the settings page
 - **Export** -- save conversations as markdown
 
@@ -148,6 +153,7 @@ At runtime, use the `/bell` slash command to view or change the bell events with
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--auto-reconnect` | off | Reconnect and auto-continue on CLI crash |
+| `--no-wakeup` | off | Disable honouring the model's `ScheduleWakeup` tool calls (autonomous-loop heartbeat) |
 
 ### Server
 

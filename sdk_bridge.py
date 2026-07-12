@@ -46,6 +46,11 @@ from config import (
     CONTINUE_PROMPT,
     DISPATCHER_DEAD,
     INTERRUPT_SENTINEL,
+    WAKEUP_DEFAULT_DELAY,
+    WAKEUP_MAX_DELAY,
+    WAKEUP_MIN_DELAY,
+    WAKEUP_RESOLVED_PROMPT,
+    WAKEUP_SENTINELS,
     Config,
     default_compact_at,
     model_context_window,
@@ -86,6 +91,50 @@ log = logging.getLogger(__name__)
 
 # Broadcaster type: async function that sends a dict to all WS clients.
 Broadcaster = Callable[[dict[str, Any]], Awaitable[None]]
+
+# Matches the CLI's inline API-error text, e.g.
+#   "API Error: 400 {"type":"error","error":{...}}"
+# The captured group is the HTTP status code.
+_API_ERROR_RE = re.compile(r"API Error:\s*(\d{3})\b")
+
+
+def detect_api_error(msg: Any, assistant_text: str) -> tuple[str | None, str | None]:
+    """Detect a turn that ended in an API error.
+
+    The Claude CLI surfaces API failures (rate-limit 429s, malformed-request
+    400s, etc.) as inline assistant text like ``API Error: 400 {...}`` and
+    then closes the turn — often with ``subtype="success"`` because, from the
+    CLI's point of view, it *did* emit output and return control cleanly.
+    ``ResultMessage.is_error`` is likewise unreliable for these.
+
+    We therefore scan the visible assistant text (and ``ResultMessage.result``
+    as a fallback) for the error banner.
+
+    Returns ``(status_code, signature)`` where ``signature`` is a short,
+    stable string identifying the error (used for repeat/loop detection), or
+    ``(None, None)`` when the turn did not end in an API error.
+    """
+    haystacks = []
+    if assistant_text:
+        haystacks.append(assistant_text)
+    result_text = getattr(msg, "result", None)
+    if isinstance(result_text, str):
+        haystacks.append(result_text)
+
+    for text in haystacks:
+        m = _API_ERROR_RE.search(text)
+        if not m:
+            continue
+        code = m.group(1)
+        # Build a stable signature from the code plus the API's own error
+        # message, so an identical fault repeating every turn collapses to
+        # the same key (used to detect an inescapable poisoned-history loop).
+        sig = code
+        detail = re.search(r'"message"\s*:\s*"([^"]{0,160})"', text)
+        if detail:
+            sig = f"{code}:{detail.group(1)}"
+        return code, sig
+    return None, None
 
 
 def _build_graphify_prompt(args: str) -> str:
@@ -147,6 +196,12 @@ class SDKBridge:
         self._initial_resume_id: str | None = None
         self._pending_permission: asyncio.Future | None = None
         self._is_auto_turn = False  # True when the turn was triggered by auto-continue
+
+        # ScheduleWakeup heartbeat.  When the model calls the ScheduleWakeup
+        # tool we arm this timer; on fire it re-injects the scheduled prompt as
+        # a fresh turn.  A new turn (or stop) cancels any pending timer.
+        self._wakeup_task: asyncio.Task | None = None
+        self._wakeup_fire_at: float | None = None  # monotonic deadline, for logs
         # Generation counter for dispatcher tasks.  Each connect() bumps
         # this so we can tell live dispatchers apart in logs and detect
         # orphaned ones (stale tasks that survived a reconnect).
@@ -233,11 +288,15 @@ class SDKBridge:
         if self.config.append_system_prompt:
             kwargs["append_system_prompt"] = self.config.append_system_prompt
 
-        # Permission callback (when not bypassing).
-        if (
-            self.config.permission_mode != "bypassPermissions"
-            and PermissionResultAllow is not None
-        ):
+        # Permission callback.  Always register it (when the SDK exposes the
+        # PermissionResult types) so we can intercept interactive tools like
+        # AskUserQuestion — the CLI routes those through can_use_tool *even in
+        # bypassPermissions mode* (step 1e of its permission pipeline), and
+        # without a callback the SDK raises "canUseTool callback is not
+        # provided" and the tool fails.  For ordinary tools the callback only
+        # fires under a real permission mode; bypass auto-allows them before
+        # ever calling us (see _handle_tool_permission).
+        if PermissionResultAllow is not None:
             kwargs["can_use_tool"] = self._handle_tool_permission
 
         return ClaudeAgentOptions(**kwargs)
@@ -487,6 +546,7 @@ class SDKBridge:
                     name = block.name
                     inp = block.input if isinstance(block.input, dict) else {}
                     is_bg = name == "Bash" and inp.get("run_in_background")
+                    self._maybe_arm_wakeup(name, inp)
                     seq = register_tool_use(state, block.id, name, inp)
                     if name == "TodoWrite" and isinstance(inp.get("todos"), list):
                         state.current_todos = inp["todos"]
@@ -671,6 +731,94 @@ class SDKBridge:
             "content": text,
             "during_turn": during_turn,
         })
+
+    # ------------------------------------------------------------------
+    # ScheduleWakeup heartbeat
+    # ------------------------------------------------------------------
+    #
+    # The model paces self-directed autonomous loops with the ``ScheduleWakeup``
+    # tool ("resume in N seconds with this prompt").  Claude Code's interactive
+    # REPL owns that timer, but the CLI subprocess we drive in streaming mode
+    # never re-injects a scheduled prompt on its own.  Without the code below,
+    # ScheduleWakeup is a silent no-op: the loop only ever continued by accident
+    # (compaction continuations), so it stalled whenever the model was idle —
+    # most visibly while waiting on a background task.  We close that gap by
+    # arming our own timer and feeding the scheduled prompt back through the
+    # event queue as a normal turn — which works even while bg tasks run, since
+    # ``_await_next_prompt`` (the bg-wait park point) consumes ``message``
+    # events.
+
+    def _maybe_arm_wakeup(self, name: str, inp: dict) -> None:
+        """If *name* is ``ScheduleWakeup``, arm/replace the wakeup timer.
+
+        Reads ``delaySeconds`` and ``prompt`` from the tool input, clamps the
+        delay to the documented [60, 3600] range, resolves the autonomous-loop
+        sentinels to a concrete continue prompt, and (re)arms the timer.  Any
+        previously pending wakeup is cancelled — the latest ScheduleWakeup call
+        wins, matching the tool's "call again to reschedule" semantics.
+        """
+        if not getattr(self.config, "wakeup_enabled", True):
+            return
+        if name != "ScheduleWakeup":
+            return
+
+        raw_delay = inp.get("delaySeconds", WAKEUP_DEFAULT_DELAY)
+        try:
+            delay = float(raw_delay)
+        except (TypeError, ValueError):
+            delay = WAKEUP_DEFAULT_DELAY
+        if delay != delay:  # NaN guard
+            delay = WAKEUP_DEFAULT_DELAY
+        delay = max(WAKEUP_MIN_DELAY, min(WAKEUP_MAX_DELAY, delay))
+
+        raw_prompt = inp.get("prompt")
+        prompt = raw_prompt if isinstance(raw_prompt, str) else ""
+        if prompt.strip() in WAKEUP_SENTINELS or not prompt.strip():
+            resolved = WAKEUP_RESOLVED_PROMPT
+        else:
+            resolved = prompt
+
+        self._arm_wakeup(delay, resolved)
+
+    def _arm_wakeup(self, delay: float, prompt: str) -> None:
+        """(Re)start the wakeup timer for *delay* seconds carrying *prompt*."""
+        self._cancel_wakeup()
+        self._wakeup_fire_at = time.monotonic() + delay
+        self._wakeup_task = asyncio.create_task(
+            self._wakeup_timer(delay, prompt), name="schedule-wakeup",
+        )
+        log.info("wakeup armed: delay=%.0fs prompt=%r", delay, prompt[:80])
+
+    def _cancel_wakeup(self) -> None:
+        """Cancel any pending wakeup timer (idempotent)."""
+        t = self._wakeup_task
+        self._wakeup_task = None
+        self._wakeup_fire_at = None
+        if t is not None and not t.done():
+            t.cancel()
+
+    async def _wakeup_timer(self, delay: float, prompt: str) -> None:
+        """Sleep *delay* seconds, then inject *prompt* as a fresh turn."""
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        if self.stop_event.is_set():
+            return
+        # Self-clear: this task is firing, so it's no longer "pending".
+        self._wakeup_task = None
+        self._wakeup_fire_at = None
+        log.info("wakeup fired: injecting scheduled prompt %r", prompt[:80])
+        # Surface the injected prompt so the user sees what triggered the turn,
+        # then queue it as a normal message.  When the worker is parked in
+        # _await_next_prompt (idle OR waiting on a background task) this wakes it
+        # and starts the next turn; when a turn is already live it is drained as
+        # a queued prompt at the next between-turns checkpoint.
+        try:
+            await self._broadcast_injected_prompt(prompt, during_turn=False)
+        except Exception as exc:
+            log.warning("wakeup injected-prompt broadcast failed: %r", exc)
+        self.event_queue.put_nowait(("message", prompt))
 
     # ------------------------------------------------------------------
     # Ghost-turn helpers
@@ -1064,7 +1212,36 @@ class SDKBridge:
     async def _handle_tool_permission(
         self, tool_name: str, tool_input: dict, context: Any,
     ) -> Any:
-        """SDK ``can_use_tool`` callback — asks the user via WebSocket."""
+        """SDK ``can_use_tool`` callback.
+
+        Special-cases ``AskUserQuestion`` — an interactive multiple-choice
+        tool the CLI invokes even under ``bypassPermissions`` (permission
+        pipeline step 1e).  orchestrator2's chat UI has no picker widget, and
+        answering the tool requires returning the selections via
+        ``updated_input`` (which we don't collect), so letting it run just
+        yields empty answers — that's how it "always failed".  Instead we
+        surface the questions in the chat and deny with guidance so Claude
+        continues the exchange in plain text, which the chat handles
+        naturally.  Every other tool keeps the prior behavior.
+        """
+        if tool_name == "AskUserQuestion":
+            await self._surface_ask_user_question(tool_input)
+            return PermissionResultDeny(
+                message=(
+                    "AskUserQuestion isn't supported in this interface, so it "
+                    "was not run. Your questions have already been shown to the "
+                    "user in the chat. Do not repeat them — end your turn and "
+                    "wait for the user's plain-text reply, then continue with "
+                    "their answer."
+                ),
+            )
+
+        # Ordinary tools only reach here under a real permission mode; bypass
+        # auto-allows them before calling us.  Preserve that: auto-allow under
+        # bypass, otherwise prompt the user over the WebSocket.
+        if self.config.permission_mode == "bypassPermissions":
+            return PermissionResultAllow()
+
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending_permission = fut
         await self.broadcast({
@@ -1077,6 +1254,88 @@ class SDKBridge:
         if allowed:
             return PermissionResultAllow()
         return PermissionResultDeny(message="User denied")
+
+    async def _surface_ask_user_question(self, tool_input: dict) -> None:
+        """Render an AskUserQuestion tool call as a readable chat message.
+
+        The tool input carries 1-4 questions, each with 2-4 labelled options
+        (an "Other"/free-text choice is always implied).  We format them as a
+        system message so the user sees exactly what Claude wanted to ask and
+        can answer in their own words.
+        """
+        questions = []
+        if isinstance(tool_input, dict) and isinstance(tool_input.get("questions"), list):
+            questions = tool_input["questions"]
+
+        lines: list[str] = []
+        lines.append(
+            "Claude has a question:" if len(questions) == 1
+            else "Claude has some questions:"
+        )
+        for qi, q in enumerate(questions, 1):
+            if not isinstance(q, dict):
+                continue
+            qtext = str(q.get("question") or "").strip()
+            multi = bool(q.get("multiSelect"))
+            prefix = f"{qi}. " if len(questions) > 1 else ""
+            lines.append("")
+            lines.append(
+                f"{prefix}{qtext}" + ("  (choose all that apply)" if multi else "")
+            )
+            opts = q.get("options")
+            if isinstance(opts, list):
+                for opt in opts:
+                    if not isinstance(opt, dict):
+                        continue
+                    label = str(opt.get("label") or "").strip()
+                    desc = str(opt.get("description") or "").strip()
+                    lines.append(f"    - {label}" + (f" \u2014 {desc}" if desc else ""))
+            lines.append("    - (or answer in your own words)")
+
+        text = "\n".join(lines).rstrip()
+        if not text:
+            text = "Claude tried to ask a question, but it had no content."
+        await self.broadcast({
+            "type": "system_msg",
+            "subtype": "info",
+            "data": {"message": text},
+        })
+
+    async def _surface_api_error_loop(self, err_code: str | None) -> None:
+        """Break out of a repeating API-error loop and warn the user.
+
+        Called when the same API error has ended two or more turns in a row.
+        A transient 429/500 clears on retry, but a 400 from a bad block deep
+        in the resumed conversation (e.g. an unsupported image) is re-sent on
+        every turn and never clears — auto-continue would hammer it forever.
+        We stop auto-continue (``needs_user_attention = "api-error"``) and, on
+        the first stuck turn only, print a recovery hint.
+        """
+        state = self.state
+        # Halt auto-continue and flag the status bar.
+        state.needs_user_attention = "api-error"
+        # Only emit the guidance banner once per stuck streak (repeat_count
+        # is exactly 2 the first time we detect the loop).
+        if state.api_error_repeat_count != 2:
+            return
+        code = err_code or "?"
+        msg = (
+            f"Stuck in a repeating API error ({code}). The same request keeps "
+            f"failing, so continuing won't help — this usually means a bad "
+            f"message earlier in the conversation (e.g. an unsupported image) "
+            f"is being re-sent on every turn.\n\n"
+            f"Recovery options:\n"
+            f"    - Start a fresh session (the surest fix — the poisoned "
+            f"history is left behind).\n"
+            f"    - Trim the conversation to drop the offending old message, "
+            f"then retry.\n"
+            f"Auto-continue has been paused so it won't keep retrying."
+        )
+        await self.broadcast({
+            "type": "system_msg",
+            "subtype": "error",
+            "data": {"message": msg},
+        })
 
     def _bg_task_command(self, entry: dict) -> str | None:
         """Look up the Bash command for a background task via its tool_use_id."""
@@ -1152,6 +1411,11 @@ class SDKBridge:
         # before this new turn's content — so the completed turn is marked.
         if state.pending_compact_turn_end is not None:
             await self._flush_pending_compact_turn_end()
+
+        # A turn is starting, so any wakeup the model scheduled earlier has been
+        # superseded — cancel it.  If the model still wants the loop to continue
+        # it will call ScheduleWakeup again before this turn ends.
+        self._cancel_wakeup()
 
         self.interrupt_event.clear()
         state.busy = True
@@ -1241,6 +1505,7 @@ class SDKBridge:
                             name = block.name
                             inp = block.input if isinstance(block.input, dict) else {}
                             is_bg = name == "Bash" and inp.get("run_in_background")
+                            self._maybe_arm_wakeup(name, inp)
 
                             seq = register_tool_use(
                                 state, block.id, name, inp,
@@ -1337,6 +1602,33 @@ class SDKBridge:
                     subtype = getattr(msg, "subtype", None) or "unknown"
                     state.last_result_subtype = subtype
 
+                    # API-ERROR DETECTION.
+                    #
+                    # The CLI reports API failures as inline assistant text
+                    # ("API Error: 400 {...}") while still closing the turn
+                    # with subtype="success".  Detect that so (a) the turn is
+                    # labelled "error" instead of "success", and (b) a fault
+                    # that repeats every turn — the classic poisoned-history
+                    # loop where a bad image/message deep in the resumed
+                    # conversation is rejected on every resend — is caught and
+                    # the auto-continue loop broken with a recovery hint.
+                    err_code, err_sig = detect_api_error(msg, assistant_text)
+                    api_error_loop = False
+                    if err_code:
+                        subtype = "error"
+                        if err_sig == state.last_api_error_signature:
+                            state.api_error_repeat_count += 1
+                        else:
+                            state.last_api_error_signature = err_sig
+                            state.api_error_repeat_count = 1
+                        # Two identical API errors back-to-back means we're
+                        # stuck (a transient 429/500 clears on retry; a 400
+                        # from poisoned history does not).
+                        api_error_loop = state.api_error_repeat_count >= 2
+                    else:
+                        state.last_api_error_signature = None
+                        state.api_error_repeat_count = 0
+
                     # COMPACT-INDUCED ResultMessage handling.
                     #
                     # When the SDK runs an internal context compaction
@@ -1420,6 +1712,12 @@ class SDKBridge:
                             "started_at": state.turn_started_at or time.monotonic(),
                         }
                         self._schedule_compact_turn_end_flush()
+
+                    # If we're stuck in an API-error loop, break auto-continue
+                    # and surface a recovery hint (once per stuck streak).
+                    if api_error_loop:
+                        await self._surface_api_error_loop(err_code)
+
                     normal_completion = True
                     break
 
@@ -1837,7 +2135,8 @@ class SDKBridge:
 
         # --- Background tasks running → wait ---
         if state.background_tasks:
-            state.needs_user_attention = None
+            if state.needs_user_attention != "api-error":
+                state.needs_user_attention = None
             await self.broadcast({
                 "type": "status_update",
                 "status": state_to_status_dict(state, config),
@@ -1851,7 +2150,11 @@ class SDKBridge:
         # state._auto_continue), so every completed turn returns control to
         # the user here.  This is the only turn-completion bell that fires.
         ring_bell(state, "turn-done")
-        state.needs_user_attention = None
+        # Preserve an "api-error" flag so the status bar keeps signalling the
+        # stuck state until the user sends their next message (which clears it
+        # in _await_next_prompt).  Any other attention flag is cleared here.
+        if state.needs_user_attention != "api-error":
+            state.needs_user_attention = None
         return await self._await_next_prompt()
 
     async def _await_next_prompt(self) -> str | None:
@@ -1877,23 +2180,37 @@ class SDKBridge:
                 await self._clear_context()
                 continue
             if kind == "wakeup":
-                # Queue edit finished — send the first queued prompt.
-                if payload == "queue-edit-done" and self.state.queued_prompts:
+                # Any wakeup is a chance to flush a queued *user* prompt.
+                # This covers "queue-edit-done" (edit finished) *and*
+                # "bg-all-done" (background tasks drained while we were
+                # parked in bg-wait).  When a background task briefly
+                # streams, _begin_ghost_turn_if_needed flips state.busy
+                # True, so a prompt the user sends in that window is routed
+                # to state.queued_prompts by server.py.  If the ghost turn's
+                # queue-edit-done poke doesn't reach us (e.g. the bg task
+                # completes first and fires bg-all-done instead), nothing
+                # else would send it and the prompt sits unsent.  A queued
+                # user prompt is always sendable once we're back to
+                # waiting — it does NOT depend on auto_continue, which only
+                # gates the synthetic continue prompt below.  Skip only when
+                # the first item is being edited in the UI.
+                if self.state.queued_prompts and self.state.queue_editing_index != 0:
                     prompt = self.state.queued_prompts.popleft()
+                    self.state.queue_editing_index = None
                     self.state.needs_user_attention = None
                     await self.broadcast({
                         "type": "user_message",
                         "content": prompt,
                     })
                     return prompt
-                # Check if we should auto-resume.
+                # No queued prompt — check if we should auto-resume.
                 auto_continue = getattr(
                     self.state, "_auto_continue", self.config.auto_continue
                 )
                 if (
                     auto_continue
                     and payload in ("bg-all-done", "rate-limit reset", "api-status-recovered")
-                    and self.state.needs_user_attention not in ("waiting", "done", "burst")
+                    and self.state.needs_user_attention not in ("waiting", "done", "burst", "api-error")
                 ):
                     self.state.needs_user_attention = None
                     # Same as the grace-window path in _between_turns:
@@ -1933,6 +2250,8 @@ class SDKBridge:
     async def _clear_context(self) -> None:
         """Clear session state and reconnect (implements /clear)."""
         state = self.state
+        # A scheduled wakeup belongs to the session we're wiping — drop it.
+        self._cancel_wakeup()
         await self.disconnect()
         state.session_id = None
         state.session_title = None
@@ -2019,6 +2338,7 @@ class SDKBridge:
         """Gracefully shut down."""
         self.stop_event.set()
         self._cancel_compact_turn_end_timer()
+        self._cancel_wakeup()
         self.event_queue.put_nowait(("quit", ""))
         if self._worker_task and not self._worker_task.done():
             self._worker_task.cancel()

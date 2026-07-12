@@ -74,17 +74,37 @@ const Panels = (() => {
 
   // ----- Tools panel -----
 
+  // tool_use_ids whose detail is currently expanded inline.  Persisted across
+  // the frequent status_update re-renders so an open tool stays open.
+  const _expandedTools = new Set();
+  let _lastToolsSig = null;
+
   function _renderTools(tools) {
     const running = tools.filter(t => t.status === 'running');
-    const grace = tools.filter(t => t.status !== 'running');
 
     elToolsCount.textContent = running.length;
     elToolsCount.classList.toggle('active', running.length > 0);
 
     if (tools.length === 0) {
+      _expandedTools.clear();
       elToolsBody.innerHTML = '<div class="panel-empty">No active tools</div>';
+      _lastToolsSig = '';
       return;
     }
+
+    // Drop expanded ids for tools that have disappeared.
+    const liveIds = new Set(tools.map(t => t.tool_use_id || ''));
+    for (const id of [..._expandedTools]) {
+      if (!liveIds.has(id)) _expandedTools.delete(id);
+    }
+
+    // Skip rebuilding when nothing material changed (see _renderBg for the
+    // rationale — avoids clobbering a selection inside an expanded detail).
+    const sig = tools.map(t =>
+      `${t.tool_use_id || ''}:${t.status || ''}`
+    ).join('|');
+    if (sig === _lastToolsSig) return;
+    _lastToolsSig = sig;
 
     let html = '';
     for (const t of tools) {
@@ -94,23 +114,60 @@ const Panels = (() => {
       const name = t.name || '?';
       const summary = _toolSummary(t);
       const dur = t.elapsed || t.duration || '';
+      const tid = t.tool_use_id || '';
+      const detail = _toolDetail(t);
+      const expandable = !!detail;
+      const open = expandable && _expandedTools.has(tid);
 
-      html += `<div class="panel-item ${statusCls}" data-tool-id="${_esc(t.tool_use_id || '')}"
+      const itemCls = statusCls
+        + (expandable ? ' expandable' : '')
+        + (open ? ' expanded' : '');
+      const caret = expandable
+        ? `<span class="item-caret">${open ? '\u25BC' : '\u25B6'}</span>`
+        : '';
+
+      html += `<div class="panel-item ${itemCls}" data-tool-id="${_esc(tid)}"
                     title="${_esc(JSON.stringify(t.input || {}).substring(0, 200))}">
         <span class="item-icon">${icon}</span>
         <span class="item-name">${_esc(name)} ${_esc(summary)}</span>
         <span class="item-time">${_esc(dur)}</span>
+        ${caret}
       </div>`;
+      if (expandable) {
+        html += `<div class="panel-item-detail${open ? ' open' : ''}" data-tool-detail="${_esc(tid)}"><pre>${_esc(detail)}</pre></div>`;
+      }
     }
     elToolsBody.innerHTML = html;
 
-    // Click to open detail in modal.
-    elToolsBody.querySelectorAll('.panel-item').forEach(el => {
+    // Click to expand/collapse the tool's detail inline.
+    elToolsBody.querySelectorAll('.panel-item[data-tool-id]').forEach(el => {
       el.addEventListener('click', () => {
         const tid = el.dataset.toolId;
-        if (tid) App.showToolDetail(tid);
+        if (!tid) return;
+        const detail = elToolsBody.querySelector(
+          `.panel-item-detail[data-tool-detail="${window.CSS && CSS.escape ? CSS.escape(tid) : tid}"]`
+        );
+        if (!detail) return;  // no detail to show
+        const nowOpen = !detail.classList.contains('open');
+        detail.classList.toggle('open', nowOpen);
+        el.classList.toggle('expanded', nowOpen);
+        const caret = el.querySelector('.item-caret');
+        if (caret) caret.textContent = nowOpen ? '\u25BC' : '\u25B6';
+        if (nowOpen) _expandedTools.add(tid);
+        else _expandedTools.delete(tid);
       });
     });
+  }
+
+  /** Full inline detail for a tool: the command for Bash, else its input. */
+  function _toolDetail(t) {
+    const inp = t.input;
+    const name = t.name || (t.header && t.header.name) || '';
+    if (name === 'Bash' && inp && inp.command) return String(inp.command);
+    if (inp && typeof inp === 'object' && Object.keys(inp).length) {
+      try { return JSON.stringify(inp, null, 2); } catch (e) { /* fall through */ }
+    }
+    return _toolSummary(t);
   }
 
   function _toolSummary(t) {
@@ -129,15 +186,40 @@ const Panels = (() => {
 
   // ----- Background tasks panel -----
 
+  // task_ids whose command detail is currently expanded inline.  Persisted
+  // across the frequent status_update re-renders so an open task stays open.
+  const _expandedBg = new Set();
+  let _lastBgSig = null;
+
   function _renderBg(tasks) {
     const running = tasks.filter(t => t.status === 'running');
     elBgCount.textContent = running.length;
     elBgCount.classList.toggle('active', running.length > 0);
 
     if (tasks.length === 0) {
+      _expandedBg.clear();
       elBgBody.innerHTML = '<div class="panel-empty">No background tasks</div>';
+      _lastBgSig = '';
       return;
     }
+
+    // Drop expanded ids for tasks that have disappeared.
+    const liveIds = new Set(tasks.map(t => t.task_id || ''));
+    for (const id of [..._expandedBg]) {
+      if (!liveIds.has(id)) _expandedBg.delete(id);
+    }
+
+    // Skip rebuilding when the task set/commands are unchanged — status_update
+    // fires many times per second and an innerHTML rebuild wipes any text the
+    // user is selecting inside an expanded command.  (Expand/collapse toggles
+    // the DOM directly, so it doesn't depend on a re-render.)  Expansion state
+    // is deliberately excluded from the signature: after a click we've already
+    // updated the DOM, and keeping the sig stable prevents a needless rebuild.
+    const sig = tasks.map(t =>
+      `${t.task_id || ''}:${t.status || ''}:${(t.command || '').length}`
+    ).join('|');
+    if (sig === _lastBgSig) return;
+    _lastBgSig = sig;
 
     let html = '';
     for (const t of tasks) {
@@ -146,20 +228,46 @@ const Panels = (() => {
       const cls = isRunning ? 'running' : 'complete';
       const name = t.name || t.command || '(unnamed)';
       const dur = t.elapsed || t.duration || '';
+      const tid = t.task_id || '';
+      const cmd = t.command || '';
+      const expandable = !!cmd;
+      const open = expandable && _expandedBg.has(tid);
 
-      html += `<div class="panel-item ${cls}" data-bg-id="${_esc(t.task_id || '')}"
+      const itemCls = cls
+        + (expandable ? ' expandable' : '')
+        + (open ? ' expanded' : '');
+      const caret = expandable
+        ? `<span class="item-caret">${open ? '\u25BC' : '\u25B6'}</span>`
+        : '';
+
+      html += `<div class="panel-item ${itemCls}" data-bg-id="${_esc(tid)}"
                     title="${_esc(t.summary || t.task_type || '')}">
         <span class="item-icon">${icon}</span>
         <span class="item-name">${_esc(name)}</span>
         <span class="item-time">${_esc(dur)}</span>
+        ${caret}
       </div>`;
+      if (expandable) {
+        html += `<div class="panel-item-detail${open ? ' open' : ''}" data-bg-detail="${_esc(tid)}"><pre>${_esc(cmd)}</pre></div>`;
+      }
     }
     elBgBody.innerHTML = html;
 
-    elBgBody.querySelectorAll('.panel-item').forEach(el => {
+    elBgBody.querySelectorAll('.panel-item[data-bg-id]').forEach(el => {
       el.addEventListener('click', () => {
         const bid = el.dataset.bgId;
-        if (bid) App.showBgDetail(bid);
+        if (!bid) return;
+        const detail = elBgBody.querySelector(
+          `.panel-item-detail[data-bg-detail="${window.CSS && CSS.escape ? CSS.escape(bid) : bid}"]`
+        );
+        if (!detail) return;  // no command to show
+        const nowOpen = !detail.classList.contains('open');
+        detail.classList.toggle('open', nowOpen);
+        el.classList.toggle('expanded', nowOpen);
+        const caret = el.querySelector('.item-caret');
+        if (caret) caret.textContent = nowOpen ? '\u25BC' : '\u25B6';
+        if (nowOpen) _expandedBg.add(bid);
+        else _expandedBg.delete(bid);
       });
     });
   }

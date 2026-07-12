@@ -258,6 +258,33 @@ html, body {
 .panel-item.complete .item-icon { color: var(--icon-complete); }
 .panel-item.error    .item-icon { color: var(--icon-error); }
 
+/* Expandable bg-task rows: caret on the right, inline command detail below */
+.panel-item .item-caret {
+  font-size: 9px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.panel-item.expandable:hover .item-caret { color: var(--text); }
+
+.panel-item-detail {
+  display: none;
+  padding: 4px 6px 6px 24px;
+}
+.panel-item-detail.open { display: block; }
+.panel-item-detail pre {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--bg-tool);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
 /* Todo items */
 .todo-item {
   display: flex;
@@ -437,6 +464,15 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+/* Bottom-justify the conversation: when it all fits on screen, the messages
+   sit at the bottom (like a terminal / chat) instead of the top.  `margin-top:
+   auto` on the first child absorbs the free space when short, and collapses to
+   0 once the content overflows — so normal scrolling is unaffected.  (The
+   short-content collapse gap in chat.js relies on this bottom-justify.) */
+#messages > *:first-child {
+  margin-top: auto;
 }
 
 /* --- Message blocks --- */
@@ -903,6 +939,10 @@ html, body {
   padding: 4px 12px;
   border-bottom: 1px dashed var(--border);
   margin-bottom: 8px;
+}
+
+.msg-turn-end.error {
+  color: var(--system-error);
 }
 
 /* --- Command result messages --- */

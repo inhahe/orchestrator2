@@ -264,6 +264,13 @@ _HARNESS_INJECTED_PREFIXES = (
     # won't match this; that's an accepted tradeoff (custom prompts
     # only show as injected on the live path, not on replay).
     "If you need input from me before continuing, pause and include",
+    # Orchestrator's ScheduleWakeup heartbeat re-injection
+    # (WAKEUP_RESOLVED_PROMPT from config.py).  Same rationale as the
+    # auto-continue prompt above: surface it as a collapsed injected box
+    # on both the live echo and history replay rather than a user bubble.
+    # A custom wakeup prompt (model-supplied /loop task text) won't match
+    # — accepted tradeoff, identical to the custom --continue-prompt case.
+    "Autonomous-loop wakeup (scheduled by you)",
 )
 
 # XML-wrapped CLI internals that the user shouldn't see at all.

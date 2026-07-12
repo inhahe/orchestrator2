@@ -218,6 +218,47 @@ def detect_subscription_plan() -> str | None:
     return plan
 
 
+def config_dir_path() -> Path:
+    """Resolve the active Claude config dir (CLAUDE_CONFIG_DIR or ~/.claude)."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(base) if base else Path.home() / ".claude"
+
+
+def detect_account_info() -> dict[str, Any]:
+    """Read the signed-in account details from ``<config-dir>/.claude.json``.
+
+    Returns a dict with whatever could be gathered (all keys optional):
+    ``email``, ``display_name``, ``org_name``, ``org_type`` (e.g.
+    ``claude_max``), ``org_role``, ``config_dir`` (always present).  The
+    ``.claude.json`` file stores these under ``oauthAccount``.  Secrets (the
+    OAuth token in ``.credentials.json``) are deliberately never read here.
+    """
+    cfg = config_dir_path()
+    info: dict[str, Any] = {"config_dir": str(cfg)}
+    path = cfg / ".claude.json"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return info
+    oauth = data.get("oauthAccount") if isinstance(data, dict) else None
+    if not isinstance(oauth, dict):
+        return info
+    email = oauth.get("emailAddress")
+    if isinstance(email, str) and email:
+        info["email"] = email
+    for src, dst in (
+        ("displayName", "display_name"),
+        ("organizationName", "org_name"),
+        ("organizationType", "org_type"),
+        ("organizationRole", "org_role"),
+    ):
+        val = oauth.get(src)
+        if isinstance(val, str) and val:
+            info[dst] = val
+    return info
+
+
 # ---------------------------------------------------------------------------
 # Rate-limit helpers
 # ---------------------------------------------------------------------------
@@ -305,7 +346,14 @@ class State:
     # deferred turn_end info {"subtype", "started_at"} so it can still be
     # emitted (by a timer, or the next turn start) instead of being lost.
     pending_compact_turn_end: dict[str, Any] | None = None
-    needs_user_attention: str | None = None  # "waiting"/"burst"/"done"/None
+    needs_user_attention: str | None = None  # "waiting"/"burst"/"done"/"api-error"/None
+    # API-error loop detection.  When a turn ends with a non-retryable API
+    # error (e.g. a 400 from a poisoned message deep in history that gets
+    # resent on every resume), the same error repeats forever.  Track the
+    # last error signature + a consecutive-repeat counter so the worker can
+    # break the auto-continue loop and warn the user instead of hammering it.
+    last_api_error_signature: str | None = None
+    api_error_repeat_count: int = 0
     recent_turn_ends: deque[float] = field(default_factory=deque)
     turn_started_at: float | None = None
 
@@ -353,6 +401,10 @@ class State:
     is_subscription: bool = False
     subscription_plan: str | None = None
 
+    # Signed-in account (read once from <config-dir>/.claude.json).  Keys:
+    # email, display_name, org_name, org_type, org_role, config_dir.
+    account: dict[str, Any] = field(default_factory=dict)
+
     # Display settings (runtime-mutable)
     collapse_tools: bool = True
     collapse_threshold: int = 3
@@ -397,6 +449,7 @@ def init_state_from_config(config: Config) -> State:
         model=config.model,
         is_subscription=sub,
         subscription_plan=detect_subscription_plan() if sub else None,
+        account=detect_account_info(),
         collapse_tools=config.collapse_tools,
         collapse_threshold=config.collapse_threshold,
         max_dom_messages=config.max_dom_messages,
@@ -464,6 +517,9 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         busy_label = "done"
         busy_class = "done"
     elif state.needs_user_attention == "burst":
+        busy_label = "burst limit"
+        busy_class = "error"
+    elif state.needs_user_attention == "api-error":
         busy_label = "api error"
         busy_class = "error"
     else:
@@ -562,6 +618,7 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         "busy_class": busy_class,
         "turns": state.turns,
         "plan_field": plan_field,
+        "account": state.account,
         "is_subscription": state.is_subscription,
         "rate_field": rate_field,
         "rate_limits": rate_limits,
@@ -626,6 +683,7 @@ def state_to_panels_dict(state: State) -> dict[str, Any]:
             "tool_use_id": tool_id,
             "seq": info.get("seq"),
             "name": info.get("name"),
+            "input": info.get("input"),
             "duration": info.get("duration"),
             "is_error": info.get("is_error", False),
         })
@@ -646,6 +704,7 @@ def state_to_panels_dict(state: State) -> dict[str, Any]:
             "name": info.get("name"),
             "status": info.get("status"),
             "duration": info.get("duration"),
+            "command": info.get("command"),
         })
     for tid in expired_bg:
         state.completed_panel_bg.pop(tid, None)

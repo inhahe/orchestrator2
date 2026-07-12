@@ -15,6 +15,32 @@ const Chat = (() => {
   let elMessages;
   let _autoScroll = true;
 
+  // --- Collapse gap (scroll-anchored collapse) ---
+  // When a run of tools collapses into one line, the document suddenly
+  // shrinks.  Instead of snapping to the new bottom (which lurches all the
+  // on-screen text upward), we freeze the current scroll position and hold
+  // the freed vertical space open as a temporary gap at the bottom of the
+  // scroller (via padding-bottom).  Subsequent streamed lines fill that gap
+  // from the top down; once real content would overflow the frozen viewport,
+  // the gap is released and normal bottom-following resumes.
+  let _gapActive = false;
+  let _gapFrozenTop = 0;      // scrollTop to hold while the gap is open
+  let _gapPad = 0;            // extra padding-bottom currently applied (px)
+  const _GAP_BASE_PAD = 12;   // #messages base padding-bottom (styles.css)
+
+  // --- Short-content collapse gap (no-scroll case) ---
+  // #messages is bottom-justified (see styles.css: first child gets
+  // margin-top:auto), so when the whole conversation fits on screen it sits at
+  // the bottom.  Collapsing a run of tools then shrinks the content, and the
+  // bottom-justify would pull the text above the collapse *downward* — the same
+  // lurch the scroll-anchored gap avoids, but with no scrollbar to freeze.
+  // Instead we hold the reclaimed space open as padding-bottom (which, under
+  // bottom-justify, pushes the content back up so the top text stays put) and
+  // shrink it as new lines stream in.
+  let _shortGapActive = false;
+  let _shortGapFreed = 0;        // px of bottom space currently held open
+  let _shortGapBaseContentH = 0; // content height when the gap opened
+
   // Track the current streaming assistant text element.
   let _streamingEl = null;
   let _streamingText = '';
@@ -110,6 +136,14 @@ const Chat = (() => {
     const summary = _activitySummary(counts);
     if (!summary) return;
 
+    // Snapshot scroll state *before* the DOM shrinks so we can anchor it.
+    // Only engage the gap when the user is following at the bottom and we're
+    // not bulk-replaying history (where a live gap would just churn).
+    const _wasPinned = _autoScroll && !_replayInProgress;
+    const _beforeTop = elMessages.scrollTop;
+    const _beforeH = elMessages.scrollHeight;
+    const _beforeContentH = _contentHeight();
+
     // Create collapsible group.
     const group = document.createElement('div');
     group.className = 'activity-group collapsed';
@@ -139,6 +173,42 @@ const Chat = (() => {
         toggle.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }
     });
+
+    // If we were following at the bottom, anchor the collapse so the text
+    // above the collapsed run stays put instead of lurching.
+    if (_wasPinned) {
+      const freedScroll = _beforeH - elMessages.scrollHeight;
+      if (freedScroll > 2) {
+        // Overflowing scroller: freeze scrollTop and hold the reclaimed space
+        // open as a bottom gap (scroll-anchored).
+        if (!_gapActive) {
+          _gapActive = true;
+          _gapFrozenTop = _beforeTop;
+          _gapPad = 0;
+        }
+        _maintainGap();
+      } else if (!_gapActive) {
+        // Not overflowing (content fits on screen, bottom-justified).  The
+        // scrollHeight didn't change, but the real content did — measure it
+        // directly and hold a padding-bottom gap so the top text stays fixed.
+        const freed = _beforeContentH - _contentHeight();
+        if (freed > 2) {
+          _shortGapActive = true;
+          _shortGapFreed = freed;
+          _shortGapBaseContentH = _contentHeight();
+          _applyShortGap();
+        }
+      }
+    }
+  }
+
+  // True rendered height of the message content (first child top → last child
+  // bottom), independent of scroll clamping or the bottom-justify margin.
+  function _contentHeight() {
+    const first = elMessages.firstElementChild;
+    const last = elMessages.lastElementChild;
+    if (!first || !last) return 0;
+    return last.getBoundingClientRect().bottom - first.getBoundingClientRect().top;
   }
 
   function _countActivityItems(elements) {
@@ -175,6 +245,12 @@ const Chat = (() => {
       if (_scrollThrottle) return;
       _scrollThrottle = setTimeout(() => {
         _scrollThrottle = null;
+        // If the user scrolls up while a collapse gap is open, release the
+        // gap so they can browse freely (our own scroll writes hold exactly
+        // at _gapFrozenTop, so they don't trip this).
+        if (_gapActive && elMessages.scrollTop < _gapFrozenTop - 4) {
+          _cancelGap();
+        }
         const threshold = 80;
         const atBottom = (elMessages.scrollHeight - elMessages.scrollTop - elMessages.clientHeight) < threshold;
         _autoScroll = atBottom;
@@ -191,15 +267,83 @@ const Chat = (() => {
     _streamingEl = null;
     _streamingText = '';
     _toolBlocks.clear();
+    _cancelGap();
+    _cancelShortGap();
   }
 
   // --- Scrolling ---
 
   function _scrollToBottom() {
+    if (_gapActive) {
+      _maintainGap();
+      _maybeTrimOldMessages();
+      return;
+    }
+    if (_shortGapActive) {
+      _maintainShortGap();
+      _maybeTrimOldMessages();
+      return;
+    }
     if (_autoScroll) {
       elMessages.scrollTop = elMessages.scrollHeight;
     }
     _maybeTrimOldMessages();
+  }
+
+  // Re-size the bottom gap so the frozen viewport top stays put while new
+  // content streams in.  When real content grows enough to fill (or exceed)
+  // the frozen viewport, the gap is released and normal following resumes.
+  function _maintainGap() {
+    // Height of real content, excluding the padding we added.
+    const baseH = elMessages.scrollHeight - _gapPad;
+    const needed = _gapFrozenTop + elMessages.clientHeight - baseH;
+    if (needed <= 0) {
+      // Content now fills past the frozen viewport — hand back to normal
+      // bottom-following.
+      _cancelGap();
+      if (_autoScroll) elMessages.scrollTop = elMessages.scrollHeight;
+      return;
+    }
+    _gapPad = needed;
+    elMessages.style.paddingBottom = (_GAP_BASE_PAD + needed) + 'px';
+    elMessages.scrollTop = _gapFrozenTop;
+  }
+
+  function _cancelGap() {
+    if (!_gapActive) return;
+    _gapActive = false;
+    _gapPad = 0;
+    elMessages.style.paddingBottom = '';
+  }
+
+  // Push the bottom-justified content up by the held-open gap so the text above
+  // the collapse doesn't drop.  (Content height + gap == pre-collapse height,
+  // so this never introduces a scrollbar.)
+  function _applyShortGap() {
+    elMessages.style.paddingBottom = (_GAP_BASE_PAD + _shortGapFreed) + 'px';
+  }
+
+  // As new lines stream in, shrink the gap 1:1 with content growth.  When the
+  // gap closes (content refilled the reclaimed space), release it and let the
+  // normal bottom-justify take over again.
+  function _maintainShortGap() {
+    const growth = _contentHeight() - _shortGapBaseContentH;
+    const remaining = _shortGapFreed - growth;
+    if (remaining <= 0) {
+      _cancelShortGap();
+      if (_autoScroll) elMessages.scrollTop = elMessages.scrollHeight;
+      return;
+    }
+    _shortGapFreed = remaining;
+    _shortGapBaseContentH = _contentHeight();
+    _applyShortGap();
+  }
+
+  function _cancelShortGap() {
+    if (!_shortGapActive) return;
+    _shortGapActive = false;
+    _shortGapFreed = 0;
+    elMessages.style.paddingBottom = '';
   }
 
   // --- DOM trimming ---
@@ -214,6 +358,8 @@ const Chat = (() => {
 
   function _maybeTrimOldMessages() {
     if (_trimPending) return;
+    if (_gapActive) return;             // don't move the frozen scroll anchor
+    if (_shortGapActive) return;        // gap math depends on stable children
     if (_maxDomChildren === 0) return;  // trimming disabled
     if (elMessages.children.length <= _maxDomChildren) return;
     _trimPending = true;
@@ -278,7 +424,10 @@ const Chat = (() => {
     // Force scroll — the user's own message should always be visible.
     // (The normal _autoScroll flag may be false due to the input textarea
     // expanding on paste, which shifts the layout and trips the scroll
-    // listener before the message is appended.)
+    // listener before the message is appended.)  Release any open collapse
+    // gap so the new turn settles at the true bottom.
+    _cancelGap();
+    _cancelShortGap();
     _autoScroll = true;
     _scrollToBottom();
   }
@@ -684,7 +833,9 @@ const Chat = (() => {
     _collapseActivity();
     const el = document.createElement('div');
     el.className = 'msg-turn-end';
-    el.textContent = `Turn ${msg.turns ?? '?'} completed (${msg.duration || '?'}) — ${msg.subtype || ''}`;
+    const _sub = msg.subtype || '';
+    if (_sub === 'error' || _sub === 'interrupted') el.className += ' error';
+    el.textContent = `Turn ${msg.turns ?? '?'} completed (${msg.duration || '?'}) — ${_sub}`;
     elMessages.appendChild(el);
     _scrollToBottom();
   }

@@ -40,6 +40,38 @@ CONTINUE_RESPONSE_DELAY_SECONDS = 2.0
 CONTINUE_BURST_LIMIT = 3
 CONTINUE_BURST_WINDOW_SECONDS = 180.0
 
+# ---------------------------------------------------------------------------
+# ScheduleWakeup / autonomous-loop heartbeat
+# ---------------------------------------------------------------------------
+#
+# The model drives self-paced autonomous loops by calling the ``ScheduleWakeup``
+# tool: "resume in N seconds with this prompt".  In Claude Code's interactive
+# REPL the harness implements that timer.  But orchestrator2 talks to the CLI in
+# streaming mode, where the CLI never re-injects a scheduled prompt on its own —
+# so ScheduleWakeup is a silent no-op and the autonomous loop stalls (most
+# visibly while waiting on a background task, when little context is produced and
+# even compaction-driven continuations don't fire).  We therefore honour
+# ScheduleWakeup ourselves: intercept the tool call, arm a timer, and re-inject
+# the prompt as a fresh turn when it fires — even while background tasks run.
+WAKEUP_MIN_DELAY = 60.0
+WAKEUP_MAX_DELAY = 3600.0
+WAKEUP_DEFAULT_DELAY = 60.0
+
+# Prompts the model passes verbatim to ScheduleWakeup for an autonomous loop with
+# no user task.  The runtime is expected to "resolve" these sentinels back to the
+# autonomous-loop instructions at fire time; since orchestrator2 owns the timer,
+# we resolve them to a concrete continue instruction (the model already carries
+# the full autonomous-loop policy from its CLAUDE.md).
+WAKEUP_SENTINELS = ("<<autonomous-loop-dynamic>>", "<<autonomous-loop>>")
+WAKEUP_RESOLVED_PROMPT = (
+    "Autonomous-loop wakeup (scheduled by you). Resume work now: first check "
+    "on any in-flight background task, then continue the next task per your "
+    "project's CLAUDE.md / roadmap. If — and only if — you are genuinely "
+    "blocked on a human decision and no other task is unblocked, stop and do "
+    "NOT schedule another wakeup; otherwise keep the loop alive by calling "
+    "ScheduleWakeup again at the end of this turn."
+)
+
 # Tools whose output is typically short and can be shown inline without
 # drowning the user's scrollback.
 SHORT_OUTPUT_TOOLS = frozenset({
@@ -339,6 +371,12 @@ class Config:
     continue_burst_limit: int = CONTINUE_BURST_LIMIT
     continue_burst_window: float = CONTINUE_BURST_WINDOW_SECONDS
 
+    # ScheduleWakeup / autonomous-loop heartbeat.  When True (default), the
+    # bridge honours the model's ScheduleWakeup tool calls by re-injecting the
+    # scheduled prompt as a fresh turn after the requested delay — including
+    # while background tasks are still running.
+    wakeup_enabled: bool = True
+
     # API status polling
     status_url: str = "https://status.claude.com/api/v2/summary.json"
     status_poll_interval: float = 30.0
@@ -622,6 +660,18 @@ def parse_args(argv: list[str] | None = None) -> Config:
         action="store_true",
         help="Reconnect and auto-continue on CLI crash.",
     )
+    ap.add_argument(
+        "--no-wakeup",
+        dest="wakeup_enabled",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable honouring the model's ScheduleWakeup tool calls. By "
+            "default the orchestrator re-injects a scheduled prompt as a fresh "
+            "turn after the requested delay (keeps autonomous loops alive, "
+            "including while background tasks run)."
+        ),
+    )
 
     # -- Config directory --
     ap.add_argument(
@@ -726,6 +776,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         append_system_prompt=args.append_system_prompt,
         mcp_config=args.mcp_config,
         auto_reconnect=args.auto_reconnect,
+        wakeup_enabled=args.wakeup_enabled,
         debug=args.debug,
         log_file=args.log_file,
         port=args.port,

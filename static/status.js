@@ -6,7 +6,7 @@
 
 const Status = (() => {
   // Element references (cached on init).
-  let elIndicator, elState, elSession, elTurns, elPlan;
+  let elIndicator, elState, elAccount, elSession, elTurns, elPlan;
   let elModel, elEffort, elThinking;
   let elContext, elRateLimit;
   let elCollapseCheck;
@@ -26,6 +26,7 @@ const Status = (() => {
   function init() {
     elIndicator = document.getElementById('status-indicator');
     elState     = document.getElementById('status-state');
+    elAccount   = document.getElementById('status-account');
     elSession   = document.getElementById('status-session');
     elTurns     = document.getElementById('status-turns');
     elPlan      = document.getElementById('status-plan');
@@ -130,6 +131,10 @@ const Status = (() => {
       _prev.stateColor = stateColor;
     }
 
+    // Account (email if available, else the config dir).  Static per session
+    // but cheap; guarded by a change cache like the rest.
+    if (elAccount) _updateAccount(status.account);
+
     // Session.
     const sid = status.session_id;
     const title = status.session_title;
@@ -203,6 +208,36 @@ const Status = (() => {
     if (status.max_dom_messages != null && _prev.maxDom !== status.max_dom_messages) {
       Chat.setMaxDomMessages(status.max_dom_messages);
       _prev.maxDom = status.max_dom_messages;
+    }
+  }
+
+  function _updateAccount(acct) {
+    acct = acct || {};
+    // Display: prefer the email; fall back to the config dir's folder name
+    // (e.g. ".claude-account-b"), then to the raw config dir.
+    let display = acct.email;
+    const cfg = acct.config_dir || '';
+    if (!display && cfg) {
+      const parts = cfg.replace(/[\\/]+$/, '').split(/[\\/]/);
+      display = parts[parts.length - 1] || cfg;
+    }
+    display = display || '--';
+
+    // Tooltip: everything we could gather.
+    const tip = [];
+    if (acct.display_name) tip.push('name: ' + acct.display_name);
+    if (acct.email) tip.push('email: ' + acct.email);
+    if (acct.org_name) tip.push('org: ' + acct.org_name);
+    if (acct.org_type) tip.push('org type: ' + acct.org_type);
+    if (acct.org_role) tip.push('role: ' + acct.org_role);
+    if (cfg) tip.push('config dir: ' + cfg);
+    const tipText = tip.join('\n') || 'Account';
+
+    const key = display + '|' + tipText;
+    if (_prev.acctKey !== key) {
+      elAccount.textContent = display;
+      elAccount.title = tipText;
+      _prev.acctKey = key;
     }
   }
 
