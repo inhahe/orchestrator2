@@ -35,6 +35,7 @@ from session import (
     render_session_markdown,
     write_session_title,
 )
+import auth
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +70,12 @@ def _data_msg(data: Any, *, label: str = "data") -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # classify() — command parser
 # ---------------------------------------------------------------------------
+
+# Read-only graphify subcommands that run directly against an existing
+# graphify-out/graph.json — fast, deterministic, no LLM turn.  Anything else
+# after ``/graphify`` is treated as a build request routed to the SDK skill.
+_GRAPHIFY_CLI_SUBCOMMANDS = frozenset({"explain", "path", "diagnose"})
+
 
 def classify(line: str) -> tuple[str, str]:
     """Parse a line of user input into ``(kind, payload)``.
@@ -149,6 +156,9 @@ def classify(line: str) -> tuple[str, str]:
     if cmd == "queue":
         return "queue", arg
     if cmd == "graphify":
+        sub = arg.split(None, 1)[0].lower() if arg.strip() else ""
+        if sub in _GRAPHIFY_CLI_SUBCOMMANDS:
+            return "graphify-cli", arg
         return "graphify", arg
     if cmd == "history":
         return "history", arg
@@ -162,6 +172,10 @@ def classify(line: str) -> tuple[str, str]:
         if arg:
             return "switch-cwd", arg
         return "status", ""
+    if cmd == "login":
+        return "login", ""
+    if cmd == "logout":
+        return "logout", ""
     if cmd in ("connect", "reconnect"):
         return "connect", ""
     if cmd == "resume":
@@ -191,6 +205,8 @@ _IMMEDIATE_HANDLERS: dict[str, str] = {
     "history":         "_cmd_history",
     "effort-show":     "_cmd_effort_show",
     "model-show":      "_cmd_model_show",
+    "login":           "_cmd_login",
+    "logout":          "_cmd_logout",
 }
 
 
@@ -233,12 +249,17 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         ("/effort <level>",              f"one of {', '.join(EFFORT_CHOICES)}"),
         ("/thinking [on|off|toggle]",    "enable/disable extended thinking"),
         ("/model [name]",                "show/set model; no arg lists available"),
+        ("/login",                       "sign in to your Claude account"),
+        ("/logout",                      "sign out of your Claude account"),
         ("/connect",                     "reconnect to the SDK"),
         ("/resume [id|title]",           "resume a session (or open picker)"),
         ("/rename <name>",               "set a custom session title"),
         ("/export [path]",               "save conversation as markdown"),
         ("/btw <question>",              "side question (separate context)"),
         ("/graphify [path] [flags]",     "build a knowledge graph (graphify)"),
+        ("/graphify explain <node>",     "explain a graph node (instant, no turn)"),
+        ("/graphify path <A> <B>",       "shortest path between two nodes"),
+        ("/graphify diagnose",           "report multigraph edge-collapse risk"),
         ("/collapse [on|off]",           "toggle collapsing of repeated blocks"),
         ("/collapse-threshold N",        "blocks shown before collapsing"),
         ("/autocompact [on|off|N]",      "auto-compact threshold"),
@@ -284,6 +305,49 @@ def _cmd_status(_payload: str, state: State, config: Config) -> CommandResult:
         "status": status,
     }
     return CommandResult(messages=[_data_msg(info, label="status")])
+
+
+def _cmd_login(_payload: str, state: State, _config: Config) -> CommandResult:
+    """Show login status, and start the Claude login flow if not signed in."""
+    if auth.is_logged_in():
+        email = auth.account_email()
+        who = f" as {email}" if email else ""
+        return CommandResult(messages=[{
+            "type": "system_msg",
+            "subtype": "info",
+            "data": {"message": f"Already signed in to Claude{who}. "
+                                f"Use /logout to switch accounts."},
+        }])
+    ok, msg = auth.launch_login()
+    return CommandResult(messages=[{
+        "type": "system_msg",
+        "subtype": "info" if ok else "error",
+        "data": {"message": f"{msg} After signing in, run /connect to reconnect."},
+    }])
+
+
+def _cmd_logout(_payload: str, _state: State, _config: Config) -> CommandResult:
+    """Sign the active config dir out of its Claude account."""
+    cli = auth.find_claude_cli()
+    if not cli:
+        return CommandResult(messages=[{
+            "type": "system_msg", "subtype": "error",
+            "data": {"message": "could not find the `claude` CLI to log out."},
+        }])
+    import subprocess
+    try:
+        subprocess.run([cli, "auth", "logout"], capture_output=True,
+                       text=True, timeout=20)
+        ok = True
+    except (OSError, subprocess.SubprocessError) as exc:
+        return CommandResult(messages=[{
+            "type": "system_msg", "subtype": "error",
+            "data": {"message": f"logout failed: {exc}"},
+        }])
+    return CommandResult(messages=[{
+        "type": "system_msg", "subtype": "info",
+        "data": {"message": "Signed out. Run /login to sign in again."},
+    }])
 
 
 def _cmd_debug(_payload: str, state: State, _config: Config) -> CommandResult:

@@ -80,8 +80,36 @@ from theme import (
     PRESET_THEMES,
 )
 from sdk_bridge import SDKBridge, _build_graphify_prompt
+import auth
 
 log = logging.getLogger("orchestrator2")
+
+
+def _ensure_logged_in(*, block: bool) -> bool:
+    """Auto-login to the Claude account (the way Claude Code does) if needed.
+
+    Runs under the CLAUDE_CONFIG_DIR already pinned by ``main()``.  When not
+    signed in, spawns ``claude auth login`` in a visible console.  With
+    ``block=True`` (the --detach parent) it then waits until the login
+    completes so the headless child starts already authenticated; with
+    ``block=False`` it returns immediately and the worker's connect-retry
+    picks up the credentials once they land.
+    """
+    if auth.is_logged_in():
+        return True
+    ok, msg = auth.launch_login()
+    print(f"Not signed in to Claude — {msg}")
+    if not ok or not block:
+        return auth.is_logged_in()
+    print("Waiting for Claude login to complete...")
+    deadline = time.monotonic() + 300.0
+    while time.monotonic() < deadline:
+        if auth.is_logged_in():
+            print("Login complete.")
+            return True
+        time.sleep(1.5)
+    print("Login not completed in time — continuing anyway.")
+    return auth.is_logged_in()
 
 # ---------------------------------------------------------------------------
 # Global singletons (initialised in lifespan)
@@ -1077,6 +1105,13 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
                 bridge.event_queue.put_nowait(("message", result.forward_payload))
             return
 
+        # /graphify explain|path|diagnose — read-only queries against the
+        # existing graph.  Run the graphify CLI directly (fast, deterministic,
+        # no LLM turn) and stream its output back into the transcript.
+        if kind == "graphify-cli":
+            await _run_graphify_cli(ws, payload)
+            return
+
         # /graphify — build the prompt here so we can give feedback and
         # route as a plain message (handled everywhere in the bridge).
         if kind == "graphify":
@@ -1140,6 +1175,91 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
     else:
         await send_to(ws, {"type": "system_msg", "subtype": "warning",
                            "data": {"message": f"unknown message type: {msg_type}"}})
+
+
+# ---------------------------------------------------------------------------
+# graphify read-only CLI subcommands
+# ---------------------------------------------------------------------------
+
+def _build_graphify_cli_argv(payload: str) -> tuple[list[str] | None, str | None]:
+    """Parse ``/graphify <sub> ...`` into an argv for ``python -m graphify``.
+
+    Only the read-only subcommands (explain / path / diagnose) are handled
+    here.  Returns ``(argv, None)`` on success or ``(None, usage_error)``.
+    """
+    import shlex
+
+    parts = payload.strip().split(None, 1)
+    sub = parts[0].lower() if parts else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    base = [sys.executable, "-m", "graphify"]
+
+    if sub == "explain":
+        if not rest:
+            return None, "usage: /graphify explain <node>"
+        # Single node label — honour surrounding quotes, otherwise pass the
+        # whole remainder as one argument (labels may contain spaces).
+        toks = shlex.split(rest)
+        label = toks[0] if len(toks) == 1 else rest
+        return base + ["explain", label], None
+
+    if sub == "path":
+        toks = shlex.split(rest)
+        if len(toks) != 2:
+            return None, "usage: /graphify path <A> <B>  (quote names with spaces)"
+        return base + ["path", toks[0], toks[1]], None
+
+    if sub == "diagnose":
+        toks = shlex.split(rest) if rest else []
+        if not toks:
+            toks = ["multigraph"]
+        return base + ["diagnose", *toks], None
+
+    return None, f"unknown graphify subcommand: {sub!r}"
+
+
+async def _run_graphify_cli(ws: WebSocket, payload: str) -> None:
+    """Run a read-only graphify subcommand and stream its output to ``ws``."""
+    argv, err = _build_graphify_cli_argv(payload)
+    if err:
+        await send_to(ws, {"type": "system_msg", "subtype": "error",
+                           "data": {"message": err}})
+        return
+
+    sub_label = payload.strip().split(None, 1)[0]
+    await send_to(ws, {"type": "system_msg", "subtype": "info",
+                       "data": {"message": f"/graphify {sub_label} — running..."}})
+
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=config.cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        text = out.decode("utf-8", "replace").rstrip()
+        rc = proc.returncode
+    except asyncio.TimeoutError:
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        await send_to(ws, {"type": "system_msg", "subtype": "error",
+                           "data": {"message": "graphify timed out after 60s"}})
+        return
+    except Exception as e:  # noqa: BLE001 — surface any launch/IO failure
+        await send_to(ws, {"type": "system_msg", "subtype": "error",
+                           "data": {"message": f"graphify failed: {e}"}})
+        return
+
+    if not text:
+        text = f"(no output, exit code {rc})"
+    elif rc:
+        text = f"{text}\n\n(exit code {rc})"
+    await send_to(ws, {"type": "command_data", "data": text})
 
 
 # ---------------------------------------------------------------------------
@@ -1274,7 +1394,10 @@ def main() -> None:
     # Parse args early so we can get the port and store for startup().
     config = parse_args()
 
-    # Set CLAUDE_CONFIG_DIR before any SDK or session code runs.
+    # Set CLAUDE_CONFIG_DIR before any SDK or session code runs.  When
+    # --config-dir is passed it wins; otherwise the SDK/CLI use whatever
+    # CLAUDE_CONFIG_DIR is inherited from the environment (or ~/.claude when
+    # unset).
     if config.config_dir:
         os.environ["CLAUDE_CONFIG_DIR"] = str(Path(config.config_dir).resolve())
 
@@ -1294,6 +1417,10 @@ def main() -> None:
     # --detach: validate everything here (errors visible in terminal),
     # then respawn headless and exit.
     if config.detach:
+        # Ensure we're signed in before spawning the headless child, blocking
+        # in this visible terminal so the child starts authenticated and
+        # doesn't pop its own login window.
+        _ensure_logged_in(block=True)
         sock, actual_port = _bind_port("0.0.0.0", config.port)
         if actual_port != config.port:
             print(f"Port {config.port} in use — using {actual_port} instead.")
@@ -1318,7 +1445,8 @@ def main() -> None:
                 continue
             child_argv.append(a)
             i += 1
-        child_argv.extend(["--port", str(actual_port), "--auto-shutdown"])
+        child_argv.extend(["--port", str(actual_port), "--auto-shutdown",
+                           "--skip-auto-login"])
 
         import subprocess
         import tempfile
@@ -1355,32 +1483,57 @@ def main() -> None:
         )
         err_file.close()
 
-        # Give the child a moment to crash on startup.
+        # Poll until the child is actually serving HTTP, then open the browser
+        # immediately — rather than sleeping a fixed 2s and hoping.  This opens
+        # the tab the instant the port accepts a connection (usually well under
+        # a second once imports finish) and still catches an early crash.  The
+        # SDK connect happens *after* the child starts serving, so the page
+        # loads right away and shows a "connecting…" status while it finishes.
         import time as _time
-        _time.sleep(2)
-        rc = proc.poll()
-        if rc is not None:
-            err = Path(err_path).read_text(errors="replace").strip()
-            print(f"Failed to start (exit {rc}):", file=sys.stderr)
-            if err:
-                for line in err.splitlines()[-20:]:
-                    print(f"  {line}", file=sys.stderr)
-            try:
-                os.unlink(err_path)
-            except OSError:
-                pass
-            sys.exit(rc or 1)
-
-        # Still running → success.  Open the browser from the parent
-        # (which has a visible console).  The child's CREATE_NO_WINDOW
-        # environment makes webbrowser.open() unreliable on Windows.
         url = f"http://localhost:{actual_port}"
-        print(f"orchestrator2 launched on {url}")
+        deadline = _time.monotonic() + 20.0
+        serving = False
+        while _time.monotonic() < deadline:
+            rc = proc.poll()
+            if rc is not None:
+                err = Path(err_path).read_text(errors="replace").strip()
+                print(f"Failed to start (exit {rc}):", file=sys.stderr)
+                if err:
+                    for line in err.splitlines()[-20:]:
+                        print(f"  {line}", file=sys.stderr)
+                try:
+                    os.unlink(err_path)
+                except OSError:
+                    pass
+                sys.exit(rc or 1)
+            probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            probe.settimeout(0.25)
+            try:
+                probe.connect(("127.0.0.1", actual_port))
+                serving = True
+            except OSError:
+                serving = False
+            finally:
+                probe.close()
+            if serving:
+                break
+            _time.sleep(0.1)
 
+        # Serving (or timed out but process still alive) → open the browser from
+        # the parent (which has a visible console).  The child's CREATE_NO_WINDOW
+        # environment makes webbrowser.open() unreliable on Windows.
+        print(f"orchestrator2 launched on {url}")
         if config.open_browser:
             webbrowser.open(f"{url}?t={int(time.time())}")
 
         sys.exit(0)
+
+    # Auto-login (non-detach path).  The --detach child skips this because the
+    # parent already ensured we're signed in.  Non-blocking: the login window
+    # opens and startup proceeds; the worker's connect-retry succeeds once the
+    # credentials appear.
+    if not config.skip_auto_login:
+        _ensure_logged_in(block=False)
 
     # Bind the socket ourselves so we know the actual port before
     # uvicorn starts (needed for --open and the startup message).

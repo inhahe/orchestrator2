@@ -6,7 +6,7 @@
 
 const Status = (() => {
   // Element references (cached on init).
-  let elIndicator, elState, elAccount, elSession, elTurns, elPlan;
+  let elIndicator, elState, elAccount, elSession, elCwd, elTurns, elPlan;
   let elModel, elEffort, elThinking;
   let elContext, elRateLimit;
   let elCollapseCheck;
@@ -28,6 +28,7 @@ const Status = (() => {
     elState     = document.getElementById('status-state');
     elAccount   = document.getElementById('status-account');
     elSession   = document.getElementById('status-session');
+    elCwd       = document.getElementById('status-cwd');
     elTurns     = document.getElementById('status-turns');
     elPlan      = document.getElementById('status-plan');
     elModel     = document.getElementById('status-model');
@@ -143,7 +144,7 @@ const Status = (() => {
       if (title) {
         elSession.textContent = title;
         elSession.title = sid || '';
-        document.title = 'orchestrator2 - ' + title;
+        document.title = title;
       } else if (sid) {
         elSession.textContent = sid.substring(0, 8);
         elSession.title = sid;
@@ -153,6 +154,14 @@ const Status = (() => {
         document.title = 'orchestrator2';
       }
       _prev.sessionKey = sessionKey;
+    }
+
+    // Working directory (full path).
+    if (elCwd && _prev.cwd !== status.cwd) {
+      const cwd = status.cwd || '--';
+      elCwd.textContent = cwd;
+      elCwd.title = cwd === '--' ? 'Working directory' : cwd;
+      _prev.cwd = status.cwd;
     }
 
     // Turns.

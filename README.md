@@ -2,18 +2,55 @@
 
 A web-based orchestrator for the Claude Agent SDK. Wraps Claude Code's agentic capabilities in a multi-file async Python server with a browser UI featuring live status, tool panels, side-by-side diffs, background task tracking, and a fully configurable color theme system.
 
+## How to Set Up & Use This
+
+**1. Prerequisites**
+
+- **Python 3.11+**
+- **Claude Code CLI** — install it from <https://claude.com/claude-code> (the `claude` command must be on your `PATH`). orchestrator2 drives the same CLI the Claude Code app uses, and shares its session store and login.
+
+**2. Install dependencies**
+
+```bash
+pip install -r requirements.txt
+```
+
+**3. Sign in to your Claude account**
+
+You need to be logged in to Claude. orchestrator2 checks this automatically on startup and, if you're not signed in, opens the normal Claude login window for you. You can also do it yourself any time:
+
+```bash
+claude auth login          # from a terminal, or
+/login                     # from inside orchestrator2 (then /connect)
+```
+
+**4. Run it**
+
+From the project directory you want Claude to work in:
+
+```bash
+python server.py --cwd "%cd%" --open
+```
+
+- `--cwd "%cd%"` — the working directory Claude operates in (defaults to the current directory).
+- `--open` — open the browser automatically. Otherwise browse to the printed URL (default `http://localhost:8420`; it auto-picks a free port if 8420 is taken).
+
+The server starts serving and the browser opens **immediately**; the status bar shows **`connecting…`** while the Claude SDK finishes loading in the background, then flips to `idle` when it's ready to take your first message.
+
+**5. Use it**
+
+- Type a message and press **Enter** to send (**Shift+Enter** for a newline).
+- Type while Claude is busy to **queue** follow-up prompts (they run in order).
+- The **status bar** (above the input) shows state, account, session, **working directory (full path)**, turns, model, effort, context usage, and rate limits.
+- The **sidebar panels** show active tools, background tasks, the pending queue, and the current plan/todos.
+- **Slash commands** start with `/` — type `/help` for the full list. Common ones: `/status`, `/cwd <path>` (switch project), `/model`, `/effort`, `/resume`, `/rename`, `/login`, `/clear`, `/interrupt`.
+
+Sessions are stored the same way Claude Code stores them — under `<config-dir>/projects/<cwd>/` — so a conversation is interchangeable with `claude --continue` / `claude --resume` **as long as both use the same `CLAUDE_CONFIG_DIR`** (account). See [Choosing a Claude account](#choosing-a-claude-account).
+
 ## Quick Start
 
 ```bash
 pip install -r requirements.txt
-python server.py
-```
-
-Opens at `http://localhost:8420`. Add `--open` to launch the browser automatically.
-
-To run from a different directory (e.g. via a launcher script):
-
-```bash
 python server.py --cwd "%cd%" --open
 ```
 
@@ -30,16 +67,22 @@ Port 8420 in use — using 52314 instead.
 orchestrator2 launched on http://localhost:52314
 ```
 
-To use a different Claude account, pass `--config-dir` to point at an alternate `CLAUDE_CONFIG_DIR`:
+### Choosing a Claude account
+
+orchestrator2 uses the config dir given by `CLAUDE_CONFIG_DIR` (or `~/.claude` when that's unset), the same as the `claude` CLI. Sessions live under `<config-dir>/projects/<cwd>/`, so `claude --continue` / `--resume` only share a conversation with orchestrator2 when both are pointed at the **same** config dir. To pin a specific account regardless of the environment, pass `--config-dir`:
 
 ```bash
 orch --config-dir "C:\Users\me\.claude-alt"
 ```
 
+Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reconnect). The active account is shown in the status bar's **account** field (hover for the config dir).
+
 ## Features
 
 - **Live WebSocket UI** -- real-time streaming of assistant messages, tool calls, and results
 - **Account display** -- the status bar shows the signed-in account (the email address from `<config-dir>/.claude.json`, falling back to the config-dir name when no email is stored). Hover it to see the display name, organization, plan type, role, and the active `CLAUDE_CONFIG_DIR` — handy when running multiple accounts/config dirs side by side
+- **Working-directory display** -- the status bar shows the full working-directory path Claude is operating in
+- **Auto-login** -- checks your Claude sign-in on startup and opens the standard Claude login window if you're not authenticated (the same flow Claude Code uses). Sign in / out at runtime with `/login` and `/logout`
 - **Side-by-side diff viewer** -- UltraCompare-style edit comparisons with configurable colors
 - **Two-layer activity collapse** -- every tool call, tool result, and thinking block renders as its own one-line collapsed row with a summary (path, command, pattern, item count, etc.); click any row to expand the full details (diff, output, command body, thinking text). Once Claude speaks again after a run of activity, the whole run between the two messages auto-collapses into a single grouped summary line ("N tools") that can also be expanded to reveal the individual rows underneath
 - **Anchored collapse (no lurch)** -- when a run of tools auto-collapses while you're following at the bottom, the text already on screen stays put instead of jerking upward. The reclaimed vertical space is held open as a temporary gap that the next streamed lines fill from the top down; once real content reaches the bottom, normal bottom-following resumes (scrolling up at any time releases the gap)
@@ -108,7 +151,7 @@ orch --config-dir "C:\Users\me\.claude-alt"
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--append-system-prompt TEXT` | -- | Extra instructions appended to the system prompt |
-| `--mcp-config PATH` | -- | Path to an MCP servers JSON file |
+| `--mcp-config PATH_OR_JSON` | -- | MCP servers config — a JSON file path or inline JSON string. Lets the orchestrator act as an MCP client |
 
 ### Display
 
@@ -204,6 +247,9 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/thinking [on\|off]` | Toggle extended thinking |
 | `/btw <question>` | Side question in separate context |
 | `/graphify [path] [flags]` | Build a knowledge graph ([graphify](https://github.com/safishamsi/graphify)) |
+| `/graphify explain <node>` | Explain a graph node + neighbors (runs directly, no LLM turn) |
+| `/graphify path <A> <B>` | Shortest path between two graph nodes (quote names with spaces) |
+| `/graphify diagnose` | Report multigraph edge-collapse risk in the graph |
 
 ### Display
 

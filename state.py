@@ -614,6 +614,7 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
     return {
         "session_id": state.session_id,
         "session_title": session_title,
+        "cwd": config.cwd,
         "busy_label": busy_label,
         "busy_class": busy_class,
         "turns": state.turns,

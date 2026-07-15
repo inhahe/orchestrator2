@@ -82,6 +82,7 @@ SHORT_OUTPUT_TOOLS = frozenset({
 SLASH_COMMANDS = [
     "/help", "/history", "/status", "/debug", "/cost", "/cwd", "/clear", "/cls",
     "/interrupt", "/i", "/compact", "/effort", "/thinking", "/model",
+    "/login", "/logout",
     "/connect", "/reconnect", "/resume", "/rename", "/export", "/models",
     "/btw", "/graphify", "/autocompact", "/max-context", "/bell",
     "/collapse", "/collapse-threshold",
@@ -415,6 +416,7 @@ class Config:
     detach: bool = False               # re-launch headless and exit terminal
     auto_shutdown: bool = False        # shut down when all browser tabs close
     config_dir: str | None = None      # CLAUDE_CONFIG_DIR override
+    skip_auto_login: bool = False      # internal: child skips the login check
 
 
 def config_to_dict(config: Config) -> dict:
@@ -573,8 +575,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
     ap.add_argument(
         "--mcp-config",
         default=None,
-        metavar="PATH",
-        help="Path to an MCP servers JSON file.",
+        metavar="PATH_OR_JSON",
+        help="MCP servers config: a path to a JSON file or an inline JSON "
+        "string (lets the orchestrator act as an MCP client).",
     )
 
     # -- Display --
@@ -722,6 +725,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
         action="store_true",
         help="Shut down when all browser tabs close (auto-set by --detach).",
     )
+    ap.add_argument(
+        "--skip-auto-login",
+        action="store_true",
+        help=argparse.SUPPRESS,  # internal: --detach child, parent already checked
+    )
 
     args = ap.parse_args(argv)
 
@@ -784,4 +792,5 @@ def parse_args(argv: list[str] | None = None) -> Config:
         detach=args.detach,
         auto_shutdown=args.auto_shutdown or args.open or args.detach,
         config_dir=args.config_dir,
+        skip_auto_login=args.skip_auto_login,
     )

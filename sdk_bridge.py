@@ -58,6 +58,7 @@ from config import (
 from state import (
     State,
     apply_rate_limit_info,
+    detect_account_info,
     extract_context_tokens,
     fmt_duration,
     fmt_tok,
@@ -280,9 +281,12 @@ class SDKBridge:
         if self.config.disallowed_tools:
             kwargs["disallowed_tools"] = list(self.config.disallowed_tools)
 
-        # MCP config.
+        # MCP config — lets the orchestrator act as an MCP client.  The SDK
+        # option is named ``mcp_servers`` and accepts a dict of server configs,
+        # a path to a JSON file, or an inline JSON string; all forms are passed
+        # through to the CLI's ``--mcp-config``.
         if self.config.mcp_config:
-            kwargs["mcp_config"] = self.config.mcp_config
+            kwargs["mcp_servers"] = self.config.mcp_config
 
         # System prompt extension.
         if self.config.append_system_prompt:
@@ -336,6 +340,13 @@ class SDKBridge:
                 pass
 
         self.client = ClaudeSDKClient(options=options)
+
+        # Re-read account details each connect so a fresh /login (then /connect)
+        # updates the displayed email/plan without a restart.
+        try:
+            self.state.account = detect_account_info()
+        except Exception:
+            pass
 
         self.state.connecting = True
         started = time.monotonic()
@@ -548,13 +559,20 @@ class SDKBridge:
                     is_bg = name == "Bash" and inp.get("run_in_background")
                     self._maybe_arm_wakeup(name, inp)
                     seq = register_tool_use(state, block.id, name, inp)
-                    if name == "TodoWrite" and isinstance(inp.get("todos"), list):
+                    todos_changed = (
+                        name == "TodoWrite" and isinstance(inp.get("todos"), list)
+                    )
+                    if todos_changed:
                         state.current_todos = inp["todos"]
                     ws_msg = format_tool_use_msg(
                         name, inp, block.id, seq,
                         is_background=bool(is_bg),
                     )
                     await self.broadcast(ws_msg)
+                    # Refresh the todos panel immediately instead of waiting
+                    # for the next ~2s status ticker.
+                    if todos_changed:
+                        await self._broadcast_panels()
                 elif ThinkingBlock and isinstance(block, ThinkingBlock):
                     thinking_text = getattr(block, "thinking", "") or ""
                     if thinking_text.strip():
@@ -731,6 +749,23 @@ class SDKBridge:
             "content": text,
             "during_turn": during_turn,
         })
+
+    async def _broadcast_panels(self) -> None:
+        """Push a fresh status_update so panels (todos, tools, bg) refresh now.
+
+        Panels otherwise only refresh on the ~2s server-side ticker, which
+        makes fast-changing panels like the todos/plan pane feel laggy — a
+        TodoWrite mid-turn wouldn't show up until the next tick.  Call this
+        right after mutating panel-backing state to reflect it immediately.
+        """
+        try:
+            await self.broadcast({
+                "type": "status_update",
+                "status": state_to_status_dict(self.state, self.config),
+                "panels": state_to_panels_dict(self.state),
+            })
+        except Exception as exc:
+            log.warning("panels status_update broadcast failed: %r", exc)
 
     # ------------------------------------------------------------------
     # ScheduleWakeup heartbeat
@@ -993,7 +1028,17 @@ class SDKBridge:
         if subtype == "init":
             first_init = not state.init_seen
             state.init_seen = True
+            # The init SystemMessage has no ``session_id`` attribute — it
+            # falls through the SDK parser's generic branch, so the id lives
+            # in ``msg.data``.  (Only task_started/task_notification get a
+            # dedicated dataclass field.)  Reading the attribute alone left
+            # ``state.session_id`` unset until the turn's ResultMessage,
+            # which broke ``/rename`` mid-first-turn ("will be applied when
+            # the session starts").
+            data_dict = getattr(msg, "data", None)
             sid = getattr(msg, "session_id", None)
+            if not sid and isinstance(data_dict, dict):
+                sid = data_dict.get("session_id")
             old_sid = state.session_id
             if sid:
                 state.session_id = sid
@@ -1512,7 +1557,11 @@ class SDKBridge:
                             )
 
                             # Capture TodoWrite plan.
-                            if name == "TodoWrite" and isinstance(inp.get("todos"), list):
+                            todos_changed = (
+                                name == "TodoWrite"
+                                and isinstance(inp.get("todos"), list)
+                            )
+                            if todos_changed:
                                 state.current_todos = inp["todos"]
 
                             ws_msg = format_tool_use_msg(
@@ -1520,6 +1569,10 @@ class SDKBridge:
                                 is_background=bool(is_bg),
                             )
                             await self.broadcast(ws_msg)
+                            # Refresh the todos panel immediately instead of
+                            # waiting for the next ~2s status ticker.
+                            if todos_changed:
+                                await self._broadcast_panels()
 
                         # Thinking
                         elif ThinkingBlock and isinstance(block, ThinkingBlock):
@@ -2314,6 +2367,15 @@ class SDKBridge:
 
     async def start(self) -> None:
         """Launch the worker loop as a background task."""
+        # Mark "connecting" immediately so the browser's very first status
+        # update (which can arrive before the worker task runs connect()) shows
+        # "connecting…" instead of a misleading "idle".  The SDK connect is the
+        # slow part of startup; the HTTP server and page are already up, so this
+        # tells the user the orchestrator is still initialising.
+        self.state.connecting = True
+        if self.state.connect_started_at is None:
+            self.state.connect_started_at = time.monotonic()
+
         async def _safe_worker():
             try:
                 await self.worker_loop()
