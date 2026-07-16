@@ -218,6 +218,11 @@ def write_session_title(session_id: str, title: str) -> None:
         return
     except (ImportError, AttributeError):
         pass
+    except FileNotFoundError:
+        # The SDK searches by its own project-dir logic and may miss the
+        # file (e.g. a non-default CLAUDE_CONFIG_DIR).  Fall through to the
+        # manual append, which locates the file via our find_session_dir.
+        pass
     project = find_session_dir(session_id)
     if project is None:
         raise OSError(f"session {session_id} not found on disk")

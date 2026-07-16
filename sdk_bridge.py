@@ -1015,6 +1015,31 @@ class SDKBridge:
         except Exception as exc:
             log.warning("deferred compact turn_end broadcast failed: %r", exc)
 
+    def _apply_pending_rename(self, sid: str) -> bool:
+        """Apply a queued ``/rename`` title to session *sid* if one exists.
+
+        Returns True when a pending title was successfully written (and the
+        queue cleared).  On failure — most commonly because the CLI hasn't
+        flushed the session JSONL to disk yet, so ``write_session_title``
+        can't locate the file — the title stays queued in
+        ``state.pending_rename`` for a later retry (called again at
+        end-of-turn, by which point the file exists).
+        """
+        state = self.state
+        title = state.pending_rename
+        if not title:
+            return False
+        try:
+            write_session_title(sid, title)
+        except Exception as exc:
+            # Keep the title queued and try again after the turn.
+            log.info("pending rename not applied yet (%s) — will retry", exc)
+            return False
+        state.pending_rename = None
+        state.session_title = title
+        log.info("applied pending rename: %s → '%s'", sid[:8], title)
+        return True
+
     # ------------------------------------------------------------------
     # System message handling (shared by turn + async paths)
     # ------------------------------------------------------------------
@@ -1042,18 +1067,17 @@ class SDKBridge:
             old_sid = state.session_id
             if sid:
                 state.session_id = sid
-                state.session_title = read_session_title(sid)
+                # Don't clobber a user-set pending title with a (title-less)
+                # disk read — keep showing what /rename set until we can
+                # persist it.
+                if not state.pending_rename:
+                    state.session_title = read_session_title(sid)
                 # Apply a pending rename (from /rename before first turn).
-                if state.pending_rename:
-                    title = state.pending_rename
-                    state.pending_rename = None
-                    try:
-                        write_session_title(sid, title)
-                        state.session_title = title
-                        log.info("applied pending rename: %s → '%s'", sid[:8], title)
-                    except Exception as exc:
-                        # Never let a rename failure kill the turn.
-                        log.warning("pending rename failed: %s", exc)
+                # May legitimately fail here — the CLI often hasn't flushed
+                # the session JSONL to disk yet, so the write can't find the
+                # file.  _apply_pending_rename keeps the title queued for a
+                # retry at end-of-turn instead of dropping it.
+                self._apply_pending_rename(sid)
                 # Warn if the SDK silently started a fresh session
                 # instead of resuming the one we asked for.
                 expected = state.expected_resume_sid
@@ -1724,9 +1748,13 @@ class SDKBridge:
                         time.monotonic() - (state.turn_started_at or time.monotonic()),
                     )
 
-                    # Reload title.
+                    # Retry a queued /rename that couldn't be written at
+                    # init time (the session JSONL now exists on disk), then
+                    # reload the title.  Reload only when nothing is pending
+                    # so a fresh title isn't clobbered by a stale disk read.
                     if state.session_id:
-                        state.session_title = read_session_title(state.session_id)
+                        if not self._apply_pending_rename(state.session_id):
+                            state.session_title = read_session_title(state.session_id)
 
                     # Rate limit info may be on ResultMessage too.
                     rate_info = getattr(msg, "rate_limit_info", None)
