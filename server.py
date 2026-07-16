@@ -1678,7 +1678,24 @@ def main() -> None:
     if config.open_browser:
         open_url = f"{url}?t={int(time.time())}"
         def _open_when_ready():
+            # `_server_ready` is set at the END of lifespan STARTUP, but uvicorn
+            # calls listen() only AFTER lifespan startup returns.  So the port is
+            # bound-but-not-listening when the event fires — opening the browser
+            # here directly races and lands on a dead port ("can't connect").
+            # After the event, poll a real TCP connect (matching the --detach
+            # parent's probe loop) until the port genuinely accepts connections.
             _server_ready.wait(timeout=30)
+            deadline = time.monotonic() + 20.0
+            while time.monotonic() < deadline:
+                probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                probe.settimeout(0.25)
+                try:
+                    probe.connect(("127.0.0.1", actual_port))
+                    break
+                except OSError:
+                    time.sleep(0.05)
+                finally:
+                    probe.close()
             webbrowser.open(open_url)
         _threading.Thread(target=_open_when_ready, daemon=True).start()
 
