@@ -38,9 +38,25 @@ from typing import Any
 import dataclasses
 import webbrowser
 
-import uvicorn
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+# NOTE: fastapi / uvicorn / sdk_bridge (which pulls in claude_agent_sdk → mcp,
+# ~0.5s on its own) are intentionally NOT imported at module top.  Importing
+# them here would make ``import server`` cost ~1.1s — a cost the --detach
+# launcher parent pays in full even though it only binds a port, spawns the
+# child and opens the browser (it never serves HTTP itself).  They're imported
+# lazily instead: fastapi/uvicorn in ``build_app()`` / ``main()`` and
+# sdk_bridge in the deferred bridge startup.  This keeps ``import server`` at
+# ~0.2s so the browser tab appears fast.
+#
+# TYPE_CHECKING-only imports so annotations (all strings under
+# ``from __future__ import annotations``) still resolve for tooling without
+# paying the runtime import cost.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:  # pragma: no cover
+    from fastapi import Request, WebSocket, WebSocketDisconnect  # noqa: F401
+    from fastapi.responses import (  # noqa: F401
+        FileResponse, HTMLResponse, RedirectResponse, Response,
+    )
+    from sdk_bridge import SDKBridge  # noqa: F401
 
 from config import (
     Config,
@@ -79,7 +95,6 @@ from theme import (
     remove_saved_color,
     PRESET_THEMES,
 )
-from sdk_bridge import SDKBridge, _build_graphify_prompt
 import auth
 
 log = logging.getLogger("orchestrator2")
@@ -140,6 +155,16 @@ _SHUTDOWN_GRACE_SECONDS = 30
 # to serve requests.  The browser-open thread waits on this before opening.
 import threading as _threading
 _server_ready = _threading.Event()
+
+# Set once the SDK bridge has been constructed (and started, when not in
+# picker mode).  The WebSocket handler awaits this before touching ``bridge``
+# — the bridge is now built off the hot startup path, so there's a brief
+# window after the page loads where ``bridge is None``.
+_bridge_ready = asyncio.Event()
+
+# Resume id stashed by lifespan for _deferred_bridge_startup to apply once the
+# bridge object exists.
+_pending_resume_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -247,16 +272,16 @@ async def lifespan(app: FastAPI):
     global config, state, bridge, theme, _ticker_task, _picker_mode
 
     # --- Startup ---
+    # This runs *before* uvicorn begins accepting connections, so keep it
+    # cheap: no heavy imports, no SDK connect.  The single biggest startup
+    # cost — importing sdk_bridge (→ claude_agent_sdk → mcp) and spawning the
+    # Claude CLI — is pushed into a background task (_deferred_bridge_startup)
+    # that runs *after* we yield, so the page serves immediately and shows a
+    # "connecting…" status while the SDK finishes wiring up.
     if config is None:
         config = parse_args()
     state = init_state_from_config(config)
     theme = load_theme()
-
-    bridge = SDKBridge(
-        config=config,
-        state=state,
-        broadcaster=broadcast,
-    )
 
     _ticker_task = asyncio.create_task(_status_ticker(), name="status-ticker")
 
@@ -267,9 +292,11 @@ async def lifespan(app: FastAPI):
         asyncio.to_thread(fetch_available_models), name="warm-model-cache",
     )
 
-    # Seed session_id early so the browser gets history on first connect
-    # (before the SDK's init message arrives).  Same approach as the TUI
-    # orchestrator's pre-connect seeding.
+    # Seed session_id early (cheap disk reads) so the browser gets history on
+    # first connect, even before the deferred bridge is up.  The resume id is
+    # stashed for _deferred_bridge_startup to apply once the bridge exists.
+    global _pending_resume_id
+    _pending_resume_id = None
     if config.resume and config.resume != _PICKER_SENTINEL:
         # Resolve the resume value to a real session UUID — it might be a
         # title/name rather than an ID (e.g. ``--resume fastpyb``).
@@ -281,23 +308,28 @@ async def lifespan(app: FastAPI):
                 config = dataclasses.replace(config, resume=_match)
         state.session_id = _resolved_resume
         state.session_title = read_session_title(_resolved_resume)
+        _pending_resume_id = _resolved_resume
     elif not config.no_continue:
         recent = find_most_recent_session_for_cwd(config.cwd)
         if recent is not None:
             state.session_id = recent.stem
             state.session_title = read_session_title(recent.stem)
-            bridge._initial_resume_id = recent.stem
+            _pending_resume_id = recent.stem
 
     # If --resume was passed without an argument, defer SDK start until the
     # user picks a session from the graphical picker.
     if config.resume == _PICKER_SENTINEL:
         _picker_mode = True
         log.info("picker mode — waiting for session selection on port %s", config.port)
+        # Build the bridge off the hot path (but don't start it — the user
+        # picks a session first via /api/resume).  _deferred_bridge_startup
+        # sets _bridge_ready once the object exists, so the resume handler's
+        # `await _bridge_ready.wait()` unblocks only when bridge is real.
+        asyncio.create_task(_deferred_bridge_startup(start=False),
+                            name="deferred-bridge")
     else:
-        if config.resume:
-            bridge._initial_resume_id = config.resume
-        await bridge.start()
-        log.info("server started on port %s, cwd=%s", config.port, config.cwd)
+        asyncio.create_task(_deferred_bridge_startup(start=True),
+                            name="deferred-bridge")
 
     _server_ready.set()
     yield
@@ -314,7 +346,86 @@ async def lifespan(app: FastAPI):
             pass
 
 
-app = FastAPI(title="Orchestrator 2", docs_url=None, redoc_url=None, lifespan=lifespan)
+async def _deferred_bridge_startup(*, start: bool) -> None:
+    """Import sdk_bridge, build the bridge and (optionally) start it.
+
+    Runs as a background task scheduled from ``lifespan`` *after* it yields,
+    so importing ``sdk_bridge`` (which pulls in claude_agent_sdk → mcp) and
+    spawning the Claude CLI don't delay the HTTP server accepting connections.
+    Sets ``_bridge_ready`` when done so the WebSocket handler can proceed.
+    """
+    global bridge
+    try:
+        from sdk_bridge import SDKBridge  # heavy import, kept off the hot path
+        bridge = SDKBridge(config=config, state=state, broadcaster=broadcast)
+        if _pending_resume_id:
+            bridge._initial_resume_id = _pending_resume_id
+        if start:
+            await bridge.start()
+            log.info("server started on port %s, cwd=%s",
+                     getattr(config, "port", "?"), getattr(config, "cwd", "?"))
+    except Exception:
+        log.exception("deferred bridge startup failed")
+    finally:
+        _bridge_ready.set()
+
+
+# ---------------------------------------------------------------------------
+# Lazy route registry
+# ---------------------------------------------------------------------------
+#
+# Routes are declared with the lightweight ``@_route(...)`` / ``@_ws_route(...)``
+# decorators below, which only *record* the handler (no fastapi import needed).
+# ``build_app()`` replays them onto a real FastAPI instance — called only by the
+# process that actually serves HTTP (the child / non-detach path), so the
+# --detach parent never imports fastapi.
+
+# (method, path, kwargs, handler) for HTTP routes; (path, handler) for WS.
+_HTTP_ROUTES: list[tuple[str, str, dict[str, Any], Any]] = []
+_WS_ROUTES: list[tuple[str, Any]] = []
+
+# Placeholder; the real FastAPI instance is created by build_app().
+app: Any = None
+
+
+def _route(method: str, path: str, **kwargs: Any):
+    """Record an HTTP route without importing fastapi."""
+    def deco(fn):
+        _HTTP_ROUTES.append((method, path, kwargs, fn))
+        return fn
+    return deco
+
+
+def _ws_route(path: str):
+    """Record a WebSocket route without importing fastapi."""
+    def deco(fn):
+        _WS_ROUTES.append((path, fn))
+        return fn
+    return deco
+
+
+def build_app() -> Any:
+    """Construct the FastAPI application (imports fastapi lazily).
+
+    Called only from the serving process.  Populates the fastapi response /
+    request classes into module globals so route bodies and FastAPI's
+    signature introspection (``get_type_hints``) resolve the string
+    annotations left by ``from __future__ import annotations``.
+    """
+    global app, Request, WebSocket, WebSocketDisconnect
+    global FileResponse, HTMLResponse, RedirectResponse, Response
+    from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+    from fastapi.responses import (
+        FileResponse, HTMLResponse, RedirectResponse, Response,
+    )
+    app = FastAPI(
+        title="Orchestrator 2", docs_url=None, redoc_url=None, lifespan=lifespan,
+    )
+    for method, path, kwargs, fn in _HTTP_ROUTES:
+        app.add_api_route(path, fn, methods=[method.upper()], **kwargs)
+    for path, fn in _WS_ROUTES:
+        app.add_api_websocket_route(path, fn)
+    return app
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +435,7 @@ app = FastAPI(title="Orchestrator 2", docs_url=None, redoc_url=None, lifespan=li
 STATIC_DIR = Path(__file__).parent / "static"
 
 
-@app.get("/", response_model=None)
+@_route("get", "/", response_model=None)
 async def index(request: Request):
     """Serve the frontend entry point, with theme CSS injected.
 
@@ -437,8 +548,10 @@ async def _reconfigure(
     config = dataclasses.replace(config, **overrides)
 
     # --- Reinitialise state + bridge ---
+    from sdk_bridge import SDKBridge  # already imported once by now; cheap
     state = init_state_from_config(config)
     bridge = SDKBridge(config=config, state=state, broadcaster=broadcast)
+    _bridge_ready.set()
 
     if new_resume:
         state.session_id = new_resume
@@ -500,7 +613,7 @@ _MIME_TYPES = {
     ".ttf": "font/ttf",
 }
 
-@app.get("/static/{path:path}")
+@_route("get", "/static/{path:path}")
 async def serve_static(path: str):
     """Serve a static file with no-cache headers."""
     file_path = STATIC_DIR / path
@@ -525,7 +638,7 @@ async def serve_static(path: str):
 # REST endpoints
 # ---------------------------------------------------------------------------
 
-@app.post("/api/shutdown")
+@_route("post", "/api/shutdown")
 async def api_shutdown() -> dict[str, Any]:
     """Gracefully shut down the server.
 
@@ -543,7 +656,7 @@ async def api_shutdown() -> dict[str, Any]:
     return {"ok": True, "message": "shutting down"}
 
 
-@app.get("/api/status")
+@_route("get", "/api/status")
 async def api_status() -> dict[str, Any]:
     """Return current status bar + panel data."""
     if state is None or config is None:
@@ -554,7 +667,7 @@ async def api_status() -> dict[str, Any]:
     }
 
 
-@app.get("/api/completions")
+@_route("get", "/api/completions")
 async def api_completions() -> dict[str, Any]:
     """Return all slash commands for tab-complete."""
     return {"commands": get_command_completions()}
@@ -607,7 +720,7 @@ def _truncate(s: str | None, max_len: int) -> str:
     return s[: max_len - 1] + "\u2026"
 
 
-@app.get("/api/sessions")
+@_route("get", "/api/sessions")
 async def api_sessions() -> dict[str, Any]:
     """Return all projects and their sessions for the picker UI."""
     projects = list_projects()
@@ -637,7 +750,7 @@ async def api_sessions() -> dict[str, Any]:
     return {"projects": result}
 
 
-@app.post("/api/resume")
+@_route("post", "/api/resume")
 async def api_resume(body: dict[str, Any]) -> dict[str, Any]:
     """Select a session from the picker and start the SDK bridge."""
     global _picker_mode
@@ -649,6 +762,9 @@ async def api_resume(body: dict[str, Any]) -> dict[str, Any]:
     if not session_id:
         return {"ok": False, "error": "No session_id provided"}
 
+    # In picker mode the bridge is built off the hot path — wait for it.
+    if bridge is None:
+        await _bridge_ready.wait()
     assert bridge is not None and config is not None and state is not None
 
     # Verify the session exists on disk.
@@ -693,7 +809,7 @@ async def _broadcast_queue_update() -> None:
     await broadcast({"type": "queue_update", "queue": items})
 
 
-@app.post("/api/queue/delete")
+@_route("post", "/api/queue/delete")
 async def api_queue_delete(body: dict[str, Any]) -> dict[str, Any]:
     """Delete a pending prompt by index."""
     if state is None:
@@ -707,7 +823,7 @@ async def api_queue_delete(body: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "removed": _truncate(removed, 80)}
 
 
-@app.post("/api/queue/send")
+@_route("post", "/api/queue/send")
 async def api_queue_send(body: dict[str, Any]) -> dict[str, Any]:
     """Send a queued prompt by index.
 
@@ -736,7 +852,7 @@ async def api_queue_send(body: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "sent": _truncate(prompt, 80)}
 
 
-@app.post("/api/queue/edit")
+@_route("post", "/api/queue/edit")
 async def api_queue_edit(body: dict[str, Any]) -> dict[str, Any]:
     """Edit a pending prompt by index.
 
@@ -761,7 +877,7 @@ async def api_queue_edit(body: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True}
 
 
-@app.post("/api/queue/editing")
+@_route("post", "/api/queue/editing")
 async def api_queue_editing(body: dict[str, Any]) -> dict[str, Any]:
     """Notify the server that the user is editing (or finished editing) a queue item.
 
@@ -780,7 +896,7 @@ async def api_queue_editing(body: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True}
 
 
-@app.post("/api/queue/merge")
+@_route("post", "/api/queue/merge")
 async def api_queue_merge() -> dict[str, Any]:
     """Merge all queued prompts into one, separated by newlines."""
     if state is None:
@@ -798,7 +914,7 @@ async def api_queue_merge() -> dict[str, Any]:
 # Todos (plan) API
 # ---------------------------------------------------------------------------
 
-@app.post("/api/todos/clear")
+@_route("post", "/api/todos/clear")
 async def api_todos_clear() -> dict[str, Any]:
     """Remove completed items from the plan panel."""
     if state is None:
@@ -820,7 +936,7 @@ async def api_todos_clear() -> dict[str, Any]:
 # Theme / settings API
 # ---------------------------------------------------------------------------
 
-@app.get("/api/theme")
+@_route("get", "/api/theme")
 async def api_theme() -> dict[str, Any]:
     """Return current theme tokens, grouped for the settings UI."""
     t = theme or load_theme()
@@ -831,7 +947,7 @@ async def api_theme() -> dict[str, Any]:
     }
 
 
-@app.post("/api/theme")
+@_route("post", "/api/theme")
 async def api_theme_update(body: dict[str, Any]) -> dict[str, Any]:
     """Update one or more theme tokens and persist to theme.conf."""
     global theme
@@ -852,7 +968,7 @@ async def api_theme_update(body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@app.post("/api/theme/preset")
+@_route("post", "/api/theme/preset")
 async def api_theme_preset(body: dict[str, Any]) -> dict[str, Any]:
     """Apply a preset theme."""
     global theme
@@ -865,7 +981,7 @@ async def api_theme_preset(body: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "css": theme.to_css_overrides(), "groups": theme.groups()}
 
 
-@app.post("/api/theme/reset")
+@_route("post", "/api/theme/reset")
 async def api_theme_reset() -> dict[str, Any]:
     """Reset all tokens to defaults."""
     global theme
@@ -874,7 +990,7 @@ async def api_theme_reset() -> dict[str, Any]:
     return {"ok": True, "css": "", "groups": theme.groups()}
 
 
-@app.post("/api/theme/saved-colors")
+@_route("post", "/api/theme/saved-colors")
 async def api_saved_colors(body: dict[str, Any]) -> dict[str, Any]:
     """Add or remove a saved colour swatch."""
     action = body.get("action", "add")
@@ -888,7 +1004,7 @@ async def api_saved_colors(body: dict[str, Any]) -> dict[str, Any]:
     return {"ok": ok, "saved_colors": load_saved_colors()}
 
 
-@app.get("/settings", response_model=None)
+@_route("get", "/settings", response_model=None)
 async def settings_page():
     """Serve the theme settings page."""
     page = STATIC_DIR / "settings.html"
@@ -944,7 +1060,7 @@ async def _shutdown_after_grace() -> None:
 # WebSocket endpoint — main real-time channel
 # ---------------------------------------------------------------------------
 
-@app.websocket("/ws")
+@_ws_route("/ws")
 async def websocket_endpoint(ws: WebSocket) -> None:
     """Handle one WebSocket client connection."""
     await ws.accept()
@@ -1030,6 +1146,11 @@ async def _send_initial_state(ws: WebSocket) -> None:
 
 async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
     """Dispatch an incoming WebSocket message."""
+    # The bridge is constructed off the hot startup path, so a very fast user
+    # action can arrive before it exists.  Wait for it (the page already shows
+    # "connecting…"); it's ready within a fraction of a second.
+    if bridge is None:
+        await _bridge_ready.wait()
     assert state is not None and config is not None and bridge is not None
     msg_type = msg.get("type", "")
 
@@ -1118,6 +1239,7 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             path_arg = payload.strip() or "."
             await broadcast({"type": "system_msg", "subtype": "info",
                              "data": {"message": f"/graphify {path_arg} — loading skill..."}})
+            from sdk_bridge import _build_graphify_prompt
             prompt = _build_graphify_prompt(payload)
             if state.busy:
                 state.queued_prompts.append(prompt)
@@ -1560,13 +1682,18 @@ def main() -> None:
             webbrowser.open(open_url)
         _threading.Thread(target=_open_when_ready, daemon=True).start()
 
+    # Build the FastAPI app now (imports fastapi lazily) — only the serving
+    # process pays this cost; the --detach parent returned long ago.
+    import uvicorn
+    fastapi_app = build_app()
+
     # Disable WebSocket keepalive pings.  The default (20s ping, 20s
     # timeout) is far too aggressive for a localhost server under heavy
     # CPU/IO load — the browser can't respond in time, the connection
     # drops, and auto-shutdown fires.  Keepalive pings exist to detect
     # dead connections through NATs/proxies; localhost doesn't need them.
     uvi_config = uvicorn.Config(
-        app, host="0.0.0.0", port=actual_port, log_level="info",
+        fastapi_app, host="0.0.0.0", port=actual_port, log_level="info",
         ws_ping_interval=None, ws_ping_timeout=None,
     )
     server = uvicorn.Server(uvi_config)
