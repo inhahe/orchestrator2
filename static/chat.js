@@ -577,16 +577,22 @@ const Chat = (() => {
 
   function _addToolUse(msg) {
     _flushStreaming();
-    const el = document.createElement('div');
-    el.className = 'msg msg-tool';
-    el.dataset.toolUseId = msg.tool_use_id;
-
     const h = msg.header || {};
     const name = msg.name || h.name || '?';
+    // AskUserQuestion needs the user's attention: render it expanded and keep
+    // it out of the collapsed activity group (mark it an activity boundary so
+    // _collapseActivity never sweeps it in with the other tools).
+    const isAsk = name === 'AskUserQuestion';
+
+    const el = document.createElement('div');
+    el.className = 'msg msg-tool' + (isAsk ? ' msg-ask activity-boundary' : '');
+    el.dataset.toolUseId = msg.tool_use_id;
+
     const summary = _toolHeaderSummary(h, msg.input);
     const statusIcon = msg.status === 'running' ? '\u25B6' :
                        msg.status === 'error' ? '\u2717' : '\u2713';
     const statusCls = msg.status || 'running';
+    const openCls = isAsk ? ' open' : '';
 
     el.innerHTML = `
       <div class="tool-header">
@@ -594,9 +600,9 @@ const Chat = (() => {
         <span class="tool-name">${_esc(name)}</span>
         <span class="tool-summary">${summary}</span>
         <span class="tool-size-hint" data-tool-use-id="${msg.tool_use_id || ''}"></span>
-        <span class="tool-expand-icon">\u25B8</span>
+        <span class="tool-expand-icon${openCls}">\u25B8</span>
       </div>
-      <div class="tool-detail">
+      <div class="tool-detail${openCls}">
         ${_toolDetailHtml(name, msg.input || {}, msg)}
       </div>`;
 
@@ -766,26 +772,35 @@ const Chat = (() => {
     const isErr = msg.status === 'error' || msg.status === 'failed';
     const name = msg.name ? _esc(msg.name) : '';
     const cmd = msg.command;
-    const summary = msg.summary || '';
+    const summary = msg.summary || '';       // model's task summary
+    const output = msg.output || '';         // actual captured stdout
     const icon = isErr ? '\u2717' : '\u2713';
     const statusCls = isErr ? 'error' : 'complete';
     const label = isErr ? 'Background task failed' : 'Background task completed';
 
     el.className = 'msg msg-tool';
-    // Don't show summary as "Output" if it's just the command repeated.
-    const hasRealOutput = summary && summary !== cmd;
+    // Show command, model summary, and actual output as three distinct
+    // sections (skip a summary/output that's just the command repeated).
+    const hasSummary = summary && summary !== cmd;
+    const hasOutput = output && output !== cmd;
     let detailHtml = '';
     if (cmd) {
       detailHtml += `<div class="detail-label">Command</div>
                      <pre>${_esc(cmd)}</pre>`;
     }
-    if (hasRealOutput) {
-      detailHtml += `<div class="detail-label">Output</div>
-                     <pre>${_esc(summary)}</pre>`;
+    if (hasSummary) {
+      detailHtml += `<div class="detail-label">Summary</div>
+                     <div class="detail-field">${_esc(summary)}</div>`;
     }
-    const summaryForDisplay = hasRealOutput ? summary : '';
-    const summaryClean = summaryForDisplay
-      ? _esc(summaryForDisplay.length > 120 ? summaryForDisplay.slice(0, 120) + '\u2026' : summaryForDisplay)
+    if (hasOutput) {
+      detailHtml += `<div class="detail-label">Output</div>
+                     <pre>${_esc(output)}</pre>`;
+    }
+    // Header one-liner: prefer the summary, else a snippet of the output.
+    const rawHeader = hasSummary ? summary : (hasOutput ? output : '');
+    const headerOneLine = rawHeader.replace(/\s+/g, ' ').trim();
+    const summaryClean = headerOneLine
+      ? _esc(headerOneLine.length > 120 ? headerOneLine.slice(0, 120) + '\u2026' : headerOneLine)
       : '';
     const displayText = name && summaryClean
       ? `${name} \u2014 ${summaryClean}`
@@ -893,6 +908,16 @@ const Chat = (() => {
     el.className = 'msg msg-command';
 
     const data = msg.data;
+    const label = msg.label;
+
+    // Model picker: current model + clickable list.
+    if (label === 'model' && data && typeof data === 'object' && data.models) {
+      _renderModelPicker(el, data);
+      elMessages.appendChild(el);
+      _scrollToBottom();
+      return;
+    }
+
     if (typeof data === 'string') {
       el.textContent = data;
     } else if (data && typeof data === 'object') {
@@ -902,6 +927,46 @@ const Chat = (() => {
     }
     elMessages.appendChild(el);
     _scrollToBottom();
+  }
+
+  function _renderModelPicker(el, data) {
+    const current = data.current || '(unknown)';
+    // Extract plain model id from e.g. "claude-opus-4-8 (pinned)".
+    const currentId = current.split(/\s+\(/)[0].trim();
+
+    let html = `<div class="model-picker">`;
+    html += `<div class="model-picker-header">`;
+    html += `<div class="model-picker-current">current model: <strong>${_esc(current)}</strong></div>`;
+    html += `<button class="model-picker-close" title="Close" aria-label="Close">\u00d7</button>`;
+    html += `</div>`;
+    html += `<div class="model-picker-list">`;
+    for (const m of data.models) {
+      const active = m.id === currentId;
+      const cls = 'model-picker-item' + (active ? ' active' : '');
+      html += `<div class="${cls}" data-model-id="${_esc(m.id)}">`;
+      html += `<span class="model-picker-name">${_esc(m.id)}</span>`;
+      if (m.description) {
+        html += `<span class="model-picker-desc">${_esc(m.description)}</span>`;
+      }
+      if (active) html += `<span class="model-picker-check">\u2713</span>`;
+      html += `</div>`;
+    }
+    html += `</div></div>`;
+    el.innerHTML = html;
+
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('.model-picker-close')) {
+        el.remove();
+        return;
+      }
+      const item = e.target.closest('.model-picker-item');
+      if (!item) return;
+      const id = item.getAttribute('data-model-id');
+      if (id) {
+        App.send({ type: 'message', text: '/model ' + id });
+        el.remove();
+      }
+    });
   }
 
   // --- History replay ---
@@ -1058,6 +1123,13 @@ const Chat = (() => {
       const n = Array.isArray(inp.todos) ? inp.todos.length : 0;
       return `<span class="sum-dim">${n} items</span>`;
     }
+    if (h.name === 'AskUserQuestion') {
+      const qs = Array.isArray(inp.questions) ? inp.questions : [];
+      const first = qs.length ? (qs[0].question || qs[0].header || '') : '';
+      const count = qs.length !== 1 ? `${qs.length} questions` : '1 question';
+      return `<span class="sum-dim">${count}</span>` +
+             (first ? ` <span class="sum-cmd">${_esc(first)}</span>` : '');
+    }
     return '';
   }
 
@@ -1121,12 +1193,44 @@ const Chat = (() => {
                <div class="detail-field">${_esc(input.pattern || '')}</div>`;
       html += `<div class="detail-label">Path</div>
                <div class="detail-field">${_esc(input.path || '.')}</div>`;
+    } else if (name === 'AskUserQuestion') {
+      html += _askQuestionDetailHtml(input);
     } else {
       // Generic: show JSON.
       html += `<div class="detail-label">Input</div>
                <pre>${_esc(JSON.stringify(input, null, 2))}</pre>`;
     }
 
+    return html;
+  }
+
+  /** AskUserQuestion: render each question with its selectable options. */
+  function _askQuestionDetailHtml(input) {
+    const qs = Array.isArray(input.questions) ? input.questions : [];
+    if (!qs.length) {
+      return `<div class="detail-label">Input</div>
+              <pre>${_esc(JSON.stringify(input, null, 2))}</pre>`;
+    }
+    let html = '';
+    for (const q of qs) {
+      const header = q.header ? `<span class="ask-q-chip">${_esc(q.header)}</span>` : '';
+      const multi = q.multiSelect ? ` <span class="sum-dim">(select multiple)</span>` : '';
+      html += `<div class="ask-question">
+        <div class="ask-q-text">${header}${_esc(q.question || '')}${multi}</div>`;
+      const opts = Array.isArray(q.options) ? q.options : [];
+      if (opts.length) {
+        html += `<ol class="ask-options">`;
+        for (const o of opts) {
+          const desc = o.description
+            ? `<span class="ask-opt-desc">${_esc(o.description)}</span>` : '';
+          html += `<li><span class="ask-opt-label">${_esc(o.label || '')}</span>${desc}</li>`;
+        }
+        html += `<li class="ask-opt-other"><span class="ask-opt-label">Other…</span>` +
+                `<span class="ask-opt-desc">provide a custom answer</span></li>`;
+        html += `</ol>`;
+      }
+      html += `</div>`;
+    }
     return html;
   }
 

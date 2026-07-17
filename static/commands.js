@@ -62,8 +62,18 @@ const Commands = (() => {
         }
       }
 
-      // Ctrl+End: scroll chat to bottom and re-enable auto-scroll.
-      if (e.key === 'End' && e.ctrlKey) {
+      // Ctrl+End: scroll chat to bottom and re-enable auto-scroll — but only
+      // when the user isn't editing text.  Inside a textarea/input (e.g. the
+      // main prompt box or a queued-prompt editor) Ctrl+End / Ctrl+Home must
+      // keep their native "jump to start/end of the text" behavior, so bail
+      // out here rather than swallowing the key.
+      const ae = document.activeElement;
+      const editing = ae && (
+        ae.tagName === 'TEXTAREA' ||
+        ae.tagName === 'INPUT' ||
+        ae.isContentEditable
+      );
+      if (e.key === 'End' && e.ctrlKey && !editing) {
         e.preventDefault();
         Chat.forceScrollToBottom();
       }

@@ -777,6 +777,56 @@ html, body {
   padding: 2px 0;
 }
 
+/* --- AskUserQuestion: rendered expanded so the question is always visible --- */
+.msg-ask {
+  border-left: 2px solid var(--accent, #6ea8fe);
+}
+.tool-detail .ask-question {
+  margin: 6px 0 10px;
+}
+.tool-detail .ask-q-text {
+  font-family: var(--font-sans, inherit);
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+.tool-detail .ask-q-chip {
+  display: inline-block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  background: var(--bg-code);
+  border-radius: var(--radius);
+  padding: 1px 6px;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+.tool-detail .ask-options {
+  margin: 2px 0 0;
+  padding-left: 20px;
+}
+.tool-detail .ask-options li {
+  margin: 3px 0;
+  line-height: 1.4;
+}
+.tool-detail .ask-opt-label {
+  color: var(--text);
+  font-weight: 600;
+}
+.tool-detail .ask-opt-desc {
+  color: var(--text-dim);
+}
+.tool-detail .ask-opt-desc::before {
+  content: " — ";
+  color: var(--text-muted);
+}
+.tool-detail .ask-opt-other .ask-opt-label {
+  color: var(--text-muted);
+  font-weight: 400;
+  font-style: italic;
+}
+
 
 /* --- Diff viewer (UltraCompare-style side-by-side) --- */
 .diff-viewer {
@@ -958,6 +1008,70 @@ html, body {
   color: var(--text-dim);
 }
 
+/* /model picker */
+.model-picker { white-space: normal; }
+.model-picker-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.model-picker-close {
+  flex: none;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+  border-radius: 4px;
+}
+.model-picker-close:hover {
+  color: var(--text-bright);
+  background: var(--bg-hover, rgba(255,255,255,0.08));
+}
+.model-picker-current {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.model-picker-current strong { color: var(--text-bright); }
+.model-picker-list { display: flex; flex-direction: column; gap: 4px; }
+.model-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.model-picker-item:hover {
+  border-color: var(--accent-dim);
+  background: var(--bg-tool-hover);
+}
+.model-picker-item.active {
+  border-color: var(--accent);
+  background: var(--bg-panel);
+}
+.model-picker-name {
+  font-weight: 600;
+  color: var(--text-bright);
+  flex: 0 0 auto;
+}
+.model-picker-desc {
+  color: var(--text-muted);
+  font-size: 11px;
+  flex: 1;
+}
+.model-picker-check {
+  color: var(--accent);
+  font-size: 14px;
+  flex: 0 0 auto;
+}
+
 /* ===================================================================
    Input bar (bottom)
    =================================================================== */
@@ -1122,4 +1236,275 @@ html, body {
   #sidebar-resize { display: none; }
   #main-container { flex-direction: column; }
   .modal-content { left: 5%; right: 5%; top: 5%; bottom: 5%; }
+}
+
+/* ===================================================================
+   Sessions button (in status bar)
+   =================================================================== */
+
+.sessions-btn {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.sessions-btn:hover {
+  color: var(--text-bright);
+  background: var(--bg-tool-hover);
+  border-color: var(--accent-dim);
+}
+
+/* ===================================================================
+   Lobby overlay (session browser)
+   =================================================================== */
+
+#lobby {
+  position: fixed;
+  inset: 0;
+  z-index: 500;
+  background: var(--bg-chat);
+  overflow-y: auto;
+}
+#lobby.hidden { display: none; }
+
+.lobby-inner {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 28px 24px 48px;
+}
+
+.lobby-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 24px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+.lobby-header h1 {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text-bright);
+}
+.lobby-header .lobby-sub {
+  color: var(--accent);
+  font-weight: 400;
+}
+.lobby-close {
+  font-size: 26px;
+  line-height: 1;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0 6px;
+}
+.lobby-close:hover { color: var(--text-bright); }
+
+.lobby-section { margin-bottom: 28px; }
+.lobby-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.lobby-section-head h2 {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+.lobby-count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--panel-count-bg);
+  border-radius: 10px;
+  padding: 1px 8px;
+}
+.lobby-empty {
+  font-size: 13px;
+  color: var(--text-muted);
+  padding: 8px 2px;
+  font-style: italic;
+}
+.lobby-empty.hidden { display: none; }
+
+/* New session row */
+.lobby-new {
+  display: flex;
+  gap: 10px;
+}
+.lobby-new input {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  outline: none;
+}
+.lobby-new input:focus { border-color: var(--accent-dim); }
+.lobby-new button {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent-dim);
+  border: none;
+  border-radius: var(--radius);
+  padding: 8px 16px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.lobby-new button:hover { background: var(--accent); }
+
+/* Running-session cards + recent-session list share one card grid so both
+   sections lay out the same way (side-by-side, wrapping to the width). */
+.lobby-cards,
+.lobby-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+}
+.lobby-cards.hidden { display: none; }
+.lobby-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.lobby-card:hover {
+  border-color: var(--accent-dim);
+  background: var(--bg-tool-hover);
+}
+.lobby-card.current {
+  border-color: var(--accent);
+}
+.lobby-card-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.lobby-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--indicator-idle);
+}
+.lobby-dot.busy {
+  background: var(--indicator-working);
+  box-shadow: 0 0 6px var(--indicator-working);
+}
+.lobby-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-bright);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.lobby-current-tag {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--accent);
+  border: 1px solid var(--accent-dim);
+  border-radius: 8px;
+  padding: 0 6px;
+  flex: 0 0 auto;
+}
+.lobby-card-cwd {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-bottom: 6px;
+}
+.lobby-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+.lobby-card-sep { opacity: 0.5; }
+.lobby-card-rid { color: var(--text-dim); }
+
+/* "closing in …" idle-teardown countdown badge */
+.lobby-countdown {
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--indicator-warn, #d8a657);
+  border: 1px solid var(--indicator-warn, #d8a657);
+  border-radius: 8px;
+  padding: 2px 7px;
+  display: inline-block;
+  opacity: 0.9;
+}
+.lobby-countdown.imminent {
+  color: var(--indicator-error, #e06c75);
+  border-color: var(--indicator-error, #e06c75);
+}
+
+/* Recent (on-disk) sessions — same card grid as running (see above) */
+.lobby-list.hidden { display: none; }
+.lobby-item {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.lobby-item:hover {
+  border-color: var(--accent-dim);
+  background: var(--bg-tool-hover);
+}
+.lobby-item-main {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.lobby-item-title {
+  font-size: 13px;
+  color: var(--text-bright);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lobby-item-age {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  flex: 0 0 auto;
+}
+.lobby-item-cwd {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 2px;
 }

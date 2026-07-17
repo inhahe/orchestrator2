@@ -302,6 +302,73 @@ def ring_bell(state: State, event: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Persistent deque — fires a callback after every mutation
+# ---------------------------------------------------------------------------
+
+class PersistentDeque(deque):
+    """A ``deque`` that invokes ``on_change()`` after any mutation.
+
+    Backs ``State.queued_prompts`` so the pending-prompt queue can be written
+    to disk on every change and survive a server restart.  ``on_change`` is
+    attached *after* the initial disk load (so populating the deque from disk
+    doesn't immediately rewrite it) and takes no arguments — the callback
+    reads the current contents from the deque itself.  The callback is a
+    plain instance attribute; when unset it resolves to the ``None`` class
+    default and mutations are silent.
+    """
+
+    on_change = None  # class default; set per-instance once persistence is wired
+
+    def _fire(self) -> None:
+        cb = self.on_change
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                # Persistence must never break queue operations.
+                pass
+
+    def append(self, x):            # type: ignore[override]
+        super().append(x); self._fire()
+
+    def appendleft(self, x):        # type: ignore[override]
+        super().appendleft(x); self._fire()
+
+    def pop(self):                  # type: ignore[override]
+        v = super().pop(); self._fire(); return v
+
+    def popleft(self):              # type: ignore[override]
+        v = super().popleft(); self._fire(); return v
+
+    def clear(self) -> None:        # type: ignore[override]
+        super().clear(); self._fire()
+
+    def extend(self, it):           # type: ignore[override]
+        super().extend(it); self._fire()
+
+    def extendleft(self, it):       # type: ignore[override]
+        super().extendleft(it); self._fire()
+
+    def insert(self, i, x):         # type: ignore[override]
+        super().insert(i, x); self._fire()
+
+    def remove(self, x):            # type: ignore[override]
+        super().remove(x); self._fire()
+
+    def rotate(self, n=1):          # type: ignore[override]
+        super().rotate(n); self._fire()
+
+    def __setitem__(self, i, x):
+        super().__setitem__(i, x); self._fire()
+
+    def __delitem__(self, i):
+        super().__delitem__(i); self._fire()
+
+    def __iadd__(self, other):
+        r = super().__iadd__(other); self._fire(); return r
+
+
+# ---------------------------------------------------------------------------
 # State dataclass
 # ---------------------------------------------------------------------------
 
@@ -360,8 +427,10 @@ class State:
     # Active (foreground) tool calls
     active_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
 
-    # Queued user prompts (typed while busy)
-    queued_prompts: deque[str] = field(default_factory=deque)
+    # Queued user prompts (typed while busy).  A PersistentDeque so the queue
+    # can be mirrored to disk on every change (survives a server restart); the
+    # save callback is wired up by server.py once the cwd is known.
+    queued_prompts: "PersistentDeque[str]" = field(default_factory=PersistentDeque)
     queue_editing_index: int | None = None  # index being edited in the UI
 
     # Echo flag for the FIRST user-typed prompt of the session when it

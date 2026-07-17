@@ -90,6 +90,14 @@ from tool_manager import (
 
 log = logging.getLogger(__name__)
 
+# Hard ceiling on a single ``client.connect()`` call.  Spawning the Claude CLI
+# and completing its init handshake normally takes a few seconds; occasionally
+# it hangs outright (the subprocess starts but never finishes the handshake),
+# which would otherwise leave the UI stuck on "connecting…" forever.  When this
+# elapses we tear down the half-open client and let ``worker_loop``'s existing
+# connect-retry loop try again — a fresh spawn almost always succeeds.
+CONNECT_TIMEOUT = 45.0
+
 # Broadcaster type: async function that sends a dict to all WS clients.
 Broadcaster = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -355,7 +363,23 @@ class SDKBridge:
                               "status": state_to_status_dict(self.state, self.config)})
 
         try:
-            await self.client.connect()
+            # Bound the connect so a hung CLI handshake can't wedge the UI on
+            # "connecting…" indefinitely.  On timeout/failure, tear down the
+            # half-open client so the retry starts from a clean slate (a
+            # timed-out connect can leave a dead subprocess and ``self.client``
+            # pointing at an unusable client).
+            try:
+                await asyncio.wait_for(self.client.connect(), timeout=CONNECT_TIMEOUT)
+            except BaseException as exc:
+                if isinstance(exc, asyncio.TimeoutError):
+                    log.error("SDK connect timed out after %.0fs — retrying",
+                              CONNECT_TIMEOUT)
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+                self.client = None
+                raise
         finally:
             self.state.connecting = False
             self.state.connect_started_at = None
@@ -1124,15 +1148,17 @@ class SDKBridge:
             entry = complete_bg_task(state, task_id, status, summary=summary)
             if entry:
                 cmd = self._bg_task_command(entry)
-                # Use output_file content as the display output.  Fall back
-                # to summary, but skip it if it's just the command repeated.
-                display_output = output or (summary if summary != cmd else None)
+                # Send the model's summary and the task's actual stdout as
+                # *separate* fields so the UI can show command, summary AND
+                # output.  Drop a "summary" that's just the command repeated.
+                model_summary = summary if (summary and summary != cmd) else None
                 data = {
                     "task_id": task_id,
                     "seq": entry.get("seq"),
                     "name": entry.get("name"),
                     "status": status,
-                    "summary": display_output,
+                    "summary": model_summary,
+                    "output": output,
                     "command": cmd,
                 }
                 await self.broadcast({"type": "bg_complete", **data})
@@ -1225,13 +1251,15 @@ class SDKBridge:
                 entry = complete_bg_task(state, task_id, status, summary=summary)
                 if entry:
                     cmd = self._bg_task_command(entry)
-                    display_output = output or (summary if summary != cmd else None)
+                    # Separate model summary from actual stdout (see above).
+                    model_summary = summary if (summary and summary != cmd) else None
                     data = {
                         "task_id": task_id,
                         "seq": entry.get("seq"),
                         "name": entry.get("name"),
                         "status": status,
-                        "summary": display_output,
+                        "summary": model_summary,
+                        "output": output,
                         "command": cmd,
                     }
                     await self.broadcast({"type": "bg_complete", **data})
@@ -1754,7 +1782,11 @@ class SDKBridge:
                     # so a fresh title isn't clobbered by a stale disk read.
                     if state.session_id:
                         if not self._apply_pending_rename(state.session_id):
-                            state.session_title = read_session_title(state.session_id)
+                            # Don't clobber a user-set title that hasn't been
+                            # persisted yet (e.g. /rename before the JSONL was
+                            # flushed to disk — pending_rename is still queued).
+                            if not state.pending_rename:
+                                state.session_title = read_session_title(state.session_id)
 
                     # Rate limit info may be on ResultMessage too.
                     rate_info = getattr(msg, "rate_limit_info", None)
@@ -1931,6 +1963,20 @@ class SDKBridge:
                 log.warning("bell broadcast failed: %r", exc)
             self.state.pending_bell = None
 
+    async def _broadcast_status(self) -> None:
+        """Push a fresh status_update (+panels) so the browser's busy/connecting
+        state and (Ns) timer track the backend.  Used from the connect
+        retry loop where the frontend would otherwise keep a stale value.
+        """
+        try:
+            await self.broadcast({
+                "type": "status_update",
+                "status": state_to_status_dict(self.state, self.config),
+                "panels": state_to_panels_dict(self.state),
+            })
+        except Exception as exc:
+            log.warning("status_update broadcast failed: %r", exc)
+
     # ------------------------------------------------------------------
     # worker_loop() — main turn driver
     # ------------------------------------------------------------------
@@ -1961,6 +2007,38 @@ class SDKBridge:
                 log.error("SDK connect failed (attempt %d): %s", _connect_attempt, exc)
 
                 if _connect_attempt >= _MAX_CONNECT_ATTEMPTS:
+                    # If the user queued prompt(s) while we were retrying,
+                    # that's a clear signal to keep trying rather than make
+                    # them re-type — restart the auto-retry (capped delay).
+                    if state.queued_prompts:
+                        _connect_attempt = 0
+                        _connect_delay = _MAX_CONNECT_DELAY
+                        # Stay "connecting" so further typed prompts keep
+                        # landing in the visible queue during the wait.
+                        state.connecting = True
+                        if state.connect_started_at is None:
+                            state.connect_started_at = time.monotonic()
+                        await self._broadcast_status()
+                        await self.broadcast({
+                            "type": "system_msg",
+                            "subtype": "error",
+                            "data": {"message": f"Still can't connect ({exc}). Retrying every {_MAX_CONNECT_DELAY:.0f}s\u2026"},
+                        })
+                        try:
+                            await asyncio.wait_for(
+                                self.stop_event.wait(), timeout=_connect_delay,
+                            )
+                            return
+                        except asyncio.TimeoutError:
+                            pass
+                        continue
+                    # Genuinely give up for now.  Clear connecting so both
+                    # the UI and the message router stop treating us as
+                    # connecting — a fresh prompt should route to the
+                    # event_queue and wake this manual-retry loop.
+                    state.connecting = False
+                    state.connect_started_at = None
+                    await self._broadcast_status()
                     await self.broadcast({
                         "type": "system_msg",
                         "subtype": "error",
@@ -1974,10 +2052,28 @@ class SDKBridge:
                         if kind == "message":
                             _connect_attempt = 0
                             _connect_delay = 2.0
+                            # Re-mark connecting so a re-typed prompt during
+                            # the next retry cycle is routed to the visible
+                            # queue rather than silently to the event_queue.
+                            state.connecting = True
+                            state.connect_started_at = time.monotonic()
                             self.event_queue.put_nowait((kind, payload))
                             break  # restart auto-retry loop
                     continue
 
+                # Non-final failure: we're still trying, so re-assert the
+                # "connecting" state for the backoff window.  connect()
+                # cleared it in its finally, but until a connect actually
+                # succeeds both the UI and the message router must keep
+                # treating us as connecting — otherwise a prompt typed
+                # during the backoff routes to the event_queue (invisible)
+                # instead of the visible queued_prompts panel, and in a
+                # never-succeeds hang it looks "eaten".  Pushing a fresh
+                # status_update also keeps the browser's (Ns) timer live.
+                state.connecting = True
+                if state.connect_started_at is None:
+                    state.connect_started_at = time.monotonic()
+                await self._broadcast_status()
                 await self.broadcast({
                     "type": "system_msg",
                     "subtype": "error",

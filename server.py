@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import base64
+import ipaddress
 import json
 import logging
 import logging.handlers
@@ -77,8 +79,10 @@ from session import (
     find_session_dir,
     list_projects,
     list_sessions_for_project,
+    load_persisted_queue,
     read_session_title,
     render_session_history,
+    save_persisted_queue,
 )
 from commands import (
     classify,
@@ -140,8 +144,132 @@ theme: Theme | None = None
 _picker_mode: bool = False
 
 # Connected WebSocket clients.
+#
+# Multi-session hub: the server can host several live sessions, each a
+# ``SessionRuntime`` with its own client set.  ``_ws_clients`` is the canonical
+# "all connected tabs" set (every socket, regardless of which runtime it's
+# attached to) — used for server-wide broadcasts and shutdown accounting.
+# ``_ws_runtime`` maps a socket to the runtime it's currently attached to.
+# ``lobby_clients`` holds tabs sitting at the lobby, not attached to any
+# session.
+from session_runtime import SessionRuntime  # noqa: E402
+
 _ws_clients: set[WebSocket] = set()
 _ws_lock = asyncio.Lock()
+
+runtimes: dict[str, SessionRuntime] = {}
+lobby_clients: set[WebSocket] = set()
+# Tabs that are attached to a session but have the lobby *overlay* open, so
+# they want live ``session_list`` pushes too (viewer counts, busy dots, new
+# sessions appearing).  Distinct from ``lobby_clients``, which are detached
+# tabs sitting at the lobby with no session.
+_lobby_watchers: set[WebSocket] = set()
+_ws_runtime: dict[WebSocket, SessionRuntime] = {}
+_default_runtime: SessionRuntime | None = None
+
+
+def _lobby_targets() -> set[WebSocket]:
+    """Every tab that should receive live session-list broadcasts."""
+    return lobby_clients | _lobby_watchers
+
+
+def _runtime_for_ws(ws: WebSocket) -> SessionRuntime | None:
+    """The session runtime the socket is currently attached to (if any)."""
+    return _ws_runtime.get(ws) or _default_runtime
+
+
+def _runtime_by_rid(rid: str | None) -> SessionRuntime | None:
+    """Look up a live runtime by its internal ``rid`` (or None)."""
+    if not rid:
+        return None
+    return runtimes.get(rid)
+
+
+# ---------------------------------------------------------------------------
+# Lobby — the list of joinable sessions (live runtimes + recent on-disk)
+# ---------------------------------------------------------------------------
+
+# The recent-on-disk scan hits the filesystem, so cache it briefly: the lobby
+# is refreshed every ticker cycle while tabs sit in it, and rescanning every
+# couple of seconds is wasteful.
+_disk_sessions_cache: tuple[float, list[dict[str, Any]]] | None = None
+_DISK_CACHE_TTL = 8.0
+
+
+def _recent_disk_sessions(limit: int = 40) -> list[dict[str, Any]]:
+    """Recent on-disk sessions for this account, excluding ones already live.
+
+    Cached for ``_DISK_CACHE_TTL`` seconds to keep lobby refreshes cheap.
+    """
+    global _disk_sessions_cache
+    now = time.monotonic()
+    if _disk_sessions_cache is not None:
+        stamp, cached = _disk_sessions_cache
+        if now - stamp < _DISK_CACHE_TTL:
+            return cached
+
+    live_ids = {
+        getattr(rt.state, "session_id", None)
+        for rt in runtimes.values()
+    }
+    out: list[dict[str, Any]] = []
+    try:
+        for proj in list_projects():
+            for sess in list_sessions_for_project(Path(proj["project_dir"])):
+                sid = sess.get("session_id")
+                if not sid or sid in live_ids:
+                    continue
+                out.append({
+                    "session_id": sid,
+                    "title": sess.get("title"),
+                    "cwd": proj.get("cwd"),
+                    "mtime": sess.get("mtime", 0),
+                    "age": _format_age(sess.get("mtime", 0)),
+                    "first_user_msg": _truncate(sess.get("first_user_msg"), 100),
+                })
+    except Exception:
+        log.warning("failed to scan disk sessions for lobby", exc_info=True)
+    out.sort(key=lambda s: s.get("mtime", 0), reverse=True)
+    out = out[:limit]
+    _disk_sessions_cache = (now, out)
+    return out
+
+
+def _session_list_payload() -> dict[str, Any]:
+    """The ``session_list`` message: running runtimes + recent disk sessions."""
+    running = [rt.meta() for rt in runtimes.values()]
+    running.sort(key=lambda m: m.get("last_activity", 0), reverse=True)
+    return {
+        "type": "session_list",
+        "running": running,
+        "recent": _recent_disk_sessions(),
+    }
+
+
+async def lobby_broadcast(msg: dict[str, Any]) -> None:
+    """Send *msg* to every lobby tab and every tab watching the lobby overlay."""
+    targets = _lobby_targets()
+    if not targets:
+        return
+    data = json.dumps(msg, default=str)
+    stale: list[WebSocket] = []
+    for ws in list(targets):
+        try:
+            await ws.send_text(data)
+        except Exception:
+            stale.append(ws)
+    for ws in stale:
+        lobby_clients.discard(ws)
+        _lobby_watchers.discard(ws)
+
+
+async def _push_session_list(target: WebSocket | None = None) -> None:
+    """Push the current session list to one tab, or to all lobby tabs."""
+    payload = _session_list_payload()
+    if target is not None:
+        await send_to(target, payload)
+    else:
+        await lobby_broadcast(payload)
 
 # Background tasks for periodic updates.
 _ticker_task: asyncio.Task | None = None
@@ -172,7 +300,12 @@ _pending_resume_id: str | None = None
 # ---------------------------------------------------------------------------
 
 async def broadcast(msg: dict[str, Any]) -> None:
-    """Send *msg* as JSON to every connected WebSocket client."""
+    """Send *msg* as JSON to **every** connected tab, across all runtimes.
+
+    Server-wide only (e.g. ``server_shutdown``).  Per-session updates must go
+    through the owning runtime's ``rt.broadcast`` so they reach just that
+    session's viewers, not tabs watching other sessions.
+    """
     if not _ws_clients:
         return
     data = json.dumps(msg, default=str)
@@ -221,42 +354,80 @@ def _enrich_panels(panels: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 async def _status_ticker() -> None:
-    """Push status_update + panel_update to clients every ~2s."""
+    """Push status_update + panel_update to each session's viewers every ~2s.
+
+    Iterates every live runtime so, once the hub hosts several sessions, each
+    set of viewers gets its own session's status.  In the single-session case
+    there's just the default runtime (whose state is the process globals).
+    """
     while True:
         await asyncio.sleep(2.0)
-        if state is None or config is None:
-            continue
-        if not _ws_clients:
-            continue
-        try:
-            # Expire panel grace items.
-            now = time.monotonic()
-            expired = [k for k, v in state.completed_panel_tools.items()
-                       if v.get("grace_end", 0) < now]
-            for k in expired:
-                state.completed_panel_tools.pop(k, None)
-            expired_bg = [k for k, v in state.completed_panel_bg.items()
-                          if v.get("grace_end", 0) < now]
-            for k in expired_bg:
-                state.completed_panel_bg.pop(k, None)
+        for rt in list(runtimes.values()):
+            st, cfg = rt.state, rt.config
+            if st is None or cfg is None:
+                continue
+            if not rt.clients:
+                continue
+            try:
+                # Expire panel grace items.
+                now = time.monotonic()
+                expired = [k for k, v in st.completed_panel_tools.items()
+                           if v.get("grace_end", 0) < now]
+                for k in expired:
+                    st.completed_panel_tools.pop(k, None)
+                expired_bg = [k for k, v in st.completed_panel_bg.items()
+                              if v.get("grace_end", 0) < now]
+                for k in expired_bg:
+                    st.completed_panel_bg.pop(k, None)
 
-            panels = _enrich_panels(state_to_panels_dict(state))
-            await broadcast({
-                "type": "status_update",
-                "status": state_to_status_dict(state, config),
-                "panels": panels,
-            })
+                panels = _enrich_panels(state_to_panels_dict(st))
+                await rt.broadcast({
+                    "type": "status_update",
+                    "status": state_to_status_dict(st, cfg),
+                    "panels": panels,
+                })
 
-            # Catch-all bell flush: bells rung from sync contexts (e.g.
-            # rate-limit hits) set state.pending_bell but have no async
-            # path to broadcast it.  Flush here so they reach the frontend
-            # within one tick instead of waiting for the next turn to end.
-            if state.pending_bell:
-                event = state.pending_bell
-                state.pending_bell = None
-                await broadcast({"type": "bell", "event": event})
-        except Exception:
-            log.exception("ticker error")
+                # Catch-all bell flush: bells rung from sync contexts (e.g.
+                # rate-limit hits) set state.pending_bell but have no async
+                # path to broadcast it.  Flush here so they reach the frontend
+                # within one tick instead of waiting for the next turn to end.
+                if st.pending_bell:
+                    event = st.pending_bell
+                    st.pending_bell = None
+                    await rt.broadcast({"type": "bell", "event": event})
+            except Exception:
+                log.exception("ticker error")
+
+        # Keep lobby tabs' session list live (viewer counts, busy dots).
+        if _lobby_targets():
+            try:
+                await _push_session_list()
+            except Exception:
+                log.exception("lobby ticker error")
+
+
+# ---------------------------------------------------------------------------
+# Queued-prompt disk persistence
+# ---------------------------------------------------------------------------
+
+def _attach_queue_persistence(st, cwd: str) -> None:
+    """Load any queue persisted for *cwd* into *st.queued_prompts*, then wire
+    the deque's on_change callback so future mutations are saved to disk.
+
+    Persisting the queue lets typed-but-not-yet-run prompts survive a full
+    server restart (browser reload already survives via server-side state).
+    """
+    try:
+        saved = load_persisted_queue(cwd)
+    except Exception:
+        saved = []
+    if saved:
+        # Populate before wiring on_change so the initial load doesn't trigger
+        # a redundant re-save of what we just read.
+        st.queued_prompts.extend(saved)
+    st.queued_prompts.on_change = (
+        lambda: save_persisted_queue(cwd, list(st.queued_prompts))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +441,7 @@ from contextlib import asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start background tasks on startup, clean up on shutdown."""
     global config, state, bridge, theme, _ticker_task, _picker_mode
+    global _default_runtime
 
     # --- Startup ---
     # This runs *before* uvicorn begins accepting connections, so keep it
@@ -281,7 +453,16 @@ async def lifespan(app: FastAPI):
     if config is None:
         config = parse_args()
     state = init_state_from_config(config)
+    _attach_queue_persistence(state, config.cwd)
     theme = load_theme()
+
+    # The default session runtime wraps the process-wide globals and is the
+    # session tabs auto-attach to on connect.  It has its own ``clients`` set
+    # (per-runtime broadcast targets only its viewers); ``_ws_clients`` tracks
+    # *all* connected tabs across every runtime + the lobby, for the global
+    # ``broadcast()`` (server-wide messages) and auto-shutdown accounting.
+    _default_runtime = SessionRuntime(config=config, state=state)
+    runtimes[_default_runtime.rid] = _default_runtime
 
     _ticker_task = asyncio.create_task(_status_ticker(), name="status-ticker")
 
@@ -315,6 +496,11 @@ async def lifespan(app: FastAPI):
             state.session_id = recent.stem
             state.session_title = read_session_title(recent.stem)
             _pending_resume_id = recent.stem
+
+    # The seeding block above may have rebound ``config`` (e.g. resolving a
+    # --resume title to a real UUID via dataclasses.replace).  Re-point the
+    # default runtime at the finalized config so its ``config`` isn't stale.
+    _default_runtime.config = config
 
     # If --resume was passed without an argument, defer SDK start until the
     # user picks a session from the graphical picker.
@@ -357,7 +543,10 @@ async def _deferred_bridge_startup(*, start: bool) -> None:
     global bridge
     try:
         from sdk_bridge import SDKBridge  # heavy import, kept off the hot path
-        bridge = SDKBridge(config=config, state=state, broadcaster=broadcast)
+        _bcast = _default_runtime.broadcast if _default_runtime is not None else broadcast
+        bridge = SDKBridge(config=config, state=state, broadcaster=_bcast)
+        if _default_runtime is not None:
+            _default_runtime.bridge = bridge
         if _pending_resume_id:
             bridge._initial_resume_id = _pending_resume_id
         if start:
@@ -368,6 +557,130 @@ async def _deferred_bridge_startup(*, start: bool) -> None:
         log.exception("deferred bridge startup failed")
     finally:
         _bridge_ready.set()
+
+
+# ---------------------------------------------------------------------------
+# Runtime lifecycle — spin up / tear down live sessions on demand
+# ---------------------------------------------------------------------------
+
+async def _create_runtime(
+    *,
+    cwd: str | None = None,
+    resume: str | None = None,
+    no_continue: bool = False,
+    model: str | None = None,
+    effort: str | None = None,
+) -> SessionRuntime:
+    """Spin up a fresh live session runtime (config clone + state + bridge).
+
+    * ``resume`` — resume a specific on-disk session id (implies no auto-continue).
+    * ``no_continue`` — start empty (a brand-new session).
+    * ``model`` / ``effort`` — per-session overrides from the launcher.
+    * otherwise — continue the most recent session in *cwd*.
+
+    Registers the runtime, starts its bridge, and refreshes the lobby.
+    """
+    assert config is not None
+    resolved_cwd = (
+        str(Path(cwd).resolve(strict=False)) if cwd else config.cwd
+    )
+    overrides: dict[str, Any] = {
+        "cwd": resolved_cwd,
+        "resume": resume,
+        "no_continue": no_continue or bool(resume),
+        "copy": False,
+    }
+    if model:
+        overrides["model"] = model
+    if effort:
+        overrides["effort"] = effort
+    cfg = dataclasses.replace(config, **overrides)
+    st = init_state_from_config(cfg)
+    _attach_queue_persistence(st, cfg.cwd)
+    rt = SessionRuntime(config=cfg, state=st)
+    runtimes[rt.rid] = rt
+
+    from sdk_bridge import SDKBridge  # already imported by now; cheap
+    br = SDKBridge(config=cfg, state=st, broadcaster=rt.broadcast)
+    rt.bridge = br
+
+    # Decide which on-disk session (if any) seeds this runtime.
+    seed_id: str | None = None
+    if resume:
+        seed_id = resume
+    elif not no_continue:
+        recent = find_most_recent_session_for_cwd(resolved_cwd)
+        if recent is not None:
+            seed_id = recent.stem
+    if seed_id:
+        st.session_id = seed_id
+        st.session_title = read_session_title(seed_id)
+        br._initial_resume_id = seed_id
+
+    await br.start()
+    log.info("runtime %s started (cwd=%s, resume=%s)",
+             rt.rid, resolved_cwd, seed_id)
+    await _push_session_list()   # lobby tabs see the new session appear
+    return rt
+
+
+async def _teardown_runtime(rt: SessionRuntime) -> None:
+    """Stop a runtime's bridge and drop it from the registry.
+
+    The default runtime is the process's primary session and is never torn
+    down here — the server-level auto-shutdown handles the whole-process case.
+    """
+    if rt is _default_runtime:
+        return
+    if runtimes.get(rt.rid) is not rt:
+        return  # already gone
+    runtimes.pop(rt.rid, None)
+    _cancel_idle_timer(rt)
+    if rt.bridge is not None:
+        try:
+            await rt.bridge.stop()
+        except Exception:
+            log.warning("error stopping bridge for runtime %s",
+                        rt.rid, exc_info=True)
+    log.info("runtime %s torn down", rt.rid)
+    await _push_session_list()
+
+
+def _cancel_idle_timer(rt: SessionRuntime) -> None:
+    """Cancel a runtime's pending idle-teardown timer, if any."""
+    if rt.idle_timer is not None:
+        rt.idle_timer.cancel()
+        rt.idle_timer = None
+    rt.idle_deadline = None
+
+
+def _maybe_start_idle_timer(rt: SessionRuntime) -> None:
+    """Start the idle-teardown countdown for a viewer-less runtime.
+
+    No-op for the default runtime (never idle-torn-down), for runtimes that
+    still have viewers, or when idle teardown is disabled (timeout <= 0).
+    """
+    if rt is _default_runtime or rt.clients:
+        return
+    timeout = getattr(config, "session_idle_timeout", 300) if config else 300
+    if timeout <= 0:
+        return
+    _cancel_idle_timer(rt)
+    rt.idle_deadline = time.time() + timeout
+    rt.idle_timer = asyncio.create_task(
+        _idle_teardown_after(rt, timeout), name=f"idle-{rt.rid}",
+    )
+
+
+async def _idle_teardown_after(rt: SessionRuntime, timeout: int) -> None:
+    """Wait out the idle grace period, then tear the runtime down."""
+    try:
+        await asyncio.sleep(timeout)
+    except asyncio.CancelledError:
+        return
+    if not rt.clients and runtimes.get(rt.rid) is rt:
+        log.info("runtime %s idle for %ds — tearing down", rt.rid, timeout)
+        await _teardown_runtime(rt)
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +717,109 @@ def _ws_route(path: str):
     return deco
 
 
+# ---------------------------------------------------------------------------
+# LAN-only authentication middleware
+# ---------------------------------------------------------------------------
+#
+# Connections from private/loopback IPs pass through freely.  Connections from
+# public IPs require HTTP Basic Auth (password set via ``--external-password``
+# or the ``ORCH2_EXTERNAL_PASSWORD`` environment variable; defaults to None
+# which blocks ALL external access).  This protects the hub from the internet
+# while keeping the LAN workflow frictionless.
+
+_PRIVATE_NETS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
+
+def _is_private_ip(ip_str: str) -> bool:
+    """Return True for loopback, LAN, and link-local addresses."""
+    try:
+        addr = ipaddress.ip_address(ip_str.split("%")[0])  # strip IPv6 zone id
+        return any(addr in net for net in _PRIVATE_NETS)
+    except ValueError:
+        return False
+
+
+class _ExternalAuthMiddleware:
+    """ASGI middleware: require Basic Auth for non-LAN clients.
+
+    * LAN / loopback → pass through (no credentials needed).
+    * External + correct password → pass through.
+    * External + wrong / missing credentials → 401.
+    * ``password is None`` → block ALL external access (no password set).
+    """
+
+    def __init__(self, app: Any, *, password: str | None) -> None:
+        self.app = app
+        self.password = password
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope["type"] in ("http", "websocket"):
+            client = scope.get("client")
+            client_ip = client[0] if client else "127.0.0.1"
+            if not _is_private_ip(client_ip):
+                # External connection — check credentials.
+                if self.password is None:
+                    await self._reject(scope, receive, send,
+                                       "External access is disabled.")
+                    return
+                # Check Basic Auth header (works for HTTP; browsers cache
+                # credentials and often include them on WS upgrades too)
+                # and a ``?password=`` query-param fallback (reliable for WS
+                # since browsers don't natively prompt for WS auth).
+                headers = dict(scope.get("headers", []))
+                auth = headers.get(b"authorization", b"").decode("utf-8", "replace")
+                qs = (scope.get("query_string") or b"").decode("utf-8", "replace")
+                pw_param = dict(
+                    p.split("=", 1) for p in qs.split("&") if "=" in p
+                ).get("password")
+                if not self._check_basic_auth(auth) and pw_param != self.password:
+                    await self._reject(scope, receive, send,
+                                       "Authentication required.")
+                    return
+        await self.app(scope, receive, send)
+
+    def _check_basic_auth(self, auth_header: str) -> bool:
+        """Validate ``Authorization: Basic <b64>`` against the configured password."""
+        if not auth_header.startswith("Basic "):
+            return False
+        try:
+            decoded = base64.b64decode(auth_header[6:]).decode("utf-8", "replace")
+        except Exception:
+            return False
+        # Accept any username; only the password matters.
+        parts = decoded.split(":", 1)
+        return len(parts) == 2 and parts[1] == self.password
+
+    @staticmethod
+    async def _reject(scope: dict, receive: Any, send: Any, message: str) -> None:
+        """Reject an unauthenticated external connection."""
+        if scope["type"] == "http":
+            body = message.encode("utf-8")
+            await send({
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    [b"content-type", b"text/plain; charset=utf-8"],
+                    [b"www-authenticate", b'Basic realm="orchestrator2"'],
+                    [b"content-length", str(len(body)).encode()],
+                ],
+            })
+            await send({"type": "http.response.body", "body": body})
+        else:
+            # WebSocket: accept then immediately close with a reason code.
+            # (ASGI doesn't let us send an HTTP 401 on a WS scope.)
+            await receive()  # websocket.connect
+            await send({"type": "websocket.close", "code": 1008,
+                        "reason": message})
+
+
 def build_app() -> Any:
     """Construct the FastAPI application (imports fastapi lazily).
 
@@ -425,6 +841,13 @@ def build_app() -> Any:
         app.add_api_route(path, fn, methods=[method.upper()], **kwargs)
     for path, fn in _WS_ROUTES:
         app.add_api_websocket_route(path, fn)
+
+    # Wrap the app with authentication for external connections.
+    ext_pw = (os.environ.get("ORCH2_EXTERNAL_PASSWORD") or "").strip() or None
+    if config is not None:
+        ext_pw = getattr(config, "external_password", ext_pw) or ext_pw
+    app = _ExternalAuthMiddleware(app, password=ext_pw)
+
     return app
 
 
@@ -550,8 +973,18 @@ async def _reconfigure(
     # --- Reinitialise state + bridge ---
     from sdk_bridge import SDKBridge  # already imported once by now; cheap
     state = init_state_from_config(config)
-    bridge = SDKBridge(config=config, state=state, broadcaster=broadcast)
+    _attach_queue_persistence(state, config.cwd)
+    _bcast = _default_runtime.broadcast if _default_runtime is not None else broadcast
+    bridge = SDKBridge(config=config, state=state, broadcaster=_bcast)
     _bridge_ready.set()
+
+    # Keep the default runtime pointing at the fresh config/state/bridge so the
+    # ticker (which reads per-runtime state) and per-runtime routing see the
+    # reconfigured session.  Its viewers (``_default_runtime.clients``) carry over.
+    if _default_runtime is not None:
+        _default_runtime.config = config
+        _default_runtime.state = state
+        _default_runtime.bridge = bridge
 
     if new_resume:
         state.session_id = new_resume
@@ -665,6 +1098,77 @@ async def api_status() -> dict[str, Any]:
         "status": state_to_status_dict(state, config),
         "panels": state_to_panels_dict(state),
     }
+
+
+@_route("get", "/api/ready")
+async def api_ready() -> dict[str, Any]:
+    """Trivial readiness probe used by the startup splash page.
+
+    The instant-startup splash (served by a stdlib pre-server while
+    fastapi/uvicorn load) polls this endpoint; once uvicorn is up it answers
+    200 here and the splash redirects to the real app.  The pre-server itself
+    answers 503 for this path, so a 200 unambiguously means "uvicorn serving".
+    """
+    return {"ready": True}
+
+
+@_route("get", "/api/whoami")
+async def api_whoami() -> dict[str, Any]:
+    """Identify this server so a new launch can decide whether to reuse it.
+
+    A launcher probes this before binding a port: if a live orchestrator2 with
+    the *same account* (``CLAUDE_CONFIG_DIR``) is already serving, the launch
+    joins it as a new session instead of starting a second server.
+    """
+    return {
+        "app": "orchestrator2",
+        "pid": os.getpid(),
+        "account": os.environ.get("CLAUDE_CONFIG_DIR") or "",
+        "port": getattr(config, "port", None) if config else None,
+        "sessions": len(runtimes),
+    }
+
+
+@_route("post", "/api/session/launch", response_model=None)
+async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
+    """Spin up (or reuse) a session runtime in this hub; return its ``rid``.
+
+    Called over HTTP by a second launch that found this hub already running.
+    Mirrors the WebSocket ``open``/``new`` lobby actions but is reachable
+    before any browser tab has attached.
+    """
+    if config is None:
+        return {"ok": False, "error": "server not initialised"}
+    cwd = body.get("cwd")
+    resume = (body.get("resume") or "").strip() or None
+    no_continue = bool(body.get("no_continue"))
+    model = (body.get("model") or "").strip() or None
+    effort = (body.get("effort") or "").strip() or None
+
+    # Resolve the on-disk session this launch would land on (an explicit
+    # resume id, or — for a plain continue — the most recent session in cwd).
+    # If a runtime is already hosting it, reuse that one so we never spin up a
+    # second bridge against the same session file.
+    target_sid = resume
+    if target_sid is None and not no_continue:
+        recent = find_most_recent_session_for_cwd(cwd or config.cwd)
+        if recent is not None:
+            target_sid = recent.stem
+    if target_sid:
+        existing = next(
+            (r for r in runtimes.values()
+             if getattr(r.state, "session_id", None) == target_sid),
+            None,
+        )
+        if existing is not None:
+            return {"ok": True, "rid": existing.rid, "reused": True}
+    try:
+        rt = await _create_runtime(cwd=cwd, resume=resume, no_continue=no_continue,
+                                   model=model, effort=effort)
+    except Exception as exc:
+        log.exception("hub session launch failed")
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "rid": rt.rid}
 
 
 @_route("get", "/api/completions")
@@ -799,14 +1303,20 @@ async def api_resume(body: dict[str, Any]) -> dict[str, Any]:
 # Pending-prompt queue API
 # ---------------------------------------------------------------------------
 
-async def _broadcast_queue_update() -> None:
-    """Push the current queue state to all connected clients."""
-    assert state is not None
+async def _broadcast_queue_update(rt: SessionRuntime | None = None) -> None:
+    """Push a runtime's queue state to that session's viewers.
+
+    Defaults to the default runtime (used by the REST queue endpoints, which
+    operate on the primary session).
+    """
+    rt = rt or _default_runtime
+    if rt is None or rt.state is None:
+        return
     items = [
         {"index": i, "text": text}
-        for i, text in enumerate(state.queued_prompts)
+        for i, text in enumerate(rt.state.queued_prompts)
     ]
-    await broadcast({"type": "queue_update", "queue": items})
+    await rt.broadcast({"type": "queue_update", "queue": items})
 
 
 @_route("post", "/api/queue/delete")
@@ -924,7 +1434,8 @@ async def api_todos_clear() -> dict[str, Any]:
         if t.get("status") != "completed"
     ]
     panels = state_to_panels_dict(state)
-    await broadcast({
+    _bcast = _default_runtime.broadcast if _default_runtime is not None else broadcast
+    await _bcast({
         "type": "status_update",
         "status": state_to_status_dict(state, config),
         "panels": panels,
@@ -1046,14 +1557,59 @@ async def _shutdown_after_grace() -> None:
             "no browser tabs connected for %ds — shutting down",
             _SHUTDOWN_GRACE_SECONDS,
         )
-        # Let the bridge clean up, then hard-exit.  os._exit avoids
-        # blocking on uvicorn's graceful-shutdown timeout.
-        if bridge:
-            try:
-                await bridge.stop()
-            except Exception:
-                pass
+        # Let every runtime's bridge clean up, then hard-exit.  os._exit
+        # avoids blocking on uvicorn's graceful-shutdown timeout.
+        for rt in list(runtimes.values()):
+            if rt.bridge is not None:
+                try:
+                    await rt.bridge.stop()
+                except Exception:
+                    pass
         os._exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Attach / detach — move a tab between the lobby and a session runtime
+# ---------------------------------------------------------------------------
+
+async def _attach_ws(ws: WebSocket, rt: SessionRuntime) -> None:
+    """Attach *ws* to runtime *rt* and send it that session's initial state.
+
+    Detaches from any previous runtime first (arming that runtime's idle
+    timer if it's now viewer-less) and refreshes the lobby viewer counts.
+    """
+    old = _ws_runtime.get(ws)
+    if old is not None and old is not rt:
+        old.discard_client(ws)
+        _maybe_start_idle_timer(old)
+    lobby_clients.discard(ws)
+    _cancel_idle_timer(rt)
+    rt.add_client(ws)
+    _ws_runtime[ws] = rt
+    await _send_initial_state(ws)
+    await _push_session_list()   # viewer counts changed
+
+
+async def _enter_lobby(ws: WebSocket) -> None:
+    """Detach *ws* from its runtime (if any) and send it the session list."""
+    old = _ws_runtime.pop(ws, None)
+    if old is not None:
+        old.discard_client(ws)
+        _maybe_start_idle_timer(old)
+    lobby_clients.add(ws)
+    await _push_session_list(ws)
+    if old is not None:
+        await _push_session_list()   # others see the viewer count drop
+
+
+def _cleanup_ws(ws: WebSocket) -> None:
+    """Remove a disconnected socket from all registries (no I/O)."""
+    old = _ws_runtime.pop(ws, None)
+    lobby_clients.discard(ws)
+    _lobby_watchers.discard(ws)
+    if old is not None:
+        old.discard_client(ws)
+        _maybe_start_idle_timer(old)
 
 
 # ---------------------------------------------------------------------------
@@ -1072,8 +1628,52 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         _ws_clients.add(ws)
 
     try:
-        # --- Send initial state ---
-        await _send_initial_state(ws)
+        # Landing behaviour:
+        #   * ``/?rid=<rid>``  → attach straight to that session.  A launch
+        #     that joined a running hub forwards its new session's rid so its
+        #     tab opens on that session; the sentinel ``default`` resolves to
+        #     the hub's default session without knowing its real rid.
+        #   * ``/`` (no rid)   → land in the **lobby** (the central hub view).
+        # Either way the lobby-aware frontend can switch sessions afterwards.
+        requested_rid: str | None = None
+        try:
+            requested_rid = ws.query_params.get("rid")
+        except Exception:
+            requested_rid = None
+        # ?lobby=1 forces the lobby (used by the ☰ Sessions button).
+        force_lobby = False
+        try:
+            force_lobby = ws.query_params.get("lobby") == "1"
+        except Exception:
+            pass
+
+        if requested_rid:
+            # The sentinel ``default`` resolves to the hub's primary session
+            # (used by launches that join a running hub without a specific rid).
+            if requested_rid == "default":
+                target = _default_runtime
+            else:
+                target = _runtime_by_rid(requested_rid)
+            if target is not None:
+                await _attach_ws(ws, target)
+            else:
+                # The rid is stale (session was torn down, hub was restarted,
+                # etc.).  Land in the lobby so the user can pick a live session.
+                await _enter_lobby(ws)
+                await send_to(ws, {
+                    "type": "system_msg", "subtype": "warning",
+                    "data": {"message":
+                        f"Session {requested_rid} is no longer running. "
+                        "Pick a session from the lobby to continue."},
+                })
+        elif force_lobby:
+            await _enter_lobby(ws)
+        elif _default_runtime is not None:
+            # Normal single-session launches (no ?rid, no ?lobby): auto-attach
+            # to the default runtime so the tab opens directly on the session.
+            await _attach_ws(ws, _default_runtime)
+        else:
+            await _enter_lobby(ws)
 
         # --- Message loop ---
         while True:
@@ -1094,21 +1694,33 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     finally:
         async with _ws_lock:
             _ws_clients.discard(ws)
+        _cleanup_ws(ws)
         _maybe_start_shutdown_timer()
 
 
 async def _send_initial_state(ws: WebSocket) -> None:
-    """Send session history, status, panels, and completions on connect."""
-    assert state is not None and config is not None
+    """Send session history, status, panels, and completions on attach.
 
-    # In picker mode the main chat UI isn't active yet.
-    if _picker_mode:
+    Scoped to the runtime *ws* is attached to, so each tab receives the
+    status/history of the session it's actually viewing.
+    """
+    rt = _runtime_for_ws(ws)
+    if rt is None or rt.state is None or rt.config is None:
+        return
+    state = rt.state
+    config = rt.config
+
+    # In picker mode the default runtime's chat UI isn't active yet.
+    if _picker_mode and rt is _default_runtime:
         await send_to(ws, {
             "type": "system_msg",
             "subtype": "info",
             "data": {"message": "Select a session to resume."},
         })
         return
+
+    # Tell the tab which session it's now viewing (rid + meta).
+    await send_to(ws, {"type": "attached", "session": rt.meta()})
 
     # Status + panels.
     panels = _enrich_panels(state_to_panels_dict(state))
@@ -1124,11 +1736,10 @@ async def _send_initial_state(ws: WebSocket) -> None:
         "commands": get_command_completions(),
     })
 
-    # Clear any stale chat content from a previous session (e.g. browser
-    # tab reconnecting after the server restarted with a different cwd).
+    # Clear any stale chat content from a previously-viewed session.
     await send_to(ws, {"type": "clear_screen"})
 
-    # Session history (if continuing a session).
+    # Session history (if this session continues an on-disk one).
     if state.session_id:
         try:
             session_dir = find_session_dir(state.session_id)
@@ -1144,14 +1755,129 @@ async def _send_initial_state(ws: WebSocket) -> None:
             log.warning("failed to load history for %s: %s", state.session_id, exc)
 
 
+async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
+    """Handle lobby / session-switching messages.  Returns True if handled.
+
+    These don't need a bridge and must not reference the per-session
+    ``bridge``/``state``/``config``/``broadcast`` shadows, so they live in
+    their own function (Python would otherwise treat those names as locals
+    across the whole function once ``_handle_ws_message`` rebinds them).
+    """
+    msg_type = msg.get("type", "")
+
+    if msg_type == "list":
+        await _push_session_list(ws)
+        return True
+
+    if msg_type == "lobby_watch":
+        # The tab opened/closed its lobby overlay while staying attached to its
+        # session.  While open it joins ``_lobby_watchers`` for live pushes.
+        if msg.get("on"):
+            _lobby_watchers.add(ws)
+            await _push_session_list(ws)   # immediate snapshot
+        else:
+            _lobby_watchers.discard(ws)
+        return True
+
+    if msg_type == "detach":
+        await _enter_lobby(ws)
+        return True
+
+    if msg_type == "attach":
+        rt = _runtime_by_rid(msg.get("rid"))
+        if rt is None:
+            await send_to(ws, {"type": "system_msg", "subtype": "error",
+                               "data": {"message": "That session is no longer running."}})
+            await _push_session_list(ws)
+            return True
+        await _attach_ws(ws, rt)
+        return True
+
+    if msg_type == "new":
+        cur = _runtime_for_ws(ws)
+        default_cwd = cur.config.cwd if cur and cur.config else (
+            config.cwd if config else None)
+        cwd = msg.get("cwd") or default_cwd
+        try:
+            rt = await _create_runtime(cwd=cwd, no_continue=True)
+        except Exception as exc:
+            log.exception("failed to create new session")
+            await send_to(ws, {"type": "system_msg", "subtype": "error",
+                               "data": {"message": f"Couldn't start a new session: {exc}"}})
+            return True
+        await _attach_ws(ws, rt)
+        return True
+
+    if msg_type == "open":
+        sid = (msg.get("session_id") or "").strip()
+        if not sid:
+            await send_to(ws, {"type": "system_msg", "subtype": "error",
+                               "data": {"message": "No session_id provided."}})
+            return True
+        # Already live?  Just attach to the existing runtime.
+        existing = next(
+            (r for r in runtimes.values()
+             if getattr(r.state, "session_id", None) == sid),
+            None,
+        )
+        if existing is not None:
+            await _attach_ws(ws, existing)
+            return True
+        cur = _runtime_for_ws(ws)
+        default_cwd = cur.config.cwd if cur and cur.config else (
+            config.cwd if config else None)
+        cwd = msg.get("cwd") or find_session_cwd(sid) or default_cwd
+        try:
+            rt = await _create_runtime(cwd=cwd, resume=sid)
+        except Exception as exc:
+            log.exception("failed to open session %s", sid)
+            await send_to(ws, {"type": "system_msg", "subtype": "error",
+                               "data": {"message": f"Couldn't open that session: {exc}"}})
+            return True
+        await _attach_ws(ws, rt)
+        return True
+
+    return False
+
+
 async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
     """Dispatch an incoming WebSocket message."""
-    # The bridge is constructed off the hot startup path, so a very fast user
-    # action can arrive before it exists.  Wait for it (the page already shows
-    # "connecting…"); it's ready within a fraction of a second.
-    if bridge is None:
-        await _bridge_ready.wait()
-    assert state is not None and config is not None and bridge is not None
+    # Lobby / session-switching messages route independently of any bridge.
+    if await _handle_lobby_message(ws, msg):
+        return
+
+    # Everything below operates on the runtime this tab is attached to.
+    rt = _runtime_for_ws(ws)
+    if rt is None:
+        await send_to(ws, {"type": "system_msg", "subtype": "warning",
+                           "data": {"message": "No session attached."}})
+        return
+    # The default runtime's bridge is built off the hot startup path, so a very
+    # fast message can arrive before it exists.  Rather than blocking (which
+    # hides the prompt from the queue panel), queue user messages immediately
+    # so they're visible, then let the bridge drain them once ready.
+    if rt.bridge is None:
+        state = rt.state
+        if state is not None and msg.get("type") == "message":
+            text = (msg.get("text") or "").strip()
+            if text:
+                kind, _payload = classify(text)
+                if kind == "message":
+                    state.queued_prompts.append(text)
+                    await _broadcast_queue_update(rt)
+                    return
+        # For non-message types, wait for the bridge.
+        if rt is _default_runtime:
+            await _bridge_ready.wait()
+
+    bridge = rt.bridge
+    state = rt.state
+    config = rt.config
+    broadcast = rt.broadcast
+    if bridge is None or state is None or config is None:
+        await send_to(ws, {"type": "system_msg", "subtype": "error",
+                           "data": {"message": "Session not ready yet — try again."}})
+        return
     msg_type = msg.get("type", "")
 
     # --- User message ---
@@ -1181,6 +1907,14 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             await bridge.stop()
             await send_to(ws, {"type": "system_msg", "subtype": "shutdown",
                                "data": {"message": "Shutting down."}})
+            return
+
+        if kind in ("switch-cwd", "resume", "resume-pick") and rt is not _default_runtime:
+            # These reconfigure the *default* runtime in place; from a
+            # secondary session, the way to change folder/session is the
+            # lobby (Sessions → open/new).
+            await send_to(ws, {"type": "system_msg", "subtype": "info",
+                               "data": {"message": "Use Sessions to open a different folder or session."}})
             return
 
         if kind == "switch-cwd":
@@ -1243,7 +1977,7 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             prompt = _build_graphify_prompt(payload)
             if state.busy:
                 state.queued_prompts.append(prompt)
-                await _broadcast_queue_update()
+                await _broadcast_queue_update(rt)
             else:
                 bridge.event_queue.put_nowait(("message", prompt))
             return
@@ -1254,7 +1988,7 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
         # checks queued_prompts after the initial connect completes.
         if kind == "message" and (state.busy or state.connecting):
             state.queued_prompts.append(payload)
-            await _broadcast_queue_update()
+            await _broadcast_queue_update(rt)
             return
 
         # Everything else (commands, messages while idle) → event queue.
@@ -1449,6 +2183,61 @@ def _try_shutdown_old_server(port: int) -> None:
             pass
 
 
+def _probe_hub(port: int) -> dict | None:
+    """Return a running orchestrator2 hub's ``/api/whoami`` on *port*, or None.
+
+    Only matches a hub for the *same account* (``CLAUDE_CONFIG_DIR``); a
+    different account can't share the single-account hub, so it falls through
+    to starting its own server.
+    """
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/whoami", timeout=1.5
+        ) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("app") != "orchestrator2":
+        return None
+    want = os.environ.get("CLAUDE_CONFIG_DIR") or ""
+    if (data.get("account") or "") != want:
+        return None
+    return data
+
+
+def _launch_into_hub(
+    port: int, *, cwd: str, resume: str | None, no_continue: bool,
+    model: str | None = None, effort: str | None = None,
+) -> str | None:
+    """Ask a running hub to open a session; return its ``rid`` (or None)."""
+    import urllib.request
+
+    payload = json.dumps({
+        "cwd": cwd,
+        "resume": resume,
+        "no_continue": no_continue,
+        "model": model,
+        "effort": effort,
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/session/launch",
+            data=payload, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as exc:
+        log.warning("hub session launch failed: %s", exc)
+        return None
+    if not isinstance(data, dict) or not data.get("ok"):
+        log.warning("hub session launch rejected: %s", data)
+        return None
+    return data.get("rid")
+
+
 def _bind_port(host: str, port: int) -> tuple[_socket.socket, int]:
     """Try to bind *port*; on failure, let the OS pick a free one.
 
@@ -1470,6 +2259,104 @@ def _bind_port(host: str, port: int) -> tuple[_socket.socket, int]:
     actual = sock.getsockname()[1]
     sock.set_inheritable(True)
     return sock, actual
+
+
+# Lightweight "starting…" page served by the stdlib pre-server (below) while
+# fastapi/uvicorn load.  Its JS polls /api/ready and redirects to the real app
+# the moment uvicorn takes over the socket.
+_SPLASH_HTML = ("""<!doctype html>
+<html><head><meta charset="utf-8"><title>orchestrator2 - starting\u2026</title>
+<style>
+  html,body{height:100%;margin:0}
+  body{background:#0a0a14;color:#cdd6f4;font-family:system-ui,'Segoe UI',sans-serif;
+       display:flex;align-items:center;justify-content:center;flex-direction:column;gap:22px}
+  .spin{width:46px;height:46px;border-radius:50%;border:4px solid #23233a;
+        border-top-color:#7aa2f7;animation:r .8s linear infinite}
+  @keyframes r{to{transform:rotate(360deg)}}
+  .t{font-size:15px;letter-spacing:.3px;color:#9aa2c0}
+  .b{font-size:12px;color:#565b7a}
+</style></head>
+<body>
+  <div class="spin"></div>
+  <div class="t">starting orchestrator2\u2026</div>
+  <div class="b" id="b">warming up the server</div>
+<script>
+  let n=0;
+  async function poll(){
+    n++;
+    if(n===12){document.getElementById('b').textContent='still starting - hang tight';}
+    try{
+      const r=await fetch('/api/ready',{cache:'no-store'});
+      if(r.ok){location.replace('/');return;}
+    }catch(e){}
+    setTimeout(poll,400);
+  }
+  poll();
+</script>
+</body></html>""").encode("utf-8")
+
+
+def _serve_splash_until(sock: _socket.socket, stop_event: "_threading.Event",
+                        ready_event: "_threading.Event") -> None:
+    """Serve the startup splash on *sock* until *stop_event* is set.
+
+    Runs in a thread on the already-bound socket so the browser tab can open in
+    ~0.3s while the heavy fastapi/uvicorn stack imports on the main thread.
+    Answers every path with the splash HTML except ``/api/ready`` (503) \u2014 the
+    real app answers 200 there once uvicorn is up, which is the splash's cue to
+    redirect.  The socket is left *listening* the whole time and handed to
+    uvicorn afterwards, so connections that arrive during the brief handoff sit
+    in the kernel backlog and get served by uvicorn (never refused).
+    """
+    sock.listen(128)
+    sock.settimeout(0.25)
+    ready_event.set()  # socket is now listening; safe to open the browser
+    while not stop_event.is_set():
+        try:
+            conn, _ = sock.accept()
+        except OSError:
+            continue  # accept timeout (settimeout) or transient error
+        try:
+            conn.settimeout(1.0)
+            data = b""
+            try:
+                while b"\r\n" not in data and len(data) < 4096:
+                    chunk = conn.recv(1024)
+                    if not chunk:
+                        break
+                    data += chunk
+            except OSError:
+                pass
+            first = data.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+            parts = first.split(" ")
+            path = parts[1] if len(parts) >= 2 else "/"
+            if path.startswith("/api/ready"):
+                body = b'{"ready": false}'
+                resp = (b"HTTP/1.1 503 Service Unavailable\r\n"
+                        b"Content-Type: application/json\r\n"
+                        b"Content-Length: " + str(len(body)).encode() +
+                        b"\r\nConnection: close\r\n\r\n" + body)
+            else:
+                body = _SPLASH_HTML
+                resp = (b"HTTP/1.1 200 OK\r\n"
+                        b"Content-Type: text/html; charset=utf-8\r\n"
+                        b"Content-Length: " + str(len(body)).encode() +
+                        b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" +
+                        body)
+            try:
+                conn.sendall(resp)
+            except OSError:
+                pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+    # Restore blocking mode and leave the socket listening for uvicorn.
+    try:
+        sock.settimeout(None)
+    except OSError:
+        pass
 
 
 def _setup_file_logging(log_path: str, fmt: str) -> None:
@@ -1509,6 +2396,138 @@ def _setup_file_logging(log_path: str, fmt: str) -> None:
     atexit.register(lambda: _flog.info("--- server shut down (pid %d) ---", os.getpid()))
 
 
+def _stdin_is_tty() -> bool:
+    """True when stdin is an interactive terminal (needed for the TUI picker).
+
+    Guarded because ``sys.stdin`` can be ``None`` (pythonw / detached child)
+    or raise on ``isatty()`` for exotic stream replacements.
+    """
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def _console_is_visible() -> bool:
+    """True when this process owns a *visible* console window (Windows).
+
+    A process launched by tray_minimizer has a real console (so stdin is a
+    tty) but its window is hidden with SW_HIDE — drawing a full-screen TUI
+    there would be invisible.  This distinguishes "usable terminal" from
+    "hidden console".
+    """
+    if sys.platform != "win32":
+        return _stdin_is_tty()
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        u = ctypes.windll.user32
+        k.GetConsoleWindow.restype = ctypes.c_void_p
+        hwnd = k.GetConsoleWindow()
+        if not hwnd:
+            return False
+        return bool(u.IsWindowVisible(ctypes.c_void_p(hwnd)))
+    except Exception:
+        return False
+
+
+def _run_launch_picker(mode: str, launch_cwd: str | None = None) -> dict | None:
+    """Run the `--resume` / `--copy` TUI picker and return its result.
+
+    Returns ``{"session_id": str | None, "cwd": str | None}`` (or ``None`` when
+    no picker could run).  ``cwd`` is the picked session's working directory —
+    the server adopts it because resume is cwd-scoped (the CLI only finds a
+    session under its own project directory).
+
+    The picker is ALWAYS run in a **child process** (`copy_session.py
+    --pick`), never in-process — so the server process never hosts a
+    full-screen Textual app whose terminal teardown could wedge the
+    subsequent uvicorn startup.  On Windows:
+
+    * if our own console is visible, the child shares it (the TUI draws in
+      the current terminal);
+    * if our console is hidden (tray_minimizer launch) or absent (IDE run /
+      double-click), the child gets its own **fresh, visible** console via
+      CREATE_NEW_CONSOLE — so the picker is always something the user can
+      actually see, while the server itself stays hidden in the tray.
+
+    The chosen id is passed back through a temp JSON file.  The child
+    inherits our environment (notably CLAUDE_CONFIG_DIR) so it lists the
+    same account.
+    """
+    import subprocess
+    import tempfile
+    import json as _json
+
+    if sys.platform != "win32":
+        # POSIX: only a real terminal can host the TUI; run it in-process.
+        if _stdin_is_tty():
+            try:
+                from copy_session import pick_session_for_launch
+                return pick_session_for_launch(mode, launch_cwd)
+            except Exception:
+                log.exception("launch picker failed")
+            return None
+        print(
+            f"--{mode} needs an interactive terminal; run orchestrator2 from a "
+            f"terminal to use the session picker.",
+            file=sys.stderr,
+        )
+        return None
+
+    def _read_result(path: str) -> dict | None:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = _json.load(f)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        sid = data.get("session_id")
+        cwd = data.get("cwd")
+        return {
+            "session_id": sid if isinstance(sid, str) and sid else None,
+            "cwd": cwd if isinstance(cwd, str) and cwd else None,
+        }
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, encoding="utf-8",
+    )
+    out_path = tmp.name
+    tmp.close()
+
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "copy_session.py")
+    argv = [sys.executable, script, "--pick", mode, "--out", out_path]
+    if launch_cwd:
+        argv.extend(["--cwd", launch_cwd])
+
+    # Share the current console when it's visible; otherwise pop a fresh,
+    # visible one (the hidden/tray or no-console case).
+    creationflags = 0 if _console_is_visible() else subprocess.CREATE_NEW_CONSOLE
+    try:
+        proc = subprocess.Popen(
+            argv,
+            creationflags=creationflags,
+            cwd=os.path.dirname(script) or None,
+        )
+        proc.wait()
+    except Exception:
+        log.exception("failed to launch picker process")
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+        return None
+
+    try:
+        return _read_result(out_path)
+    finally:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+
+
 def main() -> None:
     """Launch the server."""
     global config
@@ -1535,6 +2554,71 @@ def main() -> None:
 
     if config.log_file:
         _setup_file_logging(config.log_file, file_fmt)
+
+    # --resume (no id) / --copy: show the full-screen terminal picker so the
+    # user can choose a project + session to resume (or copy in from another
+    # account) before the server starts.  The account is the one selected by
+    # CLAUDE_CONFIG_DIR (set just above).  _run_launch_picker draws the TUI in
+    # this terminal when we have one, or pops a fresh console window when we
+    # don't (IDE run / hidden launcher).  In --detach the *parent* runs here
+    # and passes the resolved id to the child via argv below.  The headless
+    # --detach child skips this (its resume id is already concrete).
+    if config.copy or config.resume == _PICKER_SENTINEL:
+        picker_mode = "copy" if config.copy else "resume"
+        result = _run_launch_picker(picker_mode, config.cwd)
+        chosen = result.get("session_id") if isinstance(result, dict) else None
+        chosen_cwd = result.get("cwd") if isinstance(result, dict) else None
+        if chosen:
+            config = dataclasses.replace(config, resume=chosen, copy=False)
+            # Resume is cwd-scoped: adopt the picked session's own working
+            # directory so the CLI finds it (a session picked from another
+            # project — or a just-copied one — lives under that project's
+            # slug, not the launch cwd's).  Only if the dir still exists.
+            if chosen_cwd and os.path.isdir(chosen_cwd):
+                config = dataclasses.replace(
+                    config, cwd=str(Path(chosen_cwd).resolve())
+                )
+        elif config.copy:
+            # Copy cancelled, declined ("open it now?" → No), or copied into a
+            # different account (unresumable here).  In every case nothing was
+            # chosen to open, so start a FRESH empty session rather than
+            # silently auto-continuing the launch cwd's most-recent session
+            # (which is unrelated to the copy the user was doing).
+            config = dataclasses.replace(
+                config, copy=False, resume=None, no_continue=True
+            )
+        # A cancelled resume picker leaves the sentinel in place, so the
+        # in-browser picker still appears.
+
+    # --- Central-hub reuse -------------------------------------------------
+    # If a matching orchestrator2 (same account) is already serving on our
+    # port, join it — open the launched session there and point a browser at
+    # it — instead of starting a second, independent server.  Skipped by
+    # --standalone and by the in-browser resume picker (which needs its own
+    # picker-mode server).  Runs before --detach so a hub short-circuits the
+    # spawn entirely.
+    if (not config.standalone
+            and config.resume != _PICKER_SENTINEL
+            and _probe_hub(config.port) is not None):
+        rid = _launch_into_hub(
+            config.port,
+            cwd=config.cwd,
+            resume=config.resume,
+            no_continue=config.no_continue,
+            model=config.model,
+            effort=config.effort,
+        )
+        if rid:
+            url = f"http://localhost:{config.port}/?rid={rid}"
+            print(f"Joined running orchestrator2 hub on port {config.port} "
+                  f"(session {rid}).")
+            if config.open_browser:
+                webbrowser.open(f"{url}&t={int(time.time())}")
+            sys.exit(0)
+        # Hub was up but couldn't open the session — fall through and start
+        # our own server on a free port.
+        print("Hub was running but couldn't open the session — starting a "
+              "separate server.")
 
     # --detach: validate everything here (errors visible in terminal),
     # then respawn headless and exit.
@@ -1565,10 +2649,39 @@ def main() -> None:
             if a.startswith("--port="):
                 i += 1
                 continue
+            # --copy / --resume were consumed by the launch picker above; the
+            # resolved session id is re-added from config.resume below so the
+            # headless child doesn't try to open a picker it has no terminal
+            # for.
+            if a == "--copy":
+                i += 1
+                continue
+            if a == "--resume":
+                i += 1
+                if i < len(sys.argv) and not sys.argv[i].startswith("-"):
+                    i += 1  # also skip its optional value
+                continue
+            if a.startswith("--resume="):
+                i += 1
+                continue
+            # --cwd may have been overridden by the picker (adopting the picked
+            # session's project dir); strip any inherited --cwd and re-add the
+            # resolved config.cwd below.
+            if a == "--cwd":
+                i += 2
+                continue
+            if a.startswith("--cwd="):
+                i += 1
+                continue
             child_argv.append(a)
             i += 1
         child_argv.extend(["--port", str(actual_port), "--auto-shutdown",
-                           "--skip-auto-login"])
+                           "--skip-auto-login", "--cwd", config.cwd])
+        # Re-add the (possibly picker-resolved) resume target for the child.
+        if config.resume == _PICKER_SENTINEL:
+            child_argv.append("--resume")  # bare → child shows browser picker
+        elif config.resume:
+            child_argv.extend(["--resume", config.resume])
 
         import subprocess
         import tempfile
@@ -1671,36 +2784,33 @@ def main() -> None:
         msg += f"  (config-dir: {config.config_dir})"
     print(msg)
 
-    # Open browser once the server is fully initialised (lifespan done).
-    # The cache-buster query param forces the browser to do a fresh
-    # navigation instead of just focusing an existing tab with the same
-    # URL (which would show stale content from a previous session).
+    # Instant-startup splash.  fastapi/uvicorn take ~1.5s+ to import and build
+    # (occasionally much longer under Windows process-launch overhead); binding
+    # a port is instant, but the browser can't be pointed at it until *something*
+    # is listening.  So we spin up a stdlib pre-server on the already-bound
+    # socket (listens in ~0.3s), open the browser at it immediately, and load
+    # the heavy stack on this thread meanwhile.  The pre-server shows a
+    # "starting…" splash whose JS polls /api/ready; once we hand the (still
+    # listening) socket to uvicorn, that poll returns 200 and the page redirects
+    # to the real UI.  This makes the tab appear near-instantly instead of after
+    # the framework import, and eliminates the "can't connect" race entirely.
+    _splash_stop = _threading.Event()
+    _splash_ready = _threading.Event()
+    _splash_thread = _threading.Thread(
+        target=_serve_splash_until, args=(sock, _splash_stop, _splash_ready),
+        name="splash-preserver", daemon=True,
+    )
+    _splash_thread.start()
+    _splash_ready.wait(timeout=5)  # ensure the socket is listening first
+
     if config.open_browser:
-        open_url = f"{url}?t={int(time.time())}"
-        def _open_when_ready():
-            # `_server_ready` is set at the END of lifespan STARTUP, but uvicorn
-            # calls listen() only AFTER lifespan startup returns.  So the port is
-            # bound-but-not-listening when the event fires — opening the browser
-            # here directly races and lands on a dead port ("can't connect").
-            # After the event, poll a real TCP connect (matching the --detach
-            # parent's probe loop) until the port genuinely accepts connections.
-            _server_ready.wait(timeout=30)
-            deadline = time.monotonic() + 20.0
-            while time.monotonic() < deadline:
-                probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-                probe.settimeout(0.25)
-                try:
-                    probe.connect(("127.0.0.1", actual_port))
-                    break
-                except OSError:
-                    time.sleep(0.05)
-                finally:
-                    probe.close()
-            webbrowser.open(open_url)
-        _threading.Thread(target=_open_when_ready, daemon=True).start()
+        # Cache-buster forces a fresh navigation instead of re-focusing a stale
+        # tab with the same URL.
+        webbrowser.open(f"{url}?t={int(time.time())}")
 
     # Build the FastAPI app now (imports fastapi lazily) — only the serving
-    # process pays this cost; the --detach parent returned long ago.
+    # process pays this cost; the --detach parent returned long ago.  This is
+    # the slow part the splash is covering for.
     import uvicorn
     fastapi_app = build_app()
 
@@ -1714,6 +2824,13 @@ def main() -> None:
         ws_ping_interval=None, ws_ping_timeout=None,
     )
     server = uvicorn.Server(uvi_config)
+
+    # Stop the splash pre-server and hand the still-listening socket to uvicorn.
+    # Any connection that arrived during this handoff is queued in the kernel
+    # backlog and gets served by uvicorn, so nothing is refused.
+    _splash_stop.set()
+    _splash_thread.join(timeout=5)
+
     server.run(sockets=[sock])
 
 

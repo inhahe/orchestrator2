@@ -13,6 +13,7 @@ const App = (() => {
   let reconnectAttempt = 0;
   let _isBusy = false;
   let _serverShutdown = false;
+  let _didLaunchRequest = false;   // sent the one-shot ?open/?new request?
   const MAX_RECONNECT_DELAY = 30000;
   const MAX_RECONNECT_ATTEMPTS = 20;
 
@@ -22,6 +23,7 @@ const App = (() => {
     Panels.init();
     Commands.init();
     Chat.init();
+    Lobby.init();
 
     // Modal.
     document.getElementById('modal-close').addEventListener('click', closeModal);
@@ -92,7 +94,22 @@ const App = (() => {
 
   function _connect() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const params = new URLSearchParams(location.search);
+    // Forward a ?rid=<rid> from the page URL so a tab launched into a running
+    // hub attaches to that specific session instead of the hub's default one.
+    const rid = params.get('rid');
+    // ?open=<sid> / ?new[=1] launch a tab straight into a disk session or a
+    // fresh one: the tab lands in the lobby, then sends open/new on connect.
+    const openSid = params.get('open');
+    const newFlag = params.get('new');
+    const cwd = params.get('cwd');
+    const lobbyFlag = params.get('lobby');
     wsUrl = `${protocol}//${location.host}/ws`;
+    if (rid) wsUrl += `?rid=${encodeURIComponent(rid)}`;
+    else if (lobbyFlag) wsUrl += `?lobby=1`;
+
+    // Don't flash the landing lobby while we wait for the open/new to attach.
+    if (!rid && (openSid || newFlag)) Lobby.expectSession();
 
     ws = new WebSocket(wsUrl);
 
@@ -100,6 +117,17 @@ const App = (() => {
       console.log('WebSocket connected');
       reconnectDelay = 1000;
       reconnectAttempt = 0;
+      // Drive an open/new request once (only on the first connect, not on
+      // reconnects — by then the tab has a ?rid= URL and re-attaches normally).
+      if (!rid && !_didLaunchRequest) {
+        _didLaunchRequest = true;
+        if (openSid) {
+          send(cwd ? { type: 'open', session_id: openSid, cwd }
+                   : { type: 'open', session_id: openSid });
+        } else if (newFlag) {
+          send(cwd ? { type: 'new', cwd } : { type: 'new' });
+        }
+      }
     };
 
     ws.onclose = (e) => {
@@ -194,6 +222,32 @@ const App = (() => {
 
   function _dispatch(msg) {
     const type = msg.type;
+
+    // Lobby: the server's list of running + recent sessions.
+    if (type === 'session_list') {
+      Lobby.render(msg);
+      return;
+    }
+
+    // Lobby: this tab is now attached to (viewing) a specific session.
+    // Clears any leftover chat before the fresh history/status arrives.
+    if (type === 'attached') {
+      // Update the URL to ?rid=<rid> so a refresh re-attaches directly
+      // (instead of re-opening, which would fork the session).
+      const s = msg.session || {};
+      if (s.rid) {
+        try {
+          const u = new URL(location.href);
+          u.searchParams.delete('open');
+          u.searchParams.delete('new');
+          u.searchParams.delete('cwd');
+          u.searchParams.set('rid', s.rid);
+          history.replaceState(null, '', u.toString());
+        } catch (_) {}
+      }
+      Lobby.onAttached(msg.session);
+      return;
+    }
 
     // Status updates go to the status bar + panels.
     if (type === 'status_update') {

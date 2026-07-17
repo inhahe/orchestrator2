@@ -55,6 +55,69 @@ def _sanitize_cwd(cwd: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
 
 
+# ---------------------------------------------------------------------------
+# Queued-prompt persistence
+#
+# The pending-prompt queue lives in memory (State.queued_prompts); we mirror
+# it to a small JSON file so it survives a server restart.  It's stored under
+# the active config dir (account-scoped, like sessions) but *outside* the
+# ``projects/`` tree so it can never be mistaken for Claude session data.
+# ---------------------------------------------------------------------------
+
+def _orch2_state_dir() -> Path:
+    """Return ``<config-dir>/orchestrator2`` (config-dir = CLAUDE_CONFIG_DIR or ~/.claude)."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    root = Path(base) if base else Path.home() / ".claude"
+    return root / "orchestrator2"
+
+
+def queue_file_for_cwd(cwd: str) -> Path:
+    """Path to the persisted queue file for *cwd* (account + cwd scoped)."""
+    try:
+        resolved = str(Path(cwd).resolve(strict=False))
+    except OSError:
+        resolved = cwd
+    return _orch2_state_dir() / "queues" / f"{_sanitize_cwd(resolved)}.json"
+
+
+def load_persisted_queue(cwd: str) -> list[str]:
+    """Load the persisted pending-prompt queue for *cwd* (empty on any error)."""
+    path = queue_file_for_cwd(cwd)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    items = data.get("queue") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    return [x for x in items if isinstance(x, str)]
+
+
+def save_persisted_queue(cwd: str, items: Any) -> None:
+    """Atomically write the pending-prompt queue for *cwd* to disk.
+
+    When *items* is empty the file is removed so stale empties don't linger.
+    Failures are swallowed — persistence must never break queue operations.
+    """
+    path = queue_file_for_cwd(cwd)
+    lst = [str(x) for x in items]
+    try:
+        if not lst:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"cwd": cwd, "queue": lst, "saved_at": time.time()}, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def _normalize_path_for_compare(p: str) -> str:
     """Normalise paths for comparison (backslash → slash, lowercase on Win)."""
     s = p.replace("\\", "/").rstrip("/")
@@ -382,7 +445,10 @@ def _parse_session_info(jsonl: Path, project_slug: str) -> dict[str, Any] | None
                     elif isinstance(msg, str):
                         text = msg
                     text = text.strip()
-                    if text and not text.startswith("<bash") and not text.startswith("<tool"):
+                    # Skip SDK-injected XML messages (e.g. <bash>, <tool>,
+                    # <local-command-caveat>, <command-name>, etc.) that
+                    # aren't real user input.
+                    if text and not (len(text) > 1 and text[0] == '<' and text[1:2].isalpha()):
                         if info["first_user_msg"] is None:
                             info["first_user_msg"] = text
                         info["last_user_msg"] = text

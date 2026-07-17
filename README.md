@@ -54,18 +54,64 @@ pip install -r requirements.txt
 python server.py --cwd "%cd%" --open
 ```
 
-## Running Multiple Instances
+## Running Multiple Sessions (central hub)
 
-Just run `orch.bat` (or `python server.py`) from each project directory. If port 8420 is already in use, the server automatically picks a free port:
+The server is a **central hub**: the first launch starts it on port 8420, and
+every later launch from another directory *joins that hub* as a new session
+rather than starting a second server. The launch opens a browser tab attached
+to its own session, and all tabs viewing the same session stay in live sync.
 
 ```
 C:\project-a> orch
-orchestrator2 launched on http://localhost:8420
+orchestrator2 starting on http://localhost:8420
 
 C:\project-b> orch
-Port 8420 in use — using 52314 instead.
-orchestrator2 launched on http://localhost:52314
+Joined running orchestrator2 hub on port 8420 (session s2).
 ```
+
+Click **☰ Sessions** in the status bar to open the **lobby** — a browser for
+every session on the hub. It lists the sessions running live (with their
+working directory, viewer count and a busy dot) plus recent on-disk sessions
+you can reopen, and has a **New session** button (optionally pointed at a
+different working directory). Picking a running session attaches this tab to
+it; opening a recent one spins up a fresh live session for it. The lobby
+overlay closes as soon as the session loads; the tab stays attached to
+whatever it's viewing.
+
+A launch only reuses a hub with the **same account** (`CLAUDE_CONFIG_DIR`) on
+the same port. Notes:
+
+- **`--standalone`** forces a separate, independent server instead of joining
+  the hub (it binds 8420, or auto-picks a free port if that's taken).
+- If port 8420 is occupied by something that *isn't* an orchestrator2 hub for
+  this account, the launch starts its own server on an auto-selected free port.
+- A session with zero viewers is torn down after `--session-idle-timeout`
+  seconds (default 300; `0` disables); the hub itself keeps running.
+
+### Accessing the hub from other devices (LAN)
+
+The server binds `0.0.0.0`, so it's reachable from other machines on your
+network at `http://<host-ip>:8420` (find `<host-ip>` with `ipconfig`). Every
+tab — local or remote — lands on the same hub and can browse the lobby, so a
+laptop or phone on the same Wi-Fi can watch or drive any session live.
+
+Windows Firewall blocks the inbound port by default. To allow it, run once in
+an **elevated** PowerShell/Command Prompt:
+
+```powershell
+netsh advfirewall firewall add rule name="orchestrator2" ^
+  dir=in action=allow protocol=TCP localport=8420
+```
+
+Remove it later with:
+
+```powershell
+netsh advfirewall firewall delete rule name="orchestrator2"
+```
+
+Use `localport=<port>` to match a non-default `--port`. Only open the port on
+networks you trust — the hub has no authentication, so anyone who can reach it
+can control your sessions.
 
 ### Choosing a Claude account
 
@@ -98,7 +144,7 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 - **Permission dialogs** -- allow/deny tool execution from the browser
 - **AskUserQuestion fallback** -- Claude's interactive multiple-choice tool (`AskUserQuestion`) has no picker widget in the web UI, so instead of silently failing, its questions and options are surfaced as a chat message and Claude is told to continue the exchange in plain text — you just type your answer
 - **Session resume** -- automatically continues the most recent session for the working directory
-- **Session picker** -- interactive session selection with `--resume`
+- **Session picker** -- interactive full-screen terminal session selection with `--resume` (no id); `--copy` copies a session in from another account first
 - **Switch projects** -- change working directory and session with `/cwd <path>`
 - **Multi-tab support** -- multiple browser tabs receive synchronized updates
 - **Bell notifications** -- configurable audible alerts for key events
@@ -116,7 +162,8 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 | `--initial-prompt`, `-p` | -- | First message to send on startup |
 | `--no-continue` | off | Start a fresh session instead of resuming the most recent one |
 | `--no-replay` | off | When resuming, don't replay prior messages into backscroll |
-| `--resume [SESSION_ID]` | -- | Resume a specific session by ID, or omit the ID for a picker |
+| `--resume [SESSION_ID]` | -- | Resume a specific session by ID, or omit the ID to open a full-screen terminal picker (grouped by project) before the server starts |
+| `--copy` | off | Open a full-screen terminal wizard to copy a session between Claude accounts: pick source account + session, destination account, and a name. If copied into the current account it asks whether to open it now. Whenever nothing gets opened (cancelled, declined, or a cross-account copy) it then asks what to open — the current directory's most-recent session (the default), pick another, or a fresh empty session |
 | `--cwd PATH` | `.` | Working directory Claude operates in |
 
 ### Model & Effort
@@ -205,6 +252,8 @@ At runtime, use the `/bell` slash command to view or change the bell events with
 | `--port N` | 8420 | HTTP server port (auto-selects a free port if in use) |
 | `--open` | off | Open browser automatically on startup |
 | `--detach` | off | Launch the server in the background and exit the terminal (implies `--open`) |
+| `--standalone` | off | Start a separate server instead of joining a running hub on the same port/account |
+| `--session-idle-timeout SECS` | 300 | Seconds a session with zero viewers lingers before teardown (`0` disables) |
 | `--config-dir PATH` | -- | Override `CLAUDE_CONFIG_DIR` (session/credential storage). Use to run under a different Claude account |
 | `--debug` | off | Print extra diagnostic messages |
 

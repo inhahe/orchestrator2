@@ -10,6 +10,45 @@
 <body>
   <!-- Status bar is inside #input-bar below, not a top header -->
 
+  <!-- ===== Lobby overlay (session browser) ===== -->
+  <div id="lobby" class="hidden">
+    <div class="lobby-inner">
+      <header class="lobby-header">
+        <h1>orchestrator2 <span class="lobby-sub">sessions</span></h1>
+        <button id="lobby-close" class="lobby-close" title="Back to current session">&times;</button>
+      </header>
+
+      <section class="lobby-section">
+        <div class="lobby-section-head">
+          <h2>New session</h2>
+        </div>
+        <div class="lobby-new">
+          <input id="lobby-new-cwd" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="Working directory (blank = default)">
+          <button id="lobby-new-btn">+ New session</button>
+        </div>
+      </section>
+
+      <section class="lobby-section">
+        <div class="lobby-section-head">
+          <h2>Running</h2>
+          <span id="lobby-running-count" class="lobby-count">0</span>
+        </div>
+        <div id="lobby-running" class="lobby-cards"></div>
+        <div id="lobby-running-empty" class="lobby-empty hidden">No sessions running.</div>
+      </section>
+
+      <section class="lobby-section">
+        <div class="lobby-section-head">
+          <h2>Recent</h2>
+          <span id="lobby-recent-count" class="lobby-count">0</span>
+        </div>
+        <div id="lobby-recent" class="lobby-list"></div>
+        <div id="lobby-recent-empty" class="lobby-empty hidden">No recent sessions on disk.</div>
+      </section>
+    </div>
+  </div>
+
   <!-- ===== Main layout: panels + chat ===== -->
   <div id="main-container">
     <!-- Left sidebar panels -->
@@ -59,6 +98,8 @@
       <!-- Input bar (inside chat-area so it aligns naturally) -->
       <div id="input-bar">
     <div id="status-bar">
+      <button id="sessions-btn" class="sessions-btn" title="Browse sessions (lobby)">&#9776; Sessions</button>
+      <span class="status-sep">|</span>
       <span id="status-indicator" class="indicator idle"></span>
       <span id="status-state" class="status-field status-state-text" title="Current state">idle</span>
       <span class="status-sep">|</span>
@@ -126,6 +167,7 @@
   <script src="/static/panels.js"></script>
   <script src="/static/commands.js"></script>
   <script src="/static/chat.js"></script>
+  <script src="/static/lobby.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

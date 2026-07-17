@@ -94,7 +94,8 @@ SLASH_COMMANDS = [
 # from the Anthropic API can't be fetched (see fetch_available_models).
 # This goes stale as new models ship, so the live list is preferred.
 KNOWN_MODELS = [
-    ("claude-opus-4-6", "Opus 4.6 — 1M context, max capability"),
+    ("claude-opus-4-8", "Opus 4.8 — 1M context, max capability"),
+    ("claude-opus-4-6", "Opus 4.6 — 1M context"),
     ("claude-sonnet-4-6", "Sonnet 4.6 — 200k context, fast"),
     ("claude-haiku-3-5", "Haiku 3.5 — 200k context, fastest"),
 ]
@@ -345,6 +346,7 @@ class Config:
     initial_prompt: str | None = None
     no_continue: bool = False
     resume: str | None = None          # None, _PICKER_SENTINEL, or session UUID/name
+    copy: bool = False                 # --copy: TUI to copy a session from another account, then resume it
     no_replay: bool = False
     cwd: str = "."
 
@@ -415,6 +417,9 @@ class Config:
     open_browser: bool = False
     detach: bool = False               # re-launch headless and exit terminal
     auto_shutdown: bool = False        # shut down when all browser tabs close
+    session_idle_timeout: int = 300    # secs a viewer-less session lingers before teardown
+    standalone: bool = False           # don't reuse a running hub; force a separate server
+    external_password: str | None = "uncommon11"  # password for non-LAN access (None = block all external)
     config_dir: str | None = None      # CLAUDE_CONFIG_DIR override
     skip_auto_login: bool = False      # internal: child skips the login check
 
@@ -467,7 +472,17 @@ def parse_args(argv: list[str] | None = None) -> Config:
         metavar="SESSION_ID",
         help=(
             "Resume a specific session by id. Pass --resume with no value to "
-            "open an interactive picker."
+            "open an interactive picker (a full-screen TUI in the terminal, "
+            "or the in-browser picker when not run from a terminal)."
+        ),
+    )
+    ap.add_argument(
+        "--copy",
+        action="store_true",
+        help=(
+            "Open a full-screen TUI to copy a session from another Claude "
+            "account (.claude directory) into the current one, then resume it. "
+            "The destination is the account of the current CLAUDE_CONFIG_DIR."
         ),
     )
 
@@ -726,6 +741,35 @@ def parse_args(argv: list[str] | None = None) -> Config:
         help="Shut down when all browser tabs close (auto-set by --detach).",
     )
     ap.add_argument(
+        "--session-idle-timeout",
+        type=int,
+        default=300,
+        metavar="SECS",
+        help=(
+            "Seconds a session with zero viewers keeps running before it is "
+            "torn down. Default: 300 (5 min). 0 disables idle teardown."
+        ),
+    )
+    ap.add_argument(
+        "--standalone",
+        action="store_true",
+        help=(
+            "Start a separate server instead of joining an already-running "
+            "hub on the same port/account. By default a launch reuses a "
+            "running hub, adding its session there."
+        ),
+    )
+    ap.add_argument(
+        "--external-password",
+        default=None,
+        help=(
+            "Password for non-LAN access.  Connections from private/loopback "
+            "IPs are always allowed; connections from public IPs require HTTP "
+            "Basic Auth with this password.  If not set, all external access "
+            "is blocked.  Can also be set via ORCH2_EXTERNAL_PASSWORD env var."
+        ),
+    )
+    ap.add_argument(
         "--skip-auto-login",
         action="store_true",
         help=argparse.SUPPRESS,  # internal: --detach child, parent already checked
@@ -756,6 +800,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         initial_prompt=args.initial_prompt,
         no_continue=args.no_continue,
         resume=args.resume,
+        copy=args.copy,
         no_replay=args.no_replay,
         cwd=str(Path(args.cwd).resolve()),
         model=args.model,
@@ -791,6 +836,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
         open_browser=args.open or args.detach,
         detach=args.detach,
         auto_shutdown=args.auto_shutdown or args.open or args.detach,
+        session_idle_timeout=args.session_idle_timeout,
+        standalone=args.standalone,
+        external_password=args.external_password,
         config_dir=args.config_dir,
         skip_auto_login=args.skip_auto_login,
     )
