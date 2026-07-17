@@ -972,6 +972,7 @@ const Chat = (() => {
   // --- History replay ---
 
   function _replayHistory(messages) {
+    console.log('[history] _replayHistory called, messages:', messages ? messages.length : 0);
     if (!messages || !messages.length) return;
 
     _replayInProgress = true;

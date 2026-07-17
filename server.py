@@ -334,6 +334,11 @@ async def send_to(ws: WebSocket, msg: dict[str, Any]) -> None:
     try:
         await ws.send_text(json.dumps(msg, default=str))
     except Exception:
+        # Log if this was a history payload — those failures are hard to
+        # diagnose because the client just sees a blank screen.
+        if msg.get("type") == "history":
+            log.warning("failed to send history message (%d items) to client",
+                        len(msg.get("messages", [])), exc_info=True)
         pass
 
 
@@ -1303,6 +1308,22 @@ async def api_resume(body: dict[str, Any]) -> dict[str, Any]:
 # Pending-prompt queue API
 # ---------------------------------------------------------------------------
 
+def _resolve_queue_rt(body: dict[str, Any] | None = None,
+                      ) -> tuple[SessionRuntime | None, State | None, SDKBridge | None]:
+    """Resolve runtime/state/bridge for a queue API call.
+
+    The frontend includes ``rid`` in each request body.  Falls back to the
+    module-level globals (= default runtime) when ``rid`` is absent or
+    doesn't match a live runtime — backwards-compatible with older clients.
+    """
+    rid = (body or {}).get("rid") if body else None
+    rt = _runtime_by_rid(rid) if rid else None
+    if rt is not None:
+        return rt, rt.state, rt.bridge
+    # Fallback: module-level globals (default runtime).
+    return _default_runtime, state, bridge
+
+
 async def _broadcast_queue_update(rt: SessionRuntime | None = None) -> None:
     """Push a runtime's queue state to that session's viewers.
 
@@ -1322,14 +1343,15 @@ async def _broadcast_queue_update(rt: SessionRuntime | None = None) -> None:
 @_route("post", "/api/queue/delete")
 async def api_queue_delete(body: dict[str, Any]) -> dict[str, Any]:
     """Delete a pending prompt by index."""
-    if state is None:
+    rt, st, br = _resolve_queue_rt(body)
+    if st is None:
         return {"ok": False, "error": "not ready"}
     idx = body.get("index")
-    if not isinstance(idx, int) or idx < 0 or idx >= len(state.queued_prompts):
+    if not isinstance(idx, int) or idx < 0 or idx >= len(st.queued_prompts):
         return {"ok": False, "error": f"invalid index: {idx}"}
-    removed = state.queued_prompts[idx]
-    del state.queued_prompts[idx]
-    await _broadcast_queue_update()
+    removed = st.queued_prompts[idx]
+    del st.queued_prompts[idx]
+    await _broadcast_queue_update(rt)
     return {"ok": True, "removed": _truncate(removed, 80)}
 
 
@@ -1341,24 +1363,25 @@ async def api_queue_send(body: dict[str, Any]) -> dict[str, Any]:
     picks it up immediately.  If busy, moves it to the front of the queue
     so it executes next when the current turn ends.
     """
-    if state is None or bridge is None:
+    rt, st, br = _resolve_queue_rt(body)
+    if st is None or br is None:
         return {"ok": False, "error": "not ready"}
     idx = body.get("index")
-    if not isinstance(idx, int) or idx < 0 or idx >= len(state.queued_prompts):
+    if not isinstance(idx, int) or idx < 0 or idx >= len(st.queued_prompts):
         return {"ok": False, "error": f"invalid index: {idx}"}
-    prompt = state.queued_prompts[idx]
-    if state.busy:
+    prompt = st.queued_prompts[idx]
+    if st.busy:
         if idx == 0:
             # Already first in line — nothing to do.
             return {"ok": True, "already_next": True}
         # Move to front so it's the next prompt after the current turn.
-        del state.queued_prompts[idx]
-        state.queued_prompts.appendleft(prompt)
-        await _broadcast_queue_update()
+        del st.queued_prompts[idx]
+        st.queued_prompts.appendleft(prompt)
+        await _broadcast_queue_update(rt)
         return {"ok": True, "moved_to_front": True}
-    del state.queued_prompts[idx]
-    bridge.event_queue.put_nowait(("message", prompt))
-    await _broadcast_queue_update()
+    del st.queued_prompts[idx]
+    br.event_queue.put_nowait(("message", prompt))
+    await _broadcast_queue_update(rt)
     return {"ok": True, "sent": _truncate(prompt, 80)}
 
 
@@ -1369,21 +1392,22 @@ async def api_queue_edit(body: dict[str, Any]) -> dict[str, Any]:
     Also clears the editing lock atomically so the bridge doesn't send
     the old text before the update arrives.
     """
-    if state is None or bridge is None:
+    rt, st, br = _resolve_queue_rt(body)
+    if st is None or br is None:
         return {"ok": False, "error": "not ready"}
     idx = body.get("index")
     text = (body.get("text") or "").strip()
-    if not isinstance(idx, int) or idx < 0 or idx >= len(state.queued_prompts):
+    if not isinstance(idx, int) or idx < 0 or idx >= len(st.queued_prompts):
         return {"ok": False, "error": f"invalid index: {idx}"}
     if not text:
         return {"ok": False, "error": "text cannot be empty"}
     # Update text and clear editing lock in one step.
-    state.queued_prompts[idx] = text
-    state.queue_editing_index = None
-    await _broadcast_queue_update()
+    st.queued_prompts[idx] = text
+    st.queue_editing_index = None
+    await _broadcast_queue_update(rt)
     # Wake the bridge if idle so it can send the (now updated) prompt.
-    if state.queued_prompts and not state.busy:
-        bridge.event_queue.put_nowait(("wakeup", "queue-edit-done"))
+    if st.queued_prompts and not st.busy:
+        br.event_queue.put_nowait(("wakeup", "queue-edit-done"))
     return {"ok": True}
 
 
@@ -1394,29 +1418,31 @@ async def api_queue_editing(body: dict[str, Any]) -> dict[str, Any]:
     While a queue item is being edited, the bridge will hold off on
     sending it so the user can finish their edit first.
     """
-    if state is None or bridge is None:
+    rt, st, br = _resolve_queue_rt(body)
+    if st is None or br is None:
         return {"ok": False, "error": "not ready"}
     idx = body.get("index")  # int to start editing, None to stop
     if idx is not None and not isinstance(idx, int):
         return {"ok": False, "error": "index must be int or null"}
-    state.queue_editing_index = idx
-    if idx is None and state.queued_prompts and not state.busy:
+    st.queue_editing_index = idx
+    if idx is None and st.queued_prompts and not st.busy:
         # Edit finished and bridge is idle — wake it up to send the prompt.
-        bridge.event_queue.put_nowait(("wakeup", "queue-edit-done"))
+        br.event_queue.put_nowait(("wakeup", "queue-edit-done"))
     return {"ok": True}
 
 
 @_route("post", "/api/queue/merge")
-async def api_queue_merge() -> dict[str, Any]:
+async def api_queue_merge(body: dict[str, Any]) -> dict[str, Any]:
     """Merge all queued prompts into one, separated by newlines."""
-    if state is None:
+    rt, st, _br = _resolve_queue_rt(body)
+    if st is None:
         return {"ok": False, "error": "not ready"}
-    if len(state.queued_prompts) < 2:
+    if len(st.queued_prompts) < 2:
         return {"ok": False, "error": "need at least 2 prompts to merge"}
-    merged = "\n".join(state.queued_prompts)
-    state.queued_prompts.clear()
-    state.queued_prompts.append(merged)
-    await _broadcast_queue_update()
+    merged = "\n".join(st.queued_prompts)
+    st.queued_prompts.clear()
+    st.queued_prompts.append(merged)
+    await _broadcast_queue_update(rt)
     return {"ok": True, "count": 1}
 
 
@@ -1629,11 +1655,12 @@ async def websocket_endpoint(ws: WebSocket) -> None:
 
     try:
         # Landing behaviour:
-        #   * ``/?rid=<rid>``  → attach straight to that session.  A launch
-        #     that joined a running hub forwards its new session's rid so its
-        #     tab opens on that session; the sentinel ``default`` resolves to
-        #     the hub's default session without knowing its real rid.
-        #   * ``/`` (no rid)   → land in the **lobby** (the central hub view).
+        #   * ``/?rid=<rid>``  → attach straight to that session.  The
+        #     sentinel ``default`` resolves to the hub's primary session.
+        #   * ``/`` (no rid)   → auto-attach to the most recently active
+        #     runtime (so a bare ``localhost:8420`` shows the session
+        #     immediately with its scrollback).  Falls back to the default
+        #     runtime, then to the lobby.
         # Either way the lobby-aware frontend can switch sessions afterwards.
         requested_rid: str | None = None
         try:
@@ -1668,12 +1695,29 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 })
         elif force_lobby:
             await _enter_lobby(ws)
-        elif _default_runtime is not None:
-            # Normal single-session launches (no ?rid, no ?lobby): auto-attach
-            # to the default runtime so the tab opens directly on the session.
-            await _attach_ws(ws, _default_runtime)
         else:
-            await _enter_lobby(ws)
+            # No ?rid= — auto-attach to the best available runtime so a
+            # bare ``localhost:8420`` shows the session with scrollback.
+            # Prefer the most recently active runtime (the one the user
+            # was most likely looking at), then the default, then lobby.
+            best = None
+            if runtimes:
+                # Pick the runtime with the most recent activity.
+                candidates = [
+                    rt for rt in runtimes.values()
+                    if rt.state is not None and rt.state.session_id
+                ]
+                if candidates:
+                    best = max(
+                        candidates,
+                        key=lambda rt: rt.last_activity,
+                    )
+            if best is None:
+                best = _default_runtime
+            if best is not None:
+                await _attach_ws(ws, best)
+            else:
+                await _enter_lobby(ws)
 
         # --- Message loop ---
         while True:
@@ -1740,19 +1784,44 @@ async def _send_initial_state(ws: WebSocket) -> None:
     await send_to(ws, {"type": "clear_screen"})
 
     # Session history (if this session continues an on-disk one).
+    # render_session_history does synchronous file I/O that can take seconds
+    # on large JSONL files (200+ MB), so run it in a thread to avoid blocking
+    # the event loop (which would stall the WebSocket and potentially cause
+    # the client to time out before the history arrives).
     if state.session_id:
+        log.info("[history] loading for session_id=%s rt=%s",
+                 state.session_id, rt.rid)
         try:
-            session_dir = find_session_dir(state.session_id)
+            loop = asyncio.get_running_loop()
+            session_dir = await loop.run_in_executor(
+                None, find_session_dir, state.session_id,
+            )
+            log.info("[history] find_session_dir → %s", session_dir)
             if session_dir:
                 jsonl = session_dir / f"{state.session_id}.jsonl"
-                _count, history_msgs, _orphans = render_session_history(jsonl)
+                _count, history_msgs, _orphans = await loop.run_in_executor(
+                    None, render_session_history, jsonl,
+                )
+                log.info("[history] rendered %d msgs (%d records) for %s",
+                         len(history_msgs), _count, state.session_id)
                 if history_msgs:
                     await send_to(ws, {
                         "type": "history",
                         "messages": history_msgs,
                     })
+                    log.info("[history] sent %d history messages for %s",
+                             len(history_msgs), state.session_id)
+                else:
+                    log.info("[history] no messages to send for %s",
+                             state.session_id)
+            else:
+                log.warning("[history] session_dir not found for %s",
+                            state.session_id)
         except Exception as exc:
-            log.warning("failed to load history for %s: %s", state.session_id, exc)
+            log.warning("[history] failed to load history for %s: %s",
+                        state.session_id, exc, exc_info=True)
+    else:
+        log.info("[history] no session_id on state (rt=%s)", rt.rid)
 
 
 async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:

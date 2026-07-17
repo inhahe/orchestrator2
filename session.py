@@ -559,6 +559,94 @@ def list_sessions_for_project(project_dir: Path) -> list[dict[str, Any]]:
 # Session history — structured for the web frontend
 # ---------------------------------------------------------------------------
 
+def _tail_read_jsonl(
+    jsonl: Path,
+    max_records: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Read the last *max_records* JSON records from a JSONL file.
+
+    For small files (< 2 MB) reads the whole thing.  For large files,
+    seeks near the end and reads only the tail — avoiding the multi-second
+    stall of parsing a 200+ MB file when we only need the last 2000 lines.
+
+    Returns ``(records, total_skipped)`` where *total_skipped* is a lower
+    bound on how many records were before the returned window (exact for
+    small files, approximate for tail-read files).
+    """
+    SMALL_THRESHOLD = 2 * 1024 * 1024  # 2 MB
+
+    try:
+        file_size = jsonl.stat().st_size
+    except OSError:
+        file_size = 0
+
+    if file_size <= SMALL_THRESHOLD:
+        # Small file — read the whole thing (fast enough).
+        records: list[dict[str, Any]] = []
+        try:
+            f = jsonl.open(encoding="utf-8", errors="replace")
+        except OSError:
+            return [], 0
+        with f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                records.append(rec)
+        total = len(records)
+        if max_records and total > max_records:
+            return records[-max_records:], total - max_records
+        return records, 0
+
+    # Large file — binary seek to approximate tail position.
+    # Over-read by 4x the average line estimate to ensure we get enough.
+    # Average JSONL line in our sessions is ~2-10 KB; budget generously.
+    avg_line_bytes = max(file_size // max(max_records * 8, 1), 2048)
+    seek_bytes = min(max_records * avg_line_bytes * 4, file_size)
+
+    records = []
+    try:
+        with jsonl.open("rb") as fb:
+            if seek_bytes < file_size:
+                fb.seek(file_size - seek_bytes)
+                fb.readline()  # discard partial first line
+            for raw in fb:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                records.append(rec)
+    except OSError:
+        return [], 0
+
+    if max_records and len(records) > max_records:
+        skipped = len(records) - max_records
+        records = records[-max_records:]
+    else:
+        skipped = 0
+
+    # We don't know the exact total for the seek-based path; estimate.
+    if seek_bytes < file_size:
+        # We skipped (file_size - seek_bytes) bytes worth of lines.
+        approx_skipped_before_seek = int(
+            (file_size - seek_bytes) / max(avg_line_bytes, 1)
+        )
+        skipped += approx_skipped_before_seek
+
+    return records, skipped
+
+
 def render_session_history(
     jsonl: Path,
     *,
@@ -572,13 +660,15 @@ def render_session_history(
     structured messages the frontend can render.  tool_use and
     tool_result are emitted as separate messages — the frontend pairs
     them by ``tool_use_id``.
+
+    For large JSONL files (> 2 MB), only the tail of the file is read
+    to avoid blocking for seconds on 200+ MB files.
     """
     rendered = 0
 
     # --- Read and truncate ---
-    records: list[dict[str, Any]] = []
     try:
-        f = jsonl.open(encoding="utf-8", errors="replace")
+        records, truncated = _tail_read_jsonl(jsonl, max_history)
     except OSError as e:
         return 0, [{
             "type": "system",
@@ -586,27 +676,6 @@ def render_session_history(
             "content": f"Failed to open {jsonl.name}: {e}",
             "is_history": True,
         }], []
-
-    with f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(rec, dict):
-                continue
-            records.append(rec)
-
-    total_records = len(records)
-
-    if max_history and total_records > max_history:
-        records = records[-max_history:]
-        truncated = total_records - max_history
-    else:
-        truncated = 0
 
     # --- Emit structured messages ---
     messages: list[dict[str, Any]] = []

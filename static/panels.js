@@ -12,6 +12,12 @@ const Panels = (() => {
   let elTodosBody, elTodosCount;
   let _busy = false;
 
+  /** Read the current runtime ID from the page URL (?rid=...). */
+  function _rid() {
+    try { return new URL(location.href).searchParams.get('rid') || ''; }
+    catch (_) { return ''; }
+  }
+
   function init() {
     elToolsBody  = document.getElementById('panel-tools-body');
     elToolsCount = document.getElementById('panel-tools-count');
@@ -401,6 +407,7 @@ const Panels = (() => {
       const resp = await fetch('/api/queue/merge', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({rid: _rid()}),
       });
       const result = await resp.json();
       if (!result.ok) console.warn('queue merge failed:', result.error);
@@ -414,7 +421,7 @@ const Panels = (() => {
       const resp = await fetch('/api/queue/send', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({index}),
+        body: JSON.stringify({index, rid: _rid()}),
       });
       const result = await resp.json();
       if (!result.ok) console.warn('queue send failed:', result.error);
@@ -428,7 +435,7 @@ const Panels = (() => {
       const resp = await fetch('/api/queue/delete', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({index}),
+        body: JSON.stringify({index, rid: _rid()}),
       });
       const result = await resp.json();
       if (!result.ok) console.warn('queue delete failed:', result.error);
@@ -445,7 +452,7 @@ const Panels = (() => {
       fetch('/api/queue/editing', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({index: null}),
+        body: JSON.stringify({index: null, rid: _rid()}),
       }).catch(() => {});
     }
   }
@@ -454,7 +461,7 @@ const Panels = (() => {
     fetch('/api/queue/editing', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({index}),
+      body: JSON.stringify({index, rid: _rid()}),
     }).catch(() => {});
   }
 
@@ -523,7 +530,7 @@ const Panels = (() => {
       fetch('/api/queue/edit', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({index: currentIndex, text: newText}),
+        body: JSON.stringify({index: currentIndex, text: newText, rid: _rid()}),
       }).catch(err => {
         console.error('queue edit error:', err);
       }).finally(() => {
