@@ -283,6 +283,27 @@ const Panels = (() => {
   let _editingIndex = -1;         // index being edited, or -1
   let _editingOriginalText = '';  // original text for matching after queue shifts
   let _lastQueueSig = null;       // signature of last-rendered queue
+  // After an optimistic save, we've shown the new text but the server hasn't
+  // confirmed yet.  Until it does, incoming queues that still carry the OLD
+  // text are stale and must be ignored — otherwise a status_update that beats
+  // the server's queue_update broadcast rebuilds the panel with the old text,
+  // making the edit visibly "revert".  {oldText, newText} or null.
+  let _pendingEdit = null;
+  let _pendingEditTimer = null;
+
+  /** Arm the pending-edit guard until the server confirms (or times out). */
+  function _setPendingEdit(oldText, newText) {
+    _pendingEdit = { oldText, newText };
+    if (_pendingEditTimer) clearTimeout(_pendingEditTimer);
+    // Safety net: if the server never confirms (dropped broadcast, failed
+    // request), don't block queue renders forever.
+    _pendingEditTimer = setTimeout(() => { _pendingEdit = null; }, 5000);
+  }
+
+  function _clearPendingEdit() {
+    _pendingEdit = null;
+    if (_pendingEditTimer) { clearTimeout(_pendingEditTimer); _pendingEditTimer = null; }
+  }
 
   /** Hash the queue + busy-state into a tiny signature for change detection. */
   function _queueSignature(queue) {
@@ -295,6 +316,18 @@ const Panels = (() => {
     const n = queue.length;
     elQueueCount.textContent = n;
     elQueueCount.classList.toggle('active', n > 0);
+
+    // Pending optimistic edit: hold back renders that still show the old text
+    // (the server hasn't caught up yet) so the edit doesn't visibly revert.
+    if (_pendingEdit) {
+      if (queue.some(q => q.text === _pendingEdit.newText)) {
+        _clearPendingEdit();       // server confirmed — proceed to render
+      } else if (queue.some(q => q.text === _pendingEdit.oldText)) {
+        return;                    // stale queue — ignore to avoid flicker
+      } else {
+        _clearPendingEdit();       // item gone (sent/deleted) — render normally
+      }
+    }
 
     // Bail out early when nothing has actually changed.  Re-running
     // innerHTML wipes the user's text selection mid-copy — annoying
@@ -497,6 +530,9 @@ const Panels = (() => {
       // Close editor and show the new text immediately (optimistic).
       // Don't notify server here — /api/queue/edit handles the lock.
       _exitEditing(false);
+      // Guard the optimistic text against stale queue broadcasts (which would
+      // otherwise revert the edit) until the server confirms the new text.
+      _setPendingEdit(fullText, newText);
       item.classList.remove('queue-item-editing');
       const textEl = document.createElement('div');
       textEl.className = 'queue-item-text';
