@@ -254,6 +254,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         ("/connect",                     "reconnect to the SDK"),
         ("/resume [id|title]",           "resume a session (or open picker)"),
         ("/rename <name>",               "set a custom session title"),
+        ("/switch",                      "copy this session to another account & continue here"),
         ("/export [path]",               "save conversation as markdown"),
         ("/btw <question>",              "side question (separate context)"),
         ("/graphify [path] [flags]",     "build a knowledge graph (graphify)"),
@@ -405,14 +406,15 @@ def _cmd_history(payload: str, state: State, _config: Config) -> CommandResult:
     return CommandResult(messages=msgs)
 
 
-def _cmd_rename(payload: str, state: State, _config: Config) -> CommandResult:
+def _cmd_rename(payload: str, state: State, config: Config) -> CommandResult:
     sid = state.session_id
+    cfg_dir = getattr(config, "config_dir", None)
     new_title = payload.strip()
     if not new_title:
         if state.pending_rename:
             return CommandResult(messages=[_msg(f"Pending title: {state.pending_rename} (waiting for session)")])
         if sid:
-            current = read_session_title(sid)
+            current = read_session_title(sid, cfg_dir)
             if current:
                 return CommandResult(messages=[_msg(f"Current title: {current}")])
         return CommandResult(messages=[_msg("No title set. Usage: /rename <name>", level="warning")])
@@ -426,7 +428,7 @@ def _cmd_rename(payload: str, state: State, _config: Config) -> CommandResult:
             state_updates={"session_title": new_title},
         )
     try:
-        write_session_title(sid, new_title)
+        write_session_title(sid, new_title, cfg_dir)
     except (OSError, ValueError) as e:
         return CommandResult(messages=[_msg(f"Rename failed: {e}", level="error")])
     state.session_title = new_title

@@ -247,6 +247,12 @@ const Commands = (() => {
     elInput.value = '';
     elInput.style.height = 'auto';
     _hideAc();
+    // `/switch` is a client-driven overlay (account picker → name → copy),
+    // not a backend slash command, so intercept it here.
+    if (text === '/switch' || text.startsWith('/switch ')) {
+      Switch.open();
+      return;
+    }
     App.send({ type: 'message', text: text });
   }
 

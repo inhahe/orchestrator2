@@ -14,8 +14,10 @@ const App = (() => {
   let _isBusy = false;
   let _serverShutdown = false;
   let _didLaunchRequest = false;   // sent the one-shot ?open/?new request?
+  let _promptWatchdog = null;      // detects a prompt that got no server reply
   const MAX_RECONNECT_DELAY = 30000;
   const MAX_RECONNECT_ATTEMPTS = 20;
+  const PROMPT_WATCHDOG_MS = 8000; // ~how long a turn should take to start
 
   function init() {
     // Init all modules.
@@ -35,11 +37,39 @@ const App = (() => {
     // Sidebar resize.
     _initSidebarResize();
 
+    // Sidebar toggle (mobile).
+    _initSidebarToggle();
+
     // Connect WebSocket.
     _connect();
 
     // Focus input.
     Commands.focus();
+  }
+
+  // --- Sidebar toggle (mobile) ---
+
+  function _initSidebarToggle() {
+    const btn = document.getElementById('sidebar-toggle');
+    const sidebar = document.getElementById('sidebar');
+    if (!btn || !sidebar) return;
+
+    // Create a backdrop overlay for closing the sidebar on mobile.
+    const backdrop = document.createElement('div');
+    backdrop.id = 'sidebar-backdrop';
+    document.body.appendChild(backdrop);
+
+    function toggleSidebar() {
+      const visible = sidebar.classList.toggle('mobile-visible');
+      backdrop.classList.toggle('visible', visible);
+    }
+    function closeSidebar() {
+      sidebar.classList.remove('mobile-visible');
+      backdrop.classList.remove('visible');
+    }
+
+    btn.addEventListener('click', toggleSidebar);
+    backdrop.addEventListener('click', closeSidebar);
   }
 
   // --- Sidebar resize ---
@@ -103,6 +133,7 @@ const App = (() => {
     const openSid = params.get('open');
     const newFlag = params.get('new');
     const cwd = params.get('cwd');
+    const account = params.get('account');
     const lobbyFlag = params.get('lobby');
     wsUrl = `${protocol}//${location.host}/ws`;
     if (rid) wsUrl += `?rid=${encodeURIComponent(rid)}`;
@@ -122,8 +153,10 @@ const App = (() => {
       if (!rid && !_didLaunchRequest) {
         _didLaunchRequest = true;
         if (openSid) {
-          send(cwd ? { type: 'open', session_id: openSid, cwd }
-                   : { type: 'open', session_id: openSid });
+          const openMsg = { type: 'open', session_id: openSid };
+          if (cwd) openMsg.cwd = cwd;
+          if (account) openMsg.account = account;
+          send(openMsg);
         } else if (newFlag) {
           send(cwd ? { type: 'new', cwd } : { type: 'new' });
         }
@@ -208,6 +241,13 @@ const App = (() => {
       ws.send(JSON.stringify(msg));
       if (willEcho) {
         Chat.handleMessage({ type: 'user_message', content: msg.text });
+        // Watchdog: a real prompt should draw *some* server reply quickly
+        // (turn goes "working", or a queue/"still starting" notice arrives).
+        // If nothing comes back, the socket is likely half-open (server died
+        // but the browser still reports OPEN, so send() silently succeeds) or
+        // the backend is wedged — either way the user must be told rather than
+        // left staring at an idle bar.  Any inbound message clears this.
+        _armPromptWatchdog();
       }
     } else {
       Chat.handleMessage({
@@ -218,14 +258,48 @@ const App = (() => {
     }
   }
 
+  function _armPromptWatchdog() {
+    _clearPromptWatchdog();
+    _promptWatchdog = setTimeout(() => {
+      _promptWatchdog = null;
+      if (_isBusy || _serverShutdown) return;   // turn started / already handled
+      Chat.handleMessage({
+        type: 'system_msg',
+        subtype: 'error',
+        data: { message:
+          'No response from the server \u2014 it may have stopped. '
+          + 'Reconnecting\u2026' },
+      });
+      // Force the socket to notice it's dead: closing triggers onclose, which
+      // flips the status bar to "reconnecting" and drives the reconnect loop.
+      // If the server is actually alive, the reconnect re-attaches cleanly.
+      try { if (ws) ws.close(); } catch (e) {}
+    }, PROMPT_WATCHDOG_MS);
+  }
+
+  function _clearPromptWatchdog() {
+    if (_promptWatchdog) { clearTimeout(_promptWatchdog); _promptWatchdog = null; }
+  }
+
   // --- Message dispatch ---
 
   function _dispatch(msg) {
     const type = msg.type;
 
+    // Any message from the server proves it's alive and responsive, so a
+    // pending prompt is being handled — cancel the "no response" watchdog.
+    _clearPromptWatchdog();
+
     // Lobby: the server's list of running + recent sessions.
     if (type === 'session_list') {
       Lobby.render(msg);
+      return;
+    }
+
+    // Lobby: a visible banner (e.g. "this tab's session is no longer running").
+    // Forces the lobby open so the message isn't hidden behind the chat.
+    if (type === 'lobby_notice') {
+      Lobby.showNotice(msg.message || '');
       return;
     }
 
@@ -241,11 +315,33 @@ const App = (() => {
           u.searchParams.delete('open');
           u.searchParams.delete('new');
           u.searchParams.delete('cwd');
+          u.searchParams.delete('account');
           u.searchParams.set('rid', s.rid);
           history.replaceState(null, '', u.toString());
         } catch (_) {}
       }
       Lobby.onAttached(msg.session);
+      // A /switch that finished lands here (server re-attached this socket to
+      // the copied session's runtime) — close the switch overlay.
+      if (window.Switch) Switch.close();
+      return;
+    }
+
+    // /switch: account list for the picker overlay.
+    if (type === 'switch_accounts') {
+      if (window.Switch) Switch.renderAccounts(msg);
+      return;
+    }
+
+    // /switch: the copy/switch failed — show it in the overlay.
+    if (type === 'switch_error') {
+      if (window.Switch) Switch.error(msg);
+      return;
+    }
+
+    // /switch: server accepted the copy; `attached` will follow and close the
+    // overlay.  No action needed here (kept for protocol clarity).
+    if (type === 'switch_done') {
       return;
     }
 
@@ -292,6 +388,15 @@ const App = (() => {
     // Server-initiated page navigation (e.g. /resume opening the picker).
     if (type === 'navigate') {
       window.location.href = msg.url;
+      return;
+    }
+
+    // Server is restarting — show a "restarting…" splash and reload once the
+    // fresh process is serving (rather than treating it as a hard shutdown).
+    if (type === 'server_restart') {
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      _serverShutdown = true;  // suppress the normal auto-reconnect
+      if (window.Lobby && Lobby.showReloadingAndPoll) Lobby.showReloadingAndPoll();
       return;
     }
 

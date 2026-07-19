@@ -15,8 +15,17 @@
     <div class="lobby-inner">
       <header class="lobby-header">
         <h1>orchestrator2 <span class="lobby-sub">sessions</span></h1>
-        <button id="lobby-close" class="lobby-close" title="Back to current session">&times;</button>
+        <div class="lobby-header-actions">
+          <button id="lobby-restart" class="lobby-restart" title="Restart the server (reload code, resume primary session)">&#8635; Restart server</button>
+          <button id="lobby-shutdown" class="lobby-shutdown" title="Shut down the whole server (all sessions)">&#9211; Shut down server</button>
+          <button id="lobby-close" class="lobby-close" title="Back to current session">&times;</button>
+        </div>
       </header>
+
+      <div id="lobby-notice" class="lobby-notice hidden">
+        <span id="lobby-notice-text"></span>
+        <button id="lobby-notice-close" class="lobby-notice-close" title="Dismiss">&times;</button>
+      </div>
 
       <section class="lobby-section">
         <div class="lobby-section-head">
@@ -42,6 +51,9 @@
         <div class="lobby-section-head">
           <h2>Recent</h2>
           <span id="lobby-recent-count" class="lobby-count">0</span>
+        </div>
+        <div id="lobby-recent-loading" class="lobby-loading hidden">
+          <span class="lobby-spin"></span> loading sessions&hellip;
         </div>
         <div id="lobby-recent" class="lobby-list"></div>
         <div id="lobby-recent-empty" class="lobby-empty hidden">No recent sessions on disk.</div>
@@ -98,6 +110,7 @@
       <!-- Input bar (inside chat-area so it aligns naturally) -->
       <div id="input-bar">
     <div id="status-bar">
+      <button id="sidebar-toggle" class="sidebar-toggle" title="Toggle panels">&#9881;</button>
       <button id="sessions-btn" class="sessions-btn" title="Browse sessions (lobby)">&#9776; Sessions</button>
       <span class="status-sep">|</span>
       <span id="status-indicator" class="indicator idle"></span>
@@ -162,12 +175,14 @@
   </div>
 
   <!-- JS modules -->
+  <script src="/static/util.js"></script>
   <script src="/static/diff.js"></script>
   <script src="/static/status.js"></script>
   <script src="/static/panels.js"></script>
   <script src="/static/commands.js"></script>
   <script src="/static/chat.js"></script>
   <script src="/static/lobby.js"></script>
+  <script src="/static/switch.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

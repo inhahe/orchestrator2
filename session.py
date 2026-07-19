@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import uuid as uuid_mod
 from datetime import datetime
@@ -44,9 +45,14 @@ def _humanize_size(text: str) -> str:
 # Path helpers
 # ---------------------------------------------------------------------------
 
-def claude_projects_dir() -> Path:
-    """Return the Claude Code projects directory (``~/.claude/projects/``)."""
-    base = os.environ.get("CLAUDE_CONFIG_DIR")
+def claude_projects_dir(config_dir: str | None = None) -> Path:
+    """Return the Claude Code projects directory (``~/.claude/projects/``).
+
+    *config_dir* explicitly overrides the account (thread-safe, no env
+    mutation) — used when loading a cross-account hub session's history.
+    Falls back to ``CLAUDE_CONFIG_DIR`` then ``~/.claude``.
+    """
+    base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
     return Path(base if base else Path.home() / ".claude") / "projects"
 
 
@@ -184,9 +190,13 @@ def find_most_recent_session_for_cwd(cwd: str) -> Path | None:
     return max(candidates, key=lambda x: x[1])[0]
 
 
-def find_session_dir(session_id: str) -> Path | None:
-    """Locate the project dir that contains ``<session_id>.jsonl``."""
-    projects = claude_projects_dir()
+def find_session_dir(session_id: str, config_dir: str | None = None) -> Path | None:
+    """Locate the project dir that contains ``<session_id>.jsonl``.
+
+    *config_dir* scopes the search to a specific account's projects tree
+    (for cross-account hub sessions); defaults to the active env account.
+    """
+    projects = claude_projects_dir(config_dir)
     if not projects.exists():
         return None
     for project in projects.iterdir():
@@ -218,9 +228,9 @@ def sniff_session_cwd(jsonl: Path) -> str | None:
     return None
 
 
-def find_session_cwd(session_id: str) -> str | None:
+def find_session_cwd(session_id: str, config_dir: str | None = None) -> str | None:
     """Locate a session by id and return its recorded cwd."""
-    project_dir = find_session_dir(session_id)
+    project_dir = find_session_dir(session_id, config_dir)
     if project_dir is None:
         return None
     info = _parse_session_info(
@@ -233,25 +243,81 @@ def find_session_cwd(session_id: str) -> str | None:
 # Title read / write
 # ---------------------------------------------------------------------------
 
-def read_session_title(session_id: str) -> str | None:
-    """Look up a session's display title from JSONL (custom-title or ai-title)."""
-    project = find_session_dir(session_id)
-    if project is None:
-        return None
-    jsonl = project / f"{session_id}.jsonl"
-    if not jsonl.exists():
-        return None
-    custom_title: str | None = None
-    ai_title: str | None = None
+# --- Persistent, incremental title index ----------------------------------
+# Reading a session's title means finding the last ``custom-title`` (user
+# rename) / ``ai-title`` (auto summary) record.  A rename done early then
+# followed by heavy use buries the custom-title deep in a file that can be
+# hundreds of MB, so we can't just peek at the head/tail — correctness needs a
+# full scan.  Doing that for every session on every lobby refresh froze the UI
+# for many seconds.
+#
+# Session JSONLs are append-only, so the fix is to scan each file's titles once,
+# remember (title, scanned-size) in a small on-disk index, and thereafter scan
+# only the bytes appended since the last look — which is exactly where a *new*
+# rename would land.  The first run after a fresh install pays the full scan
+# once; every run after that is near-instant.
+_TITLE_INDEX_PATH = Path.home() / ".orchestrator2_title_index.json"
+_title_index: dict[str, dict[str, Any]] | None = None
+_title_index_lock = threading.Lock()
+_title_index_dirty = False
+
+
+def _load_title_index() -> dict[str, dict[str, Any]]:
+    """Lazily load the on-disk title index (path → {size, mtime, custom, ai})."""
+    global _title_index
+    if _title_index is not None:
+        return _title_index
     try:
-        with jsonl.open(encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
+        with _TITLE_INDEX_PATH.open(encoding="utf-8") as f:
+            data = json.load(f)
+        _title_index = (
+            {k: v for k, v in data.items() if isinstance(v, dict)}
+            if isinstance(data, dict) else {}
+        )
+    except (OSError, ValueError):
+        _title_index = {}
+    return _title_index
+
+
+def flush_title_index() -> None:
+    """Persist the title index if it changed (atomic replace)."""
+    global _title_index_dirty
+    with _title_index_lock:
+        if not _title_index_dirty or _title_index is None:
+            return
+        snapshot = dict(_title_index)
+        _title_index_dirty = False
+    try:
+        tmp = _TITLE_INDEX_PATH.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp, _TITLE_INDEX_PATH)
+    except OSError:
+        # Couldn't persist — keep the in-memory index; retry on next flush.
+        with _title_index_lock:
+            _title_index_dirty = True
+
+
+def _scan_titles(jsonl: Path, start: int) -> tuple[str | None, str | None]:
+    """Scan records from byte *start* to EOF; return the last (custom, ai) found.
+
+    *start* > 0 does an incremental scan of only the appended region.  We seek to
+    the exact previous size (a clean line boundary for append-only writes); any
+    partial straddling record simply fails to parse and is skipped.
+    """
+    custom: str | None = None
+    ai: str | None = None
+    try:
+        with jsonl.open("rb") as fb:
+            if start > 0:
+                fb.seek(start)
+            for raw in fb:
+                s = raw.strip()
+                if not s:
                     continue
                 try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
+                    rec = json.loads(s)
+                except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
                 if not isinstance(rec, dict):
                     continue
@@ -259,34 +325,112 @@ def read_session_title(session_id: str) -> str | None:
                 if t == "custom-title":
                     v = rec.get("customTitle")
                     if isinstance(v, str) and v.strip():
-                        custom_title = v.strip()
+                        custom = v.strip()
                 elif t == "ai-title":
                     v = rec.get("aiTitle")
                     if isinstance(v, str) and v.strip():
-                        ai_title = v.strip()
+                        ai = v.strip()
     except OSError:
-        return None
-    return custom_title or ai_title
+        pass
+    return custom, ai
 
 
-def write_session_title(session_id: str, title: str) -> None:
-    """Set a session's title by appending a ``custom-title`` record.
+def _resolve_title(jsonl: Path) -> str | None:
+    """Authoritative title for *jsonl*, using the incremental index.
 
-    Attempts to use ``claude_agent_sdk.rename_session`` first; falls back
-    to hand-rolled JSONL append.
+    Full-scans a file the first time it's seen, then only re-scans the bytes
+    appended since (which is where a new rename lands).  Account-correct by
+    construction — it reads the exact file it's handed.
     """
     try:
-        from claude_agent_sdk import rename_session as _sdk_rename  # type: ignore
-        _sdk_rename(session_id, title)
-        return
-    except (ImportError, AttributeError):
-        pass
-    except FileNotFoundError:
-        # The SDK searches by its own project-dir logic and may miss the
-        # file (e.g. a non-default CLAUDE_CONFIG_DIR).  Fall through to the
-        # manual append, which locates the file via our find_session_dir.
-        pass
-    project = find_session_dir(session_id)
+        st = jsonl.stat()
+    except OSError:
+        return None
+    size = st.st_size
+    key = str(jsonl)
+    idx = _load_title_index()
+    with _title_index_lock:
+        entry = idx.get(key)
+        if entry is not None and entry.get("size") == size:
+            return entry.get("custom") or entry.get("ai")
+        prev_size = 0
+        prev_custom: str | None = None
+        prev_ai: str | None = None
+        if entry is not None and isinstance(entry.get("size"), int) \
+                and 0 < entry["size"] <= size:
+            prev_size = entry["size"]
+            prev_custom = entry.get("custom")
+            prev_ai = entry.get("ai")
+    # Scan (I/O) outside the lock.
+    new_custom, new_ai = _scan_titles(jsonl, prev_size)
+    custom = new_custom or prev_custom
+    ai = new_ai or prev_ai
+    global _title_index_dirty
+    with _title_index_lock:
+        idx[key] = {"size": size, "mtime": st.st_mtime,
+                    "custom": custom, "ai": ai}
+        _title_index_dirty = True
+    return custom or ai
+
+
+def title_from_jsonl(jsonl: Path) -> str | None:
+    """Extract a session's display title directly from a JSONL *path*.
+
+    Prefers ``custom-title`` (user rename) over ``ai-title`` (auto summary).
+    Reads the file it's handed — no re-resolution by session id — so it's
+    inherently account-correct.  Goes through the incremental index so repeat
+    lookups (and unchanged files) are cheap.
+    """
+    if not jsonl.exists():
+        return None
+    return _resolve_title(jsonl)
+
+
+def read_session_title(session_id: str, config_dir: str | None = None) -> str | None:
+    """Look up a session's display title from JSONL (custom-title or ai-title).
+
+    *config_dir* scopes the lookup to a specific account's projects tree (for
+    cross-account hub sessions); defaults to the active env account.
+    """
+    project = find_session_dir(session_id, config_dir)
+    if project is None:
+        return None
+    return _resolve_title(project / f"{session_id}.jsonl")
+
+
+def write_session_title(
+    session_id: str, title: str, config_dir: str | None = None
+) -> None:
+    """Set a session's title by appending a ``custom-title`` record.
+
+    *config_dir* scopes the write to a specific account's projects tree.  When
+    it names an account other than the hub process's own
+    ``CLAUDE_CONFIG_DIR``, the SDK ``rename_session`` path is skipped entirely:
+    the SDK resolves the file via the *process* env, so it would either write
+    to the wrong account or fail.  We locate the file ourselves via
+    ``find_session_dir(session_id, config_dir)`` and append the record
+    directly, which is account-correct and side-effect-free.
+    """
+    # Only trust the SDK helper when we're targeting the process's own
+    # account (config_dir is None or matches the env).  Otherwise the SDK's
+    # env-scoped lookup would misfire, so go straight to the manual append.
+    env_dir = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip() or None
+    same_account = config_dir is None or (
+        env_dir is not None and os.path.normpath(config_dir) == os.path.normpath(env_dir)
+    )
+    if same_account:
+        try:
+            from claude_agent_sdk import rename_session as _sdk_rename  # type: ignore
+            _sdk_rename(session_id, title)
+            return
+        except (ImportError, AttributeError):
+            pass
+        except FileNotFoundError:
+            # The SDK searches by its own project-dir logic and may miss the
+            # file (e.g. a non-default CLAUDE_CONFIG_DIR).  Fall through to the
+            # manual append, which locates the file via our find_session_dir.
+            pass
+    project = find_session_dir(session_id, config_dir)
     if project is None:
         raise OSError(f"session {session_id} not found on disk")
     jsonl = project / f"{session_id}.jsonl"
@@ -400,12 +544,98 @@ def _extract_text(content: Any) -> str:
     return ""
 
 
+# How much of a session JSONL to read from the front when gathering list
+# metadata.  cwd, the first user message, and the AI title all live in the
+# opening records, so a bounded head read captures them without touching the
+# rest of a (possibly hundreds-of-MB) file.
+_HEAD_SCAN_BYTES = 512 * 1024
+# How many bytes to read from the tail to catch a recent rename (custom-title,
+# appended at rename time) plus the last user message / timestamp.  A fixed
+# byte budget keeps the tail read cheap even on a 276 MB file (a records-based
+# tail would over-read hundreds of MB to guarantee a record count).
+_TAIL_SCAN_BYTES = 256 * 1024
+
+# Cache of parsed session info keyed by absolute path → (mtime, size, info).
+# Session JSONLs are append-only, so an unchanged (mtime, size) pair means the
+# cached parse is still valid.  This keeps repeated lobby refreshes (every few
+# seconds while the overlay is open) from re-scanning every file on disk.
+_session_info_cache: dict[str, tuple[float, int, dict[str, Any]]] = {}
+
+
+def _absorb_session_record(
+    info: dict[str, Any],
+    rec: dict[str, Any],
+    titles: dict[str, str],
+    *,
+    count: bool,
+) -> None:
+    """Fold a single JSONL record into the accumulating *info* / *titles*.
+
+    *count* controls whether this record bumps ``msg_count`` — set True for the
+    head pass (exact for records we actually see) and False for the tail pass
+    (those records are estimated into the total separately, not double-counted).
+    """
+    t = rec.get("type")
+    if t == "custom-title":
+        v = rec.get("customTitle")
+        if isinstance(v, str) and v.strip():
+            titles["custom"] = v.strip()
+        return
+    if t == "ai-title":
+        v = rec.get("aiTitle")
+        if isinstance(v, str) and v.strip():
+            titles["ai"] = v.strip()
+        return
+    if count:
+        info["msg_count"] += 1
+    if info["cwd"] is None and isinstance(rec.get("cwd"), str):
+        info["cwd"] = rec["cwd"]
+    ts = rec.get("timestamp")
+    if isinstance(ts, str):
+        info["last_timestamp"] = ts
+    if t == "user":
+        msg = rec.get("message")
+        text = ""
+        if isinstance(msg, dict):
+            text = _extract_text(msg.get("content"))
+        elif isinstance(msg, str):
+            text = msg
+        text = text.strip()
+        # Skip SDK-injected XML messages (e.g. <bash>, <tool>,
+        # <local-command-caveat>, <command-name>, etc.) that aren't real
+        # user input.
+        if text and not (len(text) > 1 and text[0] == '<' and text[1:2].isalpha()):
+            if info["first_user_msg"] is None:
+                info["first_user_msg"] = text
+            info["last_user_msg"] = text
+
+
 def _parse_session_info(jsonl: Path, project_slug: str) -> dict[str, Any] | None:
-    """Read a session JSONL and extract id, cwd, messages, timestamp, title."""
+    """Read a session JSONL and extract id, cwd, messages, timestamp, title.
+
+    Bounded + cached: reads only the head (first ``_HEAD_SCAN_BYTES``) and — for
+    files larger than that — the tail (last ``_TAIL_SCAN_BYTES``), rather than
+    the whole file.  A session JSONL can be hundreds of MB; scanning every one
+    in full on each lobby refresh froze the UI for many seconds.  The head
+    yields cwd / first user message; the latest user message comes from the
+    tail.  The title comes from the authoritative incremental index
+    (``_resolve_title``), not the bounded read.  ``msg_count`` is exact for
+    fully-read (small) files and estimated for large ones.
+
+    Results are cached by (mtime, size); append-only JSONLs mean an unchanged
+    stat is a valid cache hit.
+    """
     try:
         st = jsonl.stat()
     except OSError:
         return None
+
+    key = str(jsonl)
+    cached = _session_info_cache.get(key)
+    if cached is not None and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return cached[2]
+
+    size = st.st_size
     info: dict[str, Any] = {
         "session_id": jsonl.stem,
         "project_slug": project_slug,
@@ -414,46 +644,71 @@ def _parse_session_info(jsonl: Path, project_slug: str) -> dict[str, Any] | None
         "last_user_msg": None,
         "last_timestamp": None,
         "mtime": st.st_mtime,
-        "size": st.st_size,
+        "size": size,
         "msg_count": 0,
         "title": None,
+        "msg_count_estimated": False,
     }
-    info["title"] = read_session_title(jsonl.stem)
+    titles: dict[str, str] = {}
+
+    # --- Head pass: read complete lines until we cross the byte budget. ---
+    head_bytes = 0
+    head_count = 0
     try:
-        with jsonl.open(encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(rec, dict):
-                    continue
-                info["msg_count"] += 1
-                if info["cwd"] is None and isinstance(rec.get("cwd"), str):
-                    info["cwd"] = rec["cwd"]
-                ts = rec.get("timestamp")
-                if isinstance(ts, str):
-                    info["last_timestamp"] = ts
-                if rec.get("type") == "user":
-                    msg = rec.get("message")
-                    text = ""
-                    if isinstance(msg, dict):
-                        text = _extract_text(msg.get("content"))
-                    elif isinstance(msg, str):
-                        text = msg
-                    text = text.strip()
-                    # Skip SDK-injected XML messages (e.g. <bash>, <tool>,
-                    # <local-command-caveat>, <command-name>, etc.) that
-                    # aren't real user input.
-                    if text and not (len(text) > 1 and text[0] == '<' and text[1:2].isalpha()):
-                        if info["first_user_msg"] is None:
-                            info["first_user_msg"] = text
-                        info["last_user_msg"] = text
+        with jsonl.open("rb") as fb:
+            for raw in fb:
+                head_bytes += len(raw)
+                s = raw.strip()
+                if s:
+                    try:
+                        rec = json.loads(s)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        rec = None
+                    if isinstance(rec, dict):
+                        head_count += 1
+                        _absorb_session_record(info, rec, titles, count=True)
+                if head_bytes >= _HEAD_SCAN_BYTES:
+                    break
     except OSError:
         return None
+
+    fully_read = head_bytes >= size
+
+    # --- Tail pass: only when the head didn't already cover the whole file. ---
+    if not fully_read:
+        tail_recs: list[dict[str, Any]] = []
+        try:
+            with jsonl.open("rb") as fb:
+                start = max(head_bytes, size - _TAIL_SCAN_BYTES)
+                if start > 0:
+                    fb.seek(start)
+                    fb.readline()  # discard the (likely partial) first line
+                for raw in fb:
+                    s = raw.strip()
+                    if not s:
+                        continue
+                    try:
+                        rec = json.loads(s)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if isinstance(rec, dict):
+                        tail_recs.append(rec)
+        except OSError:
+            tail_recs = []
+        for rec in tail_recs:
+            _absorb_session_record(info, rec, titles, count=False)
+        # Estimate the total message count from the head sample's density.
+        if head_count > 0 and head_bytes > 0:
+            est = int(size / (head_bytes / head_count))
+            info["msg_count"] = max(est, head_count)
+        info["msg_count_estimated"] = True
+
+    # Title comes from the authoritative incremental index (a rename buried
+    # mid-file wouldn't be caught by the bounded head/tail read); fall back to
+    # whatever the bounded scan happened to see.
+    info["title"] = _resolve_title(jsonl) or titles.get("custom") or titles.get("ai")
+
+    _session_info_cache[key] = (st.st_mtime, size, info)
     return info
 
 
@@ -483,9 +738,13 @@ def _is_trim_session_file(jsonl_path: Path) -> dict[str, Any] | None:
 # Listing projects and sessions
 # ---------------------------------------------------------------------------
 
-def list_projects() -> list[dict[str, Any]]:
-    """Light-weight project listing (for session picker / REST endpoint)."""
-    projects_dir = claude_projects_dir()
+def list_projects(config_dir: str | None = None) -> list[dict[str, Any]]:
+    """Light-weight project listing (for session picker / REST endpoint).
+
+    *config_dir* overrides which account's ``projects`` dir is scanned; when
+    ``None`` it falls back to ``CLAUDE_CONFIG_DIR`` / ``~/.claude``.
+    """
+    projects_dir = claude_projects_dir(config_dir)
     if not projects_dir.exists():
         return []
     out: list[dict[str, Any]] = []
@@ -793,7 +1052,7 @@ def render_session_markdown(jsonl: Path) -> str:
         "cwd": None,
         "first_ts": None,
         "last_ts": None,
-        "title": read_session_title(jsonl.stem),
+        "title": title_from_jsonl(jsonl),
     }
     body: list[str] = []
 

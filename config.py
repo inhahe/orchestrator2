@@ -83,7 +83,7 @@ SLASH_COMMANDS = [
     "/help", "/history", "/status", "/debug", "/cost", "/cwd", "/clear", "/cls",
     "/interrupt", "/i", "/compact", "/effort", "/thinking", "/model",
     "/login", "/logout",
-    "/connect", "/reconnect", "/resume", "/rename", "/export", "/models",
+    "/connect", "/reconnect", "/resume", "/rename", "/switch", "/export", "/models",
     "/btw", "/graphify", "/autocompact", "/max-context", "/bell",
     "/collapse", "/collapse-threshold",
     "/queue", "/quit", "/exit",
@@ -156,6 +156,12 @@ INTERRUPT_SENTINEL = object()
 
 # Default server port.
 DEFAULT_PORT = 8420
+
+# Password required for connections from outside the LAN when neither
+# ``--external-password`` nor ``ORCH2_EXTERNAL_PASSWORD`` is set.  LAN/loopback
+# clients never need it.  Pass ``--external-password ""`` to disable external
+# access entirely.
+DEFAULT_EXTERNAL_PASSWORD = "uncommon11"
 
 # ---------------------------------------------------------------------------
 # Model / context-window helpers
@@ -419,9 +425,10 @@ class Config:
     auto_shutdown: bool = False        # shut down when all browser tabs close
     session_idle_timeout: int = 300    # secs a viewer-less session lingers before teardown
     standalone: bool = False           # don't reuse a running hub; force a separate server
-    external_password: str | None = "uncommon11"  # password for non-LAN access (None = block all external)
+    external_password: str | None = None  # non-LAN password; None = unspecified (→ env var, else DEFAULT_EXTERNAL_PASSWORD); "" = block all external
     config_dir: str | None = None      # CLAUDE_CONFIG_DIR override
     skip_auto_login: bool = False      # internal: child skips the login check
+    wait_port: bool = False            # internal: retry binding --port while an old instance releases it (restart)
 
 
 def config_to_dict(config: Config) -> dict:
@@ -765,14 +772,21 @@ def parse_args(argv: list[str] | None = None) -> Config:
         help=(
             "Password for non-LAN access.  Connections from private/loopback "
             "IPs are always allowed; connections from public IPs require HTTP "
-            "Basic Auth with this password.  If not set, all external access "
-            "is blocked.  Can also be set via ORCH2_EXTERNAL_PASSWORD env var."
+            "Basic Auth with this password (leave the username blank).  When "
+            "omitted it falls back to the ORCH2_EXTERNAL_PASSWORD env var, then "
+            "to the built-in default 'uncommon11'.  Pass an empty string "
+            "(--external-password \"\") to block all external access."
         ),
     )
     ap.add_argument(
         "--skip-auto-login",
         action="store_true",
         help=argparse.SUPPRESS,  # internal: --detach child, parent already checked
+    )
+    ap.add_argument(
+        "--wait-port",
+        action="store_true",
+        help=argparse.SUPPRESS,  # internal: restart child waits for the old instance to free the port
     )
 
     args = ap.parse_args(argv)
@@ -841,4 +855,5 @@ def parse_args(argv: list[str] | None = None) -> Config:
         external_password=args.external_password,
         config_dir=args.config_dir,
         skip_auto_login=args.skip_auto_login,
+        wait_port=args.wait_port,
     )

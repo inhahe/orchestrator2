@@ -43,7 +43,7 @@ The server starts serving and the browser opens **immediately**; the status bar 
 - Type while Claude is busy to **queue** follow-up prompts (they run in order).
 - The **status bar** (above the input) shows state, account, session, **working directory (full path)**, turns, model, effort, context usage, and rate limits.
 - The **sidebar panels** show active tools, background tasks, the pending queue, and the current plan/todos.
-- **Slash commands** start with `/` — type `/help` for the full list. Common ones: `/status`, `/cwd <path>` (switch project), `/model`, `/effort`, `/resume`, `/rename`, `/login`, `/clear`, `/interrupt`.
+- **Slash commands** start with `/` — type `/help` for the full list. Common ones: `/status`, `/cwd <path>` (switch project), `/model`, `/effort`, `/resume`, `/rename`, `/switch` (move this session to another account), `/login`, `/clear`, `/interrupt`.
 
 Sessions are stored the same way Claude Code stores them — under `<config-dir>/projects/<cwd>/` — so a conversation is interchangeable with `claude --continue` / `claude --resume` **as long as both use the same `CLAUDE_CONFIG_DIR`** (account). See [Choosing a Claude account](#choosing-a-claude-account).
 
@@ -76,7 +76,17 @@ you can reopen, and has a **New session** button (optionally pointed at a
 different working directory). Picking a running session attaches this tab to
 it; opening a recent one spins up a fresh live session for it. The lobby
 overlay closes as soon as the session loads; the tab stays attached to
-whatever it's viewing.
+whatever it's viewing. Recent on-disk sessions are scanned across **every**
+Claude account on the machine (each is tagged with its account), so a session
+started under a different `CLAUDE_CONFIG_DIR` still shows up and reopens under
+the right account.
+
+The lobby header also has **⟳ Restart server** and **⏛ Shut down server**
+buttons. Restart spawns a fresh server process (picking up code changes) that
+resumes the primary session and reloads your tab once it's serving; the
+replacement gets its **own console window** so the `claude` subprocess draws
+into it (no stray window) and any startup failure is visible rather than
+silent.
 
 A launch only reuses a hub with the **same account** (`CLAUDE_CONFIG_DIR`) on
 the same port. Notes:
@@ -109,9 +119,18 @@ Remove it later with:
 netsh advfirewall firewall delete rule name="orchestrator2"
 ```
 
-Use `localport=<port>` to match a non-default `--port`. Only open the port on
-networks you trust — the hub has no authentication, so anyone who can reach it
-can control your sessions.
+Use `localport=<port>` to match a non-default `--port`.
+
+**Authentication.** Connections from LAN/loopback addresses (`10.x`, `172.16–31.x`,
+`192.168.x`, `127.x`, IPv6 link-local) pass through with no credentials — the
+LAN workflow stays frictionless. Connections from any other (public) address
+require a password, entered in the browser's sign-in prompt (leave the username
+blank; only the password is checked). The default password is `uncommon11`; set
+your own with `--external-password <pw>` or the `ORCH2_EXTERNAL_PASSWORD`
+environment variable, or pass `--external-password ""` to block all external
+access outright. After the page authenticates, an `HttpOnly` cookie carries the
+credential to the WebSocket automatically (browsers don't resend Basic-Auth
+headers on socket upgrades), so live streaming works from outside the LAN too.
 
 ### Choosing a Claude account
 
@@ -270,6 +289,7 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/history [N]` | Clear output and replay session history (last N records; default 2000) |
 | `/cwd [path]` | Show current working directory, or switch to a new one and reconnect |
 | `/rename [name]` | Set a custom session title |
+| `/switch` | Copy this session into another Claude account and continue it in the same window (opens an account picker, then asks for a new session name) |
 | `/export [path]` | Save conversation as markdown |
 | `/connect` | Reconnect to the SDK |
 | `/resume [id\|title]` | Resume a specific session, or open the session picker |

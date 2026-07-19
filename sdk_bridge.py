@@ -253,6 +253,12 @@ class SDKBridge:
             "env": {"CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1"},
         }
 
+        # Cross-account hub support: if the session's config specifies a
+        # non-default CLAUDE_CONFIG_DIR, inject it into the subprocess env
+        # so the bridge connects with the correct account.
+        if getattr(self.config, "config_dir", None):
+            kwargs["env"]["CLAUDE_CONFIG_DIR"] = self.config.config_dir
+
         # Session resume / continue logic.
         # Always prefer an explicit session id (from cwd lookup or --resume)
         # over the SDK's global continue_conversation, which ignores cwd.
@@ -1054,7 +1060,7 @@ class SDKBridge:
         if not title:
             return False
         try:
-            write_session_title(sid, title)
+            write_session_title(sid, title, getattr(self.config, "config_dir", None))
         except Exception as exc:
             # Keep the title queued and try again after the turn.
             log.info("pending rename not applied yet (%s) — will retry", exc)
@@ -1095,7 +1101,14 @@ class SDKBridge:
                 # disk read — keep showing what /rename set until we can
                 # persist it.
                 if not state.pending_rename:
-                    state.session_title = read_session_title(sid)
+                    # Off-load the disk read: reading a session's title means
+                    # scanning its (potentially huge) JSONL line-by-line, which
+                    # would block the event loop — freezing the status ticker so
+                    # the toolbar stays "idle" through a whole turn.
+                    state.session_title = await asyncio.to_thread(
+                        read_session_title, sid,
+                        getattr(self.config, "config_dir", None),
+                    )
                 # Apply a pending rename (from /rename before first turn).
                 # May legitimately fail here — the CLI often hasn't flushed
                 # the session JSONL to disk yet, so the write can't find the
@@ -1533,6 +1546,9 @@ class SDKBridge:
         )
 
         await self.broadcast({"type": "turn_start", "prompt": prompt_text})
+        # Flip the toolbar to "working" immediately instead of waiting up to
+        # ~2s for the next status-ticker cycle (state.busy is already True).
+        await self._broadcast_status()
 
         # Send the prompt.
         await self.client.query(prompt_text)
@@ -1785,8 +1801,21 @@ class SDKBridge:
                             # Don't clobber a user-set title that hasn't been
                             # persisted yet (e.g. /rename before the JSONL was
                             # flushed to disk — pending_rename is still queued).
-                            if not state.pending_rename:
-                                state.session_title = read_session_title(state.session_id)
+                            #
+                            # Only read when we don't already have a title: this
+                            # exists to catch the ai-title the CLI generates
+                            # after the first exchange (session_title is still
+                            # None then).  Once we have one, our own /rename
+                            # updates state directly, so re-scanning the
+                            # (possibly huge) JSONL every turn end would just
+                            # burn I/O — and, done on the event loop, froze the
+                            # status ticker at "idle" for the whole turn.
+                            if not state.pending_rename and not state.session_title:
+                                state.session_title = await asyncio.to_thread(
+                                    read_session_title,
+                                    state.session_id,
+                                    getattr(self.config, "config_dir", None),
+                                )
 
                     # Rate limit info may be on ResultMessage too.
                     rate_info = getattr(msg, "rate_limit_info", None)

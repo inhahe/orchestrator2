@@ -379,6 +379,10 @@ html, body {
 }
 .queue-delete-btn:hover { color: var(--red) !important; }
 
+.queue-item-editing {
+  flex-direction: column;
+}
+
 .queue-edit-textarea {
   width: 100%;
   min-height: 48px;
@@ -678,6 +682,26 @@ html, body {
 .msg-system.error   { color: var(--system-error); }
 .msg-system.done    { color: var(--system-done); }
 .msg-system.waiting { color: var(--system-waiting); }
+
+/* Transient "loading session…" placeholder (shown while a large session's
+   history streams in after attach). */
+.session-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-style: normal;
+  color: var(--indicator-connecting, #7aa2f7);
+}
+.session-loading-spin {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 2px solid var(--panel-dim, #23233a);
+  border-top-color: var(--indicator-connecting, #7aa2f7);
+  animation: session-loading-spin .8s linear infinite;
+  flex: 0 0 auto;
+}
+@keyframes session-loading-spin { to { transform: rotate(360deg); } }
 
 /* --- Tool blocks --- */
 
@@ -1231,11 +1255,137 @@ html, body {
    Responsive
    =================================================================== */
 
+/* ===================================================================
+   Sidebar toggle button (visible only on mobile)
+   =================================================================== */
+#sidebar-backdrop { display: none; }   /* globally hidden; shown by mobile CSS */
+
+.sidebar-toggle {
+  display: none;              /* hidden on desktop */
+  font-size: 14px;
+  color: var(--text-dim);
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.sidebar-toggle:hover {
+  color: var(--text-bright);
+  background: var(--bg-tool-hover);
+  border-color: var(--accent-dim);
+}
+
+/* ===================================================================
+   Mobile / narrow-screen layout
+   =================================================================== */
 @media (max-width: 768px) {
-  #sidebar { width: 100% !important; max-width: 100%; border-bottom: 1px solid var(--border); }
+  /* Sidebar: hidden by default, slides in as overlay when toggled */
+  #sidebar {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; bottom: 0;
+    width: 85vw !important;
+    max-width: 360px;
+    z-index: 400;
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+  }
+  #sidebar.mobile-visible { display: flex; }
   #sidebar-resize { display: none; }
+
+  /* Backdrop behind sidebar overlay */
+  #sidebar-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 399;
+    background: rgba(0,0,0,0.5);
+  }
+  #sidebar-backdrop.visible { display: block; }
+
+  /* Show the gear toggle button */
+  .sidebar-toggle { display: inline-flex; }
+
+  /* Main layout is just the chat area (full width) */
   #main-container { flex-direction: column; }
-  .modal-content { left: 5%; right: 5%; top: 5%; bottom: 5%; }
+
+  /* Status bar: compact, scrollable on small screens */
+  #status-bar {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 4px 0;
+    gap: 3px;
+  }
+  /* Hide less essential status fields on narrow screens */
+  #status-bar .status-label { display: none; }
+  #status-bar .status-sep { display: none; }
+  #status-bar .status-field { font-size: 10px; }
+  #status-bar .status-state-text { font-size: 11px; }
+  .status-checkbox { display: none; }
+
+  /* Input area: larger touch targets */
+  #input-bar { padding: 6px 8px 8px; }
+  #input-wrap { gap: 6px; }
+  #input-box {
+    font-size: 16px;        /* prevent iOS zoom-on-focus */
+    padding: 10px 12px;
+    min-height: 44px;       /* touch-friendly minimum */
+  }
+  #send-btn, #interrupt-btn {
+    width: 44px; height: 44px;
+    font-size: 18px;
+  }
+
+  /* Messages area: tighter padding */
+  #messages { padding: 8px; gap: 4px; }
+  .msg { padding: 6px 8px; font-size: 13px; }
+
+  /* Modal: near-fullscreen */
+  .modal-content { left: 2%; right: 2%; top: 2%; bottom: 2%; }
+
+  /* Lobby: full-screen, scrollable */
+  .lobby-inner { padding: 16px; }
+  .lobby-cards, .lobby-list {
+    grid-template-columns: 1fr;
+  }
+  .lobby-new {
+    flex-direction: column;
+  }
+  .lobby-new input {
+    font-size: 16px;       /* prevent iOS zoom */
+    min-height: 44px;
+  }
+  .lobby-new button {
+    min-height: 44px;
+    font-size: 15px;
+  }
+  .lobby-card, .lobby-item {
+    padding: 14px;         /* larger touch target */
+  }
+  .lobby-close {
+    font-size: 28px;
+    padding: 6px 12px;
+  }
+
+  /* Tool/code blocks: prevent horizontal overflow */
+  .tool-detail pre, pre, code {
+    max-width: calc(100vw - 32px);
+    overflow-x: auto;
+    font-size: 11px;
+  }
+
+  /* Diff viewer: stack panes vertically */
+  .diff-viewer { flex-direction: column; max-height: 60vh; }
+  .diff-gutter { width: auto; height: 1px; }
+
+  /* Sessions button: slightly larger for touch */
+  .sessions-btn {
+    padding: 4px 10px;
+    font-size: 12px;
+    min-height: 32px;
+  }
 }
 
 /* ===================================================================
@@ -1308,6 +1458,55 @@ html, body {
 }
 .lobby-close:hover { color: var(--text-bright); }
 
+.lobby-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.lobby-shutdown {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1;
+  color: var(--danger, #e06c6c);
+  background: none;
+  border: 1px solid var(--danger, #e06c6c);
+  border-radius: 5px;
+  cursor: pointer;
+  padding: 7px 12px;
+  white-space: nowrap;
+  transition: background 0.12s, color 0.12s;
+}
+.lobby-shutdown:hover {
+  background: var(--danger, #e06c6c);
+  color: #fff;
+}
+.lobby-shutdown:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.lobby-restart {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1;
+  color: var(--accent, #7aa2f7);
+  background: none;
+  border: 1px solid var(--accent, #7aa2f7);
+  border-radius: 5px;
+  cursor: pointer;
+  padding: 7px 12px;
+  white-space: nowrap;
+  transition: background 0.12s, color 0.12s;
+}
+.lobby-restart:hover {
+  background: var(--accent, #7aa2f7);
+  color: #fff;
+}
+.lobby-restart:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 .lobby-section { margin-bottom: 28px; }
 .lobby-section-head {
   display: flex;
@@ -1338,6 +1537,56 @@ html, body {
   font-style: italic;
 }
 .lobby-empty.hidden { display: none; }
+
+/* Lobby banner — e.g. "this tab's session is no longer running". */
+.lobby-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--system-warning-bg, rgba(224, 175, 104, 0.12));
+  border: 1px solid var(--system-warning, #e0af68);
+  color: var(--system-warning, #e0af68);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.lobby-notice.hidden { display: none; }
+.lobby-notice-close {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+  opacity: 0.7;
+  flex: 0 0 auto;
+}
+.lobby-notice-close:hover { opacity: 1; }
+
+/* "loading sessions…" spinner shown until the first session_list arrives. */
+.lobby-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-muted);
+  padding: 8px 2px;
+  font-style: italic;
+}
+.lobby-loading.hidden { display: none; }
+.lobby-spin {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 2px solid var(--border, #2a2a3a);
+  border-top-color: var(--accent, #7aa2f7);
+  animation: session-loading-spin .8s linear infinite;
+  flex: 0 0 auto;
+}
 
 /* New session row */
 .lobby-new {
@@ -1448,6 +1697,7 @@ html, body {
 }
 .lobby-card-sep { opacity: 0.5; }
 .lobby-card-rid { color: var(--text-dim); }
+.lobby-card-acct { color: var(--accent-dim, #7daea3); font-size: 11px; }
 
 /* "closing in …" idle-teardown countdown badge */
 .lobby-countdown {
@@ -1508,3 +1758,187 @@ html, body {
   white-space: nowrap;
   margin-top: 2px;
 }
+.lobby-item-acct {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--accent-dim, #7daea3);
+  margin-top: 2px;
+}
+
+/* ===== /switch overlay (account switch) ===== */
+.switch-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 600;                 /* above the lobby */
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.switch-overlay.hidden { display: none; }
+
+.switch-inner {
+  width: 100%;
+  max-width: 480px;
+  max-height: 80vh;
+  overflow-y: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  padding: 20px 22px 22px;
+}
+
+.switch-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.switch-header h2 {
+  margin: 0;
+  font-size: 17px;
+  color: var(--text-bright);
+  font-weight: 600;
+}
+.switch-close {
+  font-size: 24px;
+  line-height: 1;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.switch-close:hover { color: var(--text-bright); }
+
+.switch-intro {
+  margin: 0 0 14px;
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.switch-accounts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.switch-account {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  padding: 10px 12px;
+  background: var(--bg-tool);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.switch-account:hover {
+  background: var(--bg-tool-hover);
+  border-color: var(--border-light);
+}
+.switch-acct-name {
+  font-size: 14px;
+  color: var(--text-bright);
+  font-weight: 600;
+}
+.switch-acct-email {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.switch-noemail { color: var(--text-muted); font-style: italic; }
+.switch-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--bg);
+  background: var(--accent);
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+.switch-label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.switch-name {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 14px;
+  padding: 9px 11px;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  outline: none;
+}
+.switch-name:focus { border-color: var(--accent); }
+
+.switch-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 16px;
+}
+.switch-actions button {
+  font-size: 13px;
+  padding: 9px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-tool);
+  color: var(--text);
+  cursor: pointer;
+}
+.switch-actions .switch-go {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
+  margin-left: auto;
+}
+.switch-actions button:hover { border-color: var(--border-light); }
+.switch-actions .switch-go:hover { background: var(--accent-dim); }
+
+.switch-msg {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--system-warning, #e0af68);
+}
+.switch-msg.hidden { display: none; }
+
+.switch-error {
+  font-size: 13px;
+  color: var(--system-error, #f7768e);
+  line-height: 1.5;
+  padding: 6px 0;
+}
+
+.switch-loading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 18px 4px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.switch-spin {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  animation: switch-spin 0.8s linear infinite;
+  flex: 0 0 auto;
+}
+@keyframes switch-spin { to { transform: rotate(360deg); } }

@@ -74,14 +74,19 @@ const Status = (() => {
     _stopLocalTimer();
     _localTimerClass = cls;
     _localTimerStart = Date.now();
-    _localTimerInterval = setInterval(() => {
+    const render = () => {
       if (!_localTimerClass) return;
       const secs = Math.round((Date.now() - _localTimerStart) / 1000);
       const label = _localTimerClass === 'connecting'
         ? `connecting (${secs}s)`
         : `working (${_fmtDuration(secs)})`;
       _set(elState, 'textContent', label);
-    }, 1000);
+    };
+    // Paint the label right away so it flips in the SAME frame as the colour
+    // change below — otherwise the colour turns green (working) while the text
+    // still reads "idle" until the first 1s interval tick.
+    render();
+    _localTimerInterval = setInterval(render, 1000);
   }
 
   function _stopLocalTimer() {
@@ -94,12 +99,7 @@ const Status = (() => {
   }
 
   function _fmtDuration(totalSecs) {
-    if (totalSecs < 60) return `${totalSecs}s`;
-    const m = Math.floor(totalSecs / 60);
-    const s = totalSecs % 60;
-    if (m < 60) return `${m}m ${s}s`;
-    const h = Math.floor(m / 60);
-    return `${h}h ${m % 60}m ${s}s`;
+    return Util.formatDuration(totalSecs, 'clock');
   }
 
   function update(status) {

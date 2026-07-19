@@ -266,9 +266,30 @@ const Chat = (() => {
     elMessages.innerHTML = '';
     _streamingEl = null;
     _streamingText = '';
+    _loadingEl = null;   // was a child of elMessages, just cleared
     _toolBlocks.clear();
     _cancelGap();
     _cancelShortGap();
+  }
+
+  // Transient "loading session…" placeholder shown between attach and the
+  // arrival of (potentially multi-second) history for a large session, so an
+  // opened tab shows progress instead of a blank pane.  Driven by the server's
+  // ``session_loading`` messages and cleared when history replay begins.
+  let _loadingEl = null;
+  function _setSessionLoading(on) {
+    if (on) {
+      if (_loadingEl) return;
+      _loadingEl = document.createElement('div');
+      _loadingEl.className = 'msg msg-system session-loading';
+      _loadingEl.innerHTML =
+        '<span class="session-loading-spin"></span> loading session\u2026';
+      elMessages.appendChild(_loadingEl);
+      _scrollToBottom();
+    } else if (_loadingEl) {
+      _loadingEl.remove();
+      _loadingEl = null;
+    }
   }
 
   // --- Scrolling ---
@@ -401,6 +422,7 @@ const Chat = (() => {
       case 'bg_started':      _addBgStarted(msg); break;
       case 'bg_complete':     _addBgComplete(msg); break;
       case 'clear_screen':    clear(); break;
+      case 'session_loading': _setSessionLoading(msg.on); break;
       case 'command_data':    _addCommandData(msg); break;
       case 'modal':           _openModal(msg); break;
       case 'bell':            _playBell(); break;
@@ -973,6 +995,7 @@ const Chat = (() => {
 
   function _replayHistory(messages) {
     console.log('[history] _replayHistory called, messages:', messages ? messages.length : 0);
+    _setSessionLoading(false);   // history is here — drop the placeholder
     if (!messages || !messages.length) return;
 
     _replayInProgress = true;

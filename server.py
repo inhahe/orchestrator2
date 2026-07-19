@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import base64
+import hashlib
 import ipaddress
 import json
 import logging
@@ -36,6 +37,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import dataclasses
 import webbrowser
@@ -62,6 +64,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 from config import (
     Config,
+    DEFAULT_EXTERNAL_PASSWORD,
     DEFAULT_PORT,
     _PICKER_SENTINEL,
     fetch_available_models,
@@ -83,6 +86,7 @@ from session import (
     read_session_title,
     render_session_history,
     save_persisted_queue,
+    write_session_title,
 )
 from commands import (
     classify,
@@ -212,37 +216,65 @@ def _recent_disk_sessions(limit: int = 40) -> list[dict[str, Any]]:
         getattr(rt.state, "session_id", None)
         for rt in runtimes.values()
     }
-    out: list[dict[str, Any]] = []
+    # Scan every Claude account/config dir on this machine — not just the hub's
+    # own — so sessions launched under a different account still appear in the
+    # lobby.  Each session is tagged with the ``account`` (config dir) it lives
+    # under so opening it re-launches the runtime with the right account.
     try:
-        for proj in list_projects():
-            for sess in list_sessions_for_project(Path(proj["project_dir"])):
-                sid = sess.get("session_id")
-                if not sid or sid in live_ids:
-                    continue
-                out.append({
-                    "session_id": sid,
-                    "title": sess.get("title"),
-                    "cwd": proj.get("cwd"),
-                    "mtime": sess.get("mtime", 0),
-                    "age": _format_age(sess.get("mtime", 0)),
-                    "first_user_msg": _truncate(sess.get("first_user_msg"), 100),
-                })
+        from copy_session import discover_claude_dirs
+        config_dirs = [str(p) for p in discover_claude_dirs()]
     except Exception:
-        log.warning("failed to scan disk sessions for lobby", exc_info=True)
+        log.warning("failed to discover Claude config dirs", exc_info=True)
+        config_dirs = [os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")]
+
+    out: list[dict[str, Any]] = []
+    seen_sids: set[str] = set()
+    for cdir in config_dirs:
+        try:
+            for proj in list_projects(config_dir=cdir):
+                for sess in list_sessions_for_project(Path(proj["project_dir"])):
+                    sid = sess.get("session_id")
+                    if not sid or sid in live_ids or sid in seen_sids:
+                        continue
+                    seen_sids.add(sid)
+                    out.append({
+                        "session_id": sid,
+                        "title": sess.get("title"),
+                        "cwd": proj.get("cwd"),
+                        "account": cdir,
+                        "mtime": sess.get("mtime", 0),
+                        "age": _format_age(sess.get("mtime", 0)),
+                        "first_user_msg": _truncate(sess.get("first_user_msg"), 100),
+                    })
+        except Exception:
+            log.warning("failed to scan disk sessions in %s", cdir, exc_info=True)
     out.sort(key=lambda s: s.get("mtime", 0), reverse=True)
     out = out[:limit]
+    # Persist any newly-resolved titles so the next process start is fast.
+    try:
+        from session import flush_title_index
+        flush_title_index()
+    except Exception:
+        log.debug("title index flush failed", exc_info=True)
     _disk_sessions_cache = (now, out)
     return out
 
 
-def _session_list_payload() -> dict[str, Any]:
-    """The ``session_list`` message: running runtimes + recent disk sessions."""
+async def _session_list_payload() -> dict[str, Any]:
+    """The ``session_list`` message: running runtimes + recent disk sessions.
+
+    The recent-disk scan now walks every Claude account on the machine, which
+    can touch many JSONL files, so it's run in a thread to avoid blocking the
+    event loop (a stalled loop froze every session, not just the lobby).
+    """
     running = [rt.meta() for rt in runtimes.values()]
     running.sort(key=lambda m: m.get("last_activity", 0), reverse=True)
+    loop = asyncio.get_running_loop()
+    recent = await loop.run_in_executor(None, _recent_disk_sessions)
     return {
         "type": "session_list",
         "running": running,
-        "recent": _recent_disk_sessions(),
+        "recent": recent,
     }
 
 
@@ -265,11 +297,51 @@ async def lobby_broadcast(msg: dict[str, Any]) -> None:
 
 async def _push_session_list(target: WebSocket | None = None) -> None:
     """Push the current session list to one tab, or to all lobby tabs."""
-    payload = _session_list_payload()
+    payload = await _session_list_payload()
     if target is not None:
         await send_to(target, payload)
     else:
         await lobby_broadcast(payload)
+
+
+def _account_email_for(claude_dir: Path) -> str | None:
+    """Read the signed-in email for a ``.claude`` account directory.
+
+    Mirrors ``state.detect_account_info`` but for an *arbitrary* config dir
+    (not just the process env), so ``/switch`` can label each account.
+    """
+    try:
+        with open(claude_dir / ".claude.json", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    oauth = data.get("oauthAccount") if isinstance(data, dict) else None
+    if isinstance(oauth, dict):
+        em = oauth.get("emailAddress")
+        if isinstance(em, str) and em:
+            return em
+    return None
+
+
+def _switch_accounts_payload(current_cfg: str | None) -> list[dict[str, Any]]:
+    """Build the account list for the ``/switch`` picker.
+
+    Each entry: ``{config_dir, name, email, is_current}``.  Scans the same
+    ``.claude*`` directories the copy TUI discovers, reusing
+    ``copy_session.discover_claude_dirs``.
+    """
+    from copy_session import discover_claude_dirs
+    cur_norm = os.path.normpath(current_cfg) if current_cfg else None
+    accounts: list[dict[str, Any]] = []
+    for d in discover_claude_dirs():
+        accounts.append({
+            "config_dir": str(d),
+            "name": d.name,
+            "email": _account_email_for(d),
+            "is_current": cur_norm is not None
+            and os.path.normpath(str(d)) == cur_norm,
+        })
+    return accounts
 
 # Background tasks for periodic updates.
 _ticker_task: asyncio.Task | None = None
@@ -439,6 +511,7 @@ def _attach_queue_persistence(st, cwd: str) -> None:
 # FastAPI app + lifespan
 # ---------------------------------------------------------------------------
 
+import contextlib
 from contextlib import asynccontextmanager
 
 
@@ -493,13 +566,13 @@ async def lifespan(app: FastAPI):
                 _resolved_resume = _match
                 config = dataclasses.replace(config, resume=_match)
         state.session_id = _resolved_resume
-        state.session_title = read_session_title(_resolved_resume)
+        state.session_title = read_session_title(_resolved_resume, config.config_dir)
         _pending_resume_id = _resolved_resume
     elif not config.no_continue:
         recent = find_most_recent_session_for_cwd(config.cwd)
         if recent is not None:
             state.session_id = recent.stem
-            state.session_title = read_session_title(recent.stem)
+            state.session_title = read_session_title(recent.stem, config.config_dir)
             _pending_resume_id = recent.stem
 
     # The seeding block above may have rebound ``config`` (e.g. resolving a
@@ -568,6 +641,28 @@ async def _deferred_bridge_startup(*, start: bool) -> None:
 # Runtime lifecycle — spin up / tear down live sessions on demand
 # ---------------------------------------------------------------------------
 
+@contextlib.contextmanager
+def _env_config_dir(config_dir: str | None):
+    """Temporarily set ``CLAUDE_CONFIG_DIR`` for session-discovery calls.
+
+    Cross-account hub sessions store their session files under a different
+    config dir.  The session-discovery helpers in ``session.py`` read
+    ``os.environ["CLAUDE_CONFIG_DIR"]`` to find the right directory.
+    """
+    if not config_dir:
+        yield
+        return
+    orig = os.environ.get("CLAUDE_CONFIG_DIR")
+    os.environ["CLAUDE_CONFIG_DIR"] = config_dir
+    try:
+        yield
+    finally:
+        if orig is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = orig
+
+
 async def _create_runtime(
     *,
     cwd: str | None = None,
@@ -575,12 +670,14 @@ async def _create_runtime(
     no_continue: bool = False,
     model: str | None = None,
     effort: str | None = None,
+    config_dir: str | None = None,
 ) -> SessionRuntime:
     """Spin up a fresh live session runtime (config clone + state + bridge).
 
     * ``resume`` — resume a specific on-disk session id (implies no auto-continue).
     * ``no_continue`` — start empty (a brand-new session).
     * ``model`` / ``effort`` — per-session overrides from the launcher.
+    * ``config_dir`` — ``CLAUDE_CONFIG_DIR`` override for cross-account sessions.
     * otherwise — continue the most recent session in *cwd*.
 
     Registers the runtime, starts its bridge, and refreshes the lobby.
@@ -599,9 +696,16 @@ async def _create_runtime(
         overrides["model"] = model
     if effort:
         overrides["effort"] = effort
+    if config_dir:
+        overrides["config_dir"] = config_dir
     cfg = dataclasses.replace(config, **overrides)
-    st = init_state_from_config(cfg)
-    _attach_queue_persistence(st, cfg.cwd)
+    # Build the state *inside* the session's config-dir scope so account
+    # detection (detect_account_info / detect_subscription*) reads the
+    # launched session's CLAUDE_CONFIG_DIR — not the hub's.  Otherwise a
+    # cross-account session shows the hub account's email/subscription.
+    with _env_config_dir(config_dir):
+        st = init_state_from_config(cfg)
+        _attach_queue_persistence(st, cfg.cwd)
     rt = SessionRuntime(config=cfg, state=st)
     runtimes[rt.rid] = rt
 
@@ -610,23 +714,72 @@ async def _create_runtime(
     rt.bridge = br
 
     # Decide which on-disk session (if any) seeds this runtime.
+    # Session files live under CLAUDE_CONFIG_DIR, so scope the lookup to
+    # the session's account when it differs from the hub's.
     seed_id: str | None = None
-    if resume:
-        seed_id = resume
-    elif not no_continue:
-        recent = find_most_recent_session_for_cwd(resolved_cwd)
-        if recent is not None:
-            seed_id = recent.stem
+    with _env_config_dir(config_dir):
+        if resume:
+            seed_id = resume
+        elif not no_continue:
+            recent = find_most_recent_session_for_cwd(resolved_cwd)
+            if recent is not None:
+                seed_id = recent.stem
+        if seed_id:
+            st.session_id = seed_id
+            br._initial_resume_id = seed_id
+
     if seed_id:
-        st.session_id = seed_id
-        st.session_title = read_session_title(seed_id)
-        br._initial_resume_id = seed_id
+        # Read the display title in the background.  Scanning the session's
+        # JSONL (which can be hundreds of MB — a 276 MB file takes ~2.7s) would
+        # block the event loop right here, delaying this tab's attach + history
+        # AND freezing every other tab and the status ticker.  The title isn't
+        # needed to render history or interact, so fetch it off the hot path and
+        # push a status_update + lobby refresh once it's known.
+        asyncio.create_task(
+            _load_runtime_title(rt, seed_id, config_dir),
+            name=f"title-{rt.rid}",
+        )
 
     await br.start()
     log.info("runtime %s started (cwd=%s, resume=%s)",
              rt.rid, resolved_cwd, seed_id)
     await _push_session_list()   # lobby tabs see the new session appear
     return rt
+
+
+async def _load_runtime_title(
+    rt: SessionRuntime, sid: str, config_dir: str | None
+) -> None:
+    """Read a runtime's session title off the event loop and publish it.
+
+    Called as a background task from ``_create_runtime`` so the (potentially
+    multi-second) JSONL scan never blocks attach/history.  Pushes a fresh
+    status_update to the runtime's viewers and refreshes the lobby once known.
+    """
+    try:
+        title = await asyncio.to_thread(read_session_title, sid, config_dir)
+    except Exception:
+        log.debug("background title read failed for %s", sid, exc_info=True)
+        return
+    if not title:
+        return
+    st, cfg = rt.state, rt.config
+    if st is None or cfg is None:
+        return
+    # Don't clobber a title the user set via /rename (or one the SDK-init path
+    # already resolved) while we were reading.
+    if st.pending_rename or st.session_title:
+        return
+    st.session_title = title
+    try:
+        await rt.broadcast({
+            "type": "status_update",
+            "status": state_to_status_dict(st, cfg),
+            "panels": _enrich_panels(state_to_panels_dict(st)),
+        })
+        await _push_session_list()
+    except Exception:
+        log.debug("title publish failed for %s", sid, exc_info=True)
 
 
 async def _teardown_runtime(rt: SessionRuntime) -> None:
@@ -751,6 +904,9 @@ def _is_private_ip(ip_str: str) -> bool:
         return False
 
 
+_AUTH_COOKIE = "orch2_auth"
+
+
 class _ExternalAuthMiddleware:
     """ASGI middleware: require Basic Auth for non-LAN clients.
 
@@ -758,11 +914,28 @@ class _ExternalAuthMiddleware:
     * External + correct password → pass through.
     * External + wrong / missing credentials → 401.
     * ``password is None`` → block ALL external access (no password set).
+
+    A successful external HTTP auth also sets a session cookie holding a token
+    derived from the password.  This is what makes the WebSocket work from
+    outside the LAN: browsers cache HTTP Basic-Auth credentials but do **not**
+    replay the ``Authorization`` header on a ``new WebSocket()`` upgrade
+    (iOS Safari never does), so a password-protected hub would authenticate the
+    page yet silently reject its socket (close 1008), leaving the app stuck
+    "reconnecting" — which looks exactly like a rejected password.  Cookies, by
+    contrast, *are* sent on same-origin WS upgrades, so once the page load sets
+    the cookie the socket authenticates automatically.  A token (not the raw
+    password) is stored so the secret never lands in a cookie jar or log.
     """
 
     def __init__(self, app: Any, *, password: str | None) -> None:
         self.app = app
         self.password = password
+        # Deterministic token derived from the password: lets the cookie
+        # authenticate without carrying the literal secret.
+        self.token = (
+            hashlib.sha256(("orch2-auth:" + password).encode()).hexdigest()
+            if password is not None else None
+        )
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
         if scope["type"] in ("http", "websocket"):
@@ -771,23 +944,34 @@ class _ExternalAuthMiddleware:
             if not _is_private_ip(client_ip):
                 # External connection — check credentials.
                 if self.password is None:
+                    # No password configured → external access is off.  Don't
+                    # send a Basic-Auth challenge (it would prompt for a
+                    # password that can never work); just refuse.
                     await self._reject(scope, receive, send,
-                                       "External access is disabled.")
+                                       "External access is disabled.",
+                                       challenge=False)
                     return
-                # Check Basic Auth header (works for HTTP; browsers cache
-                # credentials and often include them on WS upgrades too)
-                # and a ``?password=`` query-param fallback (reliable for WS
-                # since browsers don't natively prompt for WS auth).
                 headers = dict(scope.get("headers", []))
                 auth = headers.get(b"authorization", b"").decode("utf-8", "replace")
                 qs = (scope.get("query_string") or b"").decode("utf-8", "replace")
                 pw_param = dict(
                     p.split("=", 1) for p in qs.split("&") if "=" in p
                 ).get("password")
-                if not self._check_basic_auth(auth) and pw_param != self.password:
+                if pw_param is not None:
+                    pw_param = unquote(pw_param)
+                cookie_ok = self._cookie_ok(headers.get(b"cookie", b""))
+                header_ok = self._check_basic_auth(auth)
+                param_ok = pw_param == self.password
+                if not (header_ok or param_ok or cookie_ok):
                     await self._reject(scope, receive, send,
                                        "Authentication required.")
                     return
+                # Authenticated.  If this HTTP request proved the password via
+                # the Basic header or ?password= (i.e. not already via cookie),
+                # plant the auth cookie so the follow-up WebSocket upgrade — on
+                # which the browser won't resend Basic credentials — carries it.
+                if scope["type"] == "http" and not cookie_ok:
+                    send = self._send_with_cookie(scope, send)
         await self.app(scope, receive, send)
 
     def _check_basic_auth(self, auth_header: str) -> bool:
@@ -802,19 +986,58 @@ class _ExternalAuthMiddleware:
         parts = decoded.split(":", 1)
         return len(parts) == 2 and parts[1] == self.password
 
+    def _cookie_ok(self, cookie_header: bytes) -> bool:
+        """True when the request carries a valid ``orch2_auth`` cookie."""
+        if not cookie_header or self.token is None:
+            return False
+        raw = cookie_header.decode("utf-8", "replace")
+        for part in raw.split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == _AUTH_COOKIE and value == self.token:
+                return True
+        return False
+
+    def _send_with_cookie(self, scope: dict, send: Any) -> Any:
+        """Wrap *send* to attach the auth ``Set-Cookie`` to the HTTP response."""
+        secure = "https" in (scope.get("scheme") or "")
+        cookie = (
+            f"{_AUTH_COOKIE}={self.token}; Path=/; HttpOnly; SameSite=Strict"
+            + ("; Secure" if secure else "")
+        ).encode()
+
+        async def wrapped(message: dict) -> None:
+            if message.get("type") == "http.response.start":
+                message = dict(message)
+                message["headers"] = list(message.get("headers", [])) + [
+                    (b"set-cookie", cookie)
+                ]
+            await send(message)
+
+        return wrapped
+
     @staticmethod
-    async def _reject(scope: dict, receive: Any, send: Any, message: str) -> None:
-        """Reject an unauthenticated external connection."""
+    async def _reject(scope: dict, receive: Any, send: Any, message: str,
+                      *, challenge: bool = True) -> None:
+        """Reject an unauthenticated external connection.
+
+        *challenge* controls whether a ``WWW-Authenticate: Basic`` header is
+        sent (which makes browsers show the login prompt).  It's suppressed
+        when external access is disabled outright, so users aren't asked for a
+        password that can never be accepted.
+        """
         if scope["type"] == "http":
             body = message.encode("utf-8")
+            resp_headers = [
+                [b"content-type", b"text/plain; charset=utf-8"],
+                [b"content-length", str(len(body)).encode()],
+            ]
+            if challenge:
+                resp_headers.append(
+                    [b"www-authenticate", b'Basic realm="orchestrator2"'])
             await send({
                 "type": "http.response.start",
                 "status": 401,
-                "headers": [
-                    [b"content-type", b"text/plain; charset=utf-8"],
-                    [b"www-authenticate", b'Basic realm="orchestrator2"'],
-                    [b"content-length", str(len(body)).encode()],
-                ],
+                "headers": resp_headers,
             })
             await send({"type": "http.response.body", "body": body})
         else:
@@ -848,12 +1071,30 @@ def build_app() -> Any:
         app.add_api_websocket_route(path, fn)
 
     # Wrap the app with authentication for external connections.
-    ext_pw = (os.environ.get("ORCH2_EXTERNAL_PASSWORD") or "").strip() or None
-    if config is not None:
-        ext_pw = getattr(config, "external_password", ext_pw) or ext_pw
-    app = _ExternalAuthMiddleware(app, password=ext_pw)
+    app = _ExternalAuthMiddleware(app, password=_resolve_external_password(config))
 
     return app
+
+
+def _resolve_external_password(config: Config | None) -> str | None:
+    """Resolve the non-LAN password from CLI flag, env var, then built-in default.
+
+    Precedence:
+      1. ``--external-password <pw>`` → use it verbatim.  An explicit empty
+         string (``--external-password ""``) disables external access → None.
+      2. ``ORCH2_EXTERNAL_PASSWORD`` env var (only when the flag wasn't given).
+      3. the built-in default ``DEFAULT_EXTERNAL_PASSWORD``.
+
+    The CLI flag defaults to None ("unspecified"), which is what lets us tell
+    "not passed" (→ env/default) apart from "passed empty" (→ disable).
+    """
+    cfg_pw = getattr(config, "external_password", None) if config is not None else None
+    if cfg_pw is None:
+        return ((os.environ.get("ORCH2_EXTERNAL_PASSWORD") or "").strip()
+                or DEFAULT_EXTERNAL_PASSWORD)
+    if cfg_pw == "":
+        return None   # explicitly disabled
+    return cfg_pw
 
 
 # ---------------------------------------------------------------------------
@@ -881,7 +1122,20 @@ async def index(request: Request):
     resume_param = request.query_params.get("resume")
     cwd_param = request.query_params.get("cwd")
 
-    if resume_param is not None:
+    # ?open / ?new / ?rid are *client-driven* session launches: the frontend
+    # reads them (plus cwd/account as context) and sends an open/new WS message
+    # that spins up a SEPARATE runtime.  In that case cwd is not a standalone
+    # "reconfigure the default session in place" command, so we must NOT run the
+    # legacy resume/cwd reconfigure below — doing so hijacks the default runtime
+    # (repointing this tab's session at the opened session's cwd) instead of
+    # creating an isolated one.  Fall through to serve the page untouched.
+    _client_launch = (
+        request.query_params.get("open") is not None
+        or request.query_params.get("new") is not None
+        or request.query_params.get("rid") is not None
+    )
+
+    if not _client_launch and resume_param is not None:
         if resume_param == "":
             # Bare ?resume → show the picker.
             return _serve_page("resume.html", fallback="<h1>Session Picker</h1>")
@@ -894,7 +1148,7 @@ async def index(request: Request):
             )
         return RedirectResponse("/", status_code=303)
 
-    if cwd_param is not None:
+    if not _client_launch and cwd_param is not None:
         ok, err = await _reconfigure(cwd=cwd_param)
         if not ok:
             return HTMLResponse(f"<h1>Error</h1><p>{err}</p>", status_code=400)
@@ -993,7 +1247,7 @@ async def _reconfigure(
 
     if new_resume:
         state.session_id = new_resume
-        title = read_session_title(new_resume)
+        title = read_session_title(new_resume, config.config_dir)
         if title:
             state.session_title = title
         session_cwd = find_session_cwd(new_resume)
@@ -1009,7 +1263,7 @@ async def _reconfigure(
             recent = find_most_recent_session_for_cwd(new_cwd)
             if recent is not None:
                 state.session_id = recent.stem
-                state.session_title = read_session_title(recent.stem)
+                state.session_title = read_session_title(recent.stem, config.config_dir)
                 bridge._initial_resume_id = recent.stem
 
     _picker_mode = False
@@ -1078,20 +1332,138 @@ async def serve_static(path: str):
 
 @_route("post", "/api/shutdown")
 async def api_shutdown() -> dict[str, Any]:
-    """Gracefully shut down the server.
+    """Gracefully shut down the whole server process (all sessions).
 
     Used by ``--detach`` when a new server needs to take over the port
-    occupied by an old instance, and for manual cleanup.
+    occupied by an old instance, by the lobby "Shut down server" button,
+    and for manual cleanup.  Stops *every* runtime's bridge (not just the
+    default) so no SDK subprocesses are orphaned, tells connected tabs the
+    server is going down, then hard-exits.
     """
-    log.info("shutdown requested via /api/shutdown")
-    if bridge:
-        try:
-            await bridge.stop()
-        except Exception:
-            pass
+    log.info("shutdown requested via /api/shutdown (%d runtimes)", len(runtimes))
+    try:
+        await _broadcast_shutdown("Server shut down from the lobby.")
+    except Exception:
+        pass
+    for rt in list(runtimes.values()):
+        if rt.bridge is not None:
+            try:
+                await rt.bridge.stop()
+            except Exception:
+                pass
     # Schedule a hard exit after a short delay so the response gets sent.
     asyncio.get_event_loop().call_later(0.5, lambda: os._exit(0))
     return {"ok": True, "message": "shutting down"}
+
+
+@_route("post", "/api/restart")
+async def api_restart() -> dict[str, Any]:
+    """Restart the whole server process in place (kill + relaunch).
+
+    Spawns a fresh headless server that inherits this process's launch
+    command (so it picks up any code changes), waits for us to release the
+    port (``--wait-port``), and resumes the current primary session.  We
+    verify the replacement didn't immediately crash *before* exiting — if it
+    did, we stay alive and report the error rather than leaving no server at
+    all.  Once the child is confirmed running we tell tabs to reload, stop
+    every bridge, and hard-exit so the child can take the port.
+    """
+    import subprocess
+
+    port = config.port if config is not None else 8420
+
+    # Rebuild argv from our own launch command, normalising the bits that
+    # must change for an in-place restart.
+    argv = sys.argv
+    child = [sys.executable, argv[0]]
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--detach", "--open", "--copy", "--wait-port",
+                 "--skip-auto-login", "--no-continue", "--continue"):
+            i += 1
+            continue
+        if a == "--port":
+            i += 2
+            continue
+        if a.startswith("--port="):
+            i += 1
+            continue
+        if a == "--resume":
+            i += 1
+            if i < len(argv) and not argv[i].startswith("-"):
+                i += 1
+            continue
+        if a.startswith("--resume="):
+            i += 1
+            continue
+        child.append(a)
+        i += 1
+    child.extend(["--port", str(port), "--skip-auto-login", "--wait-port"])
+    # Resume exactly the current primary session on the fresh process.
+    sid = state.session_id if state is not None else None
+    if sid:
+        child.extend(["--resume", sid])
+
+    # Preserve the account so session discovery + the SDK subprocess use it.
+    env = dict(os.environ)
+    cfg_dir = getattr(config, "config_dir", None) if config is not None else None
+    if cfg_dir:
+        env["CLAUDE_CONFIG_DIR"] = cfg_dir
+
+    # Give the replacement its OWN visible console rather than running it
+    # headless.  Two reasons, both learned the hard way:
+    #   * The SDK's ``claude`` CLI subprocess inherits the server's console.
+    #     A headless (CREATE_NO_WINDOW) server has none, so Windows hands the
+    #     child ``claude`` its *own* console window — the stray "claude" window.
+    #     A real console for the server means the subprocess draws into it
+    #     (no stray window).
+    #   * A headless restart that fails to come up dies silently, leaving no
+    #     server and no visible error.  A console makes the failure visible.
+    # The old parent is about to exit, so the child gets a fresh console
+    # (CREATE_NEW_CONSOLE) rather than sharing ours (which would close with us).
+    kwargs: dict[str, Any] = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+    else:
+        kwargs["start_new_session"] = True
+
+    try:
+        # Inherit stdio so the server's (and claude's) output shows in the new
+        # console — that's what makes a failed restart debuggable.
+        proc = subprocess.Popen(child, env=env, **kwargs)
+    except Exception as e:
+        log.exception("restart: failed to spawn replacement")
+        return {"ok": False, "error": f"spawn failed: {e}"}
+
+    # Crash-check window: the child can't bind the port until we exit, so we
+    # can't poll for "serving" — but we CAN catch an immediate crash (bad
+    # argv, import error) so we never kill ourselves with no replacement.
+    # The error text is visible in the child's console.
+    for _ in range(15):  # ~3s
+        await asyncio.sleep(0.2)
+        rc = proc.poll()
+        if rc is not None:
+            log.error("restart: replacement exited early rc=%s", rc)
+            return {"ok": False,
+                    "error": f"replacement crashed (exit {rc})",
+                    "detail": "See the new console window for the error."}
+
+    log.info("restart: replacement alive (pid %s), handing over port %s",
+             proc.pid, port)
+    try:
+        await broadcast({"type": "server_restart",
+                         "reason": "Server restarting\u2026"})
+    except Exception:
+        pass
+    for rt in list(runtimes.values()):
+        if rt.bridge is not None:
+            try:
+                await rt.bridge.stop()
+            except Exception:
+                pass
+    asyncio.get_event_loop().call_later(0.5, lambda: os._exit(0))
+    return {"ok": True, "message": "restarting", "port": port}
 
 
 @_route("get", "/api/status")
@@ -1121,9 +1493,9 @@ async def api_ready() -> dict[str, Any]:
 async def api_whoami() -> dict[str, Any]:
     """Identify this server so a new launch can decide whether to reuse it.
 
-    A launcher probes this before binding a port: if a live orchestrator2 with
-    the *same account* (``CLAUDE_CONFIG_DIR``) is already serving, the launch
-    joins it as a new session instead of starting a second server.
+    A launcher probes this before binding a port: if a live orchestrator2 is
+    already serving, the launch joins it — even across accounts — instead of
+    starting a second server.
     """
     return {
         "app": "orchestrator2",
@@ -1149,6 +1521,7 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     no_continue = bool(body.get("no_continue"))
     model = (body.get("model") or "").strip() or None
     effort = (body.get("effort") or "").strip() or None
+    config_dir = (body.get("config_dir") or "").strip() or None
 
     # Resolve the on-disk session this launch would land on (an explicit
     # resume id, or — for a plain continue — the most recent session in cwd).
@@ -1156,7 +1529,8 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     # second bridge against the same session file.
     target_sid = resume
     if target_sid is None and not no_continue:
-        recent = find_most_recent_session_for_cwd(cwd or config.cwd)
+        with _env_config_dir(config_dir):
+            recent = find_most_recent_session_for_cwd(cwd or config.cwd)
         if recent is not None:
             target_sid = recent.stem
     if target_sid:
@@ -1166,10 +1540,26 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
             None,
         )
         if existing is not None:
+            # Apply model/effort overrides from this launch to the existing
+            # runtime so the launcher's --model / --effort take effect even
+            # when the session is already live.  Reconnect the bridge so the
+            # new options are picked up by the SDK immediately.
+            need_reconnect = False
+            if model and existing.state is not None and existing.state.model != model:
+                existing.state.model = model
+                need_reconnect = True
+            if effort and existing.state is not None:
+                new_effort = None if effort == "auto" else effort
+                if existing.state.effort != new_effort:
+                    existing.state.effort = new_effort
+                    need_reconnect = True
+            if need_reconnect and existing.bridge is not None:
+                asyncio.create_task(existing.bridge.reconnect())
             return {"ok": True, "rid": existing.rid, "reused": True}
     try:
         rt = await _create_runtime(cwd=cwd, resume=resume, no_continue=no_continue,
-                                   model=model, effort=effort)
+                                   model=model, effort=effort,
+                                   config_dir=config_dir)
     except Exception as exc:
         log.exception("hub session launch failed")
         return {"ok": False, "error": str(exc)}
@@ -1283,7 +1673,7 @@ async def api_resume(body: dict[str, Any]) -> dict[str, Any]:
 
     # Update state with session info.
     state.session_id = session_id
-    title = read_session_title(session_id)
+    title = read_session_title(session_id, config.config_dir)
     if title:
         state.session_title = title
 
@@ -1616,14 +2006,21 @@ async def _attach_ws(ws: WebSocket, rt: SessionRuntime) -> None:
     await _push_session_list()   # viewer counts changed
 
 
-async def _enter_lobby(ws: WebSocket) -> None:
-    """Detach *ws* from its runtime (if any) and send it the session list."""
+async def _enter_lobby(ws: WebSocket, notice: str | None = None) -> None:
+    """Detach *ws* from its runtime (if any) and send it the session list.
+
+    *notice*, when given, is delivered as a ``lobby_notice`` message the
+    frontend shows as a visible banner *on the lobby overlay* — unlike a chat
+    ``system_msg``, which would be hidden behind the overlay.
+    """
     old = _ws_runtime.pop(ws, None)
     if old is not None:
         old.discard_client(ws)
         _maybe_start_idle_timer(old)
     lobby_clients.add(ws)
     await _push_session_list(ws)
+    if notice:
+        await send_to(ws, {"type": "lobby_notice", "message": notice})
     if old is not None:
         await _push_session_list()   # others see the viewer count drop
 
@@ -1685,39 +2082,25 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 await _attach_ws(ws, target)
             else:
                 # The rid is stale (session was torn down, hub was restarted,
-                # etc.).  Land in the lobby so the user can pick a live session.
-                await _enter_lobby(ws)
-                await send_to(ws, {
-                    "type": "system_msg", "subtype": "warning",
-                    "data": {"message":
-                        f"Session {requested_rid} is no longer running. "
-                        "Pick a session from the lobby to continue."},
-                })
+                # the computer rebooted and restored old tabs, etc.).  Land in
+                # the lobby with a *visible* banner so the user understands why
+                # this tab didn't reopen its old session.
+                await _enter_lobby(ws, notice=(
+                    "This tab's session is no longer running — the server was "
+                    "restarted (or the session was closed) since the tab was "
+                    "opened. Pick a session below to continue."))
         elif force_lobby:
             await _enter_lobby(ws)
         else:
-            # No ?rid= — auto-attach to the best available runtime so a
-            # bare ``localhost:8420`` shows the session with scrollback.
-            # Prefer the most recently active runtime (the one the user
-            # was most likely looking at), then the default, then lobby.
-            best = None
-            if runtimes:
-                # Pick the runtime with the most recent activity.
-                candidates = [
-                    rt for rt in runtimes.values()
-                    if rt.state is not None and rt.state.session_id
-                ]
-                if candidates:
-                    best = max(
-                        candidates,
-                        key=lambda rt: rt.last_activity,
-                    )
-            if best is None:
-                best = _default_runtime
-            if best is not None:
-                await _attach_ws(ws, best)
-            else:
-                await _enter_lobby(ws)
+            # No ?rid= — always land in the lobby.  A bare
+            # ``localhost:8420`` (typed manually, or opened in a new tab)
+            # is the hub's front door: show the session list so the user
+            # picks which session to view.  Auto-attaching to the primary
+            # session here was confusing — every new tab silently reopened
+            # the default session instead of the hub.  Launches that want
+            # to drop straight into a session open ``/?rid=<rid>`` (or the
+            # ``default`` sentinel) instead of a bare URL.
+            await _enter_lobby(ws)
 
         # --- Message loop ---
         while True:
@@ -1791,10 +2174,19 @@ async def _send_initial_state(ws: WebSocket) -> None:
     if state.session_id:
         log.info("[history] loading for session_id=%s rt=%s",
                  state.session_id, rt.rid)
+        # Show an immediate "loading session…" placeholder so the freshly
+        # opened tab isn't blank while the (possibly large) history renders.
+        # The frontend clears it automatically when the history replay lands;
+        # the branches below turn it off explicitly when no history is sent.
+        await send_to(ws, {"type": "session_loading", "on": True})
         try:
             loop = asyncio.get_running_loop()
+            # Scope the lookup to this session's account so a cross-account
+            # hub session's history is found under *its* config dir, not the
+            # hub's.  Passed explicitly (not via env) to stay thread-safe.
+            _cfg_dir = getattr(config, "config_dir", None)
             session_dir = await loop.run_in_executor(
-                None, find_session_dir, state.session_id,
+                None, find_session_dir, state.session_id, _cfg_dir,
             )
             log.info("[history] find_session_dir → %s", session_dir)
             if session_dir:
@@ -1814,14 +2206,110 @@ async def _send_initial_state(ws: WebSocket) -> None:
                 else:
                     log.info("[history] no messages to send for %s",
                              state.session_id)
+                    await send_to(ws, {"type": "session_loading", "on": False})
             else:
                 log.warning("[history] session_dir not found for %s",
                             state.session_id)
+                await send_to(ws, {"type": "session_loading", "on": False})
         except Exception as exc:
             log.warning("[history] failed to load history for %s: %s",
                         state.session_id, exc, exc_info=True)
+            await send_to(ws, {"type": "session_loading", "on": False})
     else:
         log.info("[history] no session_id on state (rt=%s)", rt.rid)
+
+
+async def _do_switch(ws: WebSocket, msg: dict[str, Any]) -> None:
+    """Copy this tab's current session into another account and attach here.
+
+    The ``/switch`` flow: copy the live session's JSONL into the chosen
+    account's projects tree under a *fresh* session id (so it never collides
+    with an existing one), set the entered name as its custom title, spin up a
+    runtime bound to that account resuming the copy, and attach THIS socket to
+    it — so the conversation seamlessly continues in the current window under
+    the new account.  Reuses ``copy_session.copy_session_file`` (which rewrites
+    the ``sessionId`` fields so the copy resumes cleanly).
+    """
+    import uuid
+    from copy_session import copy_session_file
+
+    rt = _ws_runtime.get(ws) or _runtime_for_ws(ws)
+    if rt is None or rt.state is None or rt.config is None \
+            or not rt.state.session_id:
+        await send_to(ws, {"type": "switch_error",
+                           "message": "No active session to switch."})
+        return
+
+    target_cfg = (msg.get("config_dir") or "").strip()
+    new_name = (msg.get("new_name") or "").strip()
+    if not target_cfg:
+        await send_to(ws, {"type": "switch_error",
+                           "message": "No target account selected."})
+        return
+    if not new_name:
+        await send_to(ws, {"type": "switch_error",
+                           "message": "Please enter a name for the new session."})
+        return
+
+    src_cfg = getattr(rt.config, "config_dir", None)
+    sid = rt.state.session_id
+    cwd = rt.config.cwd
+    loop = asyncio.get_running_loop()
+
+    # Locate the source JSONL under the current account.
+    src_dir = await loop.run_in_executor(None, find_session_dir, sid, src_cfg)
+    if src_dir is None:
+        await send_to(ws, {"type": "switch_error",
+                           "message": "Couldn't find this session's file on disk."})
+        return
+    src_jsonl = src_dir / f"{sid}.jsonl"
+    slug = src_dir.name           # same project-slug under the new account
+    dest_proj = Path(target_cfg) / "projects" / slug
+    # Fresh session id — regenerate on the (astronomically unlikely) chance the
+    # id already exists, so a switch NEVER overwrites an existing session file.
+    new_id = str(uuid.uuid4())
+    dest_jsonl = dest_proj / f"{new_id}.jsonl"
+    while dest_jsonl.exists():
+        new_id = str(uuid.uuid4())
+        dest_jsonl = dest_proj / f"{new_id}.jsonl"
+
+    # Copy (rewrites sessionId → new_id) off the event loop — the JSONL can be
+    # hundreds of MB, which would otherwise freeze every tab and the ticker.
+    try:
+        await loop.run_in_executor(
+            None, copy_session_file, src_jsonl, dest_jsonl, new_id)
+    except OSError as exc:
+        await send_to(ws, {"type": "switch_error",
+                           "message": f"Copy failed: {exc}"})
+        return
+
+    # Name the copy (append a custom-title record) under the target account.
+    try:
+        await asyncio.to_thread(
+            write_session_title, new_id, new_name, target_cfg)
+    except Exception:
+        log.warning("switch: failed to set title on copied session",
+                    exc_info=True)
+
+    # Spin up a runtime bound to the target account, resuming the copy.
+    try:
+        new_rt = await _create_runtime(
+            cwd=cwd, resume=new_id, config_dir=target_cfg)
+    except Exception as exc:
+        log.exception("switch: failed to start runtime for copied session")
+        await send_to(ws, {"type": "switch_error",
+                           "message": f"Couldn't start the switched session: {exc}"})
+        return
+
+    # Reflect the just-written title immediately (the background title read in
+    # _create_runtime may not have completed the JSONL scan yet).
+    if new_rt.state is not None and not new_rt.state.session_title:
+        new_rt.state.session_title = new_name
+
+    await send_to(ws, {"type": "switch_done", "rid": new_rt.rid})
+    # Attach THIS socket to the new runtime → history + status flow into the
+    # current window, continuing the conversation under the new account.
+    await _attach_ws(ws, new_rt)
 
 
 async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
@@ -1850,6 +2338,27 @@ async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
 
     if msg_type == "detach":
         await _enter_lobby(ws)
+        return True
+
+    if msg_type == "switch_list":
+        # /switch step 1: send the available accounts (name + email), marking
+        # the one this tab's session currently runs under.
+        cur = _ws_runtime.get(ws) or _runtime_for_ws(ws)
+        cur_cfg = getattr(cur.config, "config_dir", None) if cur and cur.config else None
+        cur_sid = getattr(cur.state, "session_id", None) if cur and cur.state else None
+        cur_title = getattr(cur.state, "session_title", None) if cur and cur.state else None
+        accounts = await asyncio.to_thread(_switch_accounts_payload, cur_cfg)
+        await send_to(ws, {
+            "type": "switch_accounts",
+            "accounts": accounts,
+            "current_session_id": cur_sid,
+            "current_title": cur_title,
+            "has_session": bool(cur_sid),
+        })
+        return True
+
+    if msg_type == "switch_do":
+        await _do_switch(ws, msg)
         return True
 
     if msg_type == "attach":
@@ -1895,9 +2404,23 @@ async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
         cur = _runtime_for_ws(ws)
         default_cwd = cur.config.cwd if cur and cur.config else (
             config.cwd if config else None)
-        cwd = msg.get("cwd") or find_session_cwd(sid) or default_cwd
+        account = (msg.get("account") or "").strip() or None
+        # Verify the session still exists on disk before spinning up a runtime
+        # to resume it.  Without this a stale ?open=<sid> (e.g. a browser-
+        # restored tab pointing at a deleted/moved session) would create an
+        # empty runtime that just sits idle with blank state and no history —
+        # which looks broken with no explanation.  Land in the lobby instead.
+        loop = asyncio.get_running_loop()
+        session_dir = await loop.run_in_executor(
+            None, find_session_dir, sid, account)
+        if session_dir is None:
+            await _enter_lobby(ws, notice=(
+                "That session could no longer be found on disk — it may have "
+                "been deleted or moved. Pick a session below to continue."))
+            return True
+        cwd = msg.get("cwd") or find_session_cwd(sid, account) or default_cwd
         try:
-            rt = await _create_runtime(cwd=cwd, resume=sid)
+            rt = await _create_runtime(cwd=cwd, resume=sid, config_dir=account)
         except Exception as exc:
             log.exception("failed to open session %s", sid)
             await send_to(ws, {"type": "system_msg", "subtype": "error",
@@ -1916,11 +2439,24 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
         return
 
     # Everything below operates on the runtime this tab is attached to.
-    rt = _runtime_for_ws(ws)
+    # Use the *genuine* attachment (``_ws_runtime``) rather than
+    # ``_runtime_for_ws``, whose default-runtime fallback would silently route
+    # a message from an unattached (lobby) socket into the default session's
+    # queue — where the sender, not being in that runtime's client set, never
+    # sees the resulting ``queue_update`` and the prompt appears to vanish.
+    rt = _ws_runtime.get(ws)
     if rt is None:
-        await send_to(ws, {"type": "system_msg", "subtype": "warning",
-                           "data": {"message": "No session attached."}})
-        return
+        # Socket isn't attached to any session (e.g. it reloaded into the
+        # lobby).  A session op (message/command) means the user wants to act
+        # on a session, so attach them to the default runtime first — that
+        # sends the session's initial state and, crucially, registers the
+        # socket as a viewer so it actually receives queue/status updates.
+        rt = _default_runtime
+        if rt is None:
+            await send_to(ws, {"type": "system_msg", "subtype": "warning",
+                               "data": {"message": "No session attached."}})
+            return
+        await _attach_ws(ws, rt)
     # The default runtime's bridge is built off the hot startup path, so a very
     # fast message can arrive before it exists.  Rather than blocking (which
     # hides the prompt from the queue panel), queue user messages immediately
@@ -1934,6 +2470,16 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
                 if kind == "message":
                     state.queued_prompts.append(text)
                     await _broadcast_queue_update(rt)
+                    # Tell the user their prompt isn't running yet — otherwise a
+                    # message queued against a not-yet-connected (or wedged)
+                    # bridge just sits there with no "working" state and no
+                    # error, looking like it vanished.
+                    await send_to(ws, {
+                        "type": "system_msg", "subtype": "warning",
+                        "data": {"message":
+                            "Session is still starting — your prompt is queued "
+                            "and will run once it connects."},
+                    })
                     return
         # For non-message types, wait for the bridge.
         if rt is _default_runtime:
@@ -2255,30 +2801,57 @@ def _try_shutdown_old_server(port: int) -> None:
 def _probe_hub(port: int) -> dict | None:
     """Return a running orchestrator2 hub's ``/api/whoami`` on *port*, or None.
 
-    Only matches a hub for the *same account* (``CLAUDE_CONFIG_DIR``); a
-    different account can't share the single-account hub, so it falls through
-    to starting its own server.
+    Any orchestrator2 hub on the port is eligible — different accounts share
+    the same hub, with each session spawning its own bridge subprocess using
+    the launcher's ``CLAUDE_CONFIG_DIR``.
+
+    Retries the HTTP request a few times on *timeout* (the hub is up but its
+    event loop was momentarily busy).  Without this, a transient stall would
+    make the probe fail, and the launcher would then spin up a whole *second*
+    server on a different port — a slow full SDK startup that also litters the
+    browser with duplicate/stray tabs.
+
+    The retries are gated behind a fast TCP-listening check so a *missing* hub
+    (first launch) stays cheap: the OS accepts a loopback connection to a
+    listening socket in well under a millisecond even when the app's event loop
+    is blocked, so if nothing is listening we bail immediately instead of
+    burning three HTTP timeouts (a closed port can *time out* rather than refuse
+    on some Windows firewall configurations).
     """
     import urllib.request
 
+    # Is anything listening at all?  (Loopback connect is instant for a live
+    # server regardless of how busy its event loop is.)
+    probe_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    probe_sock.settimeout(1.0)
     try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/api/whoami", timeout=1.5
-        ) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-    except Exception:
+        probe_sock.connect(("127.0.0.1", port))
+    except OSError:
         return None
-    if not isinstance(data, dict) or data.get("app") != "orchestrator2":
-        return None
-    want = os.environ.get("CLAUDE_CONFIG_DIR") or ""
-    if (data.get("account") or "") != want:
-        return None
-    return data
+    finally:
+        probe_sock.close()
+
+    last_exc: Exception | None = None
+    for _attempt in range(3):
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/whoami", timeout=2.0
+            ) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+            if not isinstance(data, dict) or data.get("app") != "orchestrator2":
+                return None
+            return data
+        except Exception as exc:
+            last_exc = exc
+    if last_exc is not None:
+        log.info("hub probe on port %d gave up after retries: %s", port, last_exc)
+    return None
 
 
 def _launch_into_hub(
     port: int, *, cwd: str, resume: str | None, no_continue: bool,
     model: str | None = None, effort: str | None = None,
+    config_dir: str | None = None,
 ) -> str | None:
     """Ask a running hub to open a session; return its ``rid`` (or None)."""
     import urllib.request
@@ -2289,6 +2862,7 @@ def _launch_into_hub(
         "no_continue": no_continue,
         "model": model,
         "effort": effort,
+        "config_dir": config_dir,
     }).encode("utf-8")
     try:
         req = urllib.request.Request(
@@ -2307,7 +2881,7 @@ def _launch_into_hub(
     return data.get("rid")
 
 
-def _bind_port(host: str, port: int) -> tuple[_socket.socket, int]:
+def _bind_port(host: str, port: int, wait_secs: float = 0.0) -> tuple[_socket.socket, int]:
     """Try to bind *port*; on failure, let the OS pick a free one.
 
     On Windows, ``SO_REUSEADDR`` silently allows multiple processes to
@@ -2315,19 +2889,31 @@ def _bind_port(host: str, port: int) -> tuple[_socket.socket, int]:
     We use ``SO_EXCLUSIVEADDRUSE`` instead so the bind properly fails
     when the port is already occupied.  On other platforms, the standard
     ``SO_REUSEADDR`` is used to allow reusing TIME_WAIT addresses.
+
+    When *wait_secs* > 0 (a restart child taking over from an instance that
+    is still exiting), retry binding the *requested* port for that many
+    seconds before giving up and letting the OS pick a free one.  This keeps
+    the restarted server on the same port so the browser can reload in place.
     """
-    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-    if sys.platform == "win32":
-        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_EXCLUSIVEADDRUSE, 1)  # type: ignore[attr-defined]
-    else:
-        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind((host, port))
-    except OSError:
-        sock.bind((host, 0))
-    actual = sock.getsockname()[1]
-    sock.set_inheritable(True)
-    return sock, actual
+    import time as _t
+    deadline = _t.monotonic() + max(0.0, wait_secs)
+    while True:
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        if sys.platform == "win32":
+            sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_EXCLUSIVEADDRUSE, 1)  # type: ignore[attr-defined]
+        else:
+            sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+        except OSError:
+            if _t.monotonic() < deadline:
+                sock.close()
+                _t.sleep(0.2)
+                continue
+            sock.bind((host, 0))
+        actual = sock.getsockname()[1]
+        sock.set_inheritable(True)
+        return sock, actual
 
 
 # Lightweight "starting…" page served by the stdlib pre-server (below) while
@@ -2356,7 +2942,7 @@ _SPLASH_HTML = ("""<!doctype html>
     if(n===12){document.getElementById('b').textContent='still starting - hang tight';}
     try{
       const r=await fetch('/api/ready',{cache:'no-store'});
-      if(r.ok){location.replace('/');return;}
+      if(r.ok){location.replace('/'+location.search);return;}
     }catch(e){}
     setTimeout(poll,400);
   }
@@ -2399,7 +2985,13 @@ def _serve_splash_until(sock: _socket.socket, stop_event: "_threading.Event",
             first = data.split(b"\r\n", 1)[0].decode("latin-1", "replace")
             parts = first.split(" ")
             path = parts[1] if len(parts) >= 2 else "/"
-            if path.startswith("/api/ready"):
+            if path.startswith("/api/"):
+                # The real HTTP API isn't up yet.  Answer every /api/* path
+                # (not just /api/ready) with a clean 503 JSON so a *concurrent*
+                # launcher probing /api/whoami or POSTing /api/session/launch
+                # during this splash window sees "not ready" and retries,
+                # instead of parsing the splash HTML as JSON, concluding "no
+                # hub here", and spinning up a second independent server.
                 body = b'{"ready": false}'
                 resp = (b"HTTP/1.1 503 Service Unavailable\r\n"
                         b"Content-Type: application/json\r\n"
@@ -2660,13 +3252,21 @@ def main() -> None:
         # in-browser picker still appears.
 
     # --- Central-hub reuse -------------------------------------------------
-    # If a matching orchestrator2 (same account) is already serving on our
-    # port, join it — open the launched session there and point a browser at
-    # it — instead of starting a second, independent server.  Skipped by
-    # --standalone and by the in-browser resume picker (which needs its own
-    # picker-mode server).  Runs before --detach so a hub short-circuits the
-    # spawn entirely.
+    # If an orchestrator2 hub is already serving on our port, join it — open
+    # the launched session there and point a browser at it — instead of
+    # starting a second, independent server.  Different accounts are fine:
+    # each session spawns its own bridge subprocess with the launcher's
+    # CLAUDE_CONFIG_DIR.  Skipped by --standalone and the in-browser resume
+    # picker.  Runs before --detach so a hub short-circuits the spawn.
+    #
+    # Also skipped by --wait-port: that flag marks a *restart child* whose whole
+    # job is to take over the same port from the outgoing server, which is still
+    # briefly alive (it waits for us to come up before releasing the port).  If
+    # we probed and joined it as a hub session here, we'd exit(0) instead of
+    # binding the port — the parent's crash-check then sees the child gone and
+    # aborts the restart, leaving the stale process in place.
     if (not config.standalone
+            and not config.wait_port
             and config.resume != _PICKER_SENTINEL
             and _probe_hub(config.port) is not None):
         rid = _launch_into_hub(
@@ -2676,6 +3276,7 @@ def main() -> None:
             no_continue=config.no_continue,
             model=config.model,
             effort=config.effort,
+            config_dir=config.config_dir or os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude"),
         )
         if rid:
             url = f"http://localhost:{config.port}/?rid={rid}"
@@ -2828,7 +3429,9 @@ def main() -> None:
         # environment makes webbrowser.open() unreliable on Windows.
         print(f"orchestrator2 launched on {url}")
         if config.open_browser:
-            webbrowser.open(f"{url}?t={int(time.time())}")
+            # Attach straight to the just-launched primary session (bare URLs
+            # now land in the lobby).  ``default`` resolves to the hub primary.
+            webbrowser.open(f"{url}/?rid=default&t={int(time.time())}")
 
         sys.exit(0)
 
@@ -2841,9 +3444,55 @@ def main() -> None:
 
     # Bind the socket ourselves so we know the actual port before
     # uvicorn starts (needed for --open and the startup message).
-    sock, actual_port = _bind_port("0.0.0.0", config.port)
+    # A restart child (--wait-port) retries the same port while the old
+    # instance finishes exiting, so the browser can reload in place.
+    sock, actual_port = _bind_port(
+        "0.0.0.0", config.port, wait_secs=20.0 if config.wait_port else 0.0
+    )
 
     if actual_port != config.port:
+        # The requested port is occupied — definitive proof another server
+        # already owns it.  For a normal launch that means our hub is (or is
+        # coming) up there and we should JOIN it, not start a second, fully
+        # independent server on a random port (which splits sessions across
+        # two hubs and burns a whole extra SDK startup).  The earlier reuse
+        # probe (before binding) can miss a hub that was still in its startup
+        # splash or had a momentarily-blocked event loop, so retry the join
+        # here now that we KNOW something holds the port — riding out the
+        # splash/busy window before falling back.  --standalone and the
+        # restart child (--wait-port) legitimately want their own port.
+        if not config.standalone and not config.wait_port \
+                and config.resume != _PICKER_SENTINEL:
+            sock.close()  # release the useless fallback port
+            join_cfg_dir = (config.config_dir
+                            or os.environ.get("CLAUDE_CONFIG_DIR")
+                            or str(Path.home() / ".claude"))
+            import time as _time
+            deadline = _time.monotonic() + 30.0
+            rid = None
+            while _time.monotonic() < deadline:
+                if _probe_hub(config.port) is not None:
+                    rid = _launch_into_hub(
+                        config.port, cwd=config.cwd, resume=config.resume,
+                        no_continue=config.no_continue, model=config.model,
+                        effort=config.effort, config_dir=join_cfg_dir,
+                    )
+                    if rid:
+                        break
+                _time.sleep(0.5)
+            if rid:
+                url = f"http://localhost:{config.port}/?rid={rid}"
+                print(f"Joined running orchestrator2 hub on port "
+                      f"{config.port} (session {rid}).")
+                if config.open_browser:
+                    webbrowser.open(f"{url}&t={int(time.time())}")
+                sys.exit(0)
+            # Couldn't join after retrying — fall back to a standalone server
+            # on a fresh port so the user at least gets a working instance.
+            print(f"Port {config.port} in use but couldn't join the hub — "
+                  f"starting a separate server.")
+            sock, actual_port = _bind_port("0.0.0.0", 0)
+
         print(f"Port {config.port} in use — using {actual_port} instead.")
         config = dataclasses.replace(config, port=actual_port)
 
@@ -2874,8 +3523,9 @@ def main() -> None:
 
     if config.open_browser:
         # Cache-buster forces a fresh navigation instead of re-focusing a stale
-        # tab with the same URL.
-        webbrowser.open(f"{url}?t={int(time.time())}")
+        # tab with the same URL.  Attach straight to the primary session
+        # (``default`` sentinel) since bare URLs now land in the lobby.
+        webbrowser.open(f"{url}/?rid=default&t={int(time.time())}")
 
     # Build the FastAPI app now (imports fastapi lazily) — only the serving
     # process pays this cost; the --detach parent returned long ago.  This is

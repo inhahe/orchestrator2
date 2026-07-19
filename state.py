@@ -32,9 +32,21 @@ from config import (
 # ---------------------------------------------------------------------------
 
 def fmt_duration(seconds: float) -> str:
-    """Compact duration: ``4.2s``, ``1m 23s``, ``1h 4m 5s``, ``18h 3m``."""
+    """Colon-separated elapsed clock: ``0:0:04``, ``0:2:28``, ``1:4:05``."""
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m}:{s:02d}"
+
+
+def fmt_countdown(seconds: float) -> str:
+    """Human-readable countdown: ``4s``, ``1m 23s``, ``1h 4m 5s``, ``18h 3m``.
+
+    Used for time-until-an-event (e.g. rate-limit reset), which reads more
+    naturally as ``2h 30m`` than as a colon clock.
+    """
     if seconds < 60:
-        return f"{seconds:.1f}s"
+        return f"{int(seconds)}s"
     total = int(seconds)
     h, rem = divmod(total, 3600)
     m, s = divmod(rem, 60)
@@ -634,7 +646,7 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
                 }
                 if is_hit and state.rate_limit_resets_at:
                     delta = max(0, state.rate_limit_resets_at - now_ts)
-                    entry["reset_in"] = fmt_duration(float(delta))
+                    entry["reset_in"] = fmt_countdown(float(delta))
                 rate_limits[label] = entry
     else:
         plan_field = f"${state.total_cost_usd:.4f}"
