@@ -327,17 +327,51 @@ def _parse_bell_spec(spec: str) -> str | dict[str, bool]:
 
 
 def parse_bell_events(spec: str) -> set[str]:
-    """Full-replacement parse (for --bell-on startup flag).
+    """Parse the --bell / --bell-on startup spec into the enabled-event set.
 
-    Returns the final set of enabled events.
+    Mirrors the ``/bell`` slash-command semantics so the CLI flag behaves the
+    same way as the runtime command:
+
+    * ``all`` / ``*``            -> every known event
+    * ``none`` / ``off``         -> no events (bell disabled)
+    * bare names (``turn-done bg-done``) -> REPLACE: only those events
+    * ``+``/``-`` prefixed tokens -> MODIFY the default set (``+`` adds,
+      ``-`` removes).  A bare name mixed in with prefixed tokens is treated
+      as an add.  This is what ``--bell +turn-done`` relies on.
+
+    Unknown event names are silently ignored.
     """
-    result = _parse_bell_spec(spec)
-    if result == "all":
+    p = (spec or "").strip().lower()
+    if not p:
+        return {e for e in DEFAULT_BELL_EVENTS.split(",") if e in BELL_EVENT_NAMES}
+    if p in ("all", "*"):
         return set(BELL_EVENT_NAMES)
-    if result == "none":
+    if p in ("none", "off", "disable"):
         return set()
-    assert isinstance(result, dict)
-    return {k for k, v in result.items() if v}
+
+    tokens = [t for t in p.replace(",", " ").split() if t]
+    has_mod_prefix = any(t.startswith(("+", "-")) for t in tokens)
+
+    if has_mod_prefix:
+        # MODIFY mode: start from the defaults, then apply add/remove tokens.
+        result = {e for e in DEFAULT_BELL_EVENTS.split(",") if e in BELL_EVENT_NAMES}
+        for tok in tokens:
+            if tok.startswith("-"):
+                name, op = tok[1:], "remove"
+            elif tok.startswith("+"):
+                name, op = tok[1:], "add"
+            else:
+                name, op = tok, "add"
+            if name not in BELL_EVENT_NAMES:
+                continue
+            if op == "add":
+                result.add(name)
+            else:
+                result.discard(name)
+        return result
+
+    # REPLACE mode: only the explicitly-listed valid events stay on.
+    return {tok for tok in tokens if tok in BELL_EVENT_NAMES}
 
 
 # ---------------------------------------------------------------------------
@@ -667,6 +701,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         help=(
             "Comma- or space-separated bell events to ring on. "
             f"Valid: {', '.join(sorted(BELL_EVENT_NAMES))}. "
+            "Bare names REPLACE the set; '+event'/'-event' add to / remove "
+            "from the defaults (e.g. '+turn-done'). "
             "Shortcuts: 'all' enables every event, 'none' disables the bell. "
             "(--bell-on is accepted as an alias for backward compatibility.)"
         ),

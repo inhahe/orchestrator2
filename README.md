@@ -236,14 +236,20 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--bell EVENTS` | `waiting,done,stalled,api-stall,requires-action,rate-hit,rate-reset` | Comma- or space-separated bell events to ring on. Shortcuts: `all`, `none`. (`--bell-on` is accepted as an alias.) |
+| `--bell EVENTS` | `turn-done,bg-done,requires-action,rate-hit` | Comma- or space-separated bell events to ring on. Shortcuts: `all`, `none`. (`--bell-on` is accepted as an alias.) |
 
-Valid events: `turn-done`, `waiting`, `done`, `stalled`, `api-stall`, `api-ok`, `interrupt`, `bg-done`, `requires-action`, `rate-hit`, `rate-reset`
+Valid events: `turn-done`, `interrupt`, `bg-done`, `requires-action`, `rate-hit`
+
+The flag accepts the same three forms as the `/bell` command:
+
+- **Replace** — bare event names ring on *only* those events: `--bell "turn-done bg-done"`
+- **Modify** — `+`/`-` prefixed tokens start from the defaults, then add or remove: `--bell +interrupt` (defaults **plus** `interrupt`), `--bell -bg-done` (defaults **minus** `bg-done`)
+- **Shortcuts** — `--bell all` (every event) or `--bell none` (disable the bell)
 
 At runtime, use the `/bell` slash command to view or change the bell events without restarting:
 
 - `/bell` — show current settings and usage
-- `/bell <e1> <e2>...` — REPLACE: ring on **only** these events (e.g. `/bell done` silences everything except `done`)
+- `/bell <e1> <e2>...` — REPLACE: ring on **only** these events (e.g. `/bell turn-done` silences everything except `turn-done`)
 - `/bell +<event>` — add an event to the current set
 - `/bell -<event>` — remove an event from the current set
 - `/bell all` — ring on every event

@@ -1557,35 +1557,86 @@ class SDKBridge:
         interrupted = False
         current_streaming_text = ""
         normal_completion = False
+        interrupt_announced = False
+        interrupt_finished = False
+        # After a user interrupt we keep draining the SDK's wind-down stream
+        # *inside* run_turn until the CLI's terminating ResultMessage lands,
+        # so none of it leaks to the between-turns async path as a ghost turn
+        # (the "I interrupted but it just kept working" symptom).  This
+        # timeout is the safety net for the case the old INTERRUPT_SENTINEL
+        # early-break guarded: an interrupt while the SDK isn't streaming,
+        # where no further message — and no ResultMessage — ever arrives.
+        _INTERRUPT_DRAIN_TIMEOUT = 5.0
+
+        async def _announce_interrupt() -> None:
+            """Flag the turn interrupted; give the user instant feedback once.
+
+            The visible ``turn_end`` interrupted marker is deferred to
+            ``_finish_interrupt()`` so it lands *after* the SDK's wind-down
+            output during the drain, not before it.
+            """
+            nonlocal interrupted, normal_completion, interrupt_announced
+            interrupted = True
+            normal_completion = True  # user-initiated, not a silent drop
+            if interrupt_announced:
+                return
+            interrupt_announced = True
+            await self.broadcast({
+                "type": "system_msg",
+                "subtype": "info",
+                "data": {"message": "Interrupting…"},
+            })
+
+        async def _finish_interrupt() -> None:
+            """Emit the interrupted turn_end marker at the true stop point."""
+            nonlocal interrupt_finished
+            if interrupt_finished:
+                return
+            interrupt_finished = True
+            try:
+                duration = time.monotonic() - (
+                    state.turn_started_at or time.monotonic()
+                )
+            except Exception:
+                duration = 0.0
+            await self.broadcast({
+                "type": "turn_end",
+                "subtype": "interrupted",
+                "duration": fmt_duration(duration),
+                "turns": state.turns,
+            })
 
         try:
             while True:
-                msg = await self.turn_msg_queue.get()
+                # In drain mode (post-interrupt) bound the wait so a CLI
+                # that went quiet without a ResultMessage can't hang us.
+                if interrupted:
+                    try:
+                        msg = await asyncio.wait_for(
+                            self.turn_msg_queue.get(),
+                            timeout=_INTERRUPT_DRAIN_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        log.info(
+                            "run_turn: interrupt drain quiet for %.0fs — stopping",
+                            _INTERRUPT_DRAIN_TIMEOUT,
+                        )
+                        await _finish_interrupt()
+                        break
+                else:
+                    msg = await self.turn_msg_queue.get()
 
                 if msg is DISPATCHER_DEAD:
                     raise RuntimeError("SDK dispatcher died mid-turn")
 
-                # Interrupt poke — break out, emit a synthetic turn_end
-                # so the UI shows the turn marker, and let the finally
-                # block clear ``state.busy``.  The SDK may still send a
-                # ResultMessage on its own afterwards, but we don't
-                # depend on it.
+                # Interrupt poke — begin/continue draining rather than
+                # breaking immediately.  Keeping run_turn as the message
+                # consumer until the CLI's ResultMessage means the SDK's
+                # remaining output is absorbed here instead of resurfacing
+                # as a ghost turn between turns.
                 if msg is INTERRUPT_SENTINEL:
-                    interrupted = True
-                    normal_completion = True  # user-initiated
-                    try:
-                        duration = time.monotonic() - (
-                            state.turn_started_at or time.monotonic()
-                        )
-                    except Exception:
-                        duration = 0.0
-                    await self.broadcast({
-                        "type": "turn_end",
-                        "subtype": "interrupted",
-                        "duration": fmt_duration(duration),
-                        "turns": state.turns,
-                    })
-                    break
+                    await _announce_interrupt()
+                    continue
 
                 # ---- SystemMessage ----
                 if isinstance(msg, SystemMessage):
@@ -1719,6 +1770,13 @@ class SDKBridge:
 
                     if msg.session_id:
                         state.session_id = msg.session_id
+
+                    # Terminating result after a user interrupt: emit the
+                    # deferred interrupted turn_end marker now (after the
+                    # wind-down output), and don't book the aborted turn.
+                    if interrupted:
+                        await _finish_interrupt()
+                        break
 
                     subtype = getattr(msg, "subtype", None) or "unknown"
                     state.last_result_subtype = subtype
@@ -1867,16 +1925,20 @@ class SDKBridge:
                 else:
                     self._handle_unknown_message(msg)
 
-                # Check for interrupt.
-                if self.interrupt_event.is_set():
-                    interrupted = True
+                # Check for a freshly-signalled interrupt.  Don't break:
+                # announce the interruption, then loop back into drain mode
+                # so the CLI's wind-down stream (and its terminating
+                # ResultMessage) is consumed here rather than leaking to the
+                # ghost-turn async path.  interrupt() already called
+                # client.interrupt(); re-assert it as a belt-and-braces stop
+                # in case the CLI hadn't acted on the first request yet.
+                if self.interrupt_event.is_set() and not interrupted:
                     if self.client:
                         try:
                             await self.client.interrupt()
                         except Exception:
                             pass
-                    normal_completion = True  # user-initiated, not a silent drop
-                    break
+                    await _announce_interrupt()
 
         finally:
             # Cleanup ALWAYS runs first — even on CancelledError or any
@@ -1914,6 +1976,16 @@ class SDKBridge:
                 )
             else:
                 log.warning("run_turn exit: silent (no exception, no ResultMessage)")
+
+            # If a user interrupt was announced but the loop exited before
+            # its deferred turn_end marker was emitted (e.g. an exception
+            # during the drain), emit it now so the UI still shows the
+            # turn ended as interrupted.
+            if interrupted and not interrupt_finished:
+                try:
+                    await _finish_interrupt()
+                except BaseException as bx:
+                    log.warning("deferred interrupt turn_end failed: %r", bx)
 
             # Emit a synthetic turn_end so the user sees that the turn
             # ended even when there was no ResultMessage.  Wrapped in
