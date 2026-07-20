@@ -277,6 +277,8 @@ At runtime, use the `/bell` slash command to view or change the bell events with
 | `--port N` | 8420 | HTTP server port (auto-selects a free port if in use) |
 | `--open` | off | Open browser automatically on startup |
 | `--detach` | off | Launch the server in the background and exit the terminal (implies `--open`) |
+| `--auto-shutdown` | off | Shut the server down when all browser tabs close (auto-set by `--open`/`--detach`) |
+| `--no-auto-shutdown` | off | Never auto-shut-down when tabs close, even under `--open`/`--detach`; the server runs until stopped explicitly |
 | `--standalone` | off | Start a separate server instead of joining a running hub on the same port/account |
 | `--session-idle-timeout SECS` | 300 | Seconds a session with zero viewers lingers before teardown (`0` disables) |
 | `--config-dir PATH` | -- | Override `CLAUDE_CONFIG_DIR` (session/credential storage). Use to run under a different Claude account |

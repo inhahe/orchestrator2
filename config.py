@@ -784,6 +784,15 @@ def parse_args(argv: list[str] | None = None) -> Config:
         help="Shut down when all browser tabs close (auto-set by --detach).",
     )
     ap.add_argument(
+        "--no-auto-shutdown",
+        action="store_true",
+        help=(
+            "Never auto-shut-down when all tabs close, even under --open / "
+            "--detach (which normally imply --auto-shutdown). The server keeps "
+            "running until stopped explicitly."
+        ),
+    )
+    ap.add_argument(
         "--session-idle-timeout",
         type=int,
         default=300,
@@ -885,7 +894,10 @@ def parse_args(argv: list[str] | None = None) -> Config:
         port=args.port,
         open_browser=args.open or args.detach,
         detach=args.detach,
-        auto_shutdown=args.auto_shutdown or args.open or args.detach,
+        auto_shutdown=(
+            not args.no_auto_shutdown
+            and (args.auto_shutdown or args.open or args.detach)
+        ),
         session_idle_timeout=args.session_idle_timeout,
         standalone=args.standalone,
         external_password=args.external_password,

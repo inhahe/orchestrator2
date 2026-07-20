@@ -148,6 +148,10 @@ const App = (() => {
       console.log('WebSocket connected');
       reconnectDelay = 1000;
       reconnectAttempt = 0;
+      // The server drops this ws from its lobby-watcher set on disconnect, so
+      // forget any prior subscription — the next render()/show() must re-send
+      // lobby_watch to resume live updates on this fresh socket.
+      if (window.Lobby && Lobby.onReconnect) Lobby.onReconnect();
       // Drive an open/new request once (only on the first connect, not on
       // reconnects — by then the tab has a ?rid= URL and re-attaches normally).
       if (!rid && !_didLaunchRequest) {
