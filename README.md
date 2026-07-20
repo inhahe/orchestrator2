@@ -217,7 +217,7 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--append-system-prompt TEXT` | -- | Extra instructions appended to the system prompt |
-| `--mcp-config PATH_OR_JSON` | -- | MCP servers config — a JSON file path or inline JSON string. Lets the orchestrator act as an MCP client |
+| `--mcp-config PATH_OR_JSON` | -- | MCP servers config — a JSON file path or inline JSON string. Lets the orchestrator act as an MCP client. Use the `/mcp` command at runtime to inspect and manage the configured servers |
 
 ### Display
 
@@ -337,6 +337,10 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/bell <events>` | Ring on ONLY these events (replaces current set) |
 | `/bell all` / `/bell none` | Enable every event / disable the bell |
 | `/bell +<event>` / `/bell -<event>` | Add or remove a single event from the current set |
+| `/mcp` | List configured MCP servers with connection status and tool counts |
+| `/mcp tools [server]` | List the tools each MCP server provides (optionally one server) |
+| `/mcp reconnect <server>` | Reconnect a failed / disconnected server (also re-triggers auth) |
+| `/mcp enable <server>` / `/mcp disable <server>` | Enable (reconnect) or disable (disconnect) a server |
 | `/queue [N\|send\|drop N\|clear]` | Manage queued prompts |
 
 ## Theme System

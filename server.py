@@ -90,6 +90,7 @@ from session import (
 )
 from commands import (
     classify,
+    format_mcp_status,
     get_command_completions,
     try_immediate_command,
 )
@@ -2559,6 +2560,13 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
                                    "data": {"message": f"Resume failed: {err}"}})
             return
 
+        # /mcp — list/manage MCP servers.  Needs the live SDK client
+        # (async control requests), so it can't be a synchronous immediate
+        # command; handle it here like the other bridge-backed commands.
+        if kind == "mcp":
+            await _handle_mcp(ws, rt, payload)
+            return
+
         # Try immediate command.
         result = try_immediate_command(kind, payload, state, config)
         if result is not None:
@@ -2687,6 +2695,60 @@ def _build_graphify_cli_argv(payload: str) -> tuple[list[str] | None, str | None
         return base + ["diagnose", *toks], None
 
     return None, f"unknown graphify subcommand: {sub!r}"
+
+
+async def _handle_mcp(ws: WebSocket, rt: "SessionRuntime", payload: str) -> None:
+    """Handle the ``/mcp`` command: list or manage MCP servers.
+
+    ``/mcp``                     — list servers with status + tool counts
+    ``/mcp tools [server]``      — list tools (all servers or one)
+    ``/mcp reconnect <server>``  — reconnect a failed / disconnected server
+    ``/mcp enable  <server>``    — enable (reconnect) a server
+    ``/mcp disable <server>``    — disable (disconnect) a server
+    """
+    bridge = rt.bridge
+    if bridge is None or getattr(bridge, "client", None) is None:
+        await send_to(ws, {"type": "system_msg", "subtype": "error",
+                           "data": {"message": "MCP: SDK not connected yet."}})
+        return
+
+    parts = payload.split()
+    sub = parts[0].lower() if parts else ""
+
+    if sub in ("reconnect", "enable", "disable"):
+        name = " ".join(parts[1:]).strip()
+        if not name:
+            await send_to(ws, {"type": "system_msg", "subtype": "error",
+                               "data": {"message": f"usage: /mcp {sub} <server>"}})
+            return
+        try:
+            if sub == "reconnect":
+                await bridge.reconnect_mcp_server(name)
+                verb = "reconnected"
+            else:
+                await bridge.toggle_mcp_server(name, enabled=(sub == "enable"))
+                verb = "enabled" if sub == "enable" else "disabled"
+            await send_to(ws, {"type": "system_msg", "subtype": "info",
+                               "data": {"message": f"MCP server '{name}' {verb}."}})
+        except Exception as exc:  # noqa: BLE001 — surface any control failure
+            await send_to(ws, {"type": "system_msg", "subtype": "error",
+                               "data": {"message": f"MCP {sub} failed for '{name}': {exc}"}})
+        return
+
+    # Default: list servers (optionally the full tool list via `/mcp tools`).
+    tools_mode = sub == "tools"
+    filter_name = " ".join(parts[1:]).strip() if tools_mode else ""
+    try:
+        servers = await bridge.get_mcp_status()
+    except Exception as exc:  # noqa: BLE001 — surface connection/API failures
+        await send_to(ws, {"type": "system_msg", "subtype": "error",
+                           "data": {"message": f"MCP status unavailable: {exc}"}})
+        return
+
+    content = format_mcp_status(
+        servers, tools_mode=tools_mode, filter_name=filter_name,
+    )
+    await send_to(ws, {"type": "modal", "title": "MCP Servers", "content": content})
 
 
 async def _run_graphify_cli(ws: WebSocket, payload: str) -> None:

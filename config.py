@@ -84,7 +84,7 @@ SLASH_COMMANDS = [
     "/interrupt", "/i", "/compact", "/effort", "/thinking", "/model",
     "/login", "/logout",
     "/connect", "/reconnect", "/resume", "/rename", "/switch", "/export", "/models",
-    "/btw", "/graphify", "/autocompact", "/max-context", "/bell",
+    "/btw", "/graphify", "/autocompact", "/max-context", "/bell", "/mcp",
     "/collapse", "/collapse-threshold",
     "/queue", "/quit", "/exit",
     "/quit!", "/exit!",

@@ -2590,6 +2590,38 @@ class SDKBridge:
             except Exception:
                 pass
 
+    async def get_mcp_status(self) -> list[dict[str, Any]]:
+        """Return the live status of configured MCP servers.
+
+        Queries the CLI via the SDK's ``get_mcp_status`` control request and
+        returns the ``mcpServers`` list (each a dict with name/status/tools/…).
+        Raises if the SDK isn't connected or the client lacks the method.
+        """
+        if self.client is None:
+            raise RuntimeError("SDK not connected")
+        if not hasattr(self.client, "get_mcp_status"):
+            raise RuntimeError("this SDK version has no MCP status API")
+        resp = await self.client.get_mcp_status()
+        if isinstance(resp, dict):
+            return list(resp.get("mcpServers", []) or [])
+        return []
+
+    async def reconnect_mcp_server(self, name: str) -> None:
+        """Reconnect a failed / disconnected MCP server."""
+        if self.client is None:
+            raise RuntimeError("SDK not connected")
+        if not hasattr(self.client, "reconnect_mcp_server"):
+            raise RuntimeError("this SDK version has no MCP reconnect API")
+        await self.client.reconnect_mcp_server(name)
+
+    async def toggle_mcp_server(self, name: str, enabled: bool) -> None:
+        """Enable or disable an MCP server (disconnects / reconnects it)."""
+        if self.client is None:
+            raise RuntimeError("SDK not connected")
+        if not hasattr(self.client, "toggle_mcp_server"):
+            raise RuntimeError("this SDK version has no MCP toggle API")
+        await self.client.toggle_mcp_server(name, enabled)
+
     async def start(self) -> None:
         """Launch the worker loop as a background task."""
         # Mark "connecting" immediately so the browser's very first status

@@ -153,6 +153,8 @@ def classify(line: str) -> tuple[str, str]:
         return "max-context", arg
     if cmd == "bell":
         return "bell", arg
+    if cmd == "mcp":
+        return "mcp", arg
     if cmd == "queue":
         return "queue", arg
     if cmd == "graphify":
@@ -266,6 +268,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         ("/autocompact [on|off|N]",      "auto-compact threshold"),
         ("/max-context [off|N]",         "cap context tokens"),
         ("/bell ...",                    "ring on these events (see /bell for details)"),
+        ("/mcp [reconnect|enable|disable <server>]", "list/manage MCP servers"),
         ("/queue [N|send|drop N|clear]", "manage queued prompts"),
         ("/quit, /exit",                 "graceful exit"),
         ("/quit!, /exit!",                "force exit"),
@@ -698,6 +701,100 @@ def _cmd_bell(payload: str, state: State, _config: Config) -> CommandResult:
     if invalid:
         msg_lines.append(f"  ignored unknown: {', '.join(invalid)}")
     return CommandResult(messages=[_msg("\n".join(msg_lines))])
+
+
+def format_mcp_status(
+    servers: list[dict[str, Any]],
+    *,
+    tools_mode: bool = False,
+    filter_name: str = "",
+) -> str:
+    """Render ``client.get_mcp_status()`` output as plain text for the modal.
+
+    Mirrors Claude Code's ``/mcp`` view: each configured MCP server with its
+    connection status, handshake info, transport, tool count (or full tool
+    list in ``tools_mode``), and any error / auth hint.
+    """
+    if not servers:
+        return (
+            "No MCP servers configured.\n\n"
+            "Start the orchestrator with --mcp-config <file-or-json> to "
+            "connect MCP servers."
+        )
+
+    if filter_name:
+        wanted = filter_name.lower()
+        servers = [
+            s for s in servers if str(s.get("name", "")).lower() == wanted
+        ]
+        if not servers:
+            return f"No MCP server named '{filter_name}'."
+
+    _status_label = {
+        "connected": "connected",
+        "pending": "pending…",
+        "failed": "failed",
+        "needs-auth": "needs auth",
+        "disabled": "disabled",
+    }
+
+    n = len(servers)
+    lines = [f"{n} MCP server{'s' if n != 1 else ''}", ""]
+
+    for s in servers:
+        name = str(s.get("name", "?"))
+        status = str(s.get("status", "?"))
+        label = _status_label.get(status, status)
+        scope = s.get("scope")
+        scope_str = f"  [{scope}]" if scope else ""
+        lines.append(f"{name} — {label}{scope_str}")
+
+        info = s.get("serverInfo") or {}
+        if info.get("name"):
+            ver = info.get("version")
+            lines.append(f"    server: {info['name']}" + (f" v{ver}" if ver else ""))
+
+        cfg = s.get("config") or {}
+        ctype = cfg.get("type")
+        if ctype:
+            loc = cfg.get("url") or cfg.get("command") or ""
+            lines.append(f"    transport: {ctype}" + (f" — {loc}" if loc else ""))
+
+        if status == "failed" and s.get("error"):
+            lines.append(f"    error: {s['error']}")
+        if status == "needs-auth":
+            lines.append(f"    run /mcp reconnect {name} to authenticate")
+
+        tools = s.get("tools") or []
+        if tools:
+            def _tname(t: Any) -> str:
+                return t.get("name", "?") if isinstance(t, dict) else str(t)
+
+            count = f"{len(tools)} tool{'s' if len(tools) != 1 else ''}"
+            if tools_mode:
+                lines.append(f"    {count}:")
+                for t in tools:
+                    desc = t.get("description", "") if isinstance(t, dict) else ""
+                    first = desc.splitlines()[0] if desc else ""
+                    lines.append(
+                        f"      - {_tname(t)}" + (f"  {first}" if first else "")
+                    )
+            else:
+                names = ", ".join(_tname(t) for t in tools[:8])
+                more = f", +{len(tools) - 8} more" if len(tools) > 8 else ""
+                lines.append(f"    {count}: {names}{more}")
+        elif status == "connected":
+            lines.append("    (no tools)")
+
+        lines.append("")
+
+    if not tools_mode:
+        lines.append(
+            "Manage: /mcp reconnect <server> · /mcp enable <server> · "
+            "/mcp disable <server>"
+        )
+        lines.append("Tools:  /mcp tools [server]")
+    return "\n".join(lines).rstrip()
 
 
 def _cmd_queue(payload: str, state: State, _config: Config) -> CommandResult:
