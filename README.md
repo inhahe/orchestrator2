@@ -181,6 +181,7 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 | `--initial-prompt`, `-p` | -- | First message to send on startup |
 | `--no-continue` | off | Start a fresh session instead of resuming the most recent one |
 | `--no-replay` | off | When resuming, don't replay prior messages into backscroll |
+| `--disable-prompt-cache` | off | Turn off Claude prompt caching in the CLI (sets `DISABLE_PROMPT_CACHING`). Workaround for the bundled CLI's `ttl='1h' cache_control must not come after ttl='5m'` API 400 on long resumed sessions; costs cache savings, so leave off unless you hit that error |
 | `--resume [SESSION_ID]` | -- | Resume a specific session by ID, or omit the ID to open a full-screen terminal picker (grouped by project) before the server starts |
 | `--copy` | off | Open a full-screen terminal wizard to copy a session between Claude accounts: pick source account + session, destination account, and a name. If copied into the current account it asks whether to open it now. Whenever nothing gets opened (cancelled, declined, or a cross-account copy) it then asks what to open — the current directory's most-recent session (the default), pick another, or a fresh empty session |
 | `--cwd PATH` | `.` | Working directory Claude operates in |
@@ -299,7 +300,9 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/rename [name]` | Set a custom session title |
 | `/switch` | Copy this session into another Claude account and continue it in the same window (opens an account picker, then asks for a new session name) |
 | `/export [path]` | Save conversation as markdown |
-| `/connect` | Reconnect to the SDK |
+| `/login [force]` | Show sign-in status, or launch the Claude login flow. Automatically re-authenticates when the last turn failed with a 401; `/login force` re-authenticates even when it thinks you're already signed in (use this if you hit auth errors but it insists you're logged in). After you finish signing in the browser, it confirms the signed-in account by email and updates the status bar's **account** field, then prompts you to `/connect`. |
+| `/logout` | Sign the active account out |
+| `/connect` | Reconnect. If the browser↔server WebSocket has dropped (e.g. server restart), revives it client-side even after auto-reconnect has given up; if the socket is alive, reconnects the SDK bridge. Prompts typed while disconnected are queued and sent once reconnected. |
 | `/resume [id\|title]` | Resume a specific session, or open the session picker |
 | `/quit`, `/exit`, `/q` | Graceful exit |
 | `/quit!`, `/exit!`, `/q!` | Force exit |

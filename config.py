@@ -389,6 +389,14 @@ class Config:
     copy: bool = False                 # --copy: TUI to copy a session from another account, then resume it
     no_replay: bool = False
     cwd: str = "."
+    # Workaround for a bundled-CLI prompt-cache bug: when the 1h-vs-5m
+    # cache_control TTL flips mid-session (e.g. rate-limit overage toggles
+    # eligibility) the request is rejected with "API Error: 400 ... a ttl='1h'
+    # cache_control block must not come after a ttl='5m' cache_control block".
+    # Setting DISABLE_PROMPT_CACHING in the CLI env stops it emitting any
+    # cache_control blocks, sidestepping the ordering error (at the cost of
+    # prompt-cache savings).  Opt-in.
+    disable_prompt_cache: bool = False
 
     # Model & effort
     model: str | None = None
@@ -496,6 +504,16 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--no-continue",
         action="store_true",
         help="Start a fresh session instead of resuming the most recent one in cwd.",
+    )
+    ap.add_argument(
+        "--disable-prompt-cache",
+        action="store_true",
+        help=(
+            "Disable Claude prompt caching in the CLI (sets DISABLE_PROMPT_CACHING). "
+            "Workaround for the bundled CLI's 'ttl=1h cache_control must not come "
+            "after ttl=5m' API 400 that can hit long resumed sessions. Costs cache "
+            "savings; leave off unless you hit that error."
+        ),
     )
     ap.add_argument(
         "--no-replay",
@@ -861,6 +879,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         resume=args.resume,
         copy=args.copy,
         no_replay=args.no_replay,
+        disable_prompt_cache=args.disable_prompt_cache,
         cwd=str(Path(args.cwd).resolve()),
         model=args.model,
         effort=args.effort,

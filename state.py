@@ -230,13 +230,17 @@ def detect_subscription_plan() -> str | None:
     return plan
 
 
-def config_dir_path() -> Path:
-    """Resolve the active Claude config dir (CLAUDE_CONFIG_DIR or ~/.claude)."""
-    base = os.environ.get("CLAUDE_CONFIG_DIR")
+def config_dir_path(config_dir: str | None = None) -> Path:
+    """Resolve a Claude config dir.
+
+    An explicit ``config_dir`` (a cross-account runtime's dir) wins; otherwise
+    fall back to the process env (``CLAUDE_CONFIG_DIR``) or ``~/.claude``.
+    """
+    base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
     return Path(base) if base else Path.home() / ".claude"
 
 
-def detect_account_info() -> dict[str, Any]:
+def detect_account_info(config_dir: str | None = None) -> dict[str, Any]:
     """Read the signed-in account details from ``<config-dir>/.claude.json``.
 
     Returns a dict with whatever could be gathered (all keys optional):
@@ -244,8 +248,11 @@ def detect_account_info() -> dict[str, Any]:
     ``claude_max``), ``org_role``, ``config_dir`` (always present).  The
     ``.claude.json`` file stores these under ``oauthAccount``.  Secrets (the
     OAuth token in ``.credentials.json``) are deliberately never read here.
+
+    ``config_dir`` scopes the read to a specific account (a cross-account hub
+    runtime's dir); without it the process env / default is used.
     """
-    cfg = config_dir_path()
+    cfg = config_dir_path(config_dir)
     info: dict[str, Any] = {"config_dir": str(cfg)}
     path = cfg / ".claude.json"
     try:
@@ -433,6 +440,11 @@ class State:
     # break the auto-continue loop and warn the user instead of hammering it.
     last_api_error_signature: str | None = None
     api_error_repeat_count: int = 0
+    # Sticky flag: the last turn failed to authenticate (HTTP 401).  Unlike a
+    # transient API error this won't clear on its own — the stored OAuth session
+    # is dead — so `/login` uses it to force a re-auth instead of falsely
+    # reporting "already signed in".  Cleared on the next successful turn.
+    auth_error: bool = False
     recent_turn_ends: deque[float] = field(default_factory=deque)
     turn_started_at: float | None = None
 
@@ -530,7 +542,7 @@ def init_state_from_config(config: Config) -> State:
         model=config.model,
         is_subscription=sub,
         subscription_plan=detect_subscription_plan() if sub else None,
-        account=detect_account_info(),
+        account=detect_account_info(getattr(config, "config_dir", None)),
         collapse_tools=config.collapse_tools,
         collapse_threshold=config.collapse_threshold,
         max_dom_messages=config.max_dom_messages,
@@ -591,6 +603,13 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         else:
             busy_label = f"bg wait ({len(state.background_tasks)})"
         busy_class = "bg-wait"
+    elif state.auth_error:
+        # The stored Claude login is dead (a turn 401'd, or the CLI reported an
+        # auth failure at connect).  Surfaced prominently since nothing works
+        # until the user runs /login.  Cleared on the next successful connect or
+        # clean turn, so this label goes away on its own once re-authenticated.
+        busy_label = "not authed"
+        busy_class = "error"
     elif state.needs_user_attention == "waiting":
         busy_label = "waiting"
         busy_class = "waiting"

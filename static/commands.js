@@ -253,6 +253,14 @@ const Commands = (() => {
       Switch.open();
       return;
     }
+    // `/connect` (`/reconnect`) must work even when the browser↔server socket
+    // is down — that's exactly when the user reaches for it.  Route it through
+    // App.reconnect(), which revives a dead socket client-side or, if the
+    // socket is alive, forwards the command for a server-side SDK reconnect.
+    if (text === '/connect' || text === '/reconnect') {
+      App.reconnect();
+      return;
+    }
     App.send({ type: 'message', text: text });
   }
 

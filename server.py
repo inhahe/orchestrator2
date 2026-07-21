@@ -72,6 +72,7 @@ from config import (
 )
 from state import (
     State,
+    detect_account_info,
     init_state_from_config,
     state_to_panels_dict,
     state_to_status_dict,
@@ -324,6 +325,51 @@ def _account_email_for(claude_dir: Path) -> str | None:
     return None
 
 
+async def _watch_login(rt: "SessionRuntime") -> None:
+    """After ``/login`` launches the browser OAuth, wait for it to finish.
+
+    The interactive login runs in a separate console and rewrites
+    ``<config-dir>/.credentials.json`` when it completes.  We poll for that
+    file's mtime advancing (reliable, unlike ``claude auth status``), then
+    refresh ``state.account`` from the freshly-written ``.claude.json``, clear
+    any sticky auth error, and broadcast: a confirmation naming the account plus
+    a ``status_update`` so the toolbar's *account* field updates immediately.
+    """
+    state = rt.state
+    config = rt.config
+    cfg_dir = getattr(config, "config_dir", None)
+
+    start_mtime = await asyncio.to_thread(auth.credentials_mtime, cfg_dir)
+    deadline = time.monotonic() + 300.0  # 5 min to complete the browser flow
+    while time.monotonic() < deadline:
+        await asyncio.sleep(2.0)
+        mtime = await asyncio.to_thread(auth.credentials_mtime, cfg_dir)
+        # Completed when the credentials file is (re)written after we started.
+        if mtime is not None and (start_mtime is None or mtime > start_mtime):
+            info = await asyncio.to_thread(detect_account_info, cfg_dir)
+            state.account = info
+            state.auth_error = False
+            email = info.get("email")
+            who = f" as {email}" if email else ""
+            await rt.broadcast({
+                "type": "system_msg", "subtype": "info",
+                "data": {"message": f"Signed in to Claude{who}. "
+                                    f"Run /connect to reconnect this session."},
+            })
+            await rt.broadcast({
+                "type": "status_update",
+                "status": state_to_status_dict(state, config),
+                "panels": _enrich_panels(state_to_panels_dict(state)),
+            })
+            return
+
+    await rt.broadcast({
+        "type": "system_msg", "subtype": "warning",
+        "data": {"message": "Didn't detect sign-in completing within 5 minutes. "
+                            "If you finished, run /connect; otherwise /login force."},
+    })
+
+
 def _switch_accounts_payload(current_cfg: str | None) -> list[dict[str, Any]]:
     """Build the account list for the ``/switch`` picker.
 
@@ -561,7 +607,7 @@ async def lifespan(app: FastAPI):
         # Resolve the resume value to a real session UUID — it might be a
         # title/name rather than an ID (e.g. ``--resume fastpyb``).
         _resolved_resume = config.resume
-        if not find_session_dir(config.resume):
+        if not find_session_dir(config.resume, config.config_dir):
             _match = _find_session_by_name(config.resume)
             if _match:
                 _resolved_resume = _match
@@ -1206,7 +1252,7 @@ async def _reconfigure(
     new_resume: str | None = None
     if resume:
         # Check if it's a UUID (or UUID prefix).
-        session_dir = find_session_dir(resume)
+        session_dir = find_session_dir(resume, config.config_dir)
         if session_dir:
             new_resume = resume
         else:
@@ -1667,8 +1713,8 @@ async def api_resume(body: dict[str, Any]) -> dict[str, Any]:
         await _bridge_ready.wait()
     assert bridge is not None and config is not None and state is not None
 
-    # Verify the session exists on disk.
-    session_dir = find_session_dir(session_id)
+    # Verify the session exists on disk (scoped to this runtime's account).
+    session_dir = find_session_dir(session_id, config.config_dir)
     if session_dir is None:
         return {"ok": False, "error": f"Session {session_id} not found"}
 
@@ -2581,6 +2627,10 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
                 })
             if result.forward_to_sdk and result.forward_payload:
                 bridge.event_queue.put_nowait(("message", result.forward_payload))
+            if result.login_launched:
+                # Browser OAuth completes asynchronously; watch for it, then
+                # refresh the account field / status bar for this runtime.
+                asyncio.create_task(_watch_login(rt))
             return
 
         # /graphify explain|path|diagnose — read-only queries against the

@@ -101,10 +101,49 @@ CONNECT_TIMEOUT = 45.0
 # Broadcaster type: async function that sends a dict to all WS clients.
 Broadcaster = Callable[[dict[str, Any]], Awaitable[None]]
 
-# Matches the CLI's inline API-error text, e.g.
+# Matches the CLI's inline API-error banner, e.g.
 #   "API Error: 400 {"type":"error","error":{...}}"
-# The captured group is the HTTP status code.
+# The captured group is the HTTP status code.  IMPORTANT: this is matched only
+# against the *start* of the turn output (see detect_api_error) — the harness
+# emits this banner as the entire/leading assistant response when an API call
+# fails, so anchoring it to the start avoids a false positive when the *model*
+# merely quotes the string "API Error: 401" mid-prose (e.g. a debugging chat).
 _API_ERROR_RE = re.compile(r"API Error:\s*(\d{3})\b")
+
+# Matches authentication failures the CLI prints to *stderr* at connect time,
+# e.g. "Failed to authenticate: OAuth session expired and could not be
+# refreshed" or "Invalid authentication credentials".  Unlike a per-turn 401
+# these never reach a ResultMessage — the connect itself dies — so they need a
+# separate signal so `/login` can auto-recover them too.  Safe to match as a
+# loose substring: stderr is the CLI subprocess's output, never model prose.
+_AUTH_FAIL_RE = re.compile(
+    r"OAuth session expired"
+    r"|could not be refreshed"
+    r"|Failed to authenticate"
+    r"|Invalid authentication credentials"
+    r"|authentication_error"
+    r"|Not logged in"
+    r"|Please run /login",
+    re.IGNORECASE,
+)
+
+# Matches a codeless auth-refusal banner the CLI emits as a turn's assistant
+# text (no "API Error: NNN") when the stored session is unusable, e.g.
+#   "Not logged in · Please run /login"
+# ANCHORED to the start of the (stripped) turn output on purpose: a genuine
+# refusal is the whole leading response, whereas the model discussing these
+# phrases in a debugging conversation never *begins* its entire response with
+# them.  Matching loosely here caused false "not authed" flags.
+_AUTH_BANNER_RE = re.compile(
+    r"\s*(?:"
+    r"Not logged in\b"
+    r"|Please run [`']?/?login"
+    r"|Failed to authenticate\b"
+    r"|OAuth session expired"
+    r"|Invalid authentication credentials"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def detect_api_error(msg: Any, assistant_text: str) -> tuple[str | None, str | None]:
@@ -116,8 +155,12 @@ def detect_api_error(msg: Any, assistant_text: str) -> tuple[str | None, str | N
     CLI's point of view, it *did* emit output and return control cleanly.
     ``ResultMessage.is_error`` is likewise unreliable for these.
 
-    We therefore scan the visible assistant text (and ``ResultMessage.result``
-    as a fallback) for the error banner.
+    We therefore check the *start* of the visible assistant text (and
+    ``ResultMessage.result`` as a fallback) for the error banner.  The banner is
+    matched only at the leading edge of the output — a real failure makes the
+    banner the whole/leading response, so this avoids flagging a turn where the
+    model merely *quotes* "API Error: 401" mid-prose (which is exactly what
+    happens in a chat about auth bugs).
 
     Returns ``(status_code, signature)`` where ``signature`` is a short,
     stable string identifying the error (used for repeat/loop detection), or
@@ -131,7 +174,9 @@ def detect_api_error(msg: Any, assistant_text: str) -> tuple[str | None, str | N
         haystacks.append(result_text)
 
     for text in haystacks:
-        m = _API_ERROR_RE.search(text)
+        # Anchored at the start of the stripped text (``.match``) so a quoted
+        # occurrence deeper in a long response doesn't count.
+        m = _API_ERROR_RE.match(text.lstrip())
         if not m:
             continue
         code = m.group(1)
@@ -232,6 +277,11 @@ class SDKBridge:
         line = (line or "").rstrip()
         if line:
             log.warning("[cli stderr] %s", line)
+            # A connect-time auth failure (dead OAuth session) only ever shows
+            # up here — it never reaches a turn's ResultMessage.  Flag it so
+            # `/login` forces a re-auth instead of reporting "already signed in".
+            if _AUTH_FAIL_RE.search(line):
+                self.state.auth_error = True
 
     def _make_options(self, resume_id: str | None = None) -> ClaudeAgentOptions:
         """Build ``ClaudeAgentOptions`` from config + state."""
@@ -258,6 +308,13 @@ class SDKBridge:
         # so the bridge connects with the correct account.
         if getattr(self.config, "config_dir", None):
             kwargs["env"]["CLAUDE_CONFIG_DIR"] = self.config.config_dir
+
+        # Opt-in workaround for the bundled CLI's cache_control TTL-ordering
+        # bug (see Config.disable_prompt_cache): turning off prompt caching
+        # stops the CLI emitting any cache_control blocks, so a mid-session
+        # 1h↔5m TTL flip can't produce the "must not come after" API 400.
+        if getattr(self.config, "disable_prompt_cache", False):
+            kwargs["env"]["DISABLE_PROMPT_CACHING"] = "1"
 
         # Session resume / continue logic.
         # Always prefer an explicit session id (from cwd lookup or --resume)
@@ -356,9 +413,11 @@ class SDKBridge:
         self.client = ClaudeSDKClient(options=options)
 
         # Re-read account details each connect so a fresh /login (then /connect)
-        # updates the displayed email/plan without a restart.
+        # updates the displayed email/plan without a restart.  Scoped to this
+        # runtime's account dir — a cross-account session must read its own
+        # CLAUDE_CONFIG_DIR, not the hub process's env account.
         try:
-            self.state.account = detect_account_info()
+            self.state.account = detect_account_info(getattr(self.config, "config_dir", None))
         except Exception:
             pass
 
@@ -389,6 +448,12 @@ class SDKBridge:
         finally:
             self.state.connecting = False
             self.state.connect_started_at = None
+
+        # The CLI handshake completed, so any prior auth failure is resolved
+        # (a dead OAuth session fails the connect above rather than reaching
+        # here).  Clear the sticky flag; a fresh 401 on the first turn — or an
+        # auth line on stderr — will re-set it.
+        self.state.auth_error = False
 
         # Sync frontend now that connecting flipped to False.  Without
         # this the browser keeps ``_isBusy=true`` (from the earlier
@@ -1792,6 +1857,23 @@ class SDKBridge:
                     # conversation is rejected on every resend — is caught and
                     # the auto-continue loop broken with a recovery hint.
                     err_code, err_sig = detect_api_error(msg, assistant_text)
+                    # An auth failure can arrive two ways: a per-turn HTTP 401
+                    # ("API Error: 401 {...}"), or a *codeless* banner the CLI
+                    # emits as the turn's assistant text when the stored session
+                    # is unusable ("Not logged in · Please run /login").  The
+                    # latter carries no code, so detect_api_error misses it —
+                    # scan the visible text separately so `/login` still knows to
+                    # re-auth instead of insisting we're "already signed in".
+                    auth_failed = err_code == "401"
+                    if not auth_failed:
+                        for _t in (assistant_text, getattr(msg, "result", None)):
+                            # Anchored (.match on the stripped text): only a turn
+                            # whose output *begins* with the refusal banner counts,
+                            # so the model discussing "Not logged in" / "/login" in
+                            # a debugging chat doesn't trip a false "not authed".
+                            if isinstance(_t, str) and _t and _AUTH_BANNER_RE.match(_t.lstrip()):
+                                auth_failed = True
+                                break
                     api_error_loop = False
                     if err_code:
                         subtype = "error"
@@ -1807,6 +1889,16 @@ class SDKBridge:
                     else:
                         state.last_api_error_signature = None
                         state.api_error_repeat_count = 0
+
+                    # A 401 or a codeless "not logged in" banner means the stored
+                    # OAuth session is dead and won't recover on its own.  Flag it
+                    # so `/login` forces a re-auth; only a turn that actually
+                    # authenticated clears the sticky flag.
+                    if auth_failed:
+                        subtype = "error"
+                        state.auth_error = True
+                    else:
+                        state.auth_error = False
 
                     # COMPACT-INDUCED ResultMessage handling.
                     #
@@ -2140,16 +2232,29 @@ class SDKBridge:
                     state.connecting = False
                     state.connect_started_at = None
                     await self._broadcast_status()
+                    _retry_hint = ("Your Claude login has expired — run /login to "
+                                   "re-authenticate, then send a message."
+                                   if state.auth_error
+                                   else "Send a message to retry.")
                     await self.broadcast({
                         "type": "system_msg",
                         "subtype": "error",
-                        "data": {"message": f"SDK connection failed after {_connect_attempt} attempts: {exc}. Send a message to retry."},
+                        "data": {"message": f"SDK connection failed after {_connect_attempt} attempts: {exc}. {_retry_hint}"},
                     })
-                    # Fall back to manual retry.
+                    # Fall back to manual retry.  A user message restarts the
+                    # auto-retry loop; so does an explicit /connect — the natural
+                    # thing to run after a /login re-auth (the connect-failure
+                    # message tells the user to do exactly that).
                     while not self.stop_event.is_set():
                         kind, payload = await self.event_queue.get()
                         if kind in ("quit", "force-quit"):
                             return
+                        if kind == "connect":
+                            _connect_attempt = 0
+                            _connect_delay = 2.0
+                            state.connecting = True
+                            state.connect_started_at = time.monotonic()
+                            break  # restart auto-retry loop (no prompt to requeue)
                         if kind == "message":
                             _connect_attempt = 0
                             _connect_delay = 2.0

@@ -56,6 +56,11 @@ class CommandResult:
     forward_to_sdk: bool = False
     forward_payload: str | None = None
 
+    # If True, an interactive login flow (browser OAuth) was just launched, so
+    # the caller should watch for its async completion and then refresh the
+    # account info / status bar.  Set by ``_cmd_login``.
+    login_launched: bool = False
+
 
 def _msg(text: str, *, level: str = "info") -> dict[str, Any]:
     """Helper: build a simple system message dict."""
@@ -175,7 +180,7 @@ def classify(line: str) -> tuple[str, str]:
             return "switch-cwd", arg
         return "status", ""
     if cmd == "login":
-        return "login", ""
+        return "login", arg
     if cmd == "logout":
         return "logout", ""
     if cmd in ("connect", "reconnect"):
@@ -251,9 +256,9 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         ("/effort <level>",              f"one of {', '.join(EFFORT_CHOICES)}"),
         ("/thinking [on|off|toggle]",    "enable/disable extended thinking"),
         ("/model [name]",                "show/set model; no arg lists available"),
-        ("/login",                       "sign in to your Claude account"),
+        ("/login [force]",               "sign in to your Claude account (force = re-auth even if it thinks you're signed in)"),
         ("/logout",                      "sign out of your Claude account"),
-        ("/connect",                     "reconnect to the SDK"),
+        ("/connect",                     "reconnect (revives a dropped browser socket, or the SDK)"),
         ("/resume [id|title]",           "resume a session (or open picker)"),
         ("/rename <name>",               "set a custom session title"),
         ("/switch",                      "copy this session to another account & continue here"),
@@ -311,27 +316,57 @@ def _cmd_status(_payload: str, state: State, config: Config) -> CommandResult:
     return CommandResult(messages=[_data_msg(info, label="status")])
 
 
-def _cmd_login(_payload: str, state: State, _config: Config) -> CommandResult:
-    """Show login status, and start the Claude login flow if not signed in."""
-    if auth.is_logged_in():
-        email = auth.account_email()
+def _cmd_login(payload: str, state: State, config: Config) -> CommandResult:
+    """Show login status, and start the Claude login flow when needed.
+
+    ``is_logged_in()`` only checks that a credential file exists — it can't tell
+    a still-valid session from one whose OAuth tokens (access *and* refresh) have
+    fully expired.  In the latter case the app keeps insisting "already signed
+    in" while every turn 401s.  So we treat two things as "must re-authenticate":
+    (a) a turn actually failed with a 401 (``state.auth_error``), or (b) the user
+    forced it with ``/login force``.  Either way we launch the OAuth flow instead
+    of stonewalling.
+
+    All the auth checks are scoped to *this* runtime's account
+    (``config.config_dir``) — a cross-account hub session must be checked and
+    re-authed against its own ``CLAUDE_CONFIG_DIR``, not the hub process's.
+    """
+    cfg_dir = getattr(config, "config_dir", None)
+    force = payload.strip().lower() in ("force", "relogin", "-f", "--force")
+    needs_reauth = force or state.auth_error
+
+    if auth.is_logged_in(cfg_dir) and not needs_reauth:
+        email = auth.account_email(cfg_dir)
         who = f" as {email}" if email else ""
         return CommandResult(messages=[{
             "type": "system_msg",
             "subtype": "info",
             "data": {"message": f"Already signed in to Claude{who}. "
-                                f"Use /logout to switch accounts."},
+                                f"Use /logout to switch accounts, or /login force "
+                                f"to re-authenticate if you're seeing auth errors."},
         }])
-    ok, msg = auth.launch_login()
-    return CommandResult(messages=[{
-        "type": "system_msg",
-        "subtype": "info" if ok else "error",
-        "data": {"message": f"{msg} After signing in, run /connect to reconnect."},
-    }])
+
+    ok, msg = auth.launch_login(config_dir=cfg_dir)
+    hint = ("The current session's login has expired — "
+            if state.auth_error else "")
+    if ok and state.auth_error:
+        # Optimistically clear the sticky flag; a fresh 401 will re-set it.
+        state.auth_error = False
+    return CommandResult(
+        messages=[{
+            "type": "system_msg",
+            "subtype": "info" if ok else "error",
+            "data": {"message": f"{hint}{msg} Waiting for sign-in to complete — "
+                                f"I'll confirm the account here, then run /connect."},
+        }],
+        # Tell the caller to watch for the async browser-OAuth completion and
+        # then refresh the account info / status bar.
+        login_launched=ok,
+    )
 
 
-def _cmd_logout(_payload: str, _state: State, _config: Config) -> CommandResult:
-    """Sign the active config dir out of its Claude account."""
+def _cmd_logout(_payload: str, _state: State, config: Config) -> CommandResult:
+    """Sign this runtime's account out of Claude (scoped to its config dir)."""
     cli = auth.find_claude_cli()
     if not cli:
         return CommandResult(messages=[{
@@ -339,9 +374,10 @@ def _cmd_logout(_payload: str, _state: State, _config: Config) -> CommandResult:
             "data": {"message": "could not find the `claude` CLI to log out."},
         }])
     import subprocess
+    env = auth._auth_env(getattr(config, "config_dir", None))
     try:
         subprocess.run([cli, "auth", "logout"], capture_output=True,
-                       text=True, timeout=20)
+                       text=True, timeout=20, env=env)
         ok = True
     except (OSError, subprocess.SubprocessError) as exc:
         return CommandResult(messages=[{
@@ -374,11 +410,16 @@ def _cmd_clear_screen(_payload: str, _state: State, _config: Config) -> CommandR
     return CommandResult(messages=[{"type": "clear_screen"}])
 
 
-def _cmd_history(payload: str, state: State, _config: Config) -> CommandResult:
+def _cmd_history(payload: str, state: State, config: Config) -> CommandResult:
     sid = state.session_id
     if not sid:
         return CommandResult(messages=[_msg("No active session.", level="warning")])
-    session_dir = find_session_dir(sid)
+    # Scope the lookup to *this* session's account — a cross-account hub runtime
+    # stores its session under its own CLAUDE_CONFIG_DIR, which is not the hub
+    # process's env account.  Without this the file is searched in the wrong
+    # projects tree and reported "not found on disk".
+    cfg_dir = getattr(config, "config_dir", None)
+    session_dir = find_session_dir(sid, cfg_dir)
     if session_dir is None:
         return CommandResult(messages=[_msg(f"Session {sid[:8]} not found on disk.", level="error")])
     jsonl = session_dir / f"{sid}.jsonl"
@@ -445,7 +486,9 @@ def _cmd_export(payload: str, state: State, config: Config) -> CommandResult:
     sid = state.session_id
     if not sid:
         return CommandResult(messages=[_msg("No active session yet.", level="warning")])
-    project_dir = find_session_dir(sid)
+    # Scope the lookup to *this* session's account — a cross-account hub runtime
+    # stores its session under its own CLAUDE_CONFIG_DIR, not the hub process's.
+    project_dir = find_session_dir(sid, getattr(config, "config_dir", None))
     if project_dir is None:
         return CommandResult(messages=[_msg(f"Session {sid[:8]} not found on disk.", level="error")])
     jsonl = project_dir / f"{sid}.jsonl"

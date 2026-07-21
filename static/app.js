@@ -15,6 +15,7 @@ const App = (() => {
   let _serverShutdown = false;
   let _didLaunchRequest = false;   // sent the one-shot ?open/?new request?
   let _promptWatchdog = null;      // detects a prompt that got no server reply
+  let _pendingSends = [];          // user messages typed while disconnected
   const MAX_RECONNECT_DELAY = 30000;
   const MAX_RECONNECT_ATTEMPTS = 20;
   const PROMPT_WATCHDOG_MS = 8000; // ~how long a turn should take to start
@@ -152,6 +153,8 @@ const App = (() => {
       // forget any prior subscription — the next render()/show() must re-send
       // lobby_watch to resume live updates on this fresh socket.
       if (window.Lobby && Lobby.onReconnect) Lobby.onReconnect();
+      // Flush any prompts the user typed while the socket was down.
+      _flushPending();
       // Drive an open/new request once (only on the first connect, not on
       // reconnects — by then the tab has a ?rid= URL and re-attaches normally).
       if (!rid && !_didLaunchRequest) {
@@ -196,11 +199,12 @@ const App = (() => {
 
     if (reconnectAttempt > MAX_RECONNECT_ATTEMPTS) {
       _serverShutdown = true;
-      Status.update({ busy_label: 'server stopped', busy_class: 'shutdown' });
+      Status.update({ busy_label: 'disconnected', busy_class: 'shutdown' });
       Chat.handleMessage({
         type: 'system_msg',
         subtype: 'error',
-        data: { message: 'Lost connection to server (not running).' },
+        data: { message: 'Lost connection to server (not running). '
+                         + 'Type /connect to retry once it\u2019s back up.' },
       });
       return;
     }
@@ -215,9 +219,11 @@ const App = (() => {
   function _showConnectionStatus(status) {
     if (_serverShutdown) return;
     if (status === 'disconnected') {
+      // Immediate drop reads "disconnected"; once retries are under way show
+      // the attempt counter so the user sees it's actively reconnecting.
       const label = reconnectAttempt > 1
-        ? `reconnecting (${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS})`
-        : 'reconnecting';
+        ? `disconnected — reconnecting (${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS})`
+        : 'disconnected';
       Status.update({ busy_label: label, busy_class: 'reconnecting' });
     }
   }
@@ -253,13 +259,57 @@ const App = (() => {
         // left staring at an idle bar.  Any inbound message clears this.
         _armPromptWatchdog();
       }
+    } else if (msg.type === 'message') {
+      // Socket is down — don't drop the user's prompt.  Queue it and flush on
+      // the next successful connect (ws.onopen → _flushPending), and kick a
+      // fresh reconnect in case auto-reconnect had latched off.
+      _pendingSends.push(msg);
+      Chat.handleMessage({
+        type: 'system_msg',
+        subtype: 'info',
+        data: { message: 'Not connected \u2014 queued; will send on reconnect: '
+                         + msg.text },
+      });
+      reconnect();
     } else {
+      // Non-prompt control messages (interrupt, permission_response) are stale
+      // after a drop, so there's nothing useful to queue — just report.
       Chat.handleMessage({
         type: 'system_msg',
         subtype: 'error',
         data: { message: 'Not connected to server.' }
       });
     }
+  }
+
+  // Flush prompts queued while disconnected, in order.  Re-runs them through
+  // send() so the normal optimistic-echo / watchdog logic applies once.
+  function _flushPending() {
+    if (!_pendingSends.length) return;
+    const queued = _pendingSends.slice();
+    _pendingSends = [];
+    for (const m of queued) send(m);
+  }
+
+  // Re-establish the browser\u2194server WebSocket on demand (e.g. from /connect).
+  // If the socket is alive this is a *server-side* SDK-bridge reconnect, so
+  // forward the command as usual.  If it's down \u2014 possibly latched off after
+  // auto-reconnect gave up \u2014 clear the latch and rebuild the socket so the
+  // user isn't stuck needing a manual page reload.
+  function reconnect() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      send({ type: 'message', text: '/connect' });
+      return;
+    }
+    _serverShutdown = false;
+    reconnectAttempt = 0;
+    reconnectDelay = 1000;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    // A socket already handshaking will flush the queue on its own onopen;
+    // don't open a second one that would orphan the first.
+    if (ws && ws.readyState === WebSocket.CONNECTING) return;
+    Status.update({ busy_label: 'reconnecting', busy_class: 'reconnecting' });
+    _connect();
   }
 
   function _armPromptWatchdog() {
@@ -534,5 +584,5 @@ const App = (() => {
 
   document.addEventListener('DOMContentLoaded', init);
 
-  return { send, showToolDetail, showBgDetail, openModal, closeModal };
+  return { send, reconnect, showToolDetail, showBgDetail, openModal, closeModal };
 })();
