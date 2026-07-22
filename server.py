@@ -73,6 +73,7 @@ from config import (
 )
 from state import (
     State,
+    config_dir_path,
     detect_account_info,
     init_state_from_config,
     state_to_panels_dict,
@@ -326,6 +327,59 @@ def _account_email_for(claude_dir: Path) -> str | None:
     return None
 
 
+def _clear_stale_rate_limit(st: State) -> bool:
+    """Clear a lingering rate-limit *rejection* from *st*.
+
+    Used when a rejection recorded against a previous login (or another session
+    on the same account) no longer applies.  Returns True if anything changed,
+    so the caller knows whether a status refresh is worth broadcasting.
+    """
+    if st.rate_limit_status != "rejected":
+        return False
+    st.rate_limit_status = "allowed"
+    st.rate_limit_resets_at = None
+    st.rate_limit_reset_bell_fired = False
+    st.rate_limit_utils.clear()
+    return True
+
+
+def _same_config_dir(a: str | None, b: str | None) -> bool:
+    """True when two runtime config dirs resolve to the same account store."""
+    try:
+        return config_dir_path(a).resolve() == config_dir_path(b).resolve()
+    except OSError:
+        return (a or "") == (b or "")
+
+
+async def _propagate_login_to_siblings(
+    origin: "SessionRuntime", cfg_dir: str | None, info: dict,
+) -> None:
+    """Refresh account / auth / rate-limit on sibling sessions sharing a login.
+
+    A ``/login`` rewrites the *shared* ``<config-dir>/.credentials.json``, so
+    every other live runtime on the same config dir is re-authenticated to the
+    same account.  Update their ``account`` field, clear any sticky auth error
+    and stale rate-limit rejection, and push a status refresh — so re-logging in
+    one tab fixes them all instead of the user repeating it per session.
+    """
+    for other in list(runtimes.values()):
+        if other is origin or other.state is None or other.config is None:
+            continue
+        if not _same_config_dir(getattr(other.config, "config_dir", None), cfg_dir):
+            continue
+        other.state.account = info
+        other.state.auth_error = False
+        _clear_stale_rate_limit(other.state)
+        try:
+            await other.broadcast({
+                "type": "status_update",
+                "status": state_to_status_dict(other.state, other.config),
+                "panels": _enrich_panels(state_to_panels_dict(other.state)),
+            })
+        except Exception as exc:
+            log.warning("sibling login-propagate broadcast failed: %r", exc)
+
+
 async def _watch_login(rt: "SessionRuntime") -> None:
     """After ``/login`` launches the browser OAuth, wait for it to finish.
 
@@ -350,6 +404,11 @@ async def _watch_login(rt: "SessionRuntime") -> None:
             info = await asyncio.to_thread(detect_account_info, cfg_dir)
             state.account = info
             state.auth_error = False
+            # A completed sign-in (typically to a *different* account) makes any
+            # rate-limit rejection recorded against the previous login moot —
+            # clear it so the toolbar doesn't keep showing a stale "rate
+            # limited" after the user re-authenticates to escape a limit.
+            _clear_stale_rate_limit(state)
             email = info.get("email")
             who = f" as {email}" if email else ""
             await rt.broadcast({
@@ -362,6 +421,12 @@ async def _watch_login(rt: "SessionRuntime") -> None:
                 "status": state_to_status_dict(state, config),
                 "panels": _enrich_panels(state_to_panels_dict(state)),
             })
+            # The re-login rewrote the *shared* <config-dir>/.credentials.json,
+            # so every OTHER live session on the same config dir is now
+            # re-authenticated to this account too.  Propagate the account /
+            # auth-error / stale-rate-limit refresh to them so the user doesn't
+            # have to repeat /login (or /connect) in each sibling tab.
+            await _propagate_login_to_siblings(rt, cfg_dir, info)
             return
 
     await rt.broadcast({

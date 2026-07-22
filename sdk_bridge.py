@@ -1717,6 +1717,18 @@ class SDKBridge:
 
                 # ---- AssistantMessage ----
                 elif isinstance(msg, AssistantMessage):
+                    # Real turn content means the API accepted this request, so
+                    # any lingering "rejected" rate-limit state no longer holds
+                    # (e.g. a stale rejection carried over from before a /login
+                    # account switch).  Clear it now so the status flips from
+                    # "rate limited" straight to "working" instead of waiting
+                    # for the next RateLimitEvent/ResultMessage to report
+                    # status="allowed" partway through the turn.
+                    if state.rate_limit_status == "rejected":
+                        state.rate_limit_status = "allowed"
+                        state.rate_limit_resets_at = None
+                        state.rate_limit_reset_bell_fired = False
+                        await self._broadcast_status()
                     model_id = getattr(msg, "model", None)
                     if model_id and not state.active_model:
                         state.active_model = model_id
