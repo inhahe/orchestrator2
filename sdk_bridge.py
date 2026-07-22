@@ -2320,13 +2320,11 @@ class SDKBridge:
                           for i, t in enumerate(state.queued_prompts)],
             })
         else:
-            # Wait for first user input.
-            kind, payload = await self.event_queue.get()
-            if kind == "message":
-                next_prompt = payload
-            elif kind in ("quit", "force-quit"):
-                return
-            # Other kinds: drop and wait again.
+            # Wait for first user input.  Config-change commands (/model,
+            # /effort, /thinking, /connect, /clear) can legitimately arrive
+            # *before* the first turn — apply them and keep waiting instead of
+            # silently dropping them (the old bug: /model on a fresh session
+            # did nothing).  Anything the helper doesn't recognise is ignored.
             while next_prompt is None and not self.stop_event.is_set():
                 kind, payload = await self.event_queue.get()
                 if kind == "message":
@@ -2334,6 +2332,7 @@ class SDKBridge:
                     break
                 if kind in ("quit", "force-quit"):
                     return
+                await self._apply_idle_config_command(kind, payload)
             # Echo the first prompt to chat IF the frontend didn't.
             # Messages that land on the event_queue (rather than
             # ``queued_prompts``) normally rely on the frontend's
@@ -2548,6 +2547,54 @@ class SDKBridge:
             state.needs_user_attention = None
         return await self._await_next_prompt()
 
+    async def _apply_idle_config_command(self, kind: str, payload: str) -> bool:
+        """Apply a config-change command issued while no turn is running.
+
+        Covers the commands the user can fire while idle — before the first
+        turn *or* parked between turns: ``/model``, ``/effort``, ``/thinking``,
+        ``/connect``, ``/clear``.  Each updates the relevant state, tells the
+        user, and reconnects so the change takes effect on the already-open SDK
+        connection (model/effort/thinking are fixed at connect time).  Returns
+        True when *kind* was handled, False for anything else so the caller can
+        deal with messages / quit / wakeups itself.
+
+        Shared by both idle wait points (``worker_loop``'s initial-prompt wait
+        and ``_await_next_prompt``) so a config command is never silently
+        dropped depending on which one happens to be parked.
+        """
+        state = self.state
+        if kind == "model":
+            state.model = payload
+            await self.broadcast({"type": "system_msg", "subtype": "info",
+                                  "data": {"message": f"model → {payload}"}})
+            await self.reconnect()
+            return True
+        if kind == "effort":
+            state.effort = None if payload == "auto" else payload
+            await self.broadcast({"type": "system_msg", "subtype": "info",
+                                  "data": {"message": f"effort → {payload}"}})
+            await self.reconnect()
+            return True
+        if kind == "thinking":
+            if payload == "on":
+                state.thinking_enabled = True
+            elif payload == "off":
+                state.thinking_enabled = False
+            else:
+                state.thinking_enabled = not state.thinking_enabled
+            await self.broadcast({"type": "system_msg", "subtype": "info",
+                                  "data": {"message":
+                                           f"thinking → {'on' if state.thinking_enabled else 'off'}"}})
+            await self.reconnect()
+            return True
+        if kind == "connect":
+            await self.reconnect()
+            return True
+        if kind == "clear-context":
+            await self._clear_context()
+            return True
+        return False
+
     async def _await_next_prompt(self) -> str | None:
         """Block until the user sends a message or quits."""
         # Flush any bell rung in the between-turns decision logic
@@ -2564,11 +2611,10 @@ class SDKBridge:
                 return None
             if kind == "compact":
                 return "/compact"
-            if kind == "connect":
-                await self.reconnect()
-                continue
-            if kind == "clear-context":
-                await self._clear_context()
+            # Config-change commands (model/effort/thinking/connect/clear) are
+            # applied via the shared helper so idle behaviour matches the
+            # initial-prompt wait exactly.
+            if await self._apply_idle_config_command(kind, payload):
                 continue
             if kind == "wakeup":
                 # Any wakeup is a chance to flush a queued *user* prompt.
@@ -2612,23 +2658,6 @@ class SDKBridge:
                         self.state.continue_prompt, during_turn=False,
                     )
                     return self.state.continue_prompt
-                continue
-            if kind == "effort":
-                self.state.effort = None if payload == "auto" else payload
-                await self.reconnect()
-                continue
-            if kind == "model":
-                self.state.model = payload
-                await self.reconnect()
-                continue
-            if kind == "thinking":
-                if payload == "on":
-                    self.state.thinking_enabled = True
-                elif payload == "off":
-                    self.state.thinking_enabled = False
-                else:
-                    self.state.thinking_enabled = not self.state.thinking_enabled
-                await self.reconnect()
                 continue
             if kind == "btw":
                 self.state.queued_prompts.append(payload)
