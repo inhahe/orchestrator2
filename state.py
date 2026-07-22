@@ -309,6 +309,33 @@ def apply_rate_limit_info(state: State, info: Any) -> None:
         state.rate_limit_resets_at = int(resets_at)
 
 
+def reset_rate_limit(state: State) -> bool:
+    """Wipe *all* rate-limit state (status, reset time, live utilisation).
+
+    Unlike the "stale rejection" clear (which only fires when the session is
+    currently marked ``rejected``), this zeroes everything — including the
+    per-window utilisation percentages that drive the status bar's usage
+    display.  Used when the account itself changes (a completed ``/login`` to a
+    different account, propagated to sibling sessions on the same config dir):
+    the previous account's limits and usage numbers no longer describe this
+    session, so nothing about them should linger in the toolbar.
+
+    Returns True if anything actually changed, so callers can decide whether a
+    status broadcast is worthwhile.
+    """
+    changed = bool(
+        state.rate_limit_status is not None
+        or state.rate_limit_resets_at is not None
+        or state.rate_limit_reset_bell_fired
+        or state.rate_limit_utils
+    )
+    state.rate_limit_status = None
+    state.rate_limit_resets_at = None
+    state.rate_limit_reset_bell_fired = False
+    state.rate_limit_utils.clear()
+    return changed
+
+
 def ring_bell(state: State, event: str) -> None:
     """Record a bell event.
 
