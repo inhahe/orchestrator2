@@ -27,6 +27,7 @@ import asyncio
 import atexit
 import base64
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -972,7 +973,29 @@ class _ExternalAuthMiddleware:
     contrast, *are* sent on same-origin WS upgrades, so once the page load sets
     the cookie the socket authenticates automatically.  A token (not the raw
     password) is stored so the secret never lands in a cookie jar or log.
+
+    **Brute-force throttle.**  Wrong-password attempts are counted *globally*
+    (one shared counter, NOT per source IP).  Per-IP throttling would be trivial
+    to defeat with a botnet — each of thousands of addresses would get its own
+    fresh attempt budget — so instead every wrong guess, from wherever, advances
+    a single counter.  The first ``_FREE_ATTEMPTS`` failures cost nothing; after
+    that the door is locked for an exponentially growing window
+    (``_BASE_LOCKOUT * 2**(n-1)`` seconds, capped at ``_MAX_LOCKOUT``) during
+    which every external request is refused with ``429`` *before* the password is
+    even examined — so the whole hub allows only a handful of guesses per
+    escalating window no matter how many machines are trying.  A single
+    successful auth clears the counter.  (Trade-off: an attacker can keep the
+    lockout armed and lock out the owner's *remote* access — but LAN/loopback
+    always bypasses the throttle, and the cap keeps any single lockout ≤5 min.)
+    Password / token comparisons use ``hmac.compare_digest`` so a network
+    attacker can't recover the secret via response-timing analysis.
     """
+
+    # Throttle tuning.  Small at first (a fat-fingered password shouldn't lock
+    # things for long) then grows fast against a sustained guessing campaign.
+    _FREE_ATTEMPTS = 5          # failures allowed before lockouts begin
+    _BASE_LOCKOUT = 2.0         # seconds for the first lockout past the threshold
+    _MAX_LOCKOUT = 300.0        # cap on the lockout window (5 min)
 
     def __init__(self, app: Any, *, password: str | None) -> None:
         self.app = app
@@ -983,6 +1006,10 @@ class _ExternalAuthMiddleware:
             hashlib.sha256(("orch2-auth:" + password).encode()).hexdigest()
             if password is not None else None
         )
+        # Global failure tracking (shared across all source IPs — see the
+        # brute-force note above).  In-process only; a restart forgives.
+        self._fails = 0
+        self._locked_until = 0.0    # time.monotonic() deadline
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
         if scope["type"] in ("http", "websocket"):
@@ -998,6 +1025,16 @@ class _ExternalAuthMiddleware:
                                        "External access is disabled.",
                                        challenge=False)
                     return
+                # Locked out? Refuse before touching the password so a guesser
+                # gets nothing (not even a timing signal) during the window.
+                retry_after = self._lockout_remaining()
+                if retry_after > 0:
+                    await self._reject(
+                        scope, receive, send,
+                        f"Too many failed attempts. Try again in "
+                        f"{int(retry_after) + 1}s.",
+                        challenge=False, status=429, retry_after=retry_after)
+                    return
                 headers = dict(scope.get("headers", []))
                 auth = headers.get(b"authorization", b"").decode("utf-8", "replace")
                 qs = (scope.get("query_string") or b"").decode("utf-8", "replace")
@@ -1008,18 +1045,40 @@ class _ExternalAuthMiddleware:
                     pw_param = unquote(pw_param)
                 cookie_ok = self._cookie_ok(headers.get(b"cookie", b""))
                 header_ok = self._check_basic_auth(auth)
-                param_ok = pw_param == self.password
+                param_ok = pw_param is not None and hmac.compare_digest(
+                    pw_param, self.password)
                 if not (header_ok or param_ok or cookie_ok):
+                    self._record_failure()
                     await self._reject(scope, receive, send,
                                        "Authentication required.")
                     return
-                # Authenticated.  If this HTTP request proved the password via
-                # the Basic header or ?password= (i.e. not already via cookie),
-                # plant the auth cookie so the follow-up WebSocket upgrade — on
-                # which the browser won't resend Basic credentials — carries it.
+                # Authenticated — forgive all prior failures.
+                self._record_success()
+                # If this HTTP request proved the password via the Basic header
+                # or ?password= (i.e. not already via cookie), plant the auth
+                # cookie so the follow-up WebSocket upgrade — on which the
+                # browser won't resend Basic credentials — carries it.
                 if scope["type"] == "http" and not cookie_ok:
                     send = self._send_with_cookie(scope, send)
         await self.app(scope, receive, send)
+
+    def _lockout_remaining(self) -> float:
+        """Seconds remaining on the global lockout window (0 if not locked)."""
+        remaining = self._locked_until - time.monotonic()
+        return remaining if remaining > 0 else 0.0
+
+    def _record_failure(self) -> None:
+        """Count a failed attempt and (past the threshold) arm the lockout."""
+        self._fails += 1
+        over = self._fails - self._FREE_ATTEMPTS
+        if over > 0:
+            window = min(self._BASE_LOCKOUT * (2 ** (over - 1)), self._MAX_LOCKOUT)
+            self._locked_until = time.monotonic() + window
+
+    def _record_success(self) -> None:
+        """Clear the failure history after a valid credential."""
+        self._fails = 0
+        self._locked_until = 0.0
 
     def _check_basic_auth(self, auth_header: str) -> bool:
         """Validate ``Authorization: Basic <b64>`` against the configured password."""
@@ -1031,7 +1090,7 @@ class _ExternalAuthMiddleware:
             return False
         # Accept any username; only the password matters.
         parts = decoded.split(":", 1)
-        return len(parts) == 2 and parts[1] == self.password
+        return len(parts) == 2 and hmac.compare_digest(parts[1], self.password)
 
     def _cookie_ok(self, cookie_header: bytes) -> bool:
         """True when the request carries a valid ``orch2_auth`` cookie."""
@@ -1040,7 +1099,7 @@ class _ExternalAuthMiddleware:
         raw = cookie_header.decode("utf-8", "replace")
         for part in raw.split(";"):
             name, _, value = part.strip().partition("=")
-            if name == _AUTH_COOKIE and value == self.token:
+            if name == _AUTH_COOKIE and hmac.compare_digest(value, self.token):
                 return True
         return False
 
@@ -1064,13 +1123,15 @@ class _ExternalAuthMiddleware:
 
     @staticmethod
     async def _reject(scope: dict, receive: Any, send: Any, message: str,
-                      *, challenge: bool = True) -> None:
+                      *, challenge: bool = True, status: int = 401,
+                      retry_after: float | None = None) -> None:
         """Reject an unauthenticated external connection.
 
         *challenge* controls whether a ``WWW-Authenticate: Basic`` header is
         sent (which makes browsers show the login prompt).  It's suppressed
         when external access is disabled outright, so users aren't asked for a
-        password that can never be accepted.
+        password that can never be accepted.  *status* / *retry_after* let the
+        throttle emit a ``429`` with a ``Retry-After`` hint during a lockout.
         """
         if scope["type"] == "http":
             body = message.encode("utf-8")
@@ -1081,9 +1142,12 @@ class _ExternalAuthMiddleware:
             if challenge:
                 resp_headers.append(
                     [b"www-authenticate", b'Basic realm="orchestrator2"'])
+            if retry_after is not None:
+                resp_headers.append(
+                    [b"retry-after", str(int(retry_after) + 1).encode()])
             await send({
                 "type": "http.response.start",
-                "status": 401,
+                "status": status,
                 "headers": resp_headers,
             })
             await send({"type": "http.response.body", "body": body})

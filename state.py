@@ -320,6 +320,25 @@ def ring_bell(state: State, event: str) -> None:
     state.pending_bell = event
 
 
+def in_bg_wait(state: State) -> bool:
+    """True when the session is *parked* waiting on background task(s).
+
+    Mirrors the status-bar ``bg-wait`` class: the model is not actively
+    producing a turn (``busy``), not (re)connecting, and not rate-limited — it's
+    idle-except-for-background-work.  Used to gate the ``bg-done`` bell so it
+    only rings when the user is genuinely waiting on the task, not when the
+    model spawned it mid-turn and kept right on working (in which case the
+    completion is just routine progress, not something to alert about).
+    """
+    now_ts = int(time.time())
+    rate_limited = bool(
+        state.rate_limit_status == "rejected"
+        and state.rate_limit_resets_at
+        and state.rate_limit_resets_at > now_ts
+    )
+    return not (state.busy or state.connecting or rate_limited)
+
+
 # ---------------------------------------------------------------------------
 # Persistent deque — fires a callback after every mutation
 # ---------------------------------------------------------------------------

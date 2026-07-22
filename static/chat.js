@@ -1114,10 +1114,28 @@ const Chat = (() => {
       }
     } catch (e) { /* ignore */ }
 
-    // Flash document title.
-    const orig = document.title;
-    document.title = '\u{1F514} ' + orig;
-    setTimeout(() => { document.title = orig; }, 2000);
+    // Flash the document title with a bell for 2s.
+    _flashTitleBell();
+  }
+
+  // Prefix stripped/re-applied so overlapping bells can't stack up.  The old
+  // code captured `document.title` as the restore target; a second bell within
+  // the 2s window captured the already-prefixed title and, on restore, baked a
+  // bell permanently into the tab name (the count grew over time).  Here we
+  // always strip any existing bell prefix first, keep a single shared timer,
+  // and on restore strip again from the *current* title (so a session-title
+  // change mid-flash is preserved).
+  let _titleBellTimer = null;
+  const _BELL_PREFIX_RE = /^(?:\u{1F514}\s*)+/u;
+
+  function _flashTitleBell() {
+    const base = document.title.replace(_BELL_PREFIX_RE, '');
+    document.title = '\u{1F514} ' + base;
+    if (_titleBellTimer) clearTimeout(_titleBellTimer);
+    _titleBellTimer = setTimeout(() => {
+      _titleBellTimer = null;
+      document.title = document.title.replace(_BELL_PREFIX_RE, '');
+    }, 2000);
   }
 
   // --- Helpers ---

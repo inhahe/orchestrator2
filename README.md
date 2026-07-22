@@ -132,6 +132,18 @@ access outright. After the page authenticates, an `HttpOnly` cookie carries the
 credential to the WebSocket automatically (browsers don't resend Basic-Auth
 headers on socket upgrades), so live streaming works from outside the LAN too.
 
+Wrong-password attempts are rate-limited with a single **global** counter (not
+per source IP — per-IP throttling would let a botnet get a fresh budget per
+address): the first five failures are free, after which the hub is locked out
+for an exponentially growing window (2 s, doubling each further failure up to
+5 min) during which every external request is refused with `429` before the
+password is even checked — so the whole hub allows only a handful of guesses per
+escalating window no matter how many machines are trying. A single correct
+password clears the counter. (LAN/loopback always bypasses the throttle, so a
+lockout only affects remote access, and the 5-min cap bounds it.) Password and
+cookie-token comparisons run in constant time (`hmac.compare_digest`) so the
+secret can't be recovered by response-timing analysis.
+
 ### Choosing a Claude account
 
 orchestrator2 uses the config dir given by `CLAUDE_CONFIG_DIR` (or `~/.claude` when that's unset), the same as the `claude` CLI. Sessions live under `<config-dir>/projects/<cwd>/`, so `claude --continue` / `--resume` only share a conversation with orchestrator2 when both are pointed at the **same** config dir. To pin a specific account regardless of the environment, pass `--config-dir`:
@@ -240,6 +252,11 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 | `--bell EVENTS` | `turn-done,bg-done,requires-action,rate-hit` | Comma- or space-separated bell events to ring on. Shortcuts: `all`, `none`. (`--bell-on` is accepted as an alias.) |
 
 Valid events: `turn-done`, `interrupt`, `bg-done`, `requires-action`, `rate-hit`
+
+`bg-done` rings only when a background task finishes **while the session is
+parked waiting on it** (the "bg wait" status) — not when the model spawned the
+task mid-turn and kept working, since a routine mid-turn completion isn't worth
+alerting you about.
 
 The flag accepts the same three forms as the `/bell` command:
 

@@ -63,6 +63,7 @@ from state import (
     fmt_duration,
     fmt_tok,
     humanize_size,
+    in_bg_wait,
     ring_bell,
     state_to_panels_dict,
     state_to_status_dict,
@@ -1240,8 +1241,12 @@ class SDKBridge:
                     "command": cmd,
                 }
                 await self.broadcast({"type": "bg_complete", **data})
-                ring_bell(state, "bg-done")
-                await self._flush_bell()
+                # Only ring when the session was *parked* waiting on this task
+                # (bg-wait), not when the model spawned it mid-turn and kept
+                # working — a routine mid-turn completion isn't alert-worthy.
+                if in_bg_wait(state):
+                    ring_bell(state, "bg-done")
+                    await self._flush_bell()
                 # If no more bg tasks, update status immediately and queue a wakeup.
                 if not state.background_tasks:
                     await self.broadcast({
@@ -1341,8 +1346,11 @@ class SDKBridge:
                         "command": cmd,
                     }
                     await self.broadcast({"type": "bg_complete", **data})
-                    ring_bell(state, "bg-done")
-                    await self._flush_bell()
+                    # See the task_notification branch: only alert when parked
+                    # in bg-wait, not on a mid-turn (busy) completion.
+                    if in_bg_wait(state):
+                        ring_bell(state, "bg-done")
+                        await self._flush_bell()
                     if not state.background_tasks:
                         await self.broadcast({
                             "type": "status_update",
