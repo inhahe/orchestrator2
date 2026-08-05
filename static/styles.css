@@ -978,6 +978,11 @@ html, body {
 }
 .thinking-header:hover { background: var(--bg-tool-hover); }
 
+/* Encrypted reasoning (opus-4-8 / opus-5 and newer return a signature with no
+   text).  There's nothing to expand, so the row isn't clickable. */
+.msg-thinking-encrypted .thinking-header { cursor: default; }
+.msg-thinking-encrypted .thinking-header:hover { background: none; }
+
 .thinking-summary {
   flex: 1;
   overflow: hidden;

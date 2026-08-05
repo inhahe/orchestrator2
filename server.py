@@ -162,6 +162,7 @@ _picker_mode: bool = False
 # ``lobby_clients`` holds tabs sitting at the lobby, not attached to any
 # session.
 from session_runtime import SessionRuntime  # noqa: E402
+import ws_channel  # noqa: E402
 
 _ws_clients: set[WebSocket] = set()
 _ws_lock = asyncio.Lock()
@@ -265,15 +266,28 @@ def _recent_disk_sessions(limit: int = 40) -> list[dict[str, Any]]:
     return out
 
 
-async def _session_list_payload() -> dict[str, Any]:
+async def _session_list_payload(include_recent: bool = True) -> dict[str, Any]:
     """The ``session_list`` message: running runtimes + recent disk sessions.
 
     The recent-disk scan now walks every Claude account on the machine, which
     can touch many JSONL files, so it's run in a thread to avoid blocking the
     event loop (a stalled loop froze every session, not just the lobby).
+
+    ``include_recent=False`` returns just the (in-memory, instant) running list
+    with ``recent_pending: True`` — used for the landing lobby so a cold-cache
+    disk scan doesn't stall the first paint.  The full list follows once the
+    scan finishes; the frontend keeps its "loading sessions…" spinner until
+    then.
     """
     running = [rt.meta() for rt in runtimes.values()]
     running.sort(key=lambda m: m.get("last_activity", 0), reverse=True)
+    if not include_recent:
+        return {
+            "type": "session_list",
+            "running": running,
+            "recent": [],
+            "recent_pending": True,
+        }
     loop = asyncio.get_running_loop()
     recent = await loop.run_in_executor(None, _recent_disk_sessions)
     return {
@@ -288,16 +302,17 @@ async def lobby_broadcast(msg: dict[str, Any]) -> None:
     targets = _lobby_targets()
     if not targets:
         return
-    data = json.dumps(msg, default=str)
-    stale: list[WebSocket] = []
+    data: str | None = None
     for ws in list(targets):
+        if ws_channel.send(ws, msg):
+            continue
+        if data is None:
+            data = json.dumps(msg, default=str)
         try:
             await ws.send_text(data)
         except Exception:
-            stale.append(ws)
-    for ws in stale:
-        lobby_clients.discard(ws)
-        _lobby_watchers.discard(ws)
+            lobby_clients.discard(ws)
+            _lobby_watchers.discard(ws)
 
 
 async def _push_session_list(target: WebSocket | None = None) -> None:
@@ -471,37 +486,43 @@ _pending_resume_id: str | None = None
 # ---------------------------------------------------------------------------
 
 async def broadcast(msg: dict[str, Any]) -> None:
-    """Send *msg* as JSON to **every** connected tab, across all runtimes.
+    """Enqueue *msg* for **every** connected tab, across all runtimes.
 
     Server-wide only (e.g. ``server_shutdown``).  Per-session updates must go
     through the owning runtime's ``rt.broadcast`` so they reach just that
     session's viewers, not tabs watching other sessions.
+
+    Non-blocking: hands each message to the client's outbound channel (a
+    dedicated writer task drains it), so a slow client never stalls the caller
+    or the event loop.  See ``ws_channel``.
     """
     if not _ws_clients:
         return
-    data = json.dumps(msg, default=str)
     # Snapshot to avoid mutation during iteration.
     async with _ws_lock:
         clients = list(_ws_clients)
-    stale: list[WebSocket] = []
     for ws in clients:
-        try:
-            await ws.send_text(data)
-        except Exception:
-            stale.append(ws)
-    if stale:
-        async with _ws_lock:
-            for ws in stale:
-                _ws_clients.discard(ws)
+        if not ws_channel.send(ws, msg):
+            # No channel yet (socket mid-handshake) — fall back to a direct
+            # send so nothing is silently dropped.
+            try:
+                await ws.send_text(json.dumps(msg, default=str))
+            except Exception:
+                pass
 
 
 async def _broadcast_shutdown(reason: str) -> None:
     """Tell every connected browser tab the server is about to exit."""
     await broadcast({"type": "server_shutdown", "reason": reason})
+    # Give the writer tasks a moment to flush before the process exits.
+    await ws_channel.drain_all(1.0)
 
 
 async def send_to(ws: WebSocket, msg: dict[str, Any]) -> None:
-    """Send *msg* as JSON to a single WebSocket client."""
+    """Enqueue *msg* for a single WebSocket client (non-blocking)."""
+    if ws_channel.send(ws, msg):
+        return
+    # No channel registered (e.g. an unusual pre-accept send) — send directly.
     try:
         await ws.send_text(json.dumps(msg, default=str))
     except Exception:
@@ -650,6 +671,16 @@ async def lifespan(app: FastAPI):
         asyncio.to_thread(fetch_available_models), name="warm-model-cache",
     )
 
+    # Warm the recent-disk-session cache off the event loop.  The first lobby
+    # load scans every Claude config dir's JSONL sessions (head+tail read per
+    # file); that per-file parse is cached by (mtime, size), but the cache is
+    # empty right after a restart, so the *first* tab to hit the lobby would
+    # otherwise stall for seconds on a cold disk read.  Priming it here in the
+    # background means it's usually hot before anyone connects.
+    asyncio.create_task(
+        asyncio.to_thread(_recent_disk_sessions), name="warm-disk-sessions",
+    )
+
     # Seed session_id early (cheap disk reads) so the browser gets history on
     # first connect, even before the deferred bridge is up.  The resume id is
     # stashed for _deferred_bridge_startup to apply once the bridge exists.
@@ -702,11 +733,17 @@ async def lifespan(app: FastAPI):
     if bridge:
         await bridge.stop()
     if _ticker_task and not _ticker_task.done():
+        # asyncio.wait, NOT `await task` inside `except asyncio.CancelledError: pass`:
+        # that cannot tell the ticker's cancellation from one aimed at *us*, so it
+        # silently swallows our own — which makes an enclosing anyio task group re-deliver
+        # cancellation on every event-loop iteration forever and pins a CPU core at 100%.
+        # (Same trap as sdk_bridge.cancel_and_join, whose docstring has the full story;
+        # inlined here to avoid importing sdk_bridge at shutdown when no bridge ever ran.)
         _ticker_task.cancel()
-        try:
-            await _ticker_task
-        except asyncio.CancelledError:
-            pass
+        _tdone, _ = await asyncio.wait({_ticker_task})
+        for _t in _tdone:
+            if not _t.cancelled() and _t.exception() is not None:
+                log.debug("ticker exited with %r", _t.exception())
 
 
 async def _deferred_bridge_startup(*, start: bool) -> None:
@@ -2180,9 +2217,15 @@ async def _enter_lobby(ws: WebSocket, notice: str | None = None) -> None:
         old.discard_client(ws)
         _maybe_start_idle_timer(old)
     lobby_clients.add(ws)
-    await _push_session_list(ws)
+    # Paint the lobby immediately with the running sessions (in-memory, instant)
+    # and mark the recent list pending; a cold-cache disk scan can take seconds,
+    # and blocking the landing on it is what left the tab stuck on "loading
+    # sessions".  The full list (with recent) is pushed from a background task
+    # once the scan completes.
+    await send_to(ws, await _session_list_payload(include_recent=False))
     if notice:
         await send_to(ws, {"type": "lobby_notice", "message": notice})
+    asyncio.create_task(_push_session_list(ws))
     if old is not None:
         await _push_session_list()   # others see the viewer count drop
 
@@ -2209,6 +2252,9 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     global _has_had_clients
     _cancel_shutdown_timer()
     _has_had_clients = True
+    # Give this socket its own outbound channel before any send, so every
+    # fan-out (broadcast / send_to / rt.broadcast) is a non-blocking enqueue.
+    ws_channel.register(ws)
     async with _ws_lock:
         _ws_clients.add(ws)
 
@@ -2283,6 +2329,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     finally:
         async with _ws_lock:
             _ws_clients.discard(ws)
+        ws_channel.unregister(ws)
         _cleanup_ws(ws)
         _maybe_start_shutdown_timer()
 
@@ -2474,6 +2521,20 @@ async def _do_switch(ws: WebSocket, msg: dict[str, Any]) -> None:
     await _attach_ws(ws, new_rt)
 
 
+async def _lobby_error(ws: WebSocket, message: str,
+                       notice: str | None = None) -> None:
+    """Report a failed lobby action both in the chat and on the lobby overlay.
+
+    A plain ``system_msg`` lands in the chat, which is *behind* the lobby
+    overlay — and on mobile the overlay stays open across a session switch
+    (there's no second tab to hand off to), so a chat-only error is invisible
+    and the tap just looks ignored.  Pair it with a ``lobby_notice`` banner.
+    """
+    await send_to(ws, {"type": "system_msg", "subtype": "error",
+                       "data": {"message": message}})
+    await send_to(ws, {"type": "lobby_notice", "message": notice or message})
+
+
 async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
     """Handle lobby / session-switching messages.  Returns True if handled.
 
@@ -2526,8 +2587,10 @@ async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
     if msg_type == "attach":
         rt = _runtime_by_rid(msg.get("rid"))
         if rt is None:
-            await send_to(ws, {"type": "system_msg", "subtype": "error",
-                               "data": {"message": "That session is no longer running."}})
+            await _lobby_error(
+                ws, "That session is no longer running.",
+                "That session is no longer running — it may have been closed. "
+                "Pick another below.")
             await _push_session_list(ws)
             return True
         await _attach_ws(ws, rt)
@@ -2542,8 +2605,7 @@ async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
             rt = await _create_runtime(cwd=cwd, no_continue=True)
         except Exception as exc:
             log.exception("failed to create new session")
-            await send_to(ws, {"type": "system_msg", "subtype": "error",
-                               "data": {"message": f"Couldn't start a new session: {exc}"}})
+            await _lobby_error(ws, f"Couldn't start a new session: {exc}")
             return True
         await _attach_ws(ws, rt)
         return True
@@ -2551,8 +2613,7 @@ async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
     if msg_type == "open":
         sid = (msg.get("session_id") or "").strip()
         if not sid:
-            await send_to(ws, {"type": "system_msg", "subtype": "error",
-                               "data": {"message": "No session_id provided."}})
+            await _lobby_error(ws, "No session_id provided.")
             return True
         # Already live?  Just attach to the existing runtime.
         existing = next(
@@ -2585,8 +2646,7 @@ async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
             rt = await _create_runtime(cwd=cwd, resume=sid, config_dir=account)
         except Exception as exc:
             log.exception("failed to open session %s", sid)
-            await send_to(ws, {"type": "system_msg", "subtype": "error",
-                               "data": {"message": f"Couldn't open that session: {exc}"}})
+            await _lobby_error(ws, f"Couldn't open that session: {exc}")
             return True
         await _attach_ws(ws, rt)
         return True

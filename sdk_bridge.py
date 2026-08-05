@@ -91,6 +91,44 @@ from tool_manager import (
 
 log = logging.getLogger(__name__)
 
+
+async def cancel_and_join(task: asyncio.Task, what: str) -> None:
+    """Cancel *task*, wait for it to finish, and absorb **its** failure — but never
+    our own cancellation.
+
+    The obvious spelling of this is a trap::
+
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    That ``except`` is meant to swallow the awaited task's ``CancelledError``, but
+    ``await task`` is also where a ``CancelledError`` aimed at *this* coroutine
+    arrives — so the caller silently swallows its own cancellation and carries on to
+    its next ``await``.  Under an anyio task group (every Starlette request /
+    WebSocket handler runs in one) the group then re-delivers cancellation on *every*
+    event-loop iteration forever: the coroutine keeps getting cancelled at whatever
+    await it reached next, never finishes, never leaves ``TaskGroup._tasks``, and
+    ``anyio._backends._asyncio.CancelScope._deliver_cancellation`` re-arms itself via
+    ``call_soon`` each pass.  The loop never sleeps and the process pins one CPU core
+    at 100% indefinitely — observed for 60+ CPU-hours before being caught (see
+    known-issues.md).
+
+    ``asyncio.wait`` is the fix: it reports the task's outcome instead of re-raising
+    it, so the awaitee's cancellation is absorbed while a cancellation aimed at us
+    still propagates out of the ``await`` normally.
+    """
+    task.cancel()
+    done, _ = await asyncio.wait({task})
+    for t in done:
+        if not t.cancelled():
+            exc = t.exception()
+            if exc is not None:
+                log.debug("%s exited with %r", what, exc)
+
+
 # Hard ceiling on a single ``client.connect()`` call.  Spawning the Claude CLI
 # and completing its init handshake normally takes a few seconds; occasionally
 # it hangs outright (the subprocess starts but never finishes the handshake),
@@ -405,11 +443,7 @@ class SDKBridge:
                 "creating new one (task=%s)",
                 old_task.get_name(),
             )
-            old_task.cancel()
-            try:
-                await old_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            await cancel_and_join(old_task, "orphan dispatcher")
 
         self.client = ClaudeSDKClient(options=options)
 
@@ -488,11 +522,7 @@ class SDKBridge:
     async def disconnect(self) -> None:
         """Shut down client and dispatcher."""
         if self._dispatcher_task and not self._dispatcher_task.done():
-            self._dispatcher_task.cancel()
-            try:
-                await self._dispatcher_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            await cancel_and_join(self._dispatcher_task, "dispatcher")
         if self.client:
             try:
                 await self.client.disconnect()
@@ -671,12 +701,23 @@ class SDKBridge:
                         await self._broadcast_panels()
                 elif ThinkingBlock and isinstance(block, ThinkingBlock):
                     thinking_text = getattr(block, "thinking", "") or ""
+                    signature = getattr(block, "signature", "") or ""
+                    # See the matching branch in run_turn(): newer models
+                    # return encrypted reasoning (signature, empty text).
                     if thinking_text.strip():
                         seq = register_thinking(state, thinking_text)
                         await self.broadcast({
                             "type": "thinking",
                             "seq": seq,
                             "content": thinking_text,
+                        })
+                    elif signature:
+                        seq = register_thinking(state, "", encrypted=True)
+                        await self.broadcast({
+                            "type": "thinking",
+                            "seq": seq,
+                            "content": "",
+                            "encrypted": True,
                         })
 
         elif isinstance(msg, UserMessage):
@@ -1781,12 +1822,27 @@ class SDKBridge:
                         # Thinking
                         elif ThinkingBlock and isinstance(block, ThinkingBlock):
                             thinking_text = getattr(block, "thinking", "") or ""
+                            signature = getattr(block, "signature", "") or ""
+                            # Models newer than opus-4-6 (4-8, 5, …) return
+                            # *encrypted* reasoning: the block carries a
+                            # signature but an empty ``thinking`` string, and
+                            # no thinking_delta ever streams.  Don't drop it —
+                            # surface the block so the user can still see that
+                            # the model reasoned, just without the text.
                             if thinking_text.strip():
                                 seq = register_thinking(state, thinking_text)
                                 await self.broadcast({
                                     "type": "thinking",
                                     "seq": seq,
                                     "content": thinking_text,
+                                })
+                            elif signature:
+                                seq = register_thinking(state, "", encrypted=True)
+                                await self.broadcast({
+                                    "type": "thinking",
+                                    "seq": seq,
+                                    "content": "",
+                                    "encrypted": True,
                                 })
 
                 # ---- UserMessage (tool results OR injected prompts) ----
@@ -2814,9 +2870,5 @@ class SDKBridge:
         self._cancel_wakeup()
         self.event_queue.put_nowait(("quit", ""))
         if self._worker_task and not self._worker_task.done():
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            await cancel_and_join(self._worker_task, "worker")
         await self.disconnect()

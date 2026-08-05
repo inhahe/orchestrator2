@@ -363,13 +363,21 @@ def complete_bg_task(
 def register_thinking(
     state: State,
     content: str,
+    encrypted: bool = False,
 ) -> int:
-    """Record a thinking block.  Returns the assigned thinking seq."""
+    """Record a thinking block.  Returns the assigned thinking seq.
+
+    ``encrypted`` marks a block whose reasoning the model returned in encrypted
+    form (a signature with no text — opus-4-8 / opus-5 and newer).  There's no
+    content to show, but the block is still recorded so ``/show`` and the
+    transcript reflect that the model reasoned.
+    """
     seq = state.next_thinking_seq
     state.next_thinking_seq += 1
     state.thinking_history.append({
         "seq": seq,
         "content": content,
+        "encrypted": encrypted,
         "timestamp": time.monotonic(),
     })
     return seq
@@ -666,10 +674,15 @@ def _bg_detail(match: tuple[str, dict[str, Any]], tail: int | None) -> dict[str,
 
 def _thinking_detail(entry: dict[str, Any]) -> dict[str, Any]:
     """Full detail for one thinking block."""
+    encrypted = bool(entry.get("encrypted"))
     return {
         "letter": "k",
         "seq": entry["seq"],
-        "content": entry.get("content", ""),
+        "content": entry.get("content", "") or (
+            "(reasoning returned encrypted by the model — no text available)"
+            if encrypted else ""
+        ),
+        "encrypted": encrypted,
     }
 
 

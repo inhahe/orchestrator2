@@ -714,10 +714,13 @@ def parse_args(argv: list[str] | None = None) -> Config:
     ap.add_argument(
         "--bell", "--bell-on",
         dest="bell_on",
+        nargs="+",
         default=DEFAULT_BELL_EVENTS,
-        metavar="EVENTS",
+        metavar="EVENT",
         help=(
-            "Comma- or space-separated bell events to ring on. "
+            "Bell events to ring on, as separate words or one comma-/space-"
+            "separated string (e.g. '--bell turn-done bg-done' or "
+            "'--bell \"turn-done,bg-done\"'). "
             f"Valid: {', '.join(sorted(BELL_EVENT_NAMES))}. "
             "Bare names REPLACE the set; '+event'/'-event' add to / remove "
             "from the defaults (e.g. '+turn-done'). "
@@ -903,7 +906,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
         collapse_tools=args.collapse_tools,
         collapse_threshold=max(1, args.collapse_threshold),
         max_dom_messages=max(0, args.max_dom_messages),
-        bell_on=args.bell_on,
+        bell_on=(
+            " ".join(args.bell_on)
+            if isinstance(args.bell_on, list)
+            else args.bell_on
+        ),
         append_system_prompt=args.append_system_prompt,
         mcp_config=args.mcp_config,
         auto_reconnect=args.auto_reconnect,

@@ -41,7 +41,7 @@ The server starts serving and the browser opens **immediately**; the status bar 
 
 - Type a message and press **Enter** to send (**Shift+Enter** for a newline).
 - Type while Claude is busy to **queue** follow-up prompts (they run in order).
-- The **status bar** (above the input) shows state, account, session, **working directory (full path)**, turns, model, effort, context usage, and rate limits.
+- The **status bar** (above the input) shows state, **config dir**, account, session, **working directory (full path)**, turns, model, effort, context usage, and rate limits.
 - The **sidebar panels** show active tools, background tasks, the pending queue, and the current plan/todos.
 - **Slash commands** start with `/` — type `/help` for the full list. Common ones: `/status`, `/cwd <path>` (switch project), `/model`, `/effort`, `/resume`, `/rename`, `/switch` (move this session to another account), `/login`, `/clear`, `/interrupt`.
 
@@ -80,6 +80,12 @@ whatever it's viewing. Recent on-disk sessions are scanned across **every**
 Claude account on the machine (each is tagged with its account), so a session
 started under a different `CLAUDE_CONFIG_DIR` still shows up and reopens under
 the right account.
+
+On a desktop browser each session gets its **own tab** — picking one focuses
+that tab, or opens a new one. On **mobile** (where a page can't raise another
+tab to the foreground) the lobby instead switches the *current* tab to the
+session you picked, updating the address bar to `?rid=<rid>` so a refresh
+returns to the same session.
 
 The lobby header also has **⟳ Restart server** and **⏛ Shut down server**
 buttons. Restart spawns a fresh server process (picking up code changes) that
@@ -157,6 +163,7 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 ## Features
 
 - **Live WebSocket UI** -- real-time streaming of assistant messages, tool calls, and results
+- **Config-dir display** -- a dedicated **config** field (just before **account**) shows the active `CLAUDE_CONFIG_DIR` this session uses, as its trailing folder name (e.g. `.claude-account-b`); hover for the full path. Makes it obvious which config dir / account store a session is on when running several side by side
 - **Account display** -- the status bar shows the signed-in account (the email address from `<config-dir>/.claude.json`, falling back to the config-dir name when no email is stored). Hover it to see the display name, organization, plan type, role, and the active `CLAUDE_CONFIG_DIR` — handy when running multiple accounts/config dirs side by side
 - **Working-directory display** -- the status bar shows the full working-directory path Claude is operating in
 - **Auto-login** -- checks your Claude sign-in on startup and opens the standard Claude login window if you're not authenticated (the same flow Claude Code uses). Sign in / out at runtime with `/login` and `/logout`
@@ -260,8 +267,8 @@ alerting you about.
 
 The flag accepts the same three forms as the `/bell` command:
 
-- **Replace** — bare event names ring on *only* those events: `--bell "turn-done bg-done"`
-- **Modify** — `+`/`-` prefixed tokens start from the defaults, then add or remove: `--bell +interrupt` (defaults **plus** `interrupt`), `--bell -bg-done` (defaults **minus** `bg-done`)
+- **Replace** — bare event names ring on *only* those events, given as separate words or one quoted string: `--bell turn-done bg-done` or `--bell "turn-done bg-done"`
+- **Modify** — `+`/`-` prefixed tokens start from the defaults, then add or remove: `--bell +interrupt` (defaults **plus** `interrupt`), `--bell=-bg-done` (defaults **minus** `bg-done`; use the `=` form for a leading `-` so it isn't parsed as a flag)
 - **Shortcuts** — `--bell all` (every event) or `--bell none` (disable the bell)
 
 At runtime, use the `/bell` slash command to view or change the bell events without restarting:

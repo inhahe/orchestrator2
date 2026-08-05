@@ -765,6 +765,7 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         "busy_class": busy_class,
         "turns": state.turns,
         "plan_field": plan_field,
+        "config_dir": str(config_dir_path(getattr(config, "config_dir", None))),
         "account": state.account,
         "is_subscription": state.is_subscription,
         "rate_field": rate_field,

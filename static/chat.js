@@ -709,8 +709,27 @@ const Chat = (() => {
     // otherwise show a size hint like tool headers do.
     const isSingleLine = nLines === 1;
 
+    // Models newer than opus-4-6 return *encrypted* reasoning: the block has
+    // a signature but no text, and no thinking_delta ever streams — so no
+    // client can show the content.  Render a marker instead of nothing, so
+    // it's clear the model reasoned rather than looking like it never did.
+    const encrypted = !!msg.encrypted && !text;
+
     const el = document.createElement('div');
     el.className = 'msg msg-thinking';
+    if (encrypted) {
+      el.classList.add('msg-thinking-encrypted');
+      el.innerHTML = `
+        <div class="thinking-header">
+          <span>\u{1F4AD}</span>
+          <span>Thinking</span>
+          <span class="thinking-summary" style="color:var(--text-muted); font-size:11px;"
+                title="This model returns encrypted reasoning \u2014 the text is not sent to any client.">(hidden by model)</span>
+        </div>`;
+      _trackThinkingBlock(el);
+      _scrollToBottom();
+      return;
+    }
     // Build the summary span — actual content chosen after DOM insertion
     // so we can measure available width.
     el.innerHTML = `

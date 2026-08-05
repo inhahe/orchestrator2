@@ -1036,6 +1036,16 @@ def render_session_history(
                             "content": thinking_text,
                             "is_history": True,
                         })
+                    elif block.get("signature"):
+                        # Encrypted reasoning (opus-4-8 / opus-5 and newer):
+                        # signature only, no text.  Still show the block so the
+                        # replayed transcript matches what the live turn showed.
+                        messages.append({
+                            "type": "thinking",
+                            "content": "",
+                            "encrypted": True,
+                            "is_history": True,
+                        })
             rendered += 1
 
     return rendered, messages, []

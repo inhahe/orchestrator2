@@ -6,7 +6,7 @@
 
 const Status = (() => {
   // Element references (cached on init).
-  let elIndicator, elState, elAccount, elSession, elCwd, elTurns, elPlan;
+  let elIndicator, elState, elConfigDir, elAccount, elSession, elCwd, elTurns, elPlan;
   let elModel, elEffort, elThinking;
   let elContext, elRateLimit;
   let elCollapseCheck;
@@ -26,6 +26,7 @@ const Status = (() => {
   function init() {
     elIndicator = document.getElementById('status-indicator');
     elState     = document.getElementById('status-state');
+    elConfigDir = document.getElementById('status-configdir');
     elAccount   = document.getElementById('status-account');
     elSession   = document.getElementById('status-session');
     elCwd       = document.getElementById('status-cwd');
@@ -132,6 +133,10 @@ const Status = (() => {
       _prev.stateColor = stateColor;
     }
 
+    // Config dir (the CLAUDE_CONFIG_DIR / account store this session uses).
+    // Show the folder name; full path in the tooltip.
+    if (elConfigDir) _updateConfigDir(status.config_dir);
+
     // Account (email if available, else the config dir).  Static per session
     // but cheap; guarded by a change cache like the rest.
     if (elAccount) _updateAccount(status.account);
@@ -217,6 +222,23 @@ const Status = (() => {
     if (status.max_dom_messages != null && _prev.maxDom !== status.max_dom_messages) {
       Chat.setMaxDomMessages(status.max_dom_messages);
       _prev.maxDom = status.max_dom_messages;
+    }
+  }
+
+  function _updateConfigDir(cfg) {
+    cfg = cfg || '';
+    // Display the trailing folder name (e.g. ".claude-account-b"); the full
+    // path goes in the tooltip.
+    let display = '--';
+    if (cfg) {
+      const parts = cfg.replace(/[\\/]+$/, '').split(/[\\/]/);
+      display = parts[parts.length - 1] || cfg;
+    }
+    const key = display + '|' + cfg;
+    if (_prev.configDirKey !== key) {
+      elConfigDir.textContent = display;
+      elConfigDir.title = cfg || 'Config dir';
+      _prev.configDirKey = key;
     }
   }
 
