@@ -20,6 +20,7 @@ from config import (
     Config,
     _parse_bell_spec,
     get_known_models,
+    model_cache_is_stale,
     parse_bell_events,
 )
 from state import (
@@ -925,5 +926,9 @@ def _cmd_model_show(_payload: str, state: State, _config: Config) -> CommandResu
     else:
         current = "(auto — no AssistantMessage received yet)"
     models = [{"id": m, "description": d} for m, d in get_known_models()]
-    data = {"current": current, "models": models}
+    # Flag a fallback list explicitly.  Silently showing the hardcoded list as
+    # if it were live is how "a model I know exists is missing from /model"
+    # goes unnoticed — any model id still works when typed directly.
+    data = {"current": current, "models": models,
+            "live": not model_cache_is_stale()}
     return CommandResult(messages=[_data_msg(data, label="model")])

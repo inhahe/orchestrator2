@@ -344,8 +344,8 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 
 | Command | Description |
 |---------|-------------|
-| `/model` | List available models and show current |
-| `/model <name>` | Switch to a different model |
+| `/model` | List available models and show current. The list is fetched live from the Anthropic API and refreshed hourly; if it can't be reached, a built-in fallback list is shown and labelled as such |
+| `/model <name>` | Switch to a different model. Any model id works, whether or not it appears in the list |
 | `/models` | Alias for `/model` |
 | `/effort [level]` | Show or set effort (`auto`/`low`/`medium`/`high`/`max`) |
 | `/thinking [on\|off]` | Toggle extended thinking |

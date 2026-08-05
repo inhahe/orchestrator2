@@ -992,7 +992,19 @@ const Chat = (() => {
       if (active) html += `<span class="model-picker-check">\u2713</span>`;
       html += `</div>`;
     }
-    html += `</div></div>`;
+    html += `</div>`;
+    // The server couldn't reach the model API, so this is the built-in
+    // fallback list and may be missing recently-released models.  Say so —
+    // otherwise a missing model just looks like it doesn't exist.  Any id
+    // still works when typed directly (`/model <id>`).
+    if (data.live === false) {
+      html += `<div class="model-picker-stale">`
+            + `couldn\u2019t reach the model API \u2014 showing the built-in list, `
+            + `which may be out of date. Any model id still works if you type it: `
+            + `<code>/model &lt;id&gt;</code>`
+            + `</div>`;
+    }
+    html += `</div>`;
     el.innerHTML = html;
 
     el.addEventListener('click', (e) => {

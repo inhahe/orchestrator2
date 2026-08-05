@@ -67,6 +67,7 @@ from config import (
     Config,
     DEFAULT_EXTERNAL_PASSWORD,
     DEFAULT_PORT,
+    MODEL_CACHE_TTL,
     _PICKER_SENTINEL,
     fetch_available_models,
     parse_args,
@@ -459,6 +460,36 @@ def _switch_accounts_payload(current_cfg: str | None) -> list[dict[str, Any]]:
 
 # Background tasks for periodic updates.
 _ticker_task: asyncio.Task | None = None
+_model_task: asyncio.Task | None = None
+
+
+async def _model_cache_loop() -> None:
+    """Keep the live model list (Anthropic ``/v1/models``) cached and fresh.
+
+    ``/model`` runs on the event loop, so it can only ever read a cache —
+    it must never block on the network.  This used to be a single
+    fire-and-forget fetch at startup, which was too fragile in two ways:
+
+    * Any transient failure (an OAuth access token that happened to be
+      expired at startup, a network blip) pinned the process to the
+      hardcoded ``KNOWN_MODELS`` fallback *for its entire lifetime*, so a
+      model that genuinely exists silently stopped appearing in ``/model``
+      until the server was restarted.
+    * With no refresh, a hub left running for days never picked up a model
+      released in the meantime.
+
+    So: retry with exponential backoff while it's failing, and re-fetch
+    every ``MODEL_CACHE_TTL`` once it's working.
+    """
+    backoff = 30.0
+    while True:
+        ok = bool(await asyncio.to_thread(fetch_available_models))
+        if ok:
+            backoff = 30.0
+            await asyncio.sleep(MODEL_CACHE_TTL)
+        else:
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 600.0)
 
 # Auto-shutdown: when all tabs close, shut down after a grace period.
 _shutdown_timer: asyncio.Task | None = None
@@ -638,7 +669,7 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start background tasks on startup, clean up on shutdown."""
-    global config, state, bridge, theme, _ticker_task, _picker_mode
+    global config, state, bridge, theme, _ticker_task, _model_task, _picker_mode
     global _default_runtime
 
     # --- Startup ---
@@ -664,12 +695,9 @@ async def lifespan(app: FastAPI):
 
     _ticker_task = asyncio.create_task(_status_ticker(), name="status-ticker")
 
-    # Warm the live model-list cache off the event loop so /model (which runs
-    # on the loop) can read it without blocking on a network call.  Best
-    # effort — falls back to the hardcoded list if this fails.
-    asyncio.create_task(
-        asyncio.to_thread(fetch_available_models), name="warm-model-cache",
-    )
+    # Keep the live model-list cache warm off the event loop so /model (which
+    # runs on the loop) can read it without blocking on a network call.
+    _model_task = asyncio.create_task(_model_cache_loop(), name="model-cache")
 
     # Warm the recent-disk-session cache off the event loop.  The first lobby
     # load scans every Claude config dir's JSONL sessions (head+tail read per
@@ -744,6 +772,14 @@ async def lifespan(app: FastAPI):
         for _t in _tdone:
             if not _t.cancelled() and _t.exception() is not None:
                 log.debug("ticker exited with %r", _t.exception())
+    if _model_task and not _model_task.done():
+        # Same asyncio.wait pattern as the ticker above — see that comment for
+        # why `await task` inside `except CancelledError` is the wrong shape.
+        _model_task.cancel()
+        _mdone, _ = await asyncio.wait({_model_task})
+        for _t in _mdone:
+            if not _t.cancelled() and _t.exception() is not None:
+                log.debug("model-cache loop exited with %r", _t.exception())
 
 
 async def _deferred_bridge_startup(*, start: bool) -> None:

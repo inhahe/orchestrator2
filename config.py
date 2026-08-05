@@ -10,10 +10,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -92,12 +97,18 @@ SLASH_COMMANDS = [
 
 # Fallback model list — (id, description).  Used only when the live list
 # from the Anthropic API can't be fetched (see fetch_available_models).
-# This goes stale as new models ship, so the live list is preferred.
+# This goes stale as new models ship, so the live list is preferred; the
+# cache is refreshed periodically (see _model_cache / MODEL_CACHE_TTL) so a
+# transient fetch failure no longer pins the process to this list.
 KNOWN_MODELS = [
-    ("claude-opus-4-8", "Opus 4.8 — 1M context, max capability"),
+    ("claude-opus-5", "Opus 5 — 1M context, max capability"),
+    ("claude-sonnet-5", "Sonnet 5 — 200k context"),
+    ("claude-fable-5", "Fable 5 — 200k context"),
+    ("claude-opus-4-8", "Opus 4.8 — 1M context"),
+    ("claude-opus-4-7", "Opus 4.7 — 1M context"),
     ("claude-opus-4-6", "Opus 4.6 — 1M context"),
     ("claude-sonnet-4-6", "Sonnet 4.6 — 200k context, fast"),
-    ("claude-haiku-3-5", "Haiku 3.5 — 200k context, fastest"),
+    ("claude-haiku-4-5-20251001", "Haiku 4.5 — 200k context, fastest"),
 ]
 
 # Terminal bell event system.
@@ -199,9 +210,16 @@ def default_compact_at(model: str | None) -> int:
 # ---------------------------------------------------------------------------
 
 # Cache of the live model list.  /model runs on the event loop, so it must
-# never block on a network call — it reads this cache (warmed at startup by
-# fetch_available_models) via get_known_models().  None until first fetch.
+# never block on a network call — it reads this cache (kept warm by the
+# server's model-cache loop) via get_known_models().  None until first fetch.
 _model_cache: list[tuple[str, str]] | None = None
+# time.monotonic() of the last *successful* fetch (0.0 = never).
+_model_cache_at: float = 0.0
+
+# How long a fetched model list is considered fresh.  Re-fetching matters:
+# a hub can stay up for days, and a model released in the meantime would
+# otherwise never appear in /model without a restart.
+MODEL_CACHE_TTL = 3600.0
 
 
 def _read_oauth_token() -> str | None:
@@ -243,7 +261,7 @@ def fetch_available_models(timeout: float = 6.0) -> list[tuple[str, str]] | None
     This blocks on the network, so off the event loop only (startup warm or
     the synchronous --list-models path).
     """
-    global _model_cache
+    global _model_cache, _model_cache_at
     headers = {"anthropic-version": "2023-06-01"}
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if api_key:
@@ -251,19 +269,33 @@ def fetch_available_models(timeout: float = 6.0) -> list[tuple[str, str]] | None
     else:
         token = _read_oauth_token()
         if not token:
+            log.warning("model list: no credentials (no ANTHROPIC_API_KEY and "
+                        "no OAuth token in %s) — using the fallback list",
+                        os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
             return None
         headers["Authorization"] = f"Bearer {token}"
         headers["anthropic-beta"] = "oauth-2025-04-20"
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/models?limit=100", headers=headers,
     )
+    # Failures are logged, not silent: a silent failure here is invisible and
+    # shows up much later as "a model I know exists is missing from /model".
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = json.load(resp)
-    except Exception:
+    except urllib.error.HTTPError as exc:
+        log.warning("model list: HTTP %s from /v1/models — using the fallback "
+                    "list%s", exc.code,
+                    " (token expired? re-login with /login)"
+                    if exc.code in (401, 403) else "")
+        return None
+    except Exception as exc:
+        log.warning("model list: fetch failed (%r) — using the fallback list", exc)
         return None
     data = body.get("data") if isinstance(body, dict) else None
     if not isinstance(data, list):
+        log.warning("model list: unexpected /v1/models response shape — "
+                    "using the fallback list")
         return None
     out: list[tuple[str, str]] = []
     for m in data:
@@ -277,9 +309,20 @@ def fetch_available_models(timeout: float = 6.0) -> list[tuple[str, str]] | None
         desc = f"{name} — {_fmt_window(window)} context" if window else str(name)
         out.append((mid, desc))
     if not out:
+        log.warning("model list: /v1/models returned no usable models — "
+                    "using the fallback list")
         return None
     _model_cache = out
+    _model_cache_at = time.monotonic()
+    log.info("model list: cached %d models from /v1/models", len(out))
     return out
+
+
+def model_cache_is_stale() -> bool:
+    """True when the live model list has never loaded or has aged out."""
+    if _model_cache is None:
+        return True
+    return (time.monotonic() - _model_cache_at) > MODEL_CACHE_TTL
 
 
 def get_known_models() -> list[tuple[str, str]]:
