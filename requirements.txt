@@ -1,5 +1,6 @@
 claude-agent-sdk>=0.1.59
 fastapi>=0.115
 graphifyy>=0.9.13
+psutil>=5.9
 uvicorn>=0.34
 websockets>=15.0

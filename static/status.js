@@ -218,6 +218,13 @@ const Status = (() => {
       if (elCollapseCheck) elCollapseCheck.checked = val;
     }
 
+    // --show-thinking / "/show-thinking".  No localStorage override here (as
+    // collapse-tools has): there's no checkbox for it, so the backend is the
+    // only place it can be set and is therefore authoritative.
+    if (status.show_thinking != null) {
+      Chat.setShowThinking(status.show_thinking);
+    }
+
     // DOM trim limit (0 = never trim).
     if (status.max_dom_messages != null && _prev.maxDom !== status.max_dom_messages) {
       Chat.setMaxDomMessages(status.max_dom_messages);

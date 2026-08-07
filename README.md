@@ -104,6 +104,45 @@ the same port. Notes:
 - A session with zero viewers is torn down after `--session-idle-timeout`
   seconds (default 300; `0` disables); the hub itself keeps running.
 
+### Session safety
+
+A Claude session is a single conversation file plus a single working tree. Two
+agents driving one session at the same time is silent corruption: they append
+interleaved turns to the same JSONL, edit the same files without seeing each
+other's changes, and commit over each other. Three mechanisms keep that from
+happening.
+
+**Killed servers no longer leave `claude.exe` behind.** Windows has no automatic
+process-tree teardown — killing a parent orphans its children — so a server that
+was closed with Task Manager, `taskkill /F`, or a crash used to leave its
+`claude` subprocess alive and still resumed on its session. One such orphan
+survived four days and 4.4 CPU-hours, committing into a repo, while a newly
+started server resumed the same session on top of it. The server now puts itself
+in a Windows **Job Object** with `KILL_ON_JOB_CLOSE`, so the kernel reaps every
+child the moment the server process dies — no shutdown code has to run, which is
+the whole point. (The ⟳ Restart replacement server is spawned with
+`CREATE_BREAKAWAY_FROM_JOB` so it deliberately outlives the process that started
+it.)
+
+**Resuming a session someone else is already running is refused.** Before
+connecting, the server looks for a `claude` process *outside its own tree*
+running `--resume <the same session id>`. If it finds one, the session doesn't
+start; you get an error naming the offending PID, when it started, and the exact
+`taskkill` command to clear it. The check only ever blocks on a positive match —
+if the process scan fails for any reason it lets the session through. Pass
+`--allow-duplicate-session` to override it, accepting that both agents will be
+writing to the same session file and the same files on disk.
+
+**Ending a session cleans up its MCP servers.** Each stdio MCP server runs as a
+process stack underneath that session's `claude` process. Stopping `claude`
+kills only `claude` itself, so those servers used to survive — one abandoned
+stack per session ended, piling up for as long as the hub kept running (idle
+teardown, `/cwd`, reconnects). The server now records a session's child
+processes before shutting it down and cleans up whatever is left afterwards.
+This only ever touches servers started *by* that session, which can't be reused
+by anything else once it's gone; MCP servers you reach over HTTP/SSE aren't
+child processes and are never affected.
+
 ### Accessing the hub from other devices (LAN)
 
 The server binds `0.0.0.0`, so it's reachable from other machines on your
@@ -200,6 +239,7 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 | `--initial-prompt`, `-p` | -- | First message to send on startup |
 | `--no-continue` | off | Start a fresh session instead of resuming the most recent one |
 | `--no-replay` | off | When resuming, don't replay prior messages into backscroll |
+| `--allow-duplicate-session` | off | Connect even when another Claude process is already resuming the same session id. Off by default because two agents sharing one session file and working directory commit over each other — see [Session safety](#session-safety) |
 | `--disable-prompt-cache` | off | Turn off Claude prompt caching in the CLI (sets `DISABLE_PROMPT_CACHING`). Workaround for the bundled CLI's `ttl='1h' cache_control must not come after ttl='5m'` API 400 on long resumed sessions; costs cache savings, so leave off unless you hit that error |
 | `--resume [SESSION_ID]` | -- | Resume a specific session by ID, or omit the ID to open a full-screen terminal picker (grouped by project) before the server starts |
 | `--copy` | off | Open a full-screen terminal wizard to copy a session between Claude accounts: pick source account + session, destination account, and a name. If copied into the current account it asks whether to open it now. Whenever nothing gets opened (cancelled, declined, or a cross-account copy) it then asks what to open — the current directory's most-recent session (the default), pick another, or a fresh empty session |
@@ -243,7 +283,7 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--show-thinking` | off | Print full thinking blocks (default: collapsed snippet) |
+| `--show-thinking` | off | Start thinking blocks expanded instead of collapsed to a one-line summary. Purely a display choice — the full text is always available, and blocks stay click-to-toggle either way. Change it at runtime with `/show-thinking` |
 | `--show-full-commands` | off | Display Bash command body inline |
 | `--show-tool-output` | off | Print full tool result content inline |
 | `--show-tool-everything` | off | Shorthand for `--show-full-commands` + `--show-tool-output` |
@@ -348,7 +388,8 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/model <name>` | Switch to a different model. Any model id works, whether or not it appears in the list |
 | `/models` | Alias for `/model` |
 | `/effort [level]` | Show or set effort (`auto`/`low`/`medium`/`high`/`max`) |
-| `/thinking [on\|off]` | Toggle extended thinking |
+| `/thinking [on\|off]` | Toggle extended thinking (API-level — reconnects) |
+| `/show-thinking [on\|off]` | Show or set whether thinking blocks start expanded (display only, no reconnect) |
 | `/btw <question>` | Side question in separate context |
 | `/graphify [path] [flags]` | Build a knowledge graph ([graphify](https://github.com/safishamsi/graphify)) |
 | `/graphify explain <node>` | Explain a graph node + neighbors (runs directly, no LLM turn) |

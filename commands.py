@@ -149,6 +149,8 @@ def classify(line: str) -> tuple[str, str]:
         if not arg:
             return "error", "usage: /btw <question>"
         return "btw", arg
+    if cmd in ("show-thinking", "showthinking"):
+        return "show-thinking", arg
     if cmd in ("collapse", "collapse-tools"):
         return "collapse", arg
     if cmd in ("collapse-threshold",):
@@ -204,6 +206,7 @@ _IMMEDIATE_HANDLERS: dict[str, str] = {
     "clear-screen":    "_cmd_clear_screen",
     "rename":          "_cmd_rename",
     "export":          "_cmd_export",
+    "show-thinking":   "_cmd_show_thinking",
     "collapse":        "_cmd_collapse",
     "collapse-threshold": "_cmd_collapse_threshold",
     "autocompact":     "_cmd_autocompact",
@@ -256,6 +259,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         ("/interrupt, /i",               "stop the current turn"),
         ("/effort <level>",              f"one of {', '.join(EFFORT_CHOICES)}"),
         ("/thinking [on|off|toggle]",    "enable/disable extended thinking"),
+        ("/show-thinking [on|off]",      "expand thinking blocks by default"),
         ("/model [name]",                "show/set model; no arg lists available"),
         ("/login [force]",               "sign in to your Claude account (force = re-auth even if it thinks you're signed in)"),
         ("/logout",                      "sign out of your Claude account"),
@@ -517,6 +521,33 @@ def _cmd_export(payload: str, state: State, config: Config) -> CommandResult:
         return CommandResult(messages=[_msg(f"Export write failed: {e}", level="error")])
     size = out_path.stat().st_size
     return CommandResult(messages=[_msg(f"Exported → {out_path.resolve()} ({size} bytes)")])
+
+
+def _cmd_show_thinking(payload: str, state: State, _config: Config) -> CommandResult:
+    """Expand thinking blocks by default (the runtime twin of --show-thinking).
+
+    Purely a display gate: the full text is always sent and every block stays
+    click-to-toggle either way.  This only decides whether it starts open.
+    Existing blocks are left as they are — re-rendering the backscroll would
+    discard whatever the user had already expanded or collapsed by hand.
+    """
+    p = payload.strip().lower()
+    if not p:
+        label = "ON" if state.show_thinking else "OFF"
+        return CommandResult(messages=[_msg(f"show thinking: {label}")])
+    if p in ("on", "true", "enable", "1"):
+        state.show_thinking = True
+        return CommandResult(
+            messages=[_msg("show thinking ON — new thinking blocks start expanded")],
+            state_updates={"show_thinking": True},
+        )
+    if p in ("off", "false", "disable", "0"):
+        state.show_thinking = False
+        return CommandResult(
+            messages=[_msg("show thinking OFF — new thinking blocks start collapsed")],
+            state_updates={"show_thinking": False},
+        )
+    return CommandResult(messages=[_msg("Usage: /show-thinking [on|off]", level="error")])
 
 
 def _cmd_collapse(payload: str, state: State, _config: Config) -> CommandResult:

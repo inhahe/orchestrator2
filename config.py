@@ -90,7 +90,7 @@ SLASH_COMMANDS = [
     "/login", "/logout",
     "/connect", "/reconnect", "/resume", "/rename", "/switch", "/export", "/models",
     "/btw", "/graphify", "/autocompact", "/max-context", "/bell", "/mcp",
-    "/collapse", "/collapse-threshold",
+    "/collapse", "/collapse-threshold", "/show-thinking",
     "/queue", "/quit", "/exit",
     "/quit!", "/exit!",
 ]
@@ -431,6 +431,11 @@ class Config:
     resume: str | None = None          # None, _PICKER_SENTINEL, or session UUID/name
     copy: bool = False                 # --copy: TUI to copy a session from another account, then resume it
     no_replay: bool = False
+    # Escape hatch for the duplicate-session guard (see proc_guard.py).  By
+    # default a session whose id is already being resumed by another claude
+    # process refuses to connect, because two agents sharing one session file
+    # and working tree commit over each other.
+    allow_duplicate_session: bool = False
     cwd: str = "."
     # Workaround for a bundled-CLI prompt-cache bug: when the 1h-vs-5m
     # cache_control TTL flips mid-session (e.g. rate-limit overage toggles
@@ -547,6 +552,15 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--no-continue",
         action="store_true",
         help="Start a fresh session instead of resuming the most recent one in cwd.",
+    )
+    ap.add_argument(
+        "--allow-duplicate-session",
+        action="store_true",
+        help=(
+            "Connect even when another Claude process is already resuming the "
+            "same session id. Off by default: two agents sharing one session "
+            "file and working tree overwrite each other's commits."
+        ),
     )
     ap.add_argument(
         "--disable-prompt-cache",
@@ -701,7 +715,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
     ap.add_argument(
         "--show-thinking",
         action="store_true",
-        help="Print full thinking blocks (default: collapsed snippet).",
+        help="Start thinking blocks expanded instead of collapsed to a "
+             "one-line summary (they stay click-to-toggle either way).",
     )
     ap.add_argument(
         "--show-full-commands",
@@ -922,6 +937,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     return Config(
         initial_prompt=args.initial_prompt,
         no_continue=args.no_continue,
+        allow_duplicate_session=args.allow_duplicate_session,
         resume=args.resume,
         copy=args.copy,
         no_replay=args.no_replay,

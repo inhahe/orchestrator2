@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
+import proc_guard
+
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -429,6 +431,23 @@ class SDKBridge:
         )
         self._initial_resume_id = None  # one-time use
 
+        # Refuse to become the second agent on a session someone else is
+        # already driving.  The job object (proc_guard) stops *us* leaking
+        # orphans, but it can't retroactively clean up one left by a server
+        # that died before it existed, nor a second hub, nor a `claude
+        # --resume` the user ran in a terminal.  Two agents on one session
+        # share a session JSONL and a working tree and commit over each other.
+        resume_target = getattr(options, "resume", None)
+        if resume_target and not getattr(
+                self.config, "allow_duplicate_session", False):
+            # psutil scan touches every process — keep it off the event loop.
+            dupes = await asyncio.to_thread(
+                proc_guard.find_foreign_claude_for_session, resume_target)
+            if dupes:
+                log.error("refusing to resume %s — already running as PID(s) %s",
+                          resume_target, [p.pid for p in dupes])
+                raise proc_guard.DuplicateSessionError(resume_target, dupes)
+
         # If a previous dispatcher task is somehow still alive (e.g.
         # connect() was called without disconnect() — should be
         # impossible in the current call graph, but the symptom of
@@ -519,16 +538,47 @@ class SDKBridge:
             name=f"sdk-dispatcher-{gen}",
         )
 
+    def _cli_pid(self) -> int | None:
+        """PID of our ``claude.exe``, or None if the SDK doesn't expose it.
+
+        Reaches through SDK-private attributes, so it is written to fail soft:
+        if a future SDK reshuffles them we lose MCP cleanup, which is a leak,
+        not a crash.
+        """
+        proc = getattr(getattr(self.client, "_transport", None), "_process", None)
+        pid = getattr(proc, "pid", None)
+        return pid if isinstance(pid, int) and pid > 0 else None
+
     async def disconnect(self) -> None:
-        """Shut down client and dispatcher."""
+        """Shut down client and dispatcher.
+
+        Also reaps the CLI's own children.  The SDK stops ``claude.exe`` with
+        ``terminate()``/``kill()``; on Windows that kills only that one
+        process, orphaning the stdio MCP servers it spawned.  The server's job
+        object would eventually collect them — but only when the *server*
+        exits, so a long-lived hub cycling through sessions (idle teardown,
+        ``/cwd``, reconnects) accumulates a full MCP stack per dead session.
+        """
         if self._dispatcher_task and not self._dispatcher_task.done():
             await cancel_and_join(self._dispatcher_task, "dispatcher")
         if self.client:
+            # Snapshot while the CLI is still alive — once it exits, the
+            # parent links needed to find its children are gone.
+            cli_pid = self._cli_pid()
+            kids = []
+            if cli_pid is not None:
+                kids = await asyncio.to_thread(
+                    proc_guard.snapshot_descendants, cli_pid)
             try:
                 await self.client.disconnect()
             except Exception:
                 pass
             self.client = None
+            if kids:
+                n = await asyncio.to_thread(proc_guard.reap_descendants, kids)
+                if n:
+                    log.info("reaped %d orphaned MCP/tool process(es) left by "
+                             "claude.exe pid %s", n, cli_pid)
 
     async def reconnect(self) -> None:
         """Disconnect and reconnect with current session ID."""
@@ -1300,7 +1350,12 @@ class SDKBridge:
         elif subtype == "task_started":
             task_id = getattr(msg, "task_id", None) or ""
             task_type = getattr(msg, "task_type", None) or "bash"
-            name = getattr(msg, "name", None) or ""
+            # The SDK's TaskStartedMessage field is ``description``; there is
+            # no ``name``.  Reading ``name`` silently yielded "" for every
+            # task, so the bg panel showed unlabelled rows.  Keep ``name`` as
+            # a fallback in case a future SDK renames it back.
+            name = (getattr(msg, "description", None)
+                    or getattr(msg, "name", None) or "")
             tool_use_id = getattr(msg, "tool_use_id", None)
             seq = register_bg_task(
                 state, task_id, task_type, name, tool_use_id=tool_use_id,
@@ -2271,6 +2326,20 @@ class SDKBridge:
                         "data": {"message": "SDK connected."},
                     })
                 break
+            except proc_guard.DuplicateSessionError as exc:
+                # Not transient — retrying just delays a message the user has
+                # to act on (kill the other process).  Stop cleanly and leave
+                # the explanation on screen instead of burying it under ten
+                # backoff attempts.
+                state.connecting = False
+                state.connect_started_at = None
+                await self._broadcast_status()
+                await self.broadcast({
+                    "type": "system_msg",
+                    "subtype": "error",
+                    "data": {"message": str(exc)},
+                })
+                return
             except Exception as exc:
                 _connect_attempt += 1
                 log.error("SDK connect failed (attempt %d): %s", _connect_attempt, exc)

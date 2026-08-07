@@ -163,6 +163,7 @@ _picker_mode: bool = False
 # ``lobby_clients`` holds tabs sitting at the lobby, not attached to any
 # session.
 from session_runtime import SessionRuntime  # noqa: E402
+import proc_guard  # noqa: E402
 import ws_channel  # noqa: E402
 
 _ws_clients: set[WebSocket] = set()
@@ -679,6 +680,13 @@ async def lifespan(app: FastAPI):
     # Claude CLI — is pushed into a background task (_deferred_bridge_startup)
     # that runs *after* we yield, so the page serves immediately and shows a
     # "connecting…" status while the SDK finishes wiring up.
+    # Install the process reaper FIRST, before anything can spawn a child.
+    # Only processes started after this inherit the job object, and the SDK's
+    # claude.exe is exactly what we need inside it.  (Only the serving process
+    # does this — the --detach parent must not, or it would take its own
+    # replacement down with it when it exits.)
+    proc_guard.install_process_reaper()
+
     if config is None:
         config = parse_args()
     state = init_state_from_config(config)
@@ -1659,7 +1667,14 @@ async def api_restart() -> dict[str, Any]:
     # (CREATE_NEW_CONSOLE) rather than sharing ours (which would close with us).
     kwargs: dict[str, Any] = {}
     if sys.platform == "win32":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+        # CREATE_BREAKAWAY_FROM_JOB is essential: we're in a kill-on-close job
+        # object (proc_guard) so our claude.exe children die with us.  The
+        # replacement server must NOT — it has to outlive the process that
+        # spawned it, or ⟳ Restart would shoot its own replacement the moment
+        # we exit.  breakaway_flags() is 0 when no reaper is installed.
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_CONSOLE | proc_guard.breakaway_flags()
+        )
     else:
         kwargs["start_new_session"] = True
 

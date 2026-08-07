@@ -63,6 +63,10 @@ const Chat = (() => {
   // "collapse as they accumulate" path: that produced a second, competing
   // collapsed bar that grew while tools were still streaming.
   let _collapseTools = true;          // toggled via the "collapse activity" checkbox
+  // --show-thinking / "/show-thinking on": render thinking blocks already
+  // expanded.  The full text is always sent either way — this only picks the
+  // starting state, so a block is still click-to-toggle afterwards.
+  let _showThinking = false;
 
   function _trackToolBlock(el) {
     elMessages.appendChild(el);
@@ -745,6 +749,10 @@ const Chat = (() => {
     const body = el.querySelector('.thinking-body');
     const icon = el.querySelector('.tool-expand-icon');
     const summaryEl = el.querySelector('.thinking-summary');
+    if (_showThinking) {
+      body.classList.add('open');
+      icon.classList.add('open');
+    }
     header.addEventListener('click', () => {
       body.classList.toggle('open');
       icon.classList.toggle('open');
@@ -1513,10 +1521,14 @@ const Chat = (() => {
   function setCollapseTools(v) { _collapseTools = !!v; }
   function getCollapseTools() { return _collapseTools; }
 
+  function setShowThinking(v) { _showThinking = !!v; }
+  function getShowThinking() { return _showThinking; }
+
   function forceScrollToBottom() {
     _autoScroll = true;
     elMessages.scrollTop = elMessages.scrollHeight;
   }
 
-  return { init, clear, handleMessage, setCollapseTools, getCollapseTools, setMaxDomMessages, forceScrollToBottom };
+  return { init, clear, handleMessage, setCollapseTools, getCollapseTools,
+           setShowThinking, getShowThinking, setMaxDomMessages, forceScrollToBottom };
 })();

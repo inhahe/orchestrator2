@@ -782,6 +782,9 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         "collapse_tools": state.collapse_tools,
         "collapse_threshold": state.collapse_threshold,
         "max_dom_messages": state.max_dom_messages,
+        # Display gate for --show-thinking: thinking blocks are always sent in
+        # full, this only decides whether they start expanded.
+        "show_thinking": state.show_thinking,
     }
 
 
