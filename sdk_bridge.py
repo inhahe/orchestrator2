@@ -2511,26 +2511,12 @@ class SDKBridge:
                 if kind in ("quit", "force-quit"):
                     return
                 await self._apply_idle_config_command(kind, payload)
-            # Echo the first prompt to chat IF the frontend didn't.
-            # Messages that land on the event_queue (rather than
-            # ``queued_prompts``) normally rely on the frontend's
-            # optimistic echo in ``send()`` — but that echo is skipped
-            # when ``_isBusy`` is true, and ``_isBusy`` stays true from
-            # the initial ``connecting=True`` status_update until
-            # something else flips it.  A prompt the user typed during
-            # connecting can therefore arrive here with no chat echo at
-            # all, making it look like the turn started spontaneously.
-            # The frontend stamps each message with ``client_echoed`` so
-            # we can echo here only when needed (avoiding duplicates
-            # when ``_isBusy`` was correctly false at send time).
-            if next_prompt is not None and not state.initial_prompt_client_echoed:
-                await self.broadcast({
-                    "type": "user_message",
-                    "content": next_prompt,
-                })
-            # One-shot: clear so subsequent paths can't accidentally
-            # re-read this flag.
-            state.initial_prompt_client_echoed = None
+            # No echo here.  Anything arriving on the event_queue was already
+            # echoed at enqueue time by server.py's _enqueue_prompt (or by the
+            # browser, which tells the server so).  This used to echo from a
+            # ``state.initial_prompt_client_echoed`` flag — a single slot that
+            # only ever described the *last* message the WebSocket handler saw,
+            # and which the REST producers never set at all.
 
         # --- Turn loop ---
         while next_prompt is not None and not self.stop_event.is_set():
@@ -2911,6 +2897,22 @@ class SDKBridge:
         if self.turn_active.is_set():
             try:
                 self.turn_msg_queue.put_nowait(INTERRUPT_SENTINEL)
+            except Exception:
+                pass
+        else:
+            # No live turn — the worker is parked in _await_next_prompt (idle,
+            # or waiting on background tasks), where the turn_msg_queue
+            # sentinel can't reach it and _between_turns will never run.  A
+            # prompt can still be sitting in the queue: ``turn_active`` is set
+            # only by run_turn, so while a *ghost* turn streams (a background
+            # task producing output) ``state.busy`` is True and server.py
+            # routes typed prompts to ``queued_prompts`` — with the worker
+            # parked the whole time.  Ctrl-C there used to do nothing
+            # whatsoever.  A wakeup makes the parked worker drain the queue;
+            # if it's empty the branch falls through to the auto-resume check,
+            # which ignores an "interrupt" payload, so this is a no-op.
+            try:
+                self.event_queue.put_nowait(("wakeup", "interrupt"))
             except Exception:
                 pass
         if self.client:

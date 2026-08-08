@@ -503,15 +503,12 @@ class State:
     queued_prompts: "PersistentDeque[str]" = field(default_factory=PersistentDeque)
     queue_editing_index: int | None = None  # index being edited in the UI
 
-    # Echo flag for the FIRST user-typed prompt of the session when it
-    # arrives on the event_queue (idle path) instead of queued_prompts.
-    # The frontend's ``send()`` already optimistic-echoes typed prompts
-    # when ``_isBusy=false`` and skips when busy, then sets
-    # ``client_echoed`` in the wire payload accordingly.  Without
-    # propagating this flag the worker_loop initial-prompt fallback
-    # either silently drops the echo (when ``_isBusy`` was stale-true at
-    # send time) or duplicates it (when stale-false).
-    initial_prompt_client_echoed: bool | None = None
+    # (There is deliberately no "was this prompt already echoed?" flag here.
+    # There was one — a single slot that only described the last message the
+    # WebSocket handler happened to see, so it was wrong whenever two prompts
+    # were in flight and unset entirely for the REST producers.  Transcript
+    # echoing now happens at enqueue time in server.py's ``_enqueue_prompt``,
+    # where the producer is still known.)
 
     # Background tasks (bg shells + Task subagents)
     background_tasks: dict[str, dict[str, Any]] = field(default_factory=dict)

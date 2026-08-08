@@ -1980,6 +1980,42 @@ async def _broadcast_queue_update(rt: SessionRuntime | None = None) -> None:
     await rt.broadcast({"type": "queue_update", "queue": items})
 
 
+async def _enqueue_prompt(
+    rt: SessionRuntime | None,
+    prompt: str,
+    *,
+    client_echoed: bool = False,
+) -> bool:
+    """Hand a user prompt to a runtime's bridge, echoing it to the transcript.
+
+    Every prompt the user causes to run has to appear as a "you:" message, and
+    there is exactly one producer that echoes on its own: the browser's
+    optimistic echo in ``app.js send()``, which fires only when it believes the
+    session is idle and reports itself via ``client_echoed``.  Everything else
+    that puts ``("message", …)`` on the event queue — the queue panel's green
+    send arrow and ``/queue send`` (both of which *remove* the prompt from the
+    queue, so the panel stops showing it too), ``/graphify``, any command
+    forwarding a payload — is a REST call or a server-side synthesis with no
+    echo anywhere. Those prompts used to run with no trace of what was asked:
+    an answer appearing under no question.
+
+    Echoing here rather than where the bridge *consumes* the prompt is
+    deliberate. The event queue carries plain ``(kind, payload)`` tuples with
+    nowhere to put an echo flag, and the single ``State`` slot that used to
+    stand in for one was overwritten whenever two prompts were in flight.
+    Enqueue time is the one moment we still know who produced the prompt.
+
+    Returns False if the runtime has no bridge yet (caller should fall back to
+    the pending queue).
+    """
+    if rt is None or rt.bridge is None:
+        return False
+    if not client_echoed:
+        await rt.broadcast({"type": "user_message", "content": prompt})
+    rt.bridge.event_queue.put_nowait(("message", prompt))
+    return True
+
+
 @_route("post", "/api/queue/delete")
 async def api_queue_delete(body: dict[str, Any]) -> dict[str, Any]:
     """Delete a pending prompt by index."""
@@ -2020,7 +2056,9 @@ async def api_queue_send(body: dict[str, Any]) -> dict[str, Any]:
         await _broadcast_queue_update(rt)
         return {"ok": True, "moved_to_front": True}
     del st.queued_prompts[idx]
-    br.event_queue.put_nowait(("message", prompt))
+    # REST call — the browser does no optimistic echo for the send arrow, so
+    # the backend owes the transcript this one.
+    await _enqueue_prompt(rt, prompt)
     await _broadcast_queue_update(rt)
     return {"ok": True, "sent": _truncate(prompt, 80)}
 
@@ -2852,7 +2890,9 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
                     "panels": panels,
                 })
             if result.forward_to_sdk and result.forward_payload:
-                bridge.event_queue.put_nowait(("message", result.forward_payload))
+                # e.g. /queue send, which pops a pending prompt and runs it —
+                # a prompt nobody has echoed yet.
+                await _enqueue_prompt(rt, result.forward_payload)
             if result.login_launched:
                 # Browser OAuth completes asynchronously; watch for it, then
                 # refresh the account field / status bar for this runtime.
@@ -2878,7 +2918,7 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
                 state.queued_prompts.append(prompt)
                 await _broadcast_queue_update(rt)
             else:
-                bridge.event_queue.put_nowait(("message", prompt))
+                await _enqueue_prompt(rt, prompt)
             return
 
         # User messages while busy or connecting go to the pending queue
@@ -2891,21 +2931,15 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             return
 
         # Everything else (commands, messages while idle) → event queue.
-        # For a plain user-typed ``message`` kind, capture the
-        # ``client_echoed`` flag from the wire payload so the worker_loop
-        # initial-prompt fallback can decide whether the backend needs
-        # to broadcast a ``user_message`` itself.  The frontend echoes
-        # optimistically only when its ``_isBusy=false`` at send time;
-        # when busy/connecting (real or stale-true) it skips the echo
-        # and expects the backend to handle it.
+        # A plain message goes through _enqueue_prompt so it lands in the
+        # transcript exactly once: the frontend echoes optimistically only when
+        # its ``_isBusy`` is false at send time, and it reports which way it
+        # went via ``client_echoed``.
         if kind == "message":
-            state.initial_prompt_client_echoed = bool(
-                msg.get("client_echoed", False)
-            )
+            await _enqueue_prompt(rt, payload,
+                                  client_echoed=bool(msg.get("client_echoed")))
+            return
         bridge.event_queue.put_nowait((kind, payload))
-
-        # The frontend shows user messages optimistically (app.js send()),
-        # so we don't echo back here — that would cause duplicates.
 
     # --- Explicit command (alternative to prefixed message) ---
     elif msg_type == "command":
