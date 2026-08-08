@@ -215,7 +215,7 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 - **Readable post-compact summary** -- after a compact, the harness-injected summary that becomes the new conversation's starting context is shown as a collapsed box you can click to expand and read in full (Claude Code hides this prompt from the user)
 - **Background tasks** -- track and inspect agent-spawned background work
 - **Autonomous-loop heartbeat** -- honours the model's `ScheduleWakeup` tool calls: when the agent schedules a self-paced wake-up (e.g. a 60s autonomous-loop tick), the orchestrator re-injects the scheduled prompt as a fresh turn after the requested delay, even while a background task is still running. Disable with `--no-wakeup`
-- **Pending queue** -- type messages while Claude is busy; they queue and execute in order
+- **Pending queue** -- type messages while Claude is busy; they queue and execute in order. Interrupting the current turn (Ctrl+C, the ■ button, or `/interrupt`) sends the next queued prompt straight away -- typing a correction and then hitting Ctrl+C is the "stop, do this instead" gesture. An interrupt never triggers auto-continue
 - **Queue management** -- edit or delete queued prompts from the sidebar
 - **Prompt history** -- Ctrl+Up/Down to recall previous prompts (persisted across sessions)
 - **Permission dialogs** -- allow/deny tool execution from the browser

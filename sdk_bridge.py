@@ -2301,6 +2301,54 @@ class SDKBridge:
         except Exception as exc:
             log.warning("status_update broadcast failed: %r", exc)
 
+    async def _broadcast_queue(self) -> None:
+        """Push the pending-prompt queue to this session's viewers.
+
+        The twin of server.py's ``_broadcast_queue_update`` — the bridge can't
+        call that one (it's a server-layer helper bound to the REST endpoints),
+        so mutations made *here* need their own push.
+        """
+        try:
+            await self.broadcast({
+                "type": "queue_update",
+                "queue": [{"index": i, "text": t}
+                          for i, t in enumerate(self.state.queued_prompts)],
+            })
+        except Exception as exc:
+            log.warning("queue_update broadcast failed: %r", exc)
+
+    async def _pop_queued_prompt(self) -> str | None:
+        """Take the head of the pending-prompt queue and hand it to the UI.
+
+        Returns None when the queue is empty *or* its head is being edited in
+        the panel (sending half-typed text would be worse than waiting).
+
+        Every pop has to do three things together, which is why they live in
+        one place instead of being repeated at each call site:
+
+        * echo the prompt into the transcript (``user_message``) — the frontend
+          skips its own optimistic echo while ``_isBusy``, which is exactly
+          when a prompt gets queued;
+        * clear ``queue_editing_index``, which is stale the moment the item it
+          referred to leaves the queue;
+        * **push a fresh ``queue_update``**.  The queue panel is rendered from
+          that snapshot, so without it the prompt stays listed as pending while
+          the turn it just started is already streaming into the transcript —
+          the "it sent the prompt, but it was still also in the queue" report.
+          Only the 2 s status ticker corrected it, which is precisely why the
+          omission survived so long: the ghost row healed itself just as the
+          user reached for the mouse.
+        """
+        state = self.state
+        if not state.queued_prompts or state.queue_editing_index == 0:
+            return None
+        prompt = state.queued_prompts.popleft()
+        state.queue_editing_index = None
+        state.needs_user_attention = None
+        await self.broadcast({"type": "user_message", "content": prompt})
+        await self._broadcast_queue()
+        return prompt
+
     # ------------------------------------------------------------------
     # worker_loop() — main turn driver
     # ------------------------------------------------------------------
@@ -2447,15 +2495,8 @@ class SDKBridge:
         next_prompt: str | None = None
         if config.initial_prompt:
             next_prompt = config.initial_prompt
-        elif state.queued_prompts:
-            next_prompt = state.queued_prompts.popleft()
-            state.queue_editing_index = None
-            await self.broadcast({"type": "user_message", "content": next_prompt})
-            await self.broadcast({
-                "type": "queue_update",
-                "queue": [{"index": i, "text": t}
-                          for i, t in enumerate(state.queued_prompts)],
-            })
+        elif state.queued_prompts and state.queue_editing_index != 0:
+            next_prompt = await self._pop_queued_prompt()
         else:
             # Wait for first user input.  Config-change commands (/model,
             # /effort, /thinking, /connect, /clear) can legitimately arrive
@@ -2604,6 +2645,23 @@ class SDKBridge:
         if interrupted:
             ring_bell(state, "interrupt")
             state.needs_user_attention = None
+            # A prompt queued *during* the turn the user then interrupted is
+            # the "stop — do this instead" gesture, so it still has to go out.
+            # This branch used to return straight to the idle wait, skipping
+            # the queue drain below; nothing pokes the worker after an
+            # interrupt, so the prompt sat in the panel unsent forever.
+            # Whether the user hit that or the working path was pure luck:
+            # ``interrupted`` is only True if run_turn noticed the interrupt
+            # before the SDK's ResultMessage landed, and on a fast turn the
+            # ResultMessage wins and the normal path drains the queue.  Same
+            # keypress, two outcomes — hence draining here too.
+            #
+            # We deliberately do *not* fall through to the auto-continue /
+            # compaction logic further down: an interrupted turn must never
+            # auto-resume.
+            prompt = await self._pop_queued_prompt()
+            if prompt is not None:
+                return prompt
             return await self._await_next_prompt()
 
         # --- Pending /compact ---
@@ -2616,17 +2674,11 @@ class SDKBridge:
 
         # --- Queued user prompts ---
         if state.queued_prompts:
-            if state.queue_editing_index == 0:
-                # First prompt is being edited in the UI — wait for the
-                # user to finish before sending it.
+            prompt = await self._pop_queued_prompt()
+            # None means the head is being edited in the UI — wait for the
+            # user to finish rather than sending half-typed text.
+            if prompt is None:
                 return await self._await_next_prompt()
-            prompt = state.queued_prompts.popleft()
-            state.queue_editing_index = None  # clear stale editing state
-            # Echo to chat now that the prompt is being processed.
-            await self.broadcast({
-                "type": "user_message",
-                "content": prompt,
-            })
             return prompt
 
         # --- Context trim (rolling window) ---
@@ -2768,14 +2820,8 @@ class SDKBridge:
                 # waiting — it does NOT depend on auto_continue, which only
                 # gates the synthetic continue prompt below.  Skip only when
                 # the first item is being edited in the UI.
-                if self.state.queued_prompts and self.state.queue_editing_index != 0:
-                    prompt = self.state.queued_prompts.popleft()
-                    self.state.queue_editing_index = None
-                    self.state.needs_user_attention = None
-                    await self.broadcast({
-                        "type": "user_message",
-                        "content": prompt,
-                    })
+                prompt = await self._pop_queued_prompt()
+                if prompt is not None:
                     return prompt
                 # No queued prompt — check if we should auto-resume.
                 auto_continue = getattr(
@@ -2797,9 +2843,13 @@ class SDKBridge:
                     return self.state.continue_prompt
                 continue
             if kind == "btw":
-                self.state.queued_prompts.append(payload)
+                # Send it straight through.  This used to append to the queue
+                # and pop the head back off, which is a no-op only when the
+                # queue is empty — with anything already pending it returned
+                # *that* prompt instead and left the /btw text behind.  We're
+                # idle here, so there's nothing to queue behind anyway.
                 self.state.needs_user_attention = None
-                return self.state.queued_prompts.popleft()
+                return payload
             # Unknown kind — drop and loop.
 
         return None
