@@ -2010,6 +2010,10 @@ async def _enqueue_prompt(
     """
     if rt is None or rt.bridge is None:
         return False
+    # If the previous turn ended on a compaction its "Turn N completed" marker
+    # is still pending; emit it before this prompt so the transcript doesn't
+    # read "you: … / Turn N completed".  See SDKBridge.flush_pending_turn_end.
+    await rt.bridge.flush_pending_turn_end()
     if not client_echoed:
         await rt.broadcast({"type": "user_message", "content": prompt})
     rt.bridge.event_queue.put_nowait(("message", prompt))

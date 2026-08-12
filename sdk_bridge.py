@@ -1202,6 +1202,30 @@ class SDKBridge:
         except Exception as exc:
             log.warning("deferred compact turn_end broadcast failed: %r", exc)
 
+    async def flush_pending_turn_end(self) -> None:
+        """Close out a deferred turn_end *before* echoing the next prompt.
+
+        A turn that ends on a compaction leaves its ``turn_end`` pending: the
+        marker is emitted either by a post-compact ghost turn, by the 10 s
+        timer, or by ``run_turn`` at the start of the following turn.  That
+        last path is the problem — by then the next prompt has already been
+        echoed, so the transcript reads::
+
+            you: <next prompt>
+            Turn 102 completed (0:26:41) — success
+
+        i.e. the previous turn appears to finish *after* the prompt that
+        follows it.  A queued prompt hits this every time (it starts the next
+        turn immediately, well inside the 10 s grace); a hand-typed one only
+        when the user types quickly, which is why it looked intermittent.
+
+        So every producer that is about to echo a prompt calls this first.
+        It's a pure reordering: ``run_turn`` would have flushed the same
+        pending marker moments later anyway, and flushing when nothing is
+        pending is a no-op.
+        """
+        await self._flush_pending_compact_turn_end()
+
     def _apply_pending_rename(self, sid: str) -> bool:
         """Apply a queued ``/rename`` title to session *sid* if one exists.
 
@@ -2345,6 +2369,8 @@ class SDKBridge:
         prompt = state.queued_prompts.popleft()
         state.queue_editing_index = None
         state.needs_user_attention = None
+        # Close out the previous turn first — see flush_pending_turn_end().
+        await self.flush_pending_turn_end()
         await self.broadcast({"type": "user_message", "content": prompt})
         await self._broadcast_queue()
         return prompt
