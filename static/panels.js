@@ -72,6 +72,22 @@ const Panels = (() => {
     _renderQueue(queue || []);
   }
 
+  /** Write text only when it differs.
+   *
+   * Assigning `textContent` always tears down and rebuilds the text node even
+   * when the string is identical, which dirties style and layout.  The status
+   * ticker calls every renderer on a fixed interval, so on an idle session
+   * these writes are pure waste — and they're paid on a document with tens of
+   * thousands of elements. */
+  function _setText(el, val) {
+    if (el && el.textContent !== val) el.textContent = val;
+  }
+
+  /** Same idea for the innerHTML of a panel body (empty-state placeholders). */
+  function _setHTML(el, html) {
+    if (el && el.innerHTML !== html) el.innerHTML = html;
+  }
+
   function _elapsed(startedAt) {
     // startedAt is a monotonic timestamp — server sends elapsed strings
     // in some cases; if not, we just show a placeholder.
@@ -88,12 +104,12 @@ const Panels = (() => {
   function _renderTools(tools) {
     const running = tools.filter(t => t.status === 'running');
 
-    elToolsCount.textContent = running.length;
+    _setText(elToolsCount, String(running.length));
     elToolsCount.classList.toggle('active', running.length > 0);
 
     if (tools.length === 0) {
       _expandedTools.clear();
-      elToolsBody.innerHTML = '<div class="panel-empty">No active tools</div>';
+      _setHTML(elToolsBody, '<div class="panel-empty">No active tools</div>');
       _lastToolsSig = '';
       return;
     }
@@ -199,12 +215,12 @@ const Panels = (() => {
 
   function _renderBg(tasks) {
     const running = tasks.filter(t => t.status === 'running');
-    elBgCount.textContent = running.length;
+    _setText(elBgCount, String(running.length));
     elBgCount.classList.toggle('active', running.length > 0);
 
     if (tasks.length === 0) {
       _expandedBg.clear();
-      elBgBody.innerHTML = '<div class="panel-empty">No background tasks</div>';
+      _setHTML(elBgBody, '<div class="panel-empty">No background tasks</div>');
       _lastBgSig = '';
       return;
     }
@@ -314,7 +330,7 @@ const Panels = (() => {
 
   function _renderQueue(queue) {
     const n = queue.length;
-    elQueueCount.textContent = n;
+    _setText(elQueueCount, String(n));
     elQueueCount.classList.toggle('active', n > 0);
 
     // Pending optimistic edit: hold back renders that still show the old text
@@ -621,13 +637,25 @@ const Panels = (() => {
 
   // ----- Todos panel -----
 
+  let _lastTodosSig = null;
+
   function _renderTodos(todos) {
     const pending = todos.filter(t => t.status !== 'completed');
-    elTodosCount.textContent = todos.length;
+    _setText(elTodosCount, String(todos.length));
     elTodosCount.classList.toggle('active', pending.length > 0);
 
+    // Bail out when the plan is unchanged.  This panel used to rebuild its
+    // entire innerHTML (plus a querySelector and a fresh listener) on *every*
+    // status_update — i.e. every 2s forever, on a session doing nothing —
+    // which was the single largest source of idle repaint work in the tab.
+    const sig = todos.map(t =>
+      `${t.status || 'pending'}:${t.content || ''}`
+    ).join('|');
+    if (sig === _lastTodosSig) return;
+    _lastTodosSig = sig;
+
     if (todos.length === 0) {
-      elTodosBody.innerHTML = '<div class="panel-empty">No plan yet</div>';
+      _setHTML(elTodosBody, '<div class="panel-empty">No plan yet</div>');
       return;
     }
 
@@ -686,6 +714,11 @@ const Panels = (() => {
   }
 
   function setBusy(busy) {
+    busy = !!busy;
+    // Called on every status_update.  Queue items are always rendered with the
+    // current `_busy`, so when the flag hasn't changed there is nothing to
+    // reconcile and the DOM query below is pure waste.
+    if (busy === _busy) return;
     _busy = busy;
     // Update send-button state on existing queue items.
     elQueueBody.querySelectorAll('.queue-send-btn').forEach((btn, i) => {

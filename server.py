@@ -582,6 +582,66 @@ def _enrich_panels(panels: dict[str, Any]) -> dict[str, Any]:
 # Status ticker — periodic status + panel pushes
 # ---------------------------------------------------------------------------
 
+# How often the ticker re-sends a snapshot that hasn't changed, purely as a
+# liveness heartbeat.  Everything the frontend needs is already on its side, so
+# this only has to be often enough that a wedged ticker is noticeable.
+_STATUS_HEARTBEAT_SECONDS = 30.0
+
+
+async def _tick_runtime(rt: SessionRuntime) -> bool:
+    """One ticker pass over a single runtime.  Returns True if it broadcast.
+
+    **Unchanged snapshots are not sent.**  An idle session produces a
+    byte-identical status+panels blob every tick, and delivering it still costs
+    each viewing tab a WebSocket wake-up, a JSON parse, a panel re-render and a
+    repaint of a document with tens of thousands of elements — measured at
+    ~2% of a CPU core *per open tab*, forever, on a session doing nothing.
+    Suppressing the no-op sends takes idle tabs to roughly zero.  A snapshot is
+    still forced every ``_STATUS_HEARTBEAT_SECONDS`` so the stream never goes
+    completely silent.
+
+    Split out of the ticker loop so the suppression rule is testable without
+    driving an infinite loop.
+    """
+    st, cfg = rt.state, rt.config
+    if st is None or cfg is None or not rt.clients:
+        return False
+
+    # Expire panel grace items.
+    now = time.monotonic()
+    expired = [k for k, v in st.completed_panel_tools.items()
+               if v.get("grace_end", 0) < now]
+    for k in expired:
+        st.completed_panel_tools.pop(k, None)
+    expired_bg = [k for k, v in st.completed_panel_bg.items()
+                  if v.get("grace_end", 0) < now]
+    for k in expired_bg:
+        st.completed_panel_bg.pop(k, None)
+
+    msg = {
+        "type": "status_update",
+        "status": state_to_status_dict(st, cfg),
+        "panels": _enrich_panels(state_to_panels_dict(st)),
+    }
+    sig = json.dumps(msg, default=str, sort_keys=True)
+    sent = False
+    if sig != rt.last_status_sig or (now - rt.last_status_sent) >= _STATUS_HEARTBEAT_SECONDS:
+        rt.last_status_sig = sig
+        rt.last_status_sent = now
+        await rt.broadcast(msg)
+        sent = True
+
+    # Catch-all bell flush: bells rung from sync contexts (e.g. rate-limit
+    # hits) set state.pending_bell but have no async path to broadcast it.
+    # Flush here so they reach the frontend within one tick instead of
+    # waiting for the next turn to end.
+    if st.pending_bell:
+        event = st.pending_bell
+        st.pending_bell = None
+        await rt.broadcast({"type": "bell", "event": event})
+    return sent
+
+
 async def _status_ticker() -> None:
     """Push status_update + panel_update to each session's viewers every ~2s.
 
@@ -592,38 +652,8 @@ async def _status_ticker() -> None:
     while True:
         await asyncio.sleep(2.0)
         for rt in list(runtimes.values()):
-            st, cfg = rt.state, rt.config
-            if st is None or cfg is None:
-                continue
-            if not rt.clients:
-                continue
             try:
-                # Expire panel grace items.
-                now = time.monotonic()
-                expired = [k for k, v in st.completed_panel_tools.items()
-                           if v.get("grace_end", 0) < now]
-                for k in expired:
-                    st.completed_panel_tools.pop(k, None)
-                expired_bg = [k for k, v in st.completed_panel_bg.items()
-                              if v.get("grace_end", 0) < now]
-                for k in expired_bg:
-                    st.completed_panel_bg.pop(k, None)
-
-                panels = _enrich_panels(state_to_panels_dict(st))
-                await rt.broadcast({
-                    "type": "status_update",
-                    "status": state_to_status_dict(st, cfg),
-                    "panels": panels,
-                })
-
-                # Catch-all bell flush: bells rung from sync contexts (e.g.
-                # rate-limit hits) set state.pending_bell but have no async
-                # path to broadcast it.  Flush here so they reach the frontend
-                # within one tick instead of waiting for the next turn to end.
-                if st.pending_bell:
-                    event = st.pending_bell
-                    st.pending_bell = None
-                    await rt.broadcast({"type": "bell", "event": event})
+                await _tick_runtime(rt)
             except Exception:
                 log.exception("ticker error")
 

@@ -126,7 +126,7 @@ const Status = (() => {
     }
 
     _set(elIndicator, 'title', stateLabel);
-    elState.title = stateLabel;
+    _set(elState, 'title', stateLabel);
     const stateColor = _stateColors[cls] || '';
     if (_prev.stateColor !== stateColor) {
       elState.style.color = stateColor;
@@ -184,7 +184,7 @@ const Status = (() => {
     if (status.model) {
       let m = status.model.replace('claude-', '').replace('claude_', '');
       _set(elModel, 'textContent', m);
-      elModel.title = status.model;
+      _set(elModel, 'title', status.model);
     } else {
       _set(elModel, 'textContent', '--');
     }
@@ -214,8 +214,13 @@ const Status = (() => {
     if (status.collapse_tools != null) {
       const saved = localStorage.getItem('collapse-tools');
       const val = saved !== null ? (saved === 'true') : status.collapse_tools;
-      Chat.setCollapseTools(val);
-      if (elCollapseCheck) elCollapseCheck.checked = val;
+      // Still re-read localStorage each time (that's what keeps a toggle made
+      // in another tab in sync), but only touch the DOM when it changed.
+      if (_prev.collapseVal !== val) {
+        Chat.setCollapseTools(val);
+        if (elCollapseCheck) elCollapseCheck.checked = val;
+        _prev.collapseVal = val;
+      }
     }
 
     // --show-thinking / "/show-thinking".  No localStorage override here (as
@@ -281,9 +286,9 @@ const Status = (() => {
 
   function _updateRateLimits(rl) {
     if (!rl || Object.keys(rl).length === 0) {
-      elRateLimit.textContent = '--';
-      elRateLimit.title = '';
-      elRateLimit.style.color = '';
+      _set(elRateLimit, 'textContent', '--');
+      _set(elRateLimit, 'title', '');
+      if (elRateLimit.style.color) elRateLimit.style.color = '';
       return;
     }
     const parts = [];
@@ -298,16 +303,17 @@ const Status = (() => {
           (info.reset_in ? ` (resets in ${info.reset_in})` : ''));
       }
     }
-    elRateLimit.textContent = parts.join(' | ') || '--';
-    elRateLimit.title = tipParts.join('\n');
+    _set(elRateLimit, 'textContent', parts.join(' | ') || '--');
+    _set(elRateLimit, 'title', tipParts.join('\n'));
 
     // Color the rate limit based on max usage.
     const maxPct = Math.max(
       ...Object.values(rl).map(r => r.percent_used ?? 0)
     );
-    if (maxPct >= 90) elRateLimit.style.color = 'var(--system-error)';
-    else if (maxPct >= 70) elRateLimit.style.color = 'var(--system-warning)';
-    else elRateLimit.style.color = '';
+    const color = maxPct >= 90 ? 'var(--system-error)'
+                : maxPct >= 70 ? 'var(--system-warning)'
+                : '';
+    if (elRateLimit.style.color !== color) elRateLimit.style.color = color;
   }
 
   function _fmtTok(n) {

@@ -84,14 +84,20 @@ const Commands = (() => {
     commandList = cmds || [];
   }
 
+  // Last value applied, so a repeated setBusy() with the same state doesn't
+  // touch the DOM at all.  `classList.add`/`remove` re-serialise and re-set the
+  // class attribute even when the token set is unchanged, which fires a
+  // mutation and forces a style recalc + layout of the *whole* document — and
+  // the status ticker calls this on every update, so on an idle session it was
+  // the only thing still repainting the tab.
+  let _busyApplied = null;
+
   function setBusy(busy) {
-    if (busy) {
-      elSendBtn.classList.add('hidden');
-      elInterruptBtn.classList.remove('hidden');
-    } else {
-      elSendBtn.classList.remove('hidden');
-      elInterruptBtn.classList.add('hidden');
-    }
+    busy = !!busy;
+    if (busy === _busyApplied) return;
+    _busyApplied = busy;
+    elSendBtn.classList.toggle('hidden', busy);
+    elInterruptBtn.classList.toggle('hidden', !busy);
   }
 
   function focus() {

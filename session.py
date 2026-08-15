@@ -335,32 +335,154 @@ def _scan_titles(jsonl: Path, start: int) -> tuple[str | None, str | None]:
     return custom, ai
 
 
-def _resolve_title(jsonl: Path) -> str | None:
-    """Authoritative title for *jsonl*, using the incremental index.
+# --- Sticky user renames ---------------------------------------------------
+# A rename is a statement of user intent, but the session JSONL is not a
+# reliable place to keep it, because we are not its only writer.
+#
+# The Claude Code CLI holds the title in memory (``currentSessionTitle``) and
+# re-appends it at EOF from ``reAppendSessionMetadata()`` — on *every*
+# compaction and again when a session is resumed.  It notices a rename written
+# by anyone else only if that record is still inside the last **64 KiB** of the
+# file when it next looks (``readFileTailSync`` / ``LITE_READ_BUF_SIZE``, and
+# the resume path stamps with ``skipTitleRefresh`` so it doesn't look at all).
+# On a busy session those 64 KiB are seconds wide, so a ``/rename`` usually
+# scrolls out of the window before the CLI ever reads it — after which the CLI
+# goes on re-stamping the *old* title at EOF forever, and since "last record
+# wins" it out-votes us by orders of magnitude.
+#
+# Measured on the reporter's own 845 MB session: 933 ``custom-title 'OS'``
+# records against 46 ``'OSc'``.  The rename at offset 794,639,953 was undone by
+# a compaction stamp 94 KB later (i.e. just outside the 64 KiB window), and a
+# second rename survived 45 compactions only to be reverted by the resume stamp.
+#
+# So the user's intent is kept on our side instead.  A rename records a *pin*:
+# the title we set, plus every title we have previously seen or set for that
+# file.  When resolving, a JSONL title matching one of those stale values means
+# the CLI is re-stamping something the user already replaced, so the pin wins.
+# A title we have never seen is a genuine third-party rename (e.g. ``/rename``
+# typed inside the CLI itself) and it drops the pin, so we never fight a real
+# newer intent.
+#
+# Known limitation: renaming *back* to a previously-used title from outside
+# orchestrator2 looks identical to a stale re-stamp and will be overridden.
+# The escape hatch is to rename from orchestrator2.
+_RENAME_PIN_PATH = Path.home() / ".orchestrator2_renames.json"
+_rename_pins: dict[str, dict[str, Any]] | None = None
+_rename_pin_lock = threading.Lock()
+
+
+def _load_rename_pins() -> dict[str, dict[str, Any]]:
+    """Lazily load the pin table (jsonl path → {title, stale, at})."""
+    global _rename_pins
+    if _rename_pins is not None:
+        return _rename_pins
+    try:
+        with _RENAME_PIN_PATH.open(encoding="utf-8") as f:
+            data = json.load(f)
+        _rename_pins = {
+            k: v for k, v in data.items()
+            if isinstance(v, dict) and isinstance(v.get("title"), str)
+        } if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        _rename_pins = {}
+    return _rename_pins
+
+
+def _save_rename_pins(pins: dict[str, dict[str, Any]]) -> None:
+    """Persist the pin table (atomic replace).
+
+    Unlike the title *index* — a derived cache that can be rebuilt by rescanning
+    — this file is the only record of a user's rename, so it is written through
+    immediately rather than batched behind a dirty flag.
+    """
+    try:
+        tmp = _RENAME_PIN_PATH.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(pins, f, indent=1)
+        os.replace(tmp, _RENAME_PIN_PATH)
+    except OSError:
+        pass
+
+
+def _pin_rename(jsonl: Path, title: str, prev: str | None) -> None:
+    """Record that the user set *jsonl*'s title to *title*.
+
+    *prev* is whatever the file said immediately before the rename — the value
+    the CLI has cached and will keep re-stamping.  It joins the pin's ``stale``
+    set along with any title an earlier pin had set, so a chain of renames
+    (A → B → C) still recognises a stamp of A or B as obsolete.
+    """
+    key = str(jsonl)
+    with _rename_pin_lock:
+        pins = _load_rename_pins()
+        old = pins.get(key) or {}
+        stale = {s for s in old.get("stale", []) if isinstance(s, str)}
+        if isinstance(old.get("title"), str):
+            stale.add(old["title"])
+        if prev:
+            stale.add(prev)
+        stale.discard(title)
+        pins[key] = {"title": title, "stale": sorted(stale), "at": time.time()}
+        # Sessions get deleted; without this the table would only ever grow.
+        for dead in [k for k in pins if not os.path.exists(k)]:
+            pins.pop(dead, None)
+        _save_rename_pins(pins)
+
+
+def _apply_rename_pin(key: str, custom: str | None) -> str | None:
+    """Overlay the rename pin for *key* on the raw ``custom-title`` value."""
+    pins = _load_rename_pins()
+    pin = pins.get(key)
+    if pin is None:
+        return custom
+    title = pin.get("title")
+    if not isinstance(title, str):
+        return custom
+    if custom is None or custom == title or custom in set(pin.get("stale", [])):
+        return title
+    # A title we have neither written nor seen — someone renamed the session
+    # for real (``/rename`` inside the CLI, another tool).  Yield to it and
+    # forget the pin, so we don't keep overriding a fresher intent.
+    with _rename_pin_lock:
+        pins.pop(key, None)
+        _save_rename_pins(pins)
+    return custom
+
+
+def _resolve_title_raw(jsonl: Path) -> tuple[str | None, str | None]:
+    """The (custom, ai) titles actually recorded in *jsonl*, via the index.
 
     Full-scans a file the first time it's seen, then only re-scans the bytes
     appended since (which is where a new rename lands).  Account-correct by
     construction — it reads the exact file it's handed.
+
+    This is the *raw* view: it deliberately ignores the rename pins applied by
+    ``_resolve_title``, because pinning needs to know what the file itself says.
     """
     try:
         st = jsonl.stat()
     except OSError:
-        return None
+        return None, None
     size = st.st_size
     key = str(jsonl)
     idx = _load_title_index()
+    hit = False
     with _title_index_lock:
         entry = idx.get(key)
-        if entry is not None and entry.get("size") == size:
-            return entry.get("custom") or entry.get("ai")
         prev_size = 0
         prev_custom: str | None = None
         prev_ai: str | None = None
-        if entry is not None and isinstance(entry.get("size"), int) \
+        if entry is not None and entry.get("size") == size:
+            hit = True
+            prev_custom = entry.get("custom")
+            prev_ai = entry.get("ai")
+        elif entry is not None and isinstance(entry.get("size"), int) \
                 and 0 < entry["size"] <= size:
             prev_size = entry["size"]
             prev_custom = entry.get("custom")
             prev_ai = entry.get("ai")
+    if hit:
+        return prev_custom, prev_ai
     # Scan (I/O) outside the lock.
     new_custom, new_ai = _scan_titles(jsonl, prev_size)
     custom = new_custom or prev_custom
@@ -370,7 +492,16 @@ def _resolve_title(jsonl: Path) -> str | None:
         idx[key] = {"size": size, "mtime": st.st_mtime,
                     "custom": custom, "ai": ai}
         _title_index_dirty = True
-    return custom or ai
+    return custom, ai
+
+
+def _resolve_title(jsonl: Path) -> str | None:
+    """Authoritative display title for *jsonl* — the file, plus any rename pin.
+
+    Prefers ``custom-title`` (user rename) over ``ai-title`` (auto summary).
+    """
+    custom, ai = _resolve_title_raw(jsonl)
+    return _apply_rename_pin(str(jsonl), custom) or ai
 
 
 def title_from_jsonl(jsonl: Path) -> str | None:
@@ -410,7 +541,19 @@ def write_session_title(
     to the wrong account or fail.  We locate the file ourselves via
     ``find_session_dir(session_id, config_dir)`` and append the record
     directly, which is account-correct and side-effect-free.
+
+    Either way the rename is also *pinned* on our side (``_pin_rename``),
+    because appending to the JSONL alone does not make a rename stick — see the
+    long note above ``_RENAME_PIN_PATH``.
     """
+    project = find_session_dir(session_id, config_dir)
+    jsonl = (project / f"{session_id}.jsonl") if project is not None else None
+    # Snapshot what the file says *before* we append.  That's the value the CLI
+    # has cached and will keep re-stamping at EOF, so the pin has to recognise
+    # it as obsolete rather than as a competing rename.
+    prev = (_resolve_title_raw(jsonl)[0]
+            if jsonl is not None and jsonl.exists() else None)
+
     # Only trust the SDK helper when we're targeting the process's own
     # account (config_dir is None or matches the env).  Otherwise the SDK's
     # env-scoped lookup would misfire, so go straight to the manual append.
@@ -419,10 +562,11 @@ def write_session_title(
         env_dir is not None and os.path.normpath(config_dir) == os.path.normpath(env_dir)
     )
     if same_account:
+        sdk_ok = False
         try:
             from claude_agent_sdk import rename_session as _sdk_rename  # type: ignore
             _sdk_rename(session_id, title)
-            return
+            sdk_ok = True
         except (ImportError, AttributeError):
             pass
         except FileNotFoundError:
@@ -430,10 +574,17 @@ def write_session_title(
             # file (e.g. a non-default CLAUDE_CONFIG_DIR).  Fall through to the
             # manual append, which locates the file via our find_session_dir.
             pass
-    project = find_session_dir(session_id, config_dir)
+        if sdk_ok:
+            # Preferred path: it goes through the running CLI, which also
+            # updates that process's in-memory title — so its next compaction
+            # stamp agrees with us instead of fighting us.  Pin anyway: the CLI
+            # process can be replaced (resume) and lose that memory.
+            if jsonl is not None:
+                _pin_rename(jsonl, title, prev)
+            return
     if project is None:
         raise OSError(f"session {session_id} not found on disk")
-    jsonl = project / f"{session_id}.jsonl"
+    assert jsonl is not None
     if not jsonl.exists():
         raise OSError(f"session jsonl missing: {jsonl}")
     record = {
@@ -442,7 +593,13 @@ def write_session_title(
         "sessionId": session_id,
     }
     with jsonl.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record) + "\n")
+        # Compact separators, byte-identical to the CLI's own JSON.stringify
+        # output.  Its external-writer check is
+        # ``line.startsWith('{"type":"custom-title"')`` — a space after the
+        # colon would defeat it outright, so this record has to be compact to
+        # have even a chance of being noticed.
+        f.write(json.dumps(record, separators=(",", ":")) + "\n")
+    _pin_rename(jsonl, title, prev)
 
 
 # ---------------------------------------------------------------------------
