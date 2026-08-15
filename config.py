@@ -29,21 +29,8 @@ EFFORT_LEVELS = ("low", "medium", "high", "max")
 # (typically 'high' for Opus/Sonnet 4.6).
 EFFORT_CHOICES = ("auto",) + EFFORT_LEVELS
 
-CONTINUE_PROMPT = (
-    'If you need input from me before continuing, pause and include the '
-    'literal token "[WAITING]" in your reply. If you are finished with '
-    'all your tasks, include the literal token "[DONE]" instead. '
-    'Otherwise, continue working.'
-)
-WAITING_SENTINEL = "[WAITING]"
-DONE_SENTINEL = "[DONE]"
-
 DEFAULT_COMPACT_THRESHOLD = 160_000
 DEFAULT_COMPACT_THRESHOLD_1M = 950_000
-
-CONTINUE_RESPONSE_DELAY_SECONDS = 2.0
-CONTINUE_BURST_LIMIT = 3
-CONTINUE_BURST_WINDOW_SECONDS = 180.0
 
 # ---------------------------------------------------------------------------
 # ScheduleWakeup / autonomous-loop heartbeat
@@ -114,10 +101,10 @@ KNOWN_MODELS = [
 # Terminal bell event system.
 #
 # Only events that are actually rung somewhere in the program are listed.
-# (The auto-continue loop is not wired up in the web orchestrator, so its
-# 'done'/'waiting'/'stalled' events never fire and were removed, along with
-# 'api-ok'/'rate-reset' which never had a ring site.  'api-stall' was removed
-# too: it only existed to halt that dead auto-continue loop.)
+# (The auto-continue loop was removed from the web orchestrator outright — it
+# was permanently disabled and unreachable — so its 'done'/'waiting'/'stalled'
+# events went with it, along with 'api-ok'/'rate-reset' which never had a ring
+# site.  'api-stall' went too: it only existed to halt that loop.)
 BELL_EVENT_NAMES = frozenset({
     "turn-done", "bg-done", "requires-action",
     "interrupt", "rate-hit",
@@ -462,13 +449,6 @@ class Config:
     compact_cooldown_turns: int = 3
     max_context_tokens: int = 0        # 0 = disabled
     auto_compact: bool = False
-
-    # Auto-continue
-    auto_continue: bool = False
-    continue_prompt: str | None = None
-    continue_response_delay: float = CONTINUE_RESPONSE_DELAY_SECONDS
-    continue_burst_limit: int = CONTINUE_BURST_LIMIT
-    continue_burst_window: float = CONTINUE_BURST_WINDOW_SECONDS
 
     # ScheduleWakeup / autonomous-loop heartbeat.  When True (default), the
     # bridge honours the model's ScheduleWakeup tool calls by re-injecting the

@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any
 
 from config import (
-    CONTINUE_PROMPT,
     MARKERS,
     RL_TYPE_LABEL,
     SUBSCRIPTION_RL_TYPES,
@@ -448,9 +447,6 @@ class State:
     init_seen: bool = False
     expected_resume_sid: str | None = None
 
-    # Auto-continue prompt text (runtime-mutable via /continue-prompt)
-    continue_prompt: str = CONTINUE_PROMPT
-
     # Metrics
     context_tokens: int = 0
     total_cost_usd: float = 0.0
@@ -478,7 +474,7 @@ class State:
     # deferred turn_end info {"subtype", "started_at"} so it can still be
     # emitted (by a timer, or the next turn start) instead of being lost.
     pending_compact_turn_end: dict[str, Any] | None = None
-    needs_user_attention: str | None = None  # "waiting"/"burst"/"done"/"api-error"/None
+    needs_user_attention: str | None = None  # "api-error" or None
     # API-error loop detection.  When a turn ends with a non-retryable API
     # error (e.g. a 400 from a poisoned message deep in history that gets
     # resent on every resume), the same error repeats forever.  Track the
@@ -580,7 +576,6 @@ def init_state_from_config(config: Config) -> State:
     initial_effort = None if config.effort in (None, "auto") else config.effort
     sub = detect_subscription()
     return State(
-        continue_prompt=config.continue_prompt or CONTINUE_PROMPT,
         effort=initial_effort,
         model=config.model,
         is_subscription=sub,
@@ -652,15 +647,6 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         # until the user runs /login.  Cleared on the next successful connect or
         # clean turn, so this label goes away on its own once re-authenticated.
         busy_label = "not authed"
-        busy_class = "error"
-    elif state.needs_user_attention == "waiting":
-        busy_label = "waiting"
-        busy_class = "waiting"
-    elif state.needs_user_attention == "done":
-        busy_label = "done"
-        busy_class = "done"
-    elif state.needs_user_attention == "burst":
-        busy_label = "burst limit"
         busy_class = "error"
     elif state.needs_user_attention == "api-error":
         busy_label = "api error"

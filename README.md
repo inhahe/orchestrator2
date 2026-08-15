@@ -501,7 +501,7 @@ static/
 1. **Startup**: `server.py` lifespan -> `parse_args()` -> `init_state_from_config()` -> find/resume session -> `SDKBridge.start()` -> `worker_loop`
 2. **Browser connects**: sends `status_update`, `completion_list`, then session `history`
 3. **User message**: browser -> WebSocket -> event queue -> `worker_loop` -> SDK turn -> streamed results back via WebSocket
-4. **Auto-continue**: after each turn, checks for `[DONE]`/`[WAITING]` sentinels and burst limits before sending the next continue prompt
+4. **Turn end**: every completed turn returns control to you -- there is no auto-continue loop (removed 2026-08-14; see `known-issues.md`). Background tasks still running park the session until they drain
 
 ## License
 

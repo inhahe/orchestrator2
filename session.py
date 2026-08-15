@@ -467,21 +467,22 @@ _HARNESS_INJECTED_PREFIXES = (
     # autonomous loop" wake-ups didn't render as collapsed injected
     # boxes the way compaction prompts did.
     "<tick>",
-    # Orchestrator's own auto-continue prompt (default CONTINUE_PROMPT
-    # from config.py).  On replay this would otherwise classify as a
-    # user message — the live path explicitly broadcasts it as an
-    # injected prompt, but the JSONL just records the text.  Match a
-    # stable enough prefix that any tweak to the wording after the
-    # first phrase still works.  Users with a custom --continue-prompt
-    # won't match this; that's an accepted tradeoff (custom prompts
-    # only show as injected on the live path, not on replay).
+    # The orchestrator's retired auto-continue prompt.  That loop has been
+    # removed (see known-issues.md), so nothing emits this text any more —
+    # but historical transcripts still contain it, including sessions from
+    # the single-file Python Agent orchestrator, which *does* still
+    # implement auto-continue.  Without this prefix those replay as ordinary
+    # user bubbles instead of collapsed injected-prompt boxes, so this entry
+    # is load-bearing for history rendering and must not be removed with the
+    # rest of the auto-continue code.
     "If you need input from me before continuing, pause and include",
     # Orchestrator's ScheduleWakeup heartbeat re-injection
     # (WAKEUP_RESOLVED_PROMPT from config.py).  Same rationale as the
     # auto-continue prompt above: surface it as a collapsed injected box
     # on both the live echo and history replay rather than a user bubble.
     # A custom wakeup prompt (model-supplied /loop task text) won't match
-    # — accepted tradeoff, identical to the custom --continue-prompt case.
+    # — accepted tradeoff: custom text only shows as injected on the live
+    # path, not on replay.
     "Autonomous-loop wakeup (scheduled by you)",
 )
 
@@ -511,7 +512,7 @@ def _classify_user_text(text: str) -> str:
     classification has to be content-based: prefix match against
     ``_HARNESS_INJECTED_PREFIXES``.  These cover the cases where the
     harness owns the entire payload (autonomous-loop ticks, post-compact
-    continuation, proactive ``<tick>``, orchestrator auto-continue).
+    continuation, proactive ``<tick>``, the retired auto-continue prompt).
 
     Anything not matching is treated as user-typed.  Substring scans
     were tried but caused false positives — a user who pastes the

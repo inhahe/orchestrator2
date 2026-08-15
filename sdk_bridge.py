@@ -45,7 +45,6 @@ except ImportError:
     ThinkingBlock = None  # type: ignore[assignment]
 
 from config import (
-    CONTINUE_PROMPT,
     DISPATCHER_DEAD,
     INTERRUPT_SENTINEL,
     WAKEUP_DEFAULT_DELAY,
@@ -285,12 +284,18 @@ class SDKBridge:
         self.turn_active = asyncio.Event()
         self.interrupt_event = asyncio.Event()
         self.stop_event = asyncio.Event()
+        # Set whenever no interrupt wind-down is outstanding.  Cleared only
+        # when we interrupt a stream that *no run_turn is consuming* (a ghost
+        # turn), because then nobody will absorb the CLI's terminating
+        # ResultMessage — and a turn started before it lands would eat it and
+        # die instantly.  See _await_interrupt_settled().
+        self._interrupt_settled = asyncio.Event()
+        self._interrupt_settled.set()
 
         self._dispatcher_task: asyncio.Task | None = None
         self._worker_task: asyncio.Task | None = None
         self._initial_resume_id: str | None = None
         self._pending_permission: asyncio.Future | None = None
-        self._is_auto_turn = False  # True when the turn was triggered by auto-continue
 
         # ScheduleWakeup heartbeat.  When the model calls the ScheduleWakeup
         # tool we arm this timer; on fire it re-injects the scheduled prompt as
@@ -877,6 +882,11 @@ class SDKBridge:
                 subtype, state.busy,
             )
 
+            # This is the terminator a post-interrupt turn is waiting on:
+            # the stream that was running has now stopped, so it's safe to
+            # start a new turn without it inheriting this result.
+            self._interrupt_settled.set()
+
             # If this ResultMessage closes a ghost turn, mirror the
             # cleanup that run_turn's finally block does so the UI
             # returns to idle and the next turn can start clean.
@@ -1201,6 +1211,51 @@ class SDKBridge:
             })
         except Exception as exc:
             log.warning("deferred compact turn_end broadcast failed: %r", exc)
+
+    async def _await_interrupt_settled(self, timeout: float = 5.0) -> None:
+        """Hold a starting turn until an outstanding interrupt has wound down.
+
+        From a report: "i had a queued prompt and then ctrl+c'd the turn and
+        then it sent the queued prompt (or at least showed it as coming from
+        me) but it didn't start working again, it stayed idle".
+
+        The interrupt hit a **ghost turn** — a background task streaming with
+        no ``run_turn`` consuming it — so ``interrupt()`` took the parked-worker
+        branch and poked the worker awake.  The worker drained the queue,
+        echoed the prompt and started a turn within a millisecond or two, while
+        the CLI's answer to our ``client.interrupt()`` was still in flight.  It
+        landed ~40 ms later, by which time ``turn_active`` was set, so the
+        dispatcher handed the *previous* stream's terminator to the *new* turn::
+
+            20:05:36,935 run_turn enter: turns=37 drained=0
+            20:05:36,972 UserMessage during turn: '[Request interrupted by user]'
+            20:05:36,973 run_turn ResultMessage: error_during_execution elapsed=0.0s
+            20:05:36,974 run_turn exit: normal (turns=38)
+
+        The turn died 40 ms after starting, on a result that wasn't its own —
+        prompt consumed, session idle, nothing to show for it.
+
+        Waiting here rather than swallowing the stray result in the message
+        loop is deliberate: this runs *before* ``turn_active`` is set, so the
+        terminator reaches ``_handle_async_message``, which closes the ghost
+        turn properly.  It also means the prompt is only sent to a quiesced
+        CLI — swallowing the result instead would leave us guessing whether the
+        query we'd already sent had been discarded along with the interrupt.
+        """
+        if self._interrupt_settled.is_set():
+            return
+        log.info("run_turn: waiting for interrupt wind-down before starting")
+        try:
+            await asyncio.wait_for(self._interrupt_settled.wait(), timeout)
+        except asyncio.TimeoutError:
+            log.warning(
+                "run_turn: interrupt wind-down never landed in %.0fs — "
+                "starting anyway", timeout,
+            )
+        finally:
+            # Either way the wait is over; a stale clear must not delay
+            # every future turn.
+            self._interrupt_settled.set()
 
     async def flush_pending_turn_end(self) -> None:
         """Close out a deferred turn_end *before* echoing the next prompt.
@@ -1610,12 +1665,13 @@ class SDKBridge:
         Called when the same API error has ended two or more turns in a row.
         A transient 429/500 clears on retry, but a 400 from a bad block deep
         in the resumed conversation (e.g. an unsupported image) is re-sent on
-        every turn and never clears — auto-continue would hammer it forever.
-        We stop auto-continue (``needs_user_attention = "api-error"``) and, on
-        the first stuck turn only, print a recovery hint.
+        every turn and never clears.  We flag the status bar
+        (``needs_user_attention = "api-error"``) and, on the first stuck turn
+        only, print a recovery hint.
         """
         state = self.state
-        # Halt auto-continue and flag the status bar.
+        # Flag the status bar.  This is the only attention state still in use,
+        # and it survives until the user's next message clears it.
         state.needs_user_attention = "api-error"
         # Only emit the guidance banner once per stuck streak (repeat_count
         # is exactly 2 the first time we detect the loop).
@@ -1632,7 +1688,8 @@ class SDKBridge:
             f"history is left behind).\n"
             f"    - Trim the conversation to drop the offending old message, "
             f"then retry.\n"
-            f"Auto-continue has been paused so it won't keep retrying."
+            f"Nothing is retried automatically — the session waits for your "
+            f"next message."
         )
         await self.broadcast({
             "type": "system_msg",
@@ -1699,6 +1756,12 @@ class SDKBridge:
             _bridge_id, _ta_id, self.turn_active.is_set(),
             self.turn_msg_queue.qsize(), state.busy, _prompt_preview,
         )
+
+        # An interrupt we issued against a ghost turn may still be winding
+        # down; its terminating ResultMessage belongs to *that* stream, not to
+        # this turn.  Let it land first (and be absorbed by the between-turns
+        # handler) before we claim the message queue.
+        await self._await_interrupt_settled()
 
         # Drain stale messages from the queue.
         drained = 0
@@ -2208,6 +2271,10 @@ class SDKBridge:
             self.turn_active.clear()
             state.busy = False
             state.turn_started_at = None
+            # Belt and braces: this turn consumed whatever was on the wire, so
+            # no wind-down can still be outstanding.  Guarantees a stale clear
+            # can never survive a turn and stall the next one.
+            self._interrupt_settled.set()
             # Clear foreground active tools (bg tasks survive).
             state.active_tools.clear()
 
@@ -2548,7 +2615,6 @@ class SDKBridge:
         while next_prompt is not None and not self.stop_event.is_set():
             assistant_text = ""
             interrupted = False
-            self._is_auto_turn = next_prompt == state.continue_prompt
 
             try:
                 assistant_text, interrupted = await self.run_turn(next_prompt)
@@ -2736,10 +2802,9 @@ class SDKBridge:
             return await self._await_next_prompt()
 
         # --- Turn ended → notify and wait for the user ---
-        # The auto-continue loop is not wired up in the web orchestrator
-        # (config.auto_continue is always False and nothing sets
-        # state._auto_continue), so every completed turn returns control to
-        # the user here.  This is the only turn-completion bell that fires.
+        # Every completed turn returns control to the user here — there is no
+        # auto-continue loop (removed 2026-08-14; see known-issues.md).  This
+        # is the only turn-completion bell that fires.
         ring_bell(state, "turn-done")
         # Preserve an "api-error" flag so the status bar keeps signalling the
         # stuck state until the user sends their next message (which clears it
@@ -2828,31 +2893,16 @@ class SDKBridge:
                 # queue-edit-done poke doesn't reach us (e.g. the bg task
                 # completes first and fires bg-all-done instead), nothing
                 # else would send it and the prompt sits unsent.  A queued
-                # user prompt is always sendable once we're back to
-                # waiting — it does NOT depend on auto_continue, which only
-                # gates the synthetic continue prompt below.  Skip only when
-                # the first item is being edited in the UI.
+                # user prompt is always sendable once we're back to waiting.
+                # Skip only when the first item is being edited in the UI.
                 prompt = await self._pop_queued_prompt()
                 if prompt is not None:
                     return prompt
-                # No queued prompt — check if we should auto-resume.
-                auto_continue = getattr(
-                    self.state, "_auto_continue", self.config.auto_continue
-                )
-                if (
-                    auto_continue
-                    and payload in ("bg-all-done", "rate-limit reset", "api-status-recovered")
-                    and self.state.needs_user_attention not in ("waiting", "done", "burst", "api-error")
-                ):
-                    self.state.needs_user_attention = None
-                    # Same as the grace-window path in _between_turns:
-                    # surface the synthetic continue prompt so the user
-                    # sees a collapsed injected-prompt box for the
-                    # auto-resume turn.
-                    await self._broadcast_injected_prompt(
-                        self.state.continue_prompt, during_turn=False,
-                    )
-                    return self.state.continue_prompt
+                # No queued prompt — stay parked.  The auto-continue loop that
+                # used to auto-resume here (on bg-all-done / rate-limit reset /
+                # api-status-recovered) was removed: it sat behind a flag that
+                # was permanently False, so it could never fire.  See
+                # known-issues.md.
                 continue
             if kind == "btw":
                 # Send it straight through.  This used to append to the queue
@@ -2920,7 +2970,8 @@ class SDKBridge:
         # though the user already saw the "Turn interrupted." system
         # message.  The sentinel lets the loop tick once and notice
         # ``interrupt_event`` is set.
-        if self.turn_active.is_set():
+        live = self.turn_active.is_set()
+        if live:
             try:
                 self.turn_msg_queue.put_nowait(INTERRUPT_SENTINEL)
             except Exception:
@@ -2937,13 +2988,30 @@ class SDKBridge:
             # whatsoever.  A wakeup makes the parked worker drain the queue;
             # if it's empty the branch falls through to the auto-resume check,
             # which ignores an "interrupt" payload, so this is a no-op.
-            try:
-                self.event_queue.put_nowait(("wakeup", "interrupt"))
-            except Exception:
-                pass
+            #
+            # If a *ghost turn* is what we're interrupting (state.busy with no
+            # run_turn), the CLI will answer with a wind-down UserMessage and a
+            # terminating ResultMessage that no turn is consuming.  Hold the
+            # next turn until that lands — see _await_interrupt_settled().
+            # Only when busy: interrupting a genuinely idle session produces no
+            # terminator at all, and waiting for one would stall every
+            # subsequent turn for the full timeout.
+            if self.state.busy:
+                self._interrupt_settled.clear()
+
+        # Issue the interrupt *before* poking the parked worker, so the
+        # wind-down is at least in flight before a new turn can be started.
         if self.client:
             try:
                 await self.client.interrupt()
+            except Exception:
+                self._interrupt_settled.set()
+        else:
+            self._interrupt_settled.set()
+
+        if not live:
+            try:
+                self.event_queue.put_nowait(("wakeup", "interrupt"))
             except Exception:
                 pass
 
