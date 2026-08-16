@@ -1014,6 +1014,16 @@ async def _teardown_runtime(rt: SessionRuntime) -> None:
     if rt.bridge is not None:
         try:
             await rt.bridge.stop()
+        except asyncio.CancelledError:
+            # Not caught by ``except Exception`` — it is a BaseException — and a
+            # task that ends *cancelled* raises no asyncio warning either, so
+            # this is the one failure here that would otherwise leave no trace
+            # at all.  That silence is what let a self-cancelling teardown leak
+            # 19 live CLIs for three weeks.  ``stop()`` is shielded, so the
+            # teardown itself still completes; we just say so and propagate.
+            log.warning("teardown of runtime %s was cancelled at bridge.stop() "
+                        "— shutdown continues in the background", rt.rid)
+            raise
         except Exception:
             log.warning("error stopping bridge for runtime %s",
                         rt.rid, exc_info=True)
@@ -1022,11 +1032,36 @@ async def _teardown_runtime(rt: SessionRuntime) -> None:
 
 
 def _cancel_idle_timer(rt: SessionRuntime) -> None:
-    """Cancel a runtime's pending idle-teardown timer, if any."""
-    if rt.idle_timer is not None:
-        rt.idle_timer.cancel()
-        rt.idle_timer = None
+    """Cancel a runtime's pending idle-teardown timer, if any.
+
+    **Never cancels the calling task.** ``rt.idle_timer`` is the task running
+    ``_idle_teardown_after`` → ``_teardown_runtime`` → *here*, so an
+    unconditional cancel fires a ``CancelledError`` into the teardown it is
+    part of. That lands at the next await — ``await rt.bridge.stop()`` —
+    abandoning the bridge half-way through shutdown, before it ever reaches
+    ``disconnect()``. The ``claude.exe`` is then never terminated, while the
+    runtime has *already* been dropped from ``runtimes``: an invisible live
+    agent, still resumed on its session, that the launch-time duplicate check
+    can no longer see. A hub up for one day accumulated 19 of them, several
+    resuming the same session file.
+
+    It left no trace, which is why it survived three weeks: ``CancelledError``
+    is not an ``Exception``, so the ``except Exception`` in ``_teardown_runtime``
+    logged nothing, and a task that ends *cancelled* (rather than failed) draws
+    no "Task exception was never retrieved" from asyncio either. The only
+    symptom was a "tearing down" line with no matching "torn down".
+    """
+    timer = rt.idle_timer
+    rt.idle_timer = None
     rt.idle_deadline = None
+    if timer is None:
+        return
+    try:
+        current = asyncio.current_task()
+    except RuntimeError:      # no running loop — nothing can be self-cancelled
+        current = None
+    if timer is not current:
+        timer.cancel()
 
 
 def _maybe_start_idle_timer(rt: SessionRuntime) -> None:

@@ -603,6 +603,365 @@ def write_session_title(
 
 
 # ---------------------------------------------------------------------------
+# Session-file integrity — the silent-amnesia detector
+# ---------------------------------------------------------------------------
+#
+# What this exists to catch, from a report of "after i changed the model, claude
+# seemed not to remember any of the conversation that just happened":
+#
+# A session JSONL is append-only, but it is not a *list* — it's a tree, linked
+# by ``parentUuid``.  Two consumers read it in two different ways:
+#
+#   * **We** render history by walking the file top-to-bottom, so the browser
+#     shows every record in the file.
+#   * **The CLI** rebuilds the model's context by taking the last message and
+#     walking ``parentUuid`` back to the root.
+#
+# Those agree only while the chain is intact.  On 2026-07-24 a lost write left a
+# run of NUL bytes in the middle of two different session files (both within
+# three minutes — one machine-level event, not a per-session bug: the file size
+# was committed but the data never reached disk, so NTFS returned zeros).  The
+# record in that hole was the ``tool_result`` for the preceding ``tool_use``,
+# which makes the chain unusable from that point on, so every subsequent resume
+# silently restarted from the last intact node — 2026-07-24 — and appended a
+# *new branch* there.  Three weeks later the raytracer session had 27 sibling
+# branches off that one node: 26 of them abandoned, 1,581 records of real work.
+#
+# Nothing anywhere noticed.  The browser kept showing the full transcript,
+# because we read the file linearly; the model kept getting July 24, because it
+# reads the chain.  The user only sees it when they ask a follow-up question and
+# get a blank stare — which is exactly what a `/model` switch provokes, because
+# our config commands take effect by reconnecting, and a reconnect is a resume.
+#
+# WHAT IS *NOT* DAMAGE, and the mistake this code was first written making:
+# ``total - chain`` is not loss.  A compaction re-roots the conversation — the
+# compact summary record is written with ``parentUuid: null``, a brand-new root —
+# so every record before it is off-chain *by design*.  These files reach hundreds
+# of roots (362 in the raytracer, 1,063 in the SlateOS session), which means a
+# perfectly healthy long session also shows a tiny chain and a colossal
+# "stranded" count.  Reporting that as unreachable history called a 99.7% loss on
+# a session that had lost 1.4%, and would have raised a false alarm on a session
+# that was fine.  The honest measure is the work **abandoned at a fork**: sibling
+# branches hanging off a node on the live chain, which is what a re-attaching
+# resume actually leaves behind.
+#
+# Compaction is also what *heals* this: once a session compacts, new work chains
+# from the fresh root and the corrupt region stops mattering.  That is why the
+# SlateOS session stopped re-attaching in mid-August while the raytracer, which
+# happened to resume straight onto the old node again, was still doing it weeks
+# later.  So "this file contains a hole" is not the question; "does the chain the
+# model is on right now fork away from abandoned work" is.
+#
+# The scan is cheap in the normal case: corruption lives in the *prefix* of an
+# append-only file, so once a byte range is known clean it never has to be read
+# again.  We remember how far we've scanned per file (same trick as the title
+# index above) and only look at the bytes appended since.  The expensive
+# chain-walk runs only for a file that actually has a hole.
+
+_INTEGRITY_INDEX_PATH = Path.home() / ".orchestrator2_integrity_index.json"
+_integrity_lock = threading.Lock()
+
+# Field layout of a real CLI record — verified against the files, because
+# guessing it is how the first version of this code got the type wrong:
+#
+#   user:      {"parentUuid":…,"isSidechain":…,"promptId":…,"type":"user",
+#               "message":{…},"uuid":…,"timestamp":…}
+#   assistant: {"parentUuid":…,"isSidechain":…,"message":{"model":…,
+#               "type":"message",…},"requestId":…,"type":"assistant",
+#               "uuid":…,"timestamp":…}
+#
+# ``parentUuid`` and ``isSidechain`` are always first, and ``uuid`` always comes
+# after the message body — so a record's parent is the FIRST match on the line
+# and its own uuid is the LAST.
+#
+# But the record's own ``type`` is NOT reliably the first ``"type":"…"``: on an
+# assistant record the ``message`` object comes first and carries its own
+# ``"type":"message"``, and message *content blocks* carry ``"type":"text"`` /
+# ``"tool_use"`` / ``"thinking"``.  A bare ``"type":"([a-z-]+)"`` therefore reads
+# "message" for every assistant record and never matches "assistant" at all,
+# which silently reduced leaf-detection to user records only.  Matching against
+# the known top-level type names instead skips the message-internal ones, since
+# none of them collide.
+_UUID_RE = re.compile(rb'"uuid":"([0-9a-fA-F-]{36})"')
+_PARENT_RE = re.compile(rb'"parentUuid":(?:"([0-9a-fA-F-]{36})"|null)')
+_TS_RE = re.compile(rb'"timestamp":"([^"]{10,40})"')
+_REC_TYPE_RE = re.compile(
+    rb'"type":"(user|assistant|system|summary|attachment|custom-title'
+    rb'|ai-title|queue-operation|file-history-snapshot)"')
+_SIDECHAIN_RE = re.compile(rb'"isSidechain":true')
+
+
+def _load_integrity_index() -> dict[str, Any]:
+    try:
+        with _INTEGRITY_INDEX_PATH.open(encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_integrity_index(index: dict[str, Any]) -> None:
+    try:
+        tmp = _INTEGRITY_INDEX_PATH.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(index, f)
+        tmp.replace(_INTEGRITY_INDEX_PATH)
+    except Exception:
+        pass
+
+
+def find_nul_hole(path: Path, start: int = 0) -> int | None:
+    """Byte offset of the first NUL in *path* at or after *start*, else None.
+
+    A NUL run is the signature of a write whose size was committed but whose
+    data was lost.  Scanned in chunks with an overlap of 0 — a single NUL is
+    enough to trip it, so no match can straddle a chunk boundary.
+    """
+    try:
+        with path.open("rb") as f:
+            f.seek(start)
+            pos = start
+            while True:
+                chunk = f.read(1 << 22)
+                if not chunk:
+                    return None
+                i = chunk.find(b"\x00")
+                if i != -1:
+                    return pos + i
+                pos += len(chunk)
+    except OSError:
+        return None
+
+
+def analyze_session_chain(path: Path) -> dict[str, Any]:
+    """Walk the ``parentUuid`` tree and measure what the model would actually see.
+
+    Returns ``total`` (records carrying a uuid), ``chain`` (length of the path
+    from the newest record back to the root — i.e. the conversation the CLI will
+    reconstruct on resume), ``stranded`` (records not on that path),
+    ``truncated_at`` (timestamp of the node where the live chain rejoins the old
+    history) and ``branches`` (how many sibling branches hang off it).
+
+    Deliberately regex-based rather than ``json.loads`` per line: these files run
+    to hundreds of MB and a full parse takes minutes, while we only need two
+    fields.  ``(?<!parent)`` keeps ``"parentUuid"`` from matching as ``"uuid"``.
+    """
+    parent: dict[bytes, bytes | None] = {}
+    stamp: dict[bytes, bytes] = {}
+    order: list[bytes] = []
+    leaf: bytes | None = None
+    corrupt = 0
+    with path.open("rb") as f:
+        for line in f:
+            if b"\x00" in line:
+                corrupt += 1
+                continue
+            found = _UUID_RE.findall(line)
+            if not found:
+                continue
+            u = found[-1]
+            if u in parent:
+                continue
+            pm = _PARENT_RE.search(line)
+            parent[u] = pm.group(1) if (pm and pm.group(1)) else None
+            tm = _TS_RE.search(line)
+            if tm:
+                stamp[u] = tm.group(1)
+            order.append(u)
+            # The resume leaf is the newest *main-chain* message.  Non-message
+            # records (``custom-title``, ``queue-operation``) genuinely do end
+            # these files, and subagent sidechains carry uuids and form their
+            # own short chains — either would make us measure something that is
+            # not the conversation.  Neither of the two damaged sessions
+            # actually contains a sidechain record, so this half is defensive;
+            # the trailing-``custom-title`` case is real and observed.
+            tp = _REC_TYPE_RE.search(line)
+            if (tp and tp.group(1) in (b"user", b"assistant")
+                    and not _SIDECHAIN_RE.search(line)):
+                leaf = u
+
+    total = len(order)
+    if not total or leaf is None:
+        return {"total": total, "chain": 0, "stranded": total,
+                "truncated_at": None, "branches": 0, "corrupt_lines": corrupt}
+
+    seen: set[bytes] = set()
+    cur: bytes | None = leaf
+    chain: list[bytes] = []
+    while cur is not None and cur in parent and cur not in seen:
+        seen.add(cur)
+        chain.append(cur)
+        cur = parent[cur]
+    # Two ways the walk can stop, and they are different diagnoses:
+    #   cur is None      -> reached the genuine root; the chain is whole.
+    #   cur is a uuid we
+    #   have no record of -> the parent record itself is gone (it was in the
+    #                        corrupt region), so the chain dangles.
+    rooted = cur is None
+
+    # A rooted chain can still be broken: the resumes after the damage
+    # re-attached at the last intact node, so old history and new work meet at a
+    # node with several children.  That fork is where history stops.
+    kids: dict[bytes, list[bytes]] = {}
+    for u in order:
+        p = parent.get(u)
+        if p is not None:
+            kids.setdefault(p, []).append(u)
+
+    on_chain = seen
+    join, branches = None, 0
+    for u in chain:                      # newest → oldest
+        if len(kids.get(u, ())) > 1:
+            join, branches = u, len(kids[u])
+            break
+
+    # The damage number.  NOT ``total - len(chain)``: see the note at the top of
+    # this section — compaction re-roots, so most of a healthy long session is
+    # legitimately off-chain.  What was actually lost is the subtrees hanging off
+    # the fork that the live chain does *not* go down: each one is a session's
+    # worth of work that the next resume walked away from.
+    def _subtree(root: bytes) -> tuple[int, str | None, str | None]:
+        n, stack = 0, [root]
+        first = last = None
+        while stack:
+            x = stack.pop()
+            n += 1
+            t = stamp.get(x, b"").decode() or None
+            if t:
+                first = t if first is None or t < first else first
+                last = t if last is None or t > last else last
+            stack.extend(kids.get(x, ()))
+        return n, first, last
+
+    abandoned_branches = abandoned_records = 0
+    span_first = span_last = None
+    if join is not None:
+        for c in kids[join]:
+            if c in on_chain:
+                continue
+            n, first, last = _subtree(c)
+            abandoned_branches += 1
+            abandoned_records += n
+            if first and (span_first is None or first < span_first):
+                span_first = first
+            if last and (span_last is None or last > span_last):
+                span_last = last
+
+    def _ts(u: bytes | None) -> str | None:
+        return stamp.get(u, b"").decode() or None if u else None
+
+    return {
+        "total": total,
+        "chain": len(chain),
+        # Raw statistic, kept for diagnostics.  Do NOT show this to a user as
+        # "lost" — it counts every pre-compaction record in the file.
+        "stranded": total - len(chain),
+        "rooted": rooted,
+        # Where the model's usable history stops (rooted: the fork) or starts
+        # (orphaned: the oldest node it can still reach).
+        "truncated_at": _ts(join) if join else None,
+        "chain_starts_at": _ts(chain[-1]) if chain else None,
+        "branches": branches,
+        "abandoned_branches": abandoned_branches,
+        "abandoned_records": abandoned_records,
+        "abandoned_from": span_first,
+        "abandoned_to": span_last,
+        "corrupt_lines": corrupt,
+    }
+
+
+def check_session_integrity(
+    session_id: str, config_dir: str | None = None, *, force: bool = False
+) -> dict[str, Any] | None:
+    """Report on a session whose history the model can no longer reach.
+
+    Returns None when the model's current chain is sound — the overwhelmingly
+    common case, and cheap, because only the bytes appended since the last check
+    are read.  A report is returned only when a lost-write hole is present *and*
+    the live chain forks away from abandoned work.
+
+    Both halves are needed.  A hole alone does not mean amnesia: the SlateOS
+    session carries two holes and is perfectly healthy today, because it
+    compacted afterwards and its chain now starts at that fresh root.  Warning on
+    the hole alone would have told the user they had lost 318,916 records that
+    they had not lost.
+    """
+    project = find_session_dir(session_id, config_dir)
+    if project is None:
+        return None
+    path = project / f"{session_id}.jsonl"
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+
+    with _integrity_lock:
+        index = _load_integrity_index()
+        entry = index.get(session_id) if isinstance(index.get(session_id), dict) else None
+        if entry and not force:
+            if entry.get("abandoned_records"):
+                # Known-amnesiac.  Abandoned work in the prefix cannot un-abandon
+                # itself, so re-report the stored finding without re-walking.
+                return {**entry, "path": str(path), "session_id": session_id}
+            if entry.get("scanned") == size:
+                return None
+        scanned = int(entry.get("scanned", 0)) if entry and not force else 0
+
+        hole = find_nul_hole(path, scanned)
+        if hole is None and entry:
+            hole = entry.get("hole_at")
+        if hole is None:
+            index[session_id] = {"scanned": size, "hole_at": None}
+            _save_integrity_index(index)
+            return None
+
+        # A hole is present.  Whether it *currently* costs the model anything
+        # depends on where the live chain runs, and that changes as the session
+        # grows — a compaction can heal it, a resume onto the old node can
+        # re-break it — so this re-walks whenever the file has grown.  It is the
+        # expensive path, but it only runs for a file that has a hole at all
+        # (2 of 48 here), and the caller runs it off the connect path.
+        report = analyze_session_chain(path)
+        report["hole_at"] = hole
+        index[session_id] = {**report, "scanned": size}
+        _save_integrity_index(index)
+        if not report.get("abandoned_records"):
+            return None
+        return {**report, "path": str(path), "session_id": session_id}
+
+
+def describe_integrity_problem(report: dict[str, Any]) -> str:
+    """One-line, user-facing summary of a broken session.
+
+    Deliberately quotes the *abandoned* counts and not ``stranded``: the latter
+    includes every pre-compaction record and would overstate the loss by a
+    factor of ~70 on the session this was written for.
+    """
+    branches = report.get("abandoned_branches") or 0
+    records = report.get("abandoned_records") or 0
+    span = ""
+    if report.get("abandoned_from") and report.get("abandoned_to"):
+        span = f", spanning {report['abandoned_from']} to {report['abandoned_to']}"
+    if report.get("truncated_at"):
+        where = (f"its history stops at {report['truncated_at']} and jumps "
+                 f"straight to the present")
+    elif report.get("chain_starts_at"):
+        where = f"it can see nothing before {report['chain_starts_at']}"
+    else:
+        where = "it can see almost none of this session"
+    plural = "" if branches == 1 else "es"
+    return (
+        f"This session's history is broken: a lost write left a gap in the "
+        f"session file, so every resume since has restarted from the last intact "
+        f"point — {where}. {branches} branch{plural} of later work "
+        f"({records} messages{span}) are still in the file but unreachable to the "
+        f"model. The transcript above is read from the file directly and still "
+        f"shows everything, which is why this stays invisible until the model "
+        f"forgets something."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Session info parsing
 # ---------------------------------------------------------------------------
 

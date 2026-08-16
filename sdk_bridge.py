@@ -14,6 +14,7 @@ import logging
 import re
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
@@ -71,6 +72,8 @@ from state import (
 )
 from session import (
     _classify_user_text,
+    check_session_integrity,
+    describe_integrity_problem,
     find_most_recent_session_for_cwd,
     find_session_dir,
     read_session_title,
@@ -91,6 +94,12 @@ from tool_manager import (
 )
 
 log = logging.getLogger(__name__)
+
+
+# How long a shutdown waits for a cancelled task to actually finish.  Generous
+# enough that a task unwinding through a slow ``finally`` still gets to log its
+# own exit, short enough that a wedged one can't hold a subprocess hostage.
+CANCEL_JOIN_TIMEOUT = 10.0
 
 
 async def cancel_and_join(task: asyncio.Task, what: str) -> None:
@@ -120,9 +129,25 @@ async def cancel_and_join(task: asyncio.Task, what: str) -> None:
     ``asyncio.wait`` is the fix: it reports the task's outcome instead of re-raising
     it, so the awaitee's cancellation is absorbed while a cancellation aimed at us
     still propagates out of the ``await`` normally.
+
+    The wait is **bounded**.  A task can decline to die — it need only reach an
+    await inside a ``finally`` that never completes — and every caller here is a
+    shutdown path, where blocking forever on that trades a stuck coroutine for a
+    leaked subprocess.  On expiry we log the task's own stack (the one piece of
+    evidence that is otherwise unrecoverable: a parked coroutine appears in no
+    thread dump, so ``py-spy`` shows only an idle event loop) and carry on.
     """
     task.cancel()
-    done, _ = await asyncio.wait({task})
+    done, pending = await asyncio.wait({task}, timeout=CANCEL_JOIN_TIMEOUT)
+    if pending:
+        stack = "".join(traceback.format_stack(
+            getattr(task.get_coro(), "cr_frame", None))) or "<no frame>"
+        log.error(
+            "%s did not stop within %gs of being cancelled — continuing "
+            "shutdown without it.  It is parked at:\n%s",
+            what, CANCEL_JOIN_TIMEOUT, stack,
+        )
+        return
     for t in done:
         if not t.cancelled():
             exc = t.exception()
@@ -339,6 +364,9 @@ class SDKBridge:
         # this so we can tell live dispatchers apart in logs and detect
         # orphaned ones (stale tasks that survived a reconnect).
         self._dispatcher_gen = 0
+        # Session-integrity warning is announced once per bridge, not once per
+        # reconnect — the condition is permanent and unfixable mid-session.
+        self._integrity_warned = False
 
     # ------------------------------------------------------------------
     # SDK options
@@ -576,6 +604,48 @@ class SDKBridge:
             name=f"sdk-dispatcher-{gen}",
         )
 
+        # Every connect is a *resume*, and a resume is the moment a broken
+        # parentUuid chain silently costs the model its history.  Check it here
+        # rather than at startup only: the reports that led to this ("claude
+        # seemed not to remember any of the conversation that just happened")
+        # all followed a `/model` switch, which reconnects.
+        asyncio.create_task(self._report_session_integrity(),
+                            name="session-integrity")
+
+    async def _report_session_integrity(self) -> None:
+        """Warn if the session we just resumed can't reach its own history."""
+        sid = self.state.session_id
+        if not sid:
+            return
+        try:
+            report = await asyncio.to_thread(
+                check_session_integrity, sid,
+                getattr(self.config, "config_dir", None),
+            )
+        except Exception as exc:                     # diagnostics must not break connect
+            log.warning("session integrity check failed: %r", exc)
+            return
+        if not report:
+            return
+        # Say it once per bridge — a reconnect loop shouldn't spam the
+        # transcript with a condition the user can't fix mid-session.
+        already = self._integrity_warned
+        self._integrity_warned = True
+        log.error(
+            "session %s history broken: chain=%s of %s (stranded=%s) "
+            "hole_at=%s truncated_at=%s branches=%s",
+            sid[:12], report.get("chain"), report.get("total"),
+            report.get("stranded"), report.get("hole_at"),
+            report.get("truncated_at"), report.get("branches"),
+        )
+        if already:
+            return
+        await self.broadcast({
+            "type": "system_msg",
+            "subtype": "error",
+            "data": {"message": describe_integrity_problem(report)},
+        })
+
     def _cli_pid(self) -> int | None:
         """PID of our ``claude.exe``, or None if the SDK doesn't expose it.
 
@@ -588,35 +658,63 @@ class SDKBridge:
         return pid if isinstance(pid, int) and pid > 0 else None
 
     async def disconnect(self) -> None:
-        """Shut down client and dispatcher.
+        """Shut down client and dispatcher, and make sure the CLI is dead.
 
-        Also reaps the CLI's own children.  The SDK stops ``claude.exe`` with
+        Reaps the CLI's own children.  The SDK stops ``claude.exe`` with
         ``terminate()``/``kill()``; on Windows that kills only that one
         process, orphaning the stdio MCP servers it spawned.  The server's job
         object would eventually collect them — but only when the *server*
         exits, so a long-lived hub cycling through sessions (idle teardown,
         ``/cwd``, reconnects) accumulates a full MCP stack per dead session.
+
+        It also **verifies** that ``claude.exe`` itself is gone rather than
+        assuming it.  This used to trust the SDK entirely and swallow any
+        failure with a bare ``except Exception: pass``, so a subprocess that
+        outlived its teardown did so in total silence — and a surviving CLI is
+        not a stray handle, it is a live agent still resumed on the session,
+        still able to edit files and commit.  Two of them on one session is the
+        exact hazard :mod:`proc_guard` exists to prevent, and the guard cannot
+        catch this case because the orphan is inside our own process tree.
         """
         if self._dispatcher_task and not self._dispatcher_task.done():
             await cancel_and_join(self._dispatcher_task, "dispatcher")
-        if self.client:
-            # Snapshot while the CLI is still alive — once it exits, the
-            # parent links needed to find its children are gone.
-            cli_pid = self._cli_pid()
-            kids = []
-            if cli_pid is not None:
-                kids = await asyncio.to_thread(
-                    proc_guard.snapshot_descendants, cli_pid)
-            try:
-                await self.client.disconnect()
-            except Exception:
-                pass
+        if not self.client:
+            return
+
+        # Snapshot while the CLI is still alive — once it exits, the parent
+        # links needed to find its children are gone, and its own pid may be
+        # recycled onto an unrelated process.
+        cli_pid = self._cli_pid()
+        kids: list[proc_guard.Descendant] = []
+        cli: proc_guard.Descendant | None = None
+        if cli_pid is not None:
+            kids = await asyncio.to_thread(
+                proc_guard.snapshot_descendants, cli_pid)
+            cli = await asyncio.to_thread(proc_guard.snapshot_process, cli_pid)
+
+        try:
+            await self.client.disconnect()
+        except Exception:
+            # Not fatal — the backstop below still kills the process — but
+            # never silent: this is the only place that would explain a CLI
+            # that outlived its session.
+            log.warning("SDK disconnect failed for claude.exe pid %s",
+                        cli_pid, exc_info=True)
+        finally:
             self.client = None
-            if kids:
-                n = await asyncio.to_thread(proc_guard.reap_descendants, kids)
-                if n:
-                    log.info("reaped %d orphaned MCP/tool process(es) left by "
-                             "claude.exe pid %s", n, cli_pid)
+
+        if cli is not None:
+            n = await asyncio.to_thread(proc_guard.reap_descendants, [cli])
+            if n:
+                log.warning(
+                    "claude.exe pid %s survived SDK disconnect — killed it "
+                    "directly", cli_pid,
+                )
+        if kids:
+            n = await asyncio.to_thread(proc_guard.reap_descendants, kids)
+            if n:
+                log.info("reaped %d orphaned MCP/tool process(es) left by "
+                         "claude.exe pid %s", n, cli_pid)
 
     async def reconnect(self) -> None:
         """Disconnect and reconnect with current session ID."""
@@ -1481,9 +1579,16 @@ class SDKBridge:
                 # retry at end-of-turn instead of dropping it.
                 self._apply_pending_rename(sid)
                 # Warn if the SDK silently started a fresh session
-                # instead of resuming the one we asked for.
+                # instead of resuming the one we asked for.  This used to be
+                # gated on ``first_init`` as well — but ``init_seen`` is set
+                # once and never cleared, so after the very first init the
+                # check could never fire again.  That disabled it for exactly
+                # the case it matters most: every *reconnect* is a resume, and
+                # `/model` / `/effort` / `/thinking` / `/connect` all reconnect.
+                # ``expected_resume_sid`` is set fresh by `_make_options()` on
+                # each connect, so comparing it every time is correct.
                 expected = state.expected_resume_sid
-                if first_init and expected and expected != sid:
+                if expected and expected != sid:
                     state.expected_resume_sid = None
                     log.warning(
                         "expected to resume %s but SDK started %s",
@@ -2692,25 +2797,23 @@ class SDKBridge:
         elif state.queued_prompts and state.queue_editing_index != 0:
             next_prompt = await self._pop_queued_prompt()
         else:
-            # Wait for first user input.  Config-change commands (/model,
-            # /effort, /thinking, /connect, /clear) can legitimately arrive
-            # *before* the first turn — apply them and keep waiting instead of
-            # silently dropping them (the old bug: /model on a fresh session
-            # did nothing).  Anything the helper doesn't recognise is ignored.
-            while next_prompt is None and not self.stop_event.is_set():
-                kind, payload = await self.event_queue.get()
-                if kind == "message":
-                    next_prompt = payload
-                    break
-                if kind in ("quit", "force-quit"):
-                    return
-                await self._apply_idle_config_command(kind, payload)
+            # Wait for first user input — through the *same* helper the
+            # between-turns path parks in.  This used to be a second,
+            # hand-rolled wait loop, and every divergence between the two was
+            # a bug that fired only when the user happened to be parked at
+            # this one: it dropped /compact, /btw and wakeups outright, and
+            # (like _await_next_prompt before the fix above) it never drained
+            # a prompt typed during a config command's reconnect.  Having one
+            # idle wait means idle behaviour can't depend on which wait point
+            # you're standing in.
+            #
             # No echo here.  Anything arriving on the event_queue was already
             # echoed at enqueue time by server.py's _enqueue_prompt (or by the
             # browser, which tells the server so).  This used to echo from a
             # ``state.initial_prompt_client_echoed`` flag — a single slot that
             # only ever described the *last* message the WebSocket handler saw,
             # and which the REST producers never set at all.
+            next_prompt = await self._await_next_prompt()
 
         # --- Turn loop ---
         while next_prompt is not None and not self.stop_event.is_set():
@@ -2925,9 +3028,11 @@ class SDKBridge:
         True when *kind* was handled, False for anything else so the caller can
         deal with messages / quit / wakeups itself.
 
-        Shared by both idle wait points (``worker_loop``'s initial-prompt wait
-        and ``_await_next_prompt``) so a config command is never silently
-        dropped depending on which one happens to be parked.
+        Note for callers: every branch here reconnects, and ``state.connecting``
+        is True for the duration — so a prompt typed during one is routed to
+        ``state.queued_prompts``, not to the event_queue.  A caller that returns
+        to waiting without draining that queue strands the prompt.  There is
+        exactly one such caller (``_await_next_prompt``), and it drains.
         """
         state = self.state
         if kind == "model":
@@ -2982,6 +3087,30 @@ class SDKBridge:
             # applied via the shared helper so idle behaviour matches the
             # initial-prompt wait exactly.
             if await self._apply_idle_config_command(kind, payload):
+                # Every one of those commands reconnects the SDK, and for the
+                # seconds that takes ``state.connecting`` is True — which is
+                # precisely the condition under which server.py routes a typed
+                # prompt to ``state.queued_prompts`` instead of our event_queue.
+                # So a prompt typed *during* a `/model` switch lands in the
+                # queue panel, and nothing ever pokes us afterwards: we go
+                # straight back to blocking on event_queue.get() while the UI
+                # says idle and the prompt sits there unsent forever.  That is
+                # the reported "changed the model, typed while it reconnected,
+                # then it just sat there".
+                #
+                # The between-turns path never had this hole — _between_turns()
+                # reconnects at the top and drains queued_prompts further down,
+                # so the same keystrokes worked or didn't purely on whether a
+                # turn happened to be finishing.  Draining here makes the two
+                # idle paths agree.
+                #
+                # Checking after the await is race-free: connect() clears
+                # ``connecting`` in a finally block before reconnect() returns,
+                # so a prompt is either already in queued_prompts (and popped
+                # here) or routes to the event_queue we're about to block on.
+                prompt = await self._pop_queued_prompt()
+                if prompt is not None:
+                    return prompt
                 continue
             if kind == "wakeup":
                 # Any wakeup is a chance to flush a queued *user* prompt.
@@ -3180,11 +3309,39 @@ class SDKBridge:
         )
 
     async def stop(self) -> None:
-        """Gracefully shut down."""
-        self.stop_event.set()
-        self._cancel_compact_turn_end_timer()
-        self._cancel_wakeup()
-        self.event_queue.put_nowait(("quit", ""))
-        if self._worker_task and not self._worker_task.done():
-            await cancel_and_join(self._worker_task, "worker")
-        await self.disconnect()
+        """Gracefully shut down.
+
+        **Shielded**, so a cancellation aimed at whoever called us cannot leave
+        a ``claude.exe`` running.  Shutdown here is not a request that can be
+        abandoned half-way: the interesting work (killing the CLI) is at the
+        *end* of the sequence, so a ``CancelledError`` arriving at the first
+        await skips precisely the part that matters and leaves a live agent
+        behind with no record that it happened.  That is exactly how the idle
+        teardown leaked 19 subprocesses (see ``_cancel_idle_timer``); the
+        self-cancel is fixed at its source, but a shutdown path whose
+        correctness depends on never being cancelled is a trap, so the
+        guarantee is made here too.
+
+        The caller still sees the cancellation — the shield re-raises it — but
+        the teardown itself runs to completion in the background.
+        """
+        await asyncio.shield(self._shutdown())
+
+    async def _shutdown(self) -> None:
+        """The actual shutdown sequence.  Never raises; see :meth:`stop`."""
+        try:
+            self.stop_event.set()
+            self._cancel_compact_turn_end_timer()
+            self._cancel_wakeup()
+            self.event_queue.put_nowait(("quit", ""))
+            try:
+                if self._worker_task and not self._worker_task.done():
+                    await cancel_and_join(self._worker_task, "worker")
+            finally:
+                # Unconditional: a worker that refuses to die must not also
+                # cost us the subprocess.
+                await self.disconnect()
+        except Exception:
+            # A shielded task's exception would otherwise surface as a bare
+            # "Task exception was never retrieved" with no context.
+            log.exception("bridge shutdown failed")
