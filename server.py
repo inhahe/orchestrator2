@@ -71,6 +71,7 @@ from config import (
     _PICKER_SENTINEL,
     fetch_available_models,
     parse_args,
+    parse_bell_events,
 )
 from state import (
     State,
@@ -881,12 +882,16 @@ async def _create_runtime(
     model: str | None = None,
     effort: str | None = None,
     config_dir: str | None = None,
+    bell_on: str | None = None,
 ) -> SessionRuntime:
     """Spin up a fresh live session runtime (config clone + state + bridge).
 
     * ``resume`` — resume a specific on-disk session id (implies no auto-continue).
     * ``no_continue`` — start empty (a brand-new session).
     * ``model`` / ``effort`` — per-session overrides from the launcher.
+    * ``bell_on`` — ``--bell`` spec from the launcher; without it the session
+      silently inherits the *hub process's* bell set, which is wrong whenever
+      the hub was started before (or with different flags than) this launch.
     * ``config_dir`` — ``CLAUDE_CONFIG_DIR`` override for cross-account sessions.
     * otherwise — continue the most recent session in *cwd*.
 
@@ -908,6 +913,8 @@ async def _create_runtime(
         overrides["effort"] = effort
     if config_dir:
         overrides["config_dir"] = config_dir
+    if bell_on:
+        overrides["bell_on"] = bell_on
     cfg = dataclasses.replace(config, **overrides)
     # Build the state *inside* the session's config-dir scope so account
     # detection (detect_account_info / detect_subscription*) reads the
@@ -1802,6 +1809,7 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     model = (body.get("model") or "").strip() or None
     effort = (body.get("effort") or "").strip() or None
     config_dir = (body.get("config_dir") or "").strip() or None
+    bell_on = (body.get("bell_on") or "").strip() or None
 
     # Resolve the on-disk session this launch would land on (an explicit
     # resume id, or — for a plain continue — the most recent session in cwd).
@@ -1833,13 +1841,25 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
                 if existing.state.effort != new_effort:
                     existing.state.effort = new_effort
                     need_reconnect = True
+            # Same reasoning as model/effort: the launcher asked for a bell
+            # set, so honour it on the session it actually lands on.  No
+            # reconnect needed — bell_events is read at ring time.
+            if bell_on and existing.state is not None:
+                new_bells = parse_bell_events(bell_on)
+                if existing.state.bell_events != new_bells:
+                    log.info(
+                        "hub launch: bell set for rid=%s %s -> %s",
+                        existing.rid, sorted(existing.state.bell_events),
+                        sorted(new_bells),
+                    )
+                    existing.state.bell_events = new_bells
             if need_reconnect and existing.bridge is not None:
                 asyncio.create_task(existing.bridge.reconnect())
             return {"ok": True, "rid": existing.rid, "reused": True}
     try:
         rt = await _create_runtime(cwd=cwd, resume=resume, no_continue=no_continue,
                                    model=model, effort=effort,
-                                   config_dir=config_dir)
+                                   config_dir=config_dir, bell_on=bell_on)
     except Exception as exc:
         log.exception("hub session launch failed")
         return {"ok": False, "error": str(exc)}
@@ -2777,6 +2797,28 @@ async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
     return False
 
 
+async def _do_interrupt(bridge: Any, broadcast: Any) -> None:
+    """Interrupt the running turn and report it *accurately*.
+
+    ``run_turn`` owns the announcement for a live turn: it emits "Interrupting…"
+    the moment the interrupt is noticed, then defers the visible ``turn_end``
+    interrupted marker until the CLI actually stops — after its wind-down
+    output.  Broadcasting "Turn interrupted." here as well was both a duplicate
+    and a lie: it declared the turn over the instant the user pressed Ctrl-C,
+    while the CLI was still streaming.  From a report: "it says it's interrupted
+    but then it keeps working and outputting text."  So only speak up when no
+    live ``run_turn`` will — a ghost turn, or an idle session.
+
+    ``turn_active`` is sampled *before* the await: ``bridge.interrupt()`` can
+    return after ``run_turn`` has already exited and cleared it.
+    """
+    live = bridge.turn_active.is_set()
+    await bridge.interrupt()
+    if not live:
+        await broadcast({"type": "system_msg", "subtype": "interrupted",
+                         "data": {"message": "Interrupting…"}})
+
+
 async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
     """Dispatch an incoming WebSocket message."""
     # Lobby / session-switching messages route independently of any bridge.
@@ -2858,9 +2900,7 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             return
 
         if kind == "interrupt":
-            await bridge.interrupt()
-            await broadcast({"type": "system_msg", "subtype": "interrupted",
-                             "data": {"message": "Turn interrupted."}})
+            await _do_interrupt(bridge, broadcast)
             return
 
         if kind in ("quit", "force-quit"):
@@ -2986,9 +3026,7 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
 
     # --- Interrupt ---
     elif msg_type == "interrupt":
-        await bridge.interrupt()
-        await broadcast({"type": "system_msg", "subtype": "interrupted",
-                         "data": {"message": "Turn interrupted."}})
+        await _do_interrupt(bridge, broadcast)
 
     # --- Permission response ---
     elif msg_type == "permission_response":
@@ -3257,9 +3295,16 @@ def _probe_hub(port: int) -> dict | None:
 def _launch_into_hub(
     port: int, *, cwd: str, resume: str | None, no_continue: bool,
     model: str | None = None, effort: str | None = None,
-    config_dir: str | None = None,
+    config_dir: str | None = None, bell_on: str | None = None,
 ) -> str | None:
-    """Ask a running hub to open a session; return its ``rid`` (or None)."""
+    """Ask a running hub to open a session; return its ``rid`` (or None).
+
+    ``bell_on`` is forwarded for the same reason ``model``/``effort`` are: a
+    launch that finds a hub already running never builds its own ``Config``,
+    so any flag *not* in this payload is silently dropped and the session
+    inherits whatever the hub process was started with.  That makes
+    ``--bell`` a lie whenever the hub predates it.
+    """
     import urllib.request
 
     payload = json.dumps({
@@ -3269,6 +3314,7 @@ def _launch_into_hub(
         "model": model,
         "effort": effort,
         "config_dir": config_dir,
+        "bell_on": bell_on,
     }).encode("utf-8")
     try:
         req = urllib.request.Request(
@@ -3683,6 +3729,7 @@ def main() -> None:
             model=config.model,
             effort=config.effort,
             config_dir=config.config_dir or os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude"),
+            bell_on=config.bell_on,
         )
         if rid:
             url = f"http://localhost:{config.port}/?rid={rid}"
@@ -3882,6 +3929,7 @@ def main() -> None:
                         config.port, cwd=config.cwd, resume=config.resume,
                         no_continue=config.no_continue, model=config.model,
                         effort=config.effort, config_dir=join_cfg_dir,
+                        bell_on=config.bell_on,
                     )
                     if rid:
                         break

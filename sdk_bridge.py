@@ -141,6 +141,39 @@ CONNECT_TIMEOUT = 45.0
 # Broadcaster type: async function that sends a dict to all WS clients.
 Broadcaster = Callable[[dict[str, Any]], Awaitable[None]]
 
+# --- Why output can continue after an interrupt ---------------------------
+#
+# From a report: "often when i hit ctrl-c to interrupt a turn, it says it's
+# interrupted but then it keeps working and outputting text, and i have to hit
+# ctrl-c once or maybe twice more to get it to stop."
+#
+# Seen in orchestrator2.log (pid 6760, bridge=6990)::
+#
+#     23:05:11,152  UserMessage during turn: '[Request interrupted by user for tool use]'
+#     23:05:11,153  run_turn exit: normal (turns=2)
+#     23:05:22,033  async AssistantMessage between turns: ... blocks=['ThinkingBlock']
+#     23:05:22,033  ghost turn begin: SDK streaming without active run_turn
+#     23:05:24,087  async UserMessage between turns: '[Request interrupted by user]'
+#     23:05:24,089  ghost turn end: subtype=error_during_execution compact=False elapsed=2.1s
+#
+# This is NOT the SDK ignoring the interrupt, and it is not ours to suppress.
+# The matching session JSONL shows a *background Bash task* completing 4.2 s
+# after the Ctrl-C and enqueueing a <task-notification>; the CLI then fed it to
+# the model, which is what produced the 23:05:22 stream.  The CLI builds its
+# abortController *per dequeued command* (print.ts:2133) and the SDK `interrupt`
+# control request only calls abortController.abort() — it never clears the
+# command queue, so anything dequeued afterwards runs with a fresh controller.
+# print.ts:2010-2013 says feeding notifications to the model this way "matches
+# TUI behavior where useQueueProcessor always feeds notifications to the model
+# regardless of coordinator mode", so interactive Claude Code does the same.
+#
+# The delay is therefore the background task's own runtime plus the API round
+# trip, not interrupt latency — measured at 2.1 s / 8.5 s / 10.9 s across the
+# three resurrections in 20 logged interrupts.  Discarding that output would
+# hide a legitimate result that the CLI has already written to the session
+# JSONL, so the live view would disagree with the history on reload.  We render
+# it as a normal ghost turn; see _begin_ghost_turn_if_needed.
+
 # Matches the CLI's inline API-error banner, e.g.
 #   "API Error: 400 {"type":"error","error":{...}}"
 # The captured group is the HTTP status code.  IMPORTANT: this is matched only
@@ -722,7 +755,9 @@ class SDKBridge:
             # so the UI must reflect that.  Stamp turn_started_at on
             # the first message so duration is meaningful, and push
             # one status_update so the toolbar switches off "idle".
-            await self._begin_ghost_turn_if_needed()
+            # False means a live run_turn owns this message.
+            if not await self._begin_ghost_turn_if_needed():
+                return
 
             for block in msg.content:
                 if isinstance(block, TextBlock):
@@ -792,7 +827,8 @@ class SDKBridge:
                     "async injected prompt: %r (truncated)",
                     injected[:120],
                 )
-                await self._begin_ghost_turn_if_needed()
+                if not await self._begin_ghost_turn_if_needed():
+                    return
                 await self._broadcast_injected_prompt(injected, during_turn=False)
                 return
 
@@ -839,7 +875,8 @@ class SDKBridge:
             except Exception:
                 pass
             # Tool results arriving means the ghost turn is alive too.
-            await self._begin_ghost_turn_if_needed()
+            if not await self._begin_ghost_turn_if_needed():
+                return
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, ToolResultBlock):
@@ -1056,15 +1093,26 @@ class SDKBridge:
     # Ghost-turn helpers
     # ------------------------------------------------------------------
 
-    async def _begin_ghost_turn_if_needed(self) -> None:
+    async def _begin_ghost_turn_if_needed(self) -> bool:
         """Mark a ghost turn active and push a status_update once.
 
         Called on every async assistant/user message.  Idempotent: only
         flips state once, until ``_end_ghost_turn`` clears it.
+
+        Returns False when the caller should *not* render the message, because
+        a real ``run_turn`` already owns the stream and will render it itself.
+
+        Note this deliberately renders output that arrives shortly after an
+        interrupt: that is normally a background task's <task-notification>
+        waking the model, which the CLI records in the session JSONL either
+        way.  See the "Why output can continue after an interrupt" comment at
+        the top of this module.
         """
         state = self.state
-        if state.busy or self.turn_active.is_set():
-            return
+        if self.turn_active.is_set():
+            return False
+        if state.busy:
+            return True
         # This ghost turn IS the post-compact continuation that the deferred
         # turn_end was waiting for — it will book the turn and emit its own
         # turn_end, so drop the pending one to avoid a duplicate marker.
@@ -1086,6 +1134,7 @@ class SDKBridge:
             })
         except Exception as exc:
             log.warning("ghost-turn status_update broadcast failed: %r", exc)
+        return True
 
     async def _end_ghost_turn(self, subtype: str) -> None:
         """Close out a ghost turn cleanly when its ResultMessage lands."""
@@ -1310,6 +1359,86 @@ class SDKBridge:
     # System message handling (shared by turn + async paths)
     # ------------------------------------------------------------------
 
+    async def _announce_bg_completion(
+        self, *, task_id: str, status: str, summary: str | None,
+        output: str | None, source: str,
+    ) -> None:
+        """Render a background task's completion — and say so in the log.
+
+        Both callers (``task_notification`` and ``task_updated``) used to be
+        ``if entry: ...`` with no ``else``, so a completion for a task this
+        bridge never saw *start* was dropped with no broadcast and no log line.
+        That happens for real: the CLI keeps background tasks running across a
+        ``--continue``/``--resume``, and a bridge that attached afterwards never
+        received their ``task_started``.  The model would then wake up out of
+        an idle session with no visible cause — exactly the "why doesn't it say
+        background task X completed?" case, and unobservable after the fact
+        because nothing in this path logged.
+
+        Unknown tasks are now rendered from whatever the notification itself
+        carries.  Only genuine duplicates stay silent, and they say so in the
+        log.  The bg-wait bell and the ``bg-all-done`` wakeup stay gated on a
+        *known* entry: an unregistered task was never in ``background_tasks``,
+        so "no tasks left" would be vacuously true and would inject a spurious
+        wakeup prompt.
+        """
+        state = self.state
+        known = (task_id in state.background_tasks
+                 or task_id in state.current_turn_bg)
+        entry = complete_bg_task(state, task_id, status, summary=summary)
+
+        if entry is None and known:
+            log.info(
+                "bg task %s: duplicate %s completion ignored (via %s)",
+                task_id[:12] or "?", status, source,
+            )
+            return
+        if entry is None:
+            log.warning(
+                "bg task %s: %s completion for a task this bridge never saw "
+                "start (via %s) — rendering from the notification alone",
+                task_id[:12] or "?", status, source,
+            )
+        else:
+            log.info(
+                "bg task %s (%s) completed: status=%s (via %s)",
+                task_id[:12] or "?", (entry.get("name") or "")[:40],
+                status, source,
+            )
+
+        cmd = self._bg_task_command(entry) if entry else None
+        # Send the model's summary and the task's actual stdout as *separate*
+        # fields so the UI can show command, summary AND output.  Drop a
+        # "summary" that's just the command repeated.
+        model_summary = summary if (summary and summary != cmd) else None
+        await self.broadcast({
+            "type": "bg_complete",
+            "task_id": task_id,
+            "seq": (entry or {}).get("seq"),
+            "name": (entry or {}).get("name"),
+            "status": status,
+            "summary": model_summary,
+            "output": output,
+            "command": cmd,
+        })
+
+        if entry is None:
+            return
+        # Only alert when the session was *parked* waiting on this task
+        # (bg-wait), not when the model spawned it mid-turn and kept working —
+        # a routine mid-turn completion isn't alert-worthy.
+        if in_bg_wait(state):
+            ring_bell(state, "bg-done")
+            await self._flush_bell()
+        # If no more bg tasks, update status immediately and queue a wakeup.
+        if not state.background_tasks:
+            await self.broadcast({
+                "type": "status_update",
+                "status": state_to_status_dict(state, self.config),
+                "panels": state_to_panels_dict(state),
+            })
+            self.event_queue.put_nowait(("wakeup", "bg-all-done"))
+
     async def _handle_system_message(self, msg: SystemMessage, *, during_turn: bool) -> None:
         """Process a SystemMessage from the SDK."""
         state = self.state
@@ -1394,37 +1523,10 @@ class SDKBridge:
                     output = Path(output_file).read_text(encoding="utf-8", errors="replace")
                 except Exception:
                     pass
-            entry = complete_bg_task(state, task_id, status, summary=summary)
-            if entry:
-                cmd = self._bg_task_command(entry)
-                # Send the model's summary and the task's actual stdout as
-                # *separate* fields so the UI can show command, summary AND
-                # output.  Drop a "summary" that's just the command repeated.
-                model_summary = summary if (summary and summary != cmd) else None
-                data = {
-                    "task_id": task_id,
-                    "seq": entry.get("seq"),
-                    "name": entry.get("name"),
-                    "status": status,
-                    "summary": model_summary,
-                    "output": output,
-                    "command": cmd,
-                }
-                await self.broadcast({"type": "bg_complete", **data})
-                # Only ring when the session was *parked* waiting on this task
-                # (bg-wait), not when the model spawned it mid-turn and kept
-                # working — a routine mid-turn completion isn't alert-worthy.
-                if in_bg_wait(state):
-                    ring_bell(state, "bg-done")
-                    await self._flush_bell()
-                # If no more bg tasks, update status immediately and queue a wakeup.
-                if not state.background_tasks:
-                    await self.broadcast({
-                        "type": "status_update",
-                        "status": state_to_status_dict(state, self.config),
-                        "panels": state_to_panels_dict(state),
-                    })
-                    self.event_queue.put_nowait(("wakeup", "bg-all-done"))
+            await self._announce_bg_completion(
+                task_id=task_id, status=status, summary=summary,
+                output=output, source="task_notification",
+            )
 
         elif subtype == "task_started":
             task_id = getattr(msg, "task_id", None) or ""
@@ -1452,6 +1554,13 @@ class SDKBridge:
                 "task_type": task_type,
                 "command": cmd,
             }
+            # Logged so a later completion can be matched to its start — a
+            # completion with no start line here is the "never saw it start"
+            # case in _announce_bg_completion.
+            log.info(
+                "bg task %s (%s) started: type=%s during_turn=%s",
+                task_id[:12] or "?", (name or "")[:40], task_type, during_turn,
+            )
             await self.broadcast({"type": "bg_started", **data})
 
         elif subtype == "compact_boundary":
@@ -1506,33 +1615,10 @@ class SDKBridge:
                         )
                     except Exception:
                         pass
-                entry = complete_bg_task(state, task_id, status, summary=summary)
-                if entry:
-                    cmd = self._bg_task_command(entry)
-                    # Separate model summary from actual stdout (see above).
-                    model_summary = summary if (summary and summary != cmd) else None
-                    data = {
-                        "task_id": task_id,
-                        "seq": entry.get("seq"),
-                        "name": entry.get("name"),
-                        "status": status,
-                        "summary": model_summary,
-                        "output": output,
-                        "command": cmd,
-                    }
-                    await self.broadcast({"type": "bg_complete", **data})
-                    # See the task_notification branch: only alert when parked
-                    # in bg-wait, not on a mid-turn (busy) completion.
-                    if in_bg_wait(state):
-                        ring_bell(state, "bg-done")
-                        await self._flush_bell()
-                    if not state.background_tasks:
-                        await self.broadcast({
-                            "type": "status_update",
-                            "status": state_to_status_dict(state, self.config),
-                            "panels": state_to_panels_dict(state),
-                        })
-                        self.event_queue.put_nowait(("wakeup", "bg-all-done"))
+                await self._announce_bg_completion(
+                    task_id=task_id, status=status, summary=summary,
+                    output=output, source="task_updated",
+                )
 
         # Rate limit info (may be on any system message).
         rate_info = getattr(msg, "rate_limit_info", None)
@@ -2370,10 +2456,25 @@ class SDKBridge:
         here (and the status ticker flushes as a catch-all safety net).
         """
         if self.state.pending_bell:
+            event = self.state.pending_bell
+            # Logged at the point the browser is actually told to make a
+            # sound — a ring can sit pending for a while, so "rung" and
+            # "heard" are different moments and the gap matters when the user
+            # is trying to work out what they just heard.  ``session`` is what
+            # tells apart a bell from *this* tab and one from another session
+            # in the same hub.
+            log.info(
+                "bell: %s -> browser session=%s title=%r",
+                event, (self.state.session_id or "?")[:12],
+                (self.state.session_title or "")[:40],
+            )
             try:
-                await self.broadcast(
-                    {"type": "bell", "event": self.state.pending_bell}
-                )
+                await self.broadcast({
+                    "type": "bell",
+                    "event": event,
+                    "session_id": self.state.session_id,
+                    "session_title": self.state.session_title,
+                })
             except Exception as exc:
                 log.warning("bell broadcast failed: %r", exc)
             self.state.pending_bell = None
@@ -2967,8 +3068,8 @@ class SDKBridge:
         # while the SDK isn't streaming leaves ``run_turn`` blocked on
         # ``await turn_msg_queue.get()`` indefinitely — ``state.busy``
         # never clears and the toolbar stays stuck on "working" even
-        # though the user already saw the "Turn interrupted." system
-        # message.  The sentinel lets the loop tick once and notice
+        # though the user already saw the interrupt acknowledged.
+        # The sentinel lets the loop tick once and notice
         # ``interrupt_event`` is set.
         live = self.turn_active.is_set()
         if live:

@@ -18,7 +18,6 @@ from config import (
     EFFORT_CHOICES,
     SLASH_COMMANDS,
     Config,
-    _parse_bell_spec,
     get_known_models,
     model_cache_is_stale,
     parse_bell_events,

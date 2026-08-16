@@ -8,6 +8,7 @@ Helper functions convert it into JSON-serialisable dicts for the frontend
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
@@ -25,6 +26,8 @@ from config import (
     model_context_window,
     parse_bell_events,
 )
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Formatting helpers (pure functions, no side-effects)
@@ -340,9 +343,32 @@ def ring_bell(state: State, event: str) -> None:
 
     Turn-completion events are deferred while bg tasks run.  The web
     frontend receives a ``bell`` WS message instead of ``\\a``.
+
+    Every ring is logged — including the ones filtered out by
+    ``state.bell_events``.  From a report: "i often hear it when a turn wasn't
+    just completed and no task just finished and there was no rate-hit."  With
+    several sessions live in one hub, a bell from *another* session's tab is
+    indistinguishable by ear, and nothing anywhere recorded which event fired
+    or which session it came from, so the question was unanswerable after the
+    fact.  Grep ``bell:`` to attribute one.
     """
     if event not in state.bell_events:
+        log.info(
+            "bell: %s suppressed (not in --bell set %s) session=%s",
+            event, sorted(state.bell_events) or "<empty>",
+            (state.session_id or "?")[:12],
+        )
         return
+    if state.pending_bell and state.pending_bell != event:
+        log.info(
+            "bell: %s replaced unflushed %s session=%s",
+            event, state.pending_bell, (state.session_id or "?")[:12],
+        )
+    log.info(
+        "bell: %s rung session=%s title=%r busy=%s turns=%s",
+        event, (state.session_id or "?")[:12], (state.session_title or "")[:40],
+        state.busy, state.turns,
+    )
     state.pending_bell = event
 
 

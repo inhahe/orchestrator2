@@ -325,37 +325,6 @@ def get_known_models() -> list[tuple[str, str]]:
 # Bell-event parsing
 # ---------------------------------------------------------------------------
 
-def _parse_bell_spec(spec: str) -> str | dict[str, bool]:
-    """Parse a bell-event specification string.
-
-    Returns ``"all"`` or ``"none"`` for those shortcuts, otherwise a dict
-    mapping event names to True (enabled) / False (disabled).
-    """
-    spec = spec.strip().lower()
-    if spec in ("all", "none"):
-        return spec
-    result: dict[str, bool] = {}
-    for token in spec.replace(",", " ").split():
-        token = token.strip()
-        if not token:
-            continue
-        if token.endswith(" off") or token.endswith("-off"):
-            name = token.rsplit(" ", 1)[0] if " " in token else token[:-4]
-            name = name.rstrip("-")
-        elif token.endswith(" on") or token.endswith("-on"):
-            name = token.rsplit(" ", 1)[0] if " " in token else token[:-3]
-            name = name.rstrip("-")
-            result[name] = True
-            continue
-        else:
-            name = token
-            result[name] = True
-            continue
-        # Reached only for -off / off suffix.
-        result[name] = False
-    return result
-
-
 def parse_bell_events(spec: str) -> set[str]:
     """Parse the --bell / --bell-on startup spec into the enabled-event set.
 
