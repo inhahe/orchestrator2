@@ -575,6 +575,11 @@ class SDKBridge:
         # auth line on stderr — will re-set it.
         self.state.auth_error = False
 
+        # A fresh CLI is not compacting, whatever the last one was doing when
+        # it died.
+        self.state.cli_status = None
+        self.state.cli_status_started_at = None
+
         # Sync frontend now that connecting flipped to False.  Without
         # this the browser keeps ``_isBusy=true`` (from the earlier
         # ``connecting=True`` status_update) until some other event
@@ -1157,11 +1162,27 @@ class SDKBridge:
         log.info("wakeup armed: delay=%.0fs prompt=%r", delay, prompt[:80])
 
     def _cancel_wakeup(self) -> None:
-        """Cancel any pending wakeup timer (idempotent)."""
+        """Cancel any pending wakeup timer (idempotent).
+
+        **Never cancels the calling task.**  ``_wakeup_timer`` re-arms itself
+        when it fires mid-turn, and ``_arm_wakeup`` starts by cancelling the
+        pending timer — which at that moment *is* the caller.  Self-cancelling
+        would leave the task marked for cancellation, so anything added after
+        the re-arm would silently never run.  That exact shape (a task
+        cancelling itself out of its own callback) cost this hub 19 live CLI
+        subprocesses via ``server._cancel_idle_timer``; it is not a mistake
+        worth making twice.
+        """
         t = self._wakeup_task
         self._wakeup_task = None
         self._wakeup_fire_at = None
-        if t is not None and not t.done():
+        if t is None or t.done():
+            return
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:      # no running loop
+            current = None
+        if t is not current:
             t.cancel()
 
     async def _wakeup_timer(self, delay: float, prompt: str) -> None:
@@ -1172,6 +1193,23 @@ class SDKBridge:
             return
         if self.stop_event.is_set():
             return
+
+        # A turn is still running: the loop is not stalled, so it needs no
+        # nudge — and injecting one would put "Resume work now…" into a
+        # conversation that is already mid-thought, as a user message the model
+        # must then obey.  Observed after an auto-compaction: the model
+        # scheduled a wakeup, the CLI compacted, the post-compact continuation
+        # restarted the work by itself, and the wakeup then fired into that
+        # live turn.  Defer instead of dropping — a turn that ends without the
+        # model re-arming would otherwise strand the loop for good.
+        if self.state.busy:
+            log.info(
+                "wakeup fired mid-turn — deferring %.0fs (turn still running)",
+                WAKEUP_MIN_DELAY,
+            )
+            self._arm_wakeup(WAKEUP_MIN_DELAY, prompt)
+            return
+
         # Self-clear: this task is firing, so it's no longer "pending".
         self._wakeup_task = None
         self._wakeup_fire_at = None
@@ -1686,6 +1724,24 @@ class SDKBridge:
                 "message": f"[compacted -- {trigger} -- was ~{tok_str} tok]",
             }
 
+        elif subtype == "status":
+            # The CLI narrating its own work.  The value we care about is
+            # ``"compacting"`` (set when an auto-compaction starts, cleared
+            # with ``None`` when it ends): a compaction is a single
+            # summarisation call over the whole context and can run for
+            # minutes with no output whatsoever — one measured run took 141 s —
+            # so without this the status bar just says "working" and the
+            # session is indistinguishable from a wedged one.
+            d = msg.data if isinstance(msg.data, dict) else {}
+            new_status = d.get("status")
+            if new_status != state.cli_status:
+                state.cli_status = new_status
+                state.cli_status_started_at = (
+                    time.monotonic() if new_status else None)
+                log.info("CLI status: %s", new_status or "(cleared)")
+                await self._broadcast_panels()
+            return
+
         elif subtype == "session_state_changed":
             # The session lifecycle state lives in ``msg.data['state']``
             # (SystemMessage only carries ``subtype`` + ``data``).  Emitted
@@ -1977,6 +2033,11 @@ class SDKBridge:
         self.interrupt_event.clear()
         state.busy = True
         state.turn_started_at = time.monotonic()
+        # A compaction cannot span a turn boundary, so anything left here is
+        # stale — e.g. the CLI died mid-compaction and never sent the clearing
+        # status.  Without this the bar would read "compacting" forever.
+        state.cli_status = None
+        state.cli_status_started_at = None
         state.compact_during_last_turn = False
         state.current_turn_tool_seqs = []
 

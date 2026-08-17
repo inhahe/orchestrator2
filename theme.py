@@ -102,6 +102,7 @@ _TOKEN_DEFS: list[tuple[str, str, str, str]] = [
     ("indicator-error", "$red",        "Icons",     "Error status dot"),
     ("indicator-connecting","$yellow", "Icons",     "Connecting status dot"),
     ("indicator-bg-wait","$purple",    "Icons",     "Background-wait status dot"),
+    ("indicator-compacting","$yellow", "Icons",     "Compacting status dot"),
     ("modal-backdrop",  "rgba(0,0,0,0.6)","Backgrounds","Modal dim overlay"),
     ("scrollbar-thumb", "$border",     "Borders",   "Scrollbar thumb"),
     ("scrollbar-hover", "$border-light","Borders",  "Scrollbar thumb hover"),

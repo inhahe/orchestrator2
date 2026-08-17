@@ -158,6 +158,7 @@ html, body {
 .indicator.shutdown  { background: var(--indicator-error); }
 .indicator.connecting { background: var(--indicator-connecting); animation: pulse 1.2s infinite; }
 .indicator.bg-wait   { background: var(--indicator-bg-wait); animation: pulse 1.2s infinite; }
+.indicator.compacting { background: var(--indicator-compacting); animation: pulse 1.2s infinite; }
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }

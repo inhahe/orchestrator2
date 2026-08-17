@@ -19,6 +19,7 @@ const Status = (() => {
     shutdown:     'var(--system-error)',
     error:        'var(--system-error)',
     'bg-wait':    'var(--indicator-bg-wait)',
+    compacting:   'var(--indicator-compacting)',
     waiting:      'var(--system-waiting)',
     done:         'var(--system-done)',
   };
@@ -78,9 +79,10 @@ const Status = (() => {
     const render = () => {
       if (!_localTimerClass) return;
       const secs = Math.round((Date.now() - _localTimerStart) / 1000);
-      const label = _localTimerClass === 'connecting'
-        ? `connecting (${secs}s)`
-        : `working (${_fmtDuration(secs)})`;
+      let label;
+      if (_localTimerClass === 'connecting') label = `connecting (${secs}s)`;
+      else if (_localTimerClass === 'compacting') label = `compacting (${_fmtDuration(secs)})`;
+      else label = `working (${_fmtDuration(secs)})`;
       _set(elState, 'textContent', label);
     };
     // Paint the label right away so it flips in the SAME frame as the colour
@@ -116,7 +118,7 @@ const Status = (() => {
     }
 
     // Start/stop local timer for connecting and working states.
-    const timedStates = ['connecting', 'working'];
+    const timedStates = ['connecting', 'working', 'compacting'];
     if (timedStates.includes(cls)) {
       if (_localTimerClass !== cls) _startLocalTimer(cls);
       // Don't overwrite the local timer's label — it updates every 1s.

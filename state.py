@@ -489,6 +489,15 @@ class State:
     connecting: bool = False
     connect_started_at: float | None = None
 
+    # What the *CLI* says it is doing, from ``system``/``status`` messages.
+    # Today the only value is ``"compacting"`` (set when the CLI starts an
+    # auto-compaction, cleared with ``None`` when it finishes).  Worth
+    # surfacing because an auto-compaction is long and completely silent — one
+    # observed run took 141 s during which the model emitted nothing at all,
+    # so the status bar said "working" with no output and looked wedged.
+    cli_status: str | None = None
+    cli_status_started_at: float | None = None   # time.monotonic()
+
     # Turn/compact state
     last_result_subtype: str | None = None
     last_compact_trigger: str | None = None
@@ -648,6 +657,18 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         else:
             busy_label = "connecting"
         busy_class = "connecting"
+    elif state.cli_status == "compacting":
+        # Ranked above ``busy`` on purpose: a compaction happens *inside* a
+        # turn, so busy is also true, and "compacting" is the more informative
+        # of the two — it is the one that explains why nothing is being
+        # printed.  Timed, because the interesting question during a silent
+        # two-minute stretch is "how long has this been going on".
+        if state.cli_status_started_at is not None:
+            elapsed = fmt_duration(time.monotonic() - state.cli_status_started_at)
+            busy_label = f"compacting ({elapsed})"
+        else:
+            busy_label = "compacting"
+        busy_class = "compacting"
     elif state.busy:
         if state.turn_started_at is not None:
             elapsed = fmt_duration(time.monotonic() - state.turn_started_at)

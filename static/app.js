@@ -404,8 +404,11 @@ const App = (() => {
       if (msg.status) {
         Status.update(msg.status);
         // Track busy state for queue routing and input styling.
+        // "compacting" counts as busy: it happens inside a live turn, so a
+        // prompt typed now queues exactly as it would during one.
         _isBusy = msg.status.busy_class === 'working' ||
-                  msg.status.busy_class === 'connecting';
+                  msg.status.busy_class === 'connecting' ||
+                  msg.status.busy_class === 'compacting';
         Commands.setBusy(_isBusy);
         Panels.setBusy(_isBusy);
       }
