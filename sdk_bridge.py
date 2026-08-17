@@ -163,6 +163,34 @@ async def cancel_and_join(task: asyncio.Task, what: str) -> None:
 # connect-retry loop try again — a fresh spawn almost always succeeds.
 CONNECT_TIMEOUT = 45.0
 
+# --- Why the bg-done bell waits before it rings ---------------------------
+#
+# From a report: "i seem to still be hearing bells when no turn is starting or
+# stopping, even though i have --bell turn-done bg-done rate-hit".
+#
+# Every ``bg-done`` bell in the log was followed, 2.3-5.0 s later, by a
+# ``ghost turn begin`` in the *same* session — nine rings, nine resumptions, no
+# exceptions.  That is not a coincidence: when a background Bash task finishes,
+# the CLI feeds its ``<task-notification>`` to the model, which promptly starts
+# streaming again (see the "Why output can continue after an interrupt" comment
+# below).  So at the instant the task completes the session looks parked --
+# ``run_turn`` has already exited and ``state.busy`` is False -- but it is
+# about to keep working on its own.
+#
+# ``in_bg_wait()`` tests exactly that instant, so it read "the model is between
+# tool calls" as "the user is waiting on this task" and rang.  The bell is
+# supposed to mean *come and look, this is finished and nothing else is
+# happening*; ringing three seconds before the model picks the result up and
+# carries on is the opposite of that.
+#
+# The fix is to make the claim survive a moment's scrutiny: arm the ring, wait,
+# and only ring if the session is *still* idle when the timer fires.  Any
+# resumption -- ghost turn or real turn -- cancels it at the point ``busy``
+# flips True.  The grace is generously above the observed 5.0 s worst case,
+# because a bell that is a few seconds late costs nothing and a bell that
+# should never have rung costs the user's attention.
+BG_DONE_BELL_GRACE = 10.0
+
 # Broadcaster type: async function that sends a dict to all WS clients.
 Broadcaster = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -360,6 +388,8 @@ class SDKBridge:
         # a fresh turn.  A new turn (or stop) cancels any pending timer.
         self._wakeup_task: asyncio.Task | None = None
         self._wakeup_fire_at: float | None = None  # monotonic deadline, for logs
+        # Deferred ``bg-done`` bell.  See _arm_bg_done_bell().
+        self._bg_done_bell_task: asyncio.Task | None = None
         # Generation counter for dispatcher tasks.  Each connect() bumps
         # this so we can tell live dispatchers apart in logs and detect
         # orphaned ones (stale tasks that survived a reconnect).
@@ -1305,6 +1335,65 @@ class SDKBridge:
         self.event_queue.put_nowait(("message", prompt))
 
     # ------------------------------------------------------------------
+    # Deferred bg-done bell
+    # ------------------------------------------------------------------
+
+    def _arm_bg_done_bell(self) -> None:
+        """Ring ``bg-done`` only if the session is *still* idle in a moment.
+
+        A background task finishing wakes the model far more often than it
+        frees the user, so "is the session idle?" is not a question worth
+        answering at the instant of completion — see the ``BG_DONE_BELL_GRACE``
+        comment at the top of this module.  Arm a timer instead and re-ask when
+        it fires; ``_cancel_bg_done_bell`` withdraws the ring the moment the
+        model resumes.
+
+        One pending ring at a time.  A burst of completions should produce one
+        bell, not one per task, and the pending timer already re-checks the
+        session at fire time, so it speaks for the whole burst.
+        """
+        task = self._bg_done_bell_task
+        if task is not None and not task.done():
+            return
+        self._bg_done_bell_task = asyncio.create_task(
+            self._ring_bg_done_after_grace(), name="bg-done-bell")
+
+    def _cancel_bg_done_bell(self) -> None:
+        """Withdraw a pending ``bg-done`` ring because the session is working.
+
+        Called wherever ``state.busy`` flips True — a real turn or a ghost one.
+        Both mean the same thing for the bell: whatever the task produced, the
+        model is acting on it, so there is nothing for the user to come back to.
+        """
+        task = self._bg_done_bell_task
+        self._bg_done_bell_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _ring_bg_done_after_grace(self) -> None:
+        """Wait out the grace, then ring if the session never resumed."""
+        try:
+            await asyncio.sleep(BG_DONE_BELL_GRACE)
+        except asyncio.CancelledError:
+            return
+        self._bg_done_bell_task = None
+        if self.stop_event.is_set():
+            return
+        # Belt-and-braces: _cancel_bg_done_bell covers the busy flip, but a
+        # reconnect or a rate-limit rejection can also land inside the grace
+        # and neither is a moment to interrupt the user.
+        if not in_bg_wait(self.state):
+            log.info(
+                "bell: bg-done withdrawn — session resumed within %.0fs "
+                "session=%s busy=%s",
+                BG_DONE_BELL_GRACE, (self.state.session_id or "?")[:12],
+                self.state.busy,
+            )
+            return
+        ring_bell(self.state, "bg-done")
+        await self._flush_bell()
+
+    # ------------------------------------------------------------------
     # Ghost-turn helpers
     # ------------------------------------------------------------------
 
@@ -1332,6 +1421,9 @@ class SDKBridge:
         # turn_end was waiting for — it will book the turn and emit its own
         # turn_end, so drop the pending one to avoid a duplicate marker.
         self._claim_pending_compact_turn_end()
+        # This stream is very often the model picking up a background task that
+        # just finished — the exact case a pending bg-done ring must not survive.
+        self._cancel_bg_done_bell()
         state.busy = True
         state.turn_started_at = time.monotonic()
         # Reset compact flag — any prior compact has been absorbed by
@@ -1641,10 +1733,10 @@ class SDKBridge:
             return
         # Only alert when the session was *parked* waiting on this task
         # (bg-wait), not when the model spawned it mid-turn and kept working —
-        # a routine mid-turn completion isn't alert-worthy.
+        # a routine mid-turn completion isn't alert-worthy.  "Parked" is judged
+        # a few seconds from now rather than right here; see _arm_bg_done_bell.
         if in_bg_wait(state):
-            ring_bell(state, "bg-done")
-            await self._flush_bell()
+            self._arm_bg_done_bell()
         # If no more bg tasks, update status immediately and queue a wakeup.
         if not state.background_tasks:
             await self.broadcast({
@@ -2110,6 +2202,7 @@ class SDKBridge:
         self._cancel_wakeup()
 
         self.interrupt_event.clear()
+        self._cancel_bg_done_bell()
         state.busy = True
         state.turn_started_at = time.monotonic()
         # A compaction cannot span a turn boundary, so anything left here is
@@ -3611,6 +3704,7 @@ class SDKBridge:
             self.stop_event.set()
             self._cancel_compact_turn_end_timer()
             self._cancel_wakeup()
+            self._cancel_bg_done_bell()
             self.event_queue.put_nowait(("quit", ""))
             try:
                 if self._worker_task and not self._worker_task.done():

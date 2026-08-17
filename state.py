@@ -381,6 +381,15 @@ def in_bg_wait(state: State) -> bool:
     only rings when the user is genuinely waiting on the task, not when the
     model spawned it mid-turn and kept right on working (in which case the
     completion is just routine progress, not something to alert about).
+
+    **Necessary but not sufficient for that bell.**  This is a snapshot of one
+    instant, and the instant a background task completes is the worst one to
+    take it: the CLI immediately feeds the task's ``<task-notification>`` to the
+    model, which resumes streaming a few seconds later, so a session that is
+    merely *between tool calls* answers True here.  Every ``bg-done`` ring in
+    the logged evidence was followed by a ``ghost turn begin`` 2.3-5.0 s later.
+    ``SDKBridge._arm_bg_done_bell`` therefore re-asks after a grace period
+    instead of trusting the first answer.
     """
     now_ts = int(time.time())
     rate_limited = bool(
