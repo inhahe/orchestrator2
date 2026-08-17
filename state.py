@@ -396,18 +396,40 @@ def in_bg_wait(state: State) -> bool:
 # ---------------------------------------------------------------------------
 
 class PersistentDeque(deque):
-    """A ``deque`` that invokes ``on_change()`` after any mutation.
+    """A ``deque`` that notifies subscribers after any mutation.
 
-    Backs ``State.queued_prompts`` so the pending-prompt queue can be written
-    to disk on every change and survive a server restart.  ``on_change`` is
-    attached *after* the initial disk load (so populating the deque from disk
-    doesn't immediately rewrite it) and takes no arguments — the callback
-    reads the current contents from the deque itself.  The callback is a
-    plain instance attribute; when unset it resolves to the ``None`` class
-    default and mutations are silent.
+    Backs ``State.queued_prompts``.  Two independent things need to know when
+    the pending-prompt queue changes, and they must not have to know about each
+    other:
+
+    * **persistence** — the queue is mirrored to disk on every change so
+      typed-but-not-yet-run prompts survive a server restart (``on_change``,
+      wired by ``server._attach_queue_persistence``);
+    * **the worker** — a prompt appended while the worker is parked has to
+      *poke* it, or it sits unsent forever (``add_listener``, wired by
+      ``SDKBridge``).
+
+    ``on_change`` is a single slot, which is why the second subscriber gets a
+    list instead of fighting for it.  Hooking the **container** rather than the
+    call sites is the point: `queued_prompts` has half a dozen writers spread
+    across ``server.py`` and ``sdk_bridge.py``, and every "the prompt didn't
+    send" bug in this project's history has been a writer that forgot to poke.
+    A writer added tomorrow gets it for free and cannot reintroduce the bug.
+
+    Callbacks take no arguments — they read the current contents from the deque
+    itself — and their exceptions are swallowed: neither persistence nor a
+    wake-up may break a queue operation.
     """
 
     on_change = None  # class default; set per-instance once persistence is wired
+
+    def add_listener(self, cb) -> None:
+        """Subscribe *cb* to every mutation.  Additive; never clobbers."""
+        # Instance attribute created on first use — a class-level mutable
+        # default would be shared by every session's queue in the hub.
+        if "_listeners" not in self.__dict__:
+            self._listeners = []
+        self._listeners.append(cb)
 
     def _fire(self) -> None:
         cb = self.on_change
@@ -416,6 +438,11 @@ class PersistentDeque(deque):
                 cb()
             except Exception:
                 # Persistence must never break queue operations.
+                pass
+        for listener in self.__dict__.get("_listeners", ()):
+            try:
+                listener()
+            except Exception:
                 pass
 
     def append(self, x):            # type: ignore[override]

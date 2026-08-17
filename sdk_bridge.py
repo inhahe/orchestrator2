@@ -368,6 +368,18 @@ class SDKBridge:
         # reconnect — the condition is permanent and unfixable mid-session.
         self._integrity_warned = False
 
+        # Any mutation of the pending-prompt queue pokes the worker.  See
+        # _poke_for_queued_prompt() for why this is wired to the *container*
+        # and not to the (many) places that write to it.
+        try:
+            state.queued_prompts.add_listener(self._poke_for_queued_prompt)
+        except AttributeError:
+            # A plain deque (a test fixture, or a State built by older code).
+            # Losing the poke degrades to the previous behaviour rather than
+            # breaking construction.
+            log.warning("queued_prompts has no add_listener — worker pokes "
+                        "disabled for this bridge")
+
     # ------------------------------------------------------------------
     # SDK options
     # ------------------------------------------------------------------
@@ -488,7 +500,13 @@ class SDKBridge:
     # ------------------------------------------------------------------
 
     async def connect(self, resume_id: str | None = None) -> None:
-        """Create SDK client, connect, and start the message dispatcher."""
+        """Create SDK client, connect, and start the message dispatcher.
+
+        **Must run on the worker task** — this is where the SDK transport's
+        anyio cancel scope gets *entered*, and the scope's host task is whoever
+        is holding it.  See :meth:`_warn_if_foreign_task`.
+        """
+        self._warn_if_foreign_task("connect")
         options = self._make_options(resume_id)
         log.info(
             "connect: resume=%s, cwd=%s",
@@ -579,6 +597,26 @@ class SDKBridge:
         # it died.
         self.state.cli_status = None
         self.state.cli_status_started_at = None
+
+        # Anything the user typed during the connect went to
+        # ``state.queued_prompts`` (that is what ``state.connecting`` routes),
+        # and the poke it fired was declined because the client wasn't usable
+        # yet.  Now it is, so poke again.
+        #
+        # Race-free by the same argument as the ``/model`` drain: ``connecting``
+        # was cleared in the ``finally`` above, and server.py's router tests it
+        # and appends with no await in between — so a prompt is either already
+        # in the queue (and poked here) or routes to the event_queue we are
+        # about to be parked on.
+        #
+        # This is the half that fixes reconnects nobody awaits.  A reconnect
+        # started *by the worker* is followed by a drain the worker performs
+        # itself; a reconnect started by ``api_session_launch`` (hub reuse
+        # applying --model/--effort to a live session) is a bare
+        # ``create_task`` with no worker involvement at all, so the poke has to
+        # come from inside ``connect()`` — the one place every reconnect,
+        # whoever launched it, must pass through.
+        self._poke_for_queued_prompt()
 
         # Sync frontend now that connecting flipped to False.  Without
         # this the browser keeps ``_isBusy=true`` (from the earlier
@@ -681,6 +719,7 @@ class SDKBridge:
         exact hazard :mod:`proc_guard` exists to prevent, and the guard cannot
         catch this case because the orphan is inside our own process tree.
         """
+        self._warn_if_foreign_task("disconnect")
         if self._dispatcher_task and not self._dispatcher_task.done():
             await cancel_and_join(self._dispatcher_task, "dispatcher")
         if not self.client:
@@ -721,8 +760,48 @@ class SDKBridge:
                 log.info("reaped %d orphaned MCP/tool process(es) left by "
                          "claude.exe pid %s", n, cli_pid)
 
+    def _warn_if_foreign_task(self, what: str) -> None:
+        """Log loudly if an SDK teardown is running off the worker task.
+
+        The SDK's subprocess transport opens an anyio task group for its stderr
+        reader inside whoever calls ``connect()`` — always the worker — and
+        tears it down with ``cancel_scope.cancel()`` inside whoever calls
+        ``disconnect()``.  anyio delivers a scope's cancellation to the task
+        that *entered* it, so a disconnect from any other task cancels the
+        worker.  The SDK wraps that teardown in ``suppress(Exception)``, which
+        also eats the "cancel scope exited in a different task" ``RuntimeError``
+        — so the reconnect reports success and the worker dies without a single
+        log line.  The session then looks perfectly healthy (``stop_event``
+        clear, client connected, sockets attached, status "idle") while every
+        prompt lands in an ``event_queue`` nobody is reading.
+
+        Callers must therefore route reconnects through the event queue.  The
+        one legitimate exception is :meth:`_shutdown`, which has already joined
+        the worker — hence the ``done()`` check.
+        """
+        worker = self._worker_task
+        if worker is None or worker.done():
+            return
+        try:
+            if asyncio.current_task() is worker:
+                return
+        except RuntimeError:
+            return
+        log.error(
+            "SDK %s called from %r, not the worker task — this cancels the "
+            "worker via the transport's anyio cancel scope and silently wedges "
+            "the session.  Route it through event_queue instead.  Called "
+            "from:\n%s",
+            what, asyncio.current_task(),
+            "".join(traceback.format_stack()),
+        )
+
     async def reconnect(self) -> None:
-        """Disconnect and reconnect with current session ID."""
+        """Disconnect and reconnect with current session ID.
+
+        **Must run on the worker task.**  See :meth:`_warn_if_foreign_task`.
+        Outside callers push ``("connect", "")`` onto :attr:`event_queue`.
+        """
         sid = self.state.session_id
         # Purge stale bg tasks — old CLI subprocess is dead.
         n_stale = len(self.state.background_tasks)
@@ -2675,6 +2754,60 @@ class SDKBridge:
         except Exception as exc:
             log.warning("queue_update broadcast failed: %r", exc)
 
+    #: The ``wakeup`` payload used by the queue poke.  Distinct from
+    #: "queue-edit-done" / "bg-all-done" purely so the log says which of the
+    #: three woke the worker.
+    QUEUE_POKE = "queued-prompt"
+    #: The same poke after it has yielded once to higher-priority events.
+    #: A distinct payload is what bounds the yielding to a single hop.
+    QUEUE_POKE_DEFERRED = "queued-prompt-deferred"
+
+    def _poke_for_queued_prompt(self) -> None:
+        """Tell the worker that the pending-prompt queue changed.
+
+        Wired to ``PersistentDeque``'s listener list, so it fires for *every*
+        writer — ``server.py``'s message router, ``/queue`` editing, the
+        graphify path, ``_between_turns``, and anything added later.
+
+        This exists because ``queued_prompts`` and the worker's park point are
+        connected by nothing but convention.  The worker parks on
+        ``event_queue``; prompts typed while ``state.busy`` or
+        ``state.connecting`` go to ``queued_prompts`` instead; and the drain
+        happens only at hand-placed checkpoints.  Every "I typed a prompt and it
+        just sat there" bug in this project has been the same shape — a state
+        transition that queues a prompt without any of those checkpoints being
+        reached afterwards:
+
+        * a prompt typed during a ``/model`` reconnect (fixed by draining in
+          ``_await_next_prompt`` after a config command);
+        * a prompt typed during a *ghost* turn that ended on ``bg-all-done``
+          rather than ``queue-edit-done``;
+        * a prompt typed during the reconnect that ``api_session_launch``
+          fires when a second launch reuses a live session — an
+          ``asyncio.create_task(bridge.reconnect())`` from *outside* the worker,
+          so no checkpoint of any kind runs afterwards.  That last one is what
+          produced this report, and no amount of care at the call sites would
+          have prevented it, because the call site is in ``server.py`` and the
+          park point is in ``sdk_bridge.py``.
+
+        Hooking the container closes the class instead of the instance: a
+        future writer cannot forget to poke, because it doesn't have to know
+        there is a poke.
+
+        Cheap and idempotent-in-effect: the wakeup is a no-op when the worker
+        isn't parked (it is consumed later and pops nothing), and
+        ``_pop_queued_prompt`` is the only thing that can act on it.
+        """
+        if not self.state.queued_prompts:
+            # Emptying the queue is a mutation too; there is nothing to send.
+            return
+        if self.stop_event.is_set():
+            return
+        try:
+            self.event_queue.put_nowait(("wakeup", self.QUEUE_POKE))
+        except Exception as exc:      # pragma: no cover — unbounded queue
+            log.warning("queue poke failed: %r", exc)
+
     async def _pop_queued_prompt(self) -> str | None:
         """Take the head of the pending-prompt queue and hand it to the UI.
 
@@ -2713,8 +2846,13 @@ class SDKBridge:
     # worker_loop() — main turn driver
     # ------------------------------------------------------------------
 
-    async def worker_loop(self) -> None:
-        """Main loop: connect, run turns, handle auto-continue."""
+    async def worker_loop(self, *, skip_connect: bool = False) -> None:
+        """Main loop: connect, run turns, handle auto-continue.
+
+        *skip_connect* is set only by :meth:`_spawn_worker` when it restarts a
+        worker that was killed while the SDK connection was still up — opening a
+        second one would fork a duplicate ``claude.exe`` on the same session.
+        """
         state = self.state
         config = self.config
 
@@ -2723,7 +2861,7 @@ class SDKBridge:
         _MAX_CONNECT_DELAY = 30.0
         _MAX_CONNECT_ATTEMPTS = 10
         _connect_attempt = 0
-        while not self.stop_event.is_set():
+        while not skip_connect and not self.stop_event.is_set():
             try:
                 await self.connect()
                 if _connect_attempt:
@@ -2853,7 +2991,10 @@ class SDKBridge:
         # Messages sent during connect go to state.queued_prompts (so
         # they appear in the queue panel).  Check those first.
         next_prompt: str | None = None
-        if config.initial_prompt:
+        if config.initial_prompt and not skip_connect:
+            # ``not skip_connect``: a restarted worker (see _spawn_worker) has
+            # already run this session's initial prompt — re-sending it would
+            # replay the launch prompt in the middle of a live conversation.
             next_prompt = config.initial_prompt
         elif state.queued_prompts and state.queue_editing_index != 0:
             next_prompt = await self._pop_queued_prompt()
@@ -3186,6 +3327,38 @@ class SDKBridge:
                 # else would send it and the prompt sits unsent.  A queued
                 # user prompt is always sendable once we're back to waiting.
                 # Skip only when the first item is being edited in the UI.
+                #
+                # ...or when a connect is in flight.  ``_poke_for_queued_prompt``
+                # fires the instant a prompt is appended, and a prompt appended
+                # *because* we are connecting would otherwise be popped here and
+                # handed to ``run_turn`` — which would call ``query()`` on a
+                # client whose ``connect()`` has not returned yet.  Declining is
+                # safe because ``connect()`` re-pokes on the way out, once the
+                # client is actually usable.
+                if self.state.connecting:
+                    log.debug("queue poke while connecting — deferred to connect()")
+                    continue
+                # The queue poke is the *lowest-priority* signal here, and it
+                # is the only wakeup that can arrive without the user having
+                # asked for anything.  Everything else already on the event
+                # queue is an explicit request — `/model`, `/btw`, `/compact`,
+                # a quit — and must not be overtaken by a "the queue changed"
+                # nudge that fires synchronously from the append.
+                #
+                # Two things went wrong when it didn't yield: a `/model` typed
+                # right after a prompt was queued had its reconnect deferred
+                # until after the prompt had already run (on the old model),
+                # and `/btw` — whose entire purpose is to jump the queue — lost
+                # to the queue head it is supposed to jump.
+                #
+                # Re-queue rather than drop: dropping would strand the prompt
+                # again for any pending event whose handler doesn't itself
+                # drain.  One hop only (the payload records that it has already
+                # yielded), so a queue full of pokes still terminates.
+                if payload == self.QUEUE_POKE and not self.event_queue.empty():
+                    self.event_queue.put_nowait(
+                        ("wakeup", self.QUEUE_POKE_DEFERRED))
+                    continue
                 prompt = await self._pop_queued_prompt()
                 if prompt is not None:
                     return prompt
@@ -3349,11 +3522,55 @@ class SDKBridge:
         if self.state.connect_started_at is None:
             self.state.connect_started_at = time.monotonic()
 
+        self._spawn_worker(skip_connect=False)
+
+    def _spawn_worker(self, *, skip_connect: bool) -> None:
+        """Create the worker task, restarting it if it is killed unexpectedly.
+
+        A ``CancelledError`` reaching the worker while :attr:`stop_event` is
+        *clear* is never legitimate — every real shutdown sets the event first
+        (see :meth:`_shutdown`).  It means some other task cancelled us, and the
+        only known way for that to happen is an SDK teardown run off-worker
+        (see :meth:`_warn_if_foreign_task`), which does it silently.  The old
+        code re-raised, so the task simply vanished: no log, no UI change, and a
+        session that accepted prompts into an ``event_queue`` nobody would ever
+        read again.  Every symptom pointed at healthy components, which is why
+        it took a live ``sys.remote_exec`` probe to find.
+
+        So instead of dying we respawn.  The replacement task is deliberately a
+        *fresh* task rather than a retry loop inside this one: anyio's
+        ``CancelScope._deliver_cancellation`` re-arms itself via ``call_soon``
+        for every task still inside the scope, so a worker that swallowed the
+        cancellation and carried on would be cancelled again at its next await,
+        forever.  A new task was never in the scope, so it is untouchable.
+
+        *skip_connect* is passed on so the restart doesn't open a **second**
+        ``claude.exe`` against the same session: after a foreign reconnect the
+        connection is already live, and :mod:`proc_guard` would (correctly)
+        reject the duplicate.
+        """
+
         async def _safe_worker():
             try:
-                await self.worker_loop()
+                await self.worker_loop(skip_connect=skip_connect)
             except asyncio.CancelledError:
-                raise
+                if self.stop_event.is_set():
+                    raise
+                task = asyncio.current_task()
+                if task is not None:
+                    # Consume the cancellation request so the fresh task isn't
+                    # born into a "cancelling" state (3.11+ semantics).
+                    task.uncancel()
+                log.error(
+                    "worker task cancelled with stop_event clear -- something "
+                    "outside the worker cancelled it (see _warn_if_foreign_task). "
+                    "Restarting the worker; %d event(s) still queued.",
+                    self.event_queue.qsize(), stack_info=True,
+                )
+                self.state.busy = False
+                self.state.connecting = False
+                self._spawn_worker(skip_connect=self.client is not None)
+                return
             except Exception as exc:
                 log.exception("worker_loop crashed: %s", exc)
                 try:

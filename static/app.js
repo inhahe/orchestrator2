@@ -15,10 +15,14 @@ const App = (() => {
   let _serverShutdown = false;
   let _didLaunchRequest = false;   // sent the one-shot ?open/?new request?
   let _promptWatchdog = null;      // detects a prompt that got no server reply
+  let _promptSeq = 0;              // per-tab counter behind each prompt_id
+  let _watchedPrompt = null;       // { id, disposition } for the in-flight prompt
   let _pendingSends = [];          // user messages typed while disconnected
   const MAX_RECONNECT_DELAY = 30000;
   const MAX_RECONNECT_ATTEMPTS = 20;
   const PROMPT_WATCHDOG_MS = 8000; // ~how long a turn should take to start
+  // Tab-unique so two tabs on one session can't collide on an id.
+  const TAB_ID = Math.random().toString(36).slice(2, 10);
 
   function init() {
     // Init all modules.
@@ -172,6 +176,10 @@ const App = (() => {
 
     ws.onclose = (e) => {
       console.log('WebSocket closed:', e.code, e.reason);
+      // The drop *is* the answer the watchdog was waiting for, and the
+      // reconnect banner says it better than "no response from the server".
+      // Leaving it armed would also have it close an already-closed socket.
+      _clearPromptWatchdog();
       _showConnectionStatus('disconnected');
       _scheduleReconnect();
     };
@@ -245,19 +253,20 @@ const App = (() => {
         !msg.text.startsWith('/') &&
         !_isBusy
       );
+      // Only prompts that arm a watchdog carry an id — the server no-ops the
+      // ack without one, so slash commands and control frames are unaffected.
+      const promptId = willEcho ? (TAB_ID + '-' + (++_promptSeq)) : null;
       if (msg.type === 'message') {
         msg = Object.assign({}, msg, { client_echoed: !!willEcho });
+        if (promptId) msg.prompt_id = promptId;
       }
       ws.send(JSON.stringify(msg));
       if (willEcho) {
         Chat.handleMessage({ type: 'user_message', content: msg.text });
-        // Watchdog: a real prompt should draw *some* server reply quickly
-        // (turn goes "working", or a queue/"still starting" notice arrives).
-        // If nothing comes back, the socket is likely half-open (server died
-        // but the browser still reports OPEN, so send() silently succeeds) or
-        // the backend is wedged — either way the user must be told rather than
-        // left staring at an idle bar.  Any inbound message clears this.
-        _armPromptWatchdog();
+        // Watchdog: a prompt must reach a state that *explains* it within a few
+        // seconds — running, or visibly parked in the pending queue.  See
+        // _armPromptWatchdog for why "any reply arrived" is not that state.
+        _armPromptWatchdog(promptId);
       }
     } else if (msg.type === 'message') {
       // Socket is down — don't drop the user's prompt.  Queue it and flush on
@@ -312,11 +321,66 @@ const App = (() => {
     _connect();
   }
 
-  function _armPromptWatchdog() {
+  /* Watch one specific prompt until the session reaches a state that explains it.
+   *
+   * This used to be a plain timer cleared by *any* inbound message, on the
+   * theory that traffic proves the server is handling the prompt.  It doesn't.
+   * The server pushes a forced status snapshot every 30s
+   * (`_STATUS_HEARTBEAT_SECONDS`) whether or not anything changed, plus panel
+   * updates, bells and background-task notices — so a backend that had stopped
+   * processing prompts entirely kept re-disarming the very watchdog meant to
+   * notice that.  When a session's worker task was silently cancelled (see
+   * known-issues.md), the tab sat on "idle" indefinitely and never once
+   * complained.
+   *
+   * So the check is now correlated and outcome-based.  The server acks the
+   * prompt by id with where it landed, and at the deadline we ask what that
+   * disposition implies:
+   *
+   *   no ack            → the server never took it.  Half-open socket or dead
+   *                       server; close and reconnect (the old behaviour, now
+   *                       reached only when it's actually true).
+   *   'queued'          → parked behind a running turn, visible in the pending
+   *                       panel.  Benign.
+   *   'immediate'       → answered inline.  Done.
+   *   'rejected'        → the server said no.  It already explained why.
+   *   'enqueued' + busy → the worker picked it up.  Working as intended.
+   *   'enqueued' + idle → the failure this exists for: the server accepted the
+   *                       prompt for immediate execution and the session never
+   *                       started.  Reconnecting won't help (the server is
+   *                       fine, the session isn't), so say so plainly instead.
+   */
+  function _armPromptWatchdog(promptId) {
     _clearPromptWatchdog();
+    _watchedPrompt = { id: promptId, disposition: null, started: false };
     _promptWatchdog = setTimeout(() => {
       _promptWatchdog = null;
-      if (_isBusy || _serverShutdown) return;   // turn started / already handled
+      const watched = _watchedPrompt;
+      _watchedPrompt = null;
+      if (_serverShutdown) return;              // already handled
+      const disposition = watched ? watched.disposition : null;
+      const started = _isBusy || !!(watched && watched.started);
+
+      if (disposition === 'queued' || disposition === 'immediate'
+          || disposition === 'rejected') return;
+
+      if (disposition === 'enqueued') {
+        if (started) return;                    // the turn ran
+        Chat.handleMessage({
+          type: 'system_msg',
+          subtype: 'error',
+          data: { message:
+            'The server accepted your prompt but this session never started '
+            + 'running it \u2014 its worker may be wedged. Try /connect, or '
+            + '\u2630 Sessions \u2192 \u21bb Restart server.' },
+        });
+        return;
+      }
+
+      // No ack at all.  A turn that visibly ran still proves the server heard
+      // us, which covers a tab talking to a pre-ack backend (version skew is a
+      // recurring reality here — see known-issues.md).
+      if (started) return;
       Chat.handleMessage({
         type: 'system_msg',
         subtype: 'error',
@@ -333,6 +397,7 @@ const App = (() => {
 
   function _clearPromptWatchdog() {
     if (_promptWatchdog) { clearTimeout(_promptWatchdog); _promptWatchdog = null; }
+    _watchedPrompt = null;
   }
 
   // --- Message dispatch ---
@@ -340,9 +405,16 @@ const App = (() => {
   function _dispatch(msg) {
     const type = msg.type;
 
-    // Any message from the server proves it's alive and responsive, so a
-    // pending prompt is being handled — cancel the "no response" watchdog.
-    _clearPromptWatchdog();
+    // The server telling us where the prompt we're watching landed.  This does
+    // *not* disarm the watchdog — it decides what the watchdog will check for.
+    // Only the id we're actually waiting on counts, so a late ack for a prompt
+    // that has already been resolved can't vouch for the current one.
+    if (type === 'prompt_ack') {
+      if (_watchedPrompt && _watchedPrompt.id === msg.prompt_id) {
+        _watchedPrompt.disposition = msg.disposition || null;
+      }
+      return;
+    }
 
     // Lobby: the server's list of running + recent sessions.
     if (type === 'session_list') {
@@ -409,6 +481,11 @@ const App = (() => {
         _isBusy = msg.status.busy_class === 'working' ||
                   msg.status.busy_class === 'connecting' ||
                   msg.status.busy_class === 'compacting';
+        // A short turn can start *and finish* inside the watchdog window, so
+        // "is busy at the deadline" would wrongly accuse a session that did
+        // exactly what it was asked.  What the watchdog actually needs to know
+        // is whether the prompt was ever picked up, so latch the transition.
+        if (_isBusy && _watchedPrompt) _watchedPrompt.started = true;
         Commands.setBusy(_isBusy);
         Panels.setBusy(_isBusy);
       }

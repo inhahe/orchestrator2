@@ -567,6 +567,48 @@ async def send_to(ws: WebSocket, msg: dict[str, Any]) -> None:
         pass
 
 
+# Where a prompt ended up.  The sending tab arms a watchdog when it sends a
+# prompt and needs to know which resting state to expect, because they are not
+# equally benign:
+#
+#   ``queued``    — parked in ``state.queued_prompts`` behind a running turn or
+#                   a connect.  Visible in the pending panel; nothing is wrong.
+#   ``enqueued``  — handed to the worker on ``event_queue`` to run *now*.  The
+#                   session must therefore go busy shortly; if it doesn't, the
+#                   worker is wedged or dead and the tab says so.
+#   ``immediate`` — answered inline (an immediate slash command).  Done.
+#   ``rejected``  — no runtime/bridge could take it.  The prompt is lost and the
+#                   user has to be told.
+#
+# Silence — no ack at all — is its own signal: the socket is half-open or the
+# server is gone.  That is the case the old watchdog handled; the point of the
+# ack is that the other four stop being indistinguishable from it.
+PROMPT_QUEUED = "queued"
+PROMPT_ENQUEUED = "enqueued"
+PROMPT_IMMEDIATE = "immediate"
+PROMPT_REJECTED = "rejected"
+
+
+async def _ack_prompt(ws: WebSocket, msg: dict[str, Any],
+                      disposition: str) -> None:
+    """Tell the sending tab where its prompt landed.
+
+    Correlated by the tab's own ``prompt_id`` rather than by "some traffic
+    arrived": a status heartbeat, another session's broadcast, or a background
+    notification all prove the server is *running*, which is not the question.
+    The old watchdog cleared on any inbound message and so was routinely
+    disarmed by the 30s forced status snapshot — see known-issues.md.
+
+    No id, no ack: older tabs and non-prompt sends stay unchanged.
+    """
+    pid = msg.get("prompt_id")
+    if not pid:
+        return
+    msg["_acked"] = True
+    await send_to(ws, {"type": "prompt_ack", "prompt_id": pid,
+                       "disposition": disposition})
+
+
 # ---------------------------------------------------------------------------
 # Panel enrichment — add headers to active_tools for the frontend
 # ---------------------------------------------------------------------------
@@ -1889,7 +1931,23 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
                     )
                     existing.state.bell_events = new_bells
             if need_reconnect and existing.bridge is not None:
-                asyncio.create_task(existing.bridge.reconnect())
+                # Route the reconnect through the worker's event queue rather
+                # than ``asyncio.create_task(bridge.reconnect())``.  A reconnect
+                # run in a *foreign* task **kills the worker**: the SDK's
+                # subprocess transport enters an anyio task group for its stderr
+                # reader inside whichever task called ``connect()`` (the worker),
+                # and its ``close()`` does ``cancel_scope.cancel()`` from
+                # whichever task calls ``disconnect()``.  anyio delivers that
+                # cancellation to the scope's *host* task — the worker, parked in
+                # ``event_queue.get()`` — and the SDK swallows the resulting
+                # "exited in a different task" RuntimeError under
+                # ``suppress(Exception)``.  Net effect: the reconnect appears to
+                # succeed, ``stop_event`` stays clear, the bridge/state/sockets
+                # all look healthy, and the worker task is silently dead, so
+                # every later prompt sits in the event queue forever and the
+                # session shows "idle" while ignoring input.  See known-issues.md
+                # "worker killed by cross-task SDK disconnect".
+                existing.bridge.event_queue.put_nowait(("connect", ""))
             return {"ok": True, "rid": existing.rid, "reused": True}
     try:
         rt = await _create_runtime(cwd=cwd, resume=resume, no_continue=no_continue,
@@ -2855,6 +2913,25 @@ async def _do_interrupt(bridge: Any, broadcast: Any) -> None:
 
 
 async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
+    """Dispatch an incoming WebSocket message, then ack it if it was a prompt.
+
+    The ack is applied **here**, once, rather than at each of the dispatcher's
+    two dozen early returns.  A tab that sent a ``prompt_id`` has a watchdog
+    running against it, so a branch that forgets to ack doesn't fail safe — it
+    produces a spurious "no response from the server" and closes a healthy
+    socket.  Defaulting the un-dispositioned case to ``immediate`` (the branch
+    answered inline: an immediate command, ``/mcp``, an interrupt, an error
+    reply) makes the protocol total by construction, so a *future* early return
+    can't reintroduce that.
+    """
+    try:
+        await _dispatch_ws_message(ws, msg)
+    finally:
+        if not msg.get("_acked"):
+            await _ack_prompt(ws, msg, PROMPT_IMMEDIATE)
+
+
+async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
     """Dispatch an incoming WebSocket message."""
     # Lobby / session-switching messages route independently of any bridge.
     if await _handle_lobby_message(ws, msg):
@@ -2902,6 +2979,7 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
                             "Session is still starting — your prompt is queued "
                             "and will run once it connects."},
                     })
+                    await _ack_prompt(ws, msg, PROMPT_QUEUED)
                     return
         # For non-message types, wait for the bridge.
         if rt is _default_runtime:
@@ -2914,6 +2992,7 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
     if bridge is None or state is None or config is None:
         await send_to(ws, {"type": "system_msg", "subtype": "error",
                            "data": {"message": "Session not ready yet — try again."}})
+        await _ack_prompt(ws, msg, PROMPT_REJECTED)
         return
     msg_type = msg.get("type", "")
 
@@ -3037,6 +3116,7 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
         if kind == "message" and (state.busy or state.connecting):
             state.queued_prompts.append(payload)
             await _broadcast_queue_update(rt)
+            await _ack_prompt(ws, msg, PROMPT_QUEUED)
             return
 
         # Everything else (commands, messages while idle) → event queue.
@@ -3045,10 +3125,13 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
         # its ``_isBusy`` is false at send time, and it reports which way it
         # went via ``client_echoed``.
         if kind == "message":
-            await _enqueue_prompt(rt, payload,
-                                  client_echoed=bool(msg.get("client_echoed")))
+            ok = await _enqueue_prompt(
+                rt, payload, client_echoed=bool(msg.get("client_echoed")))
+            await _ack_prompt(
+                ws, msg, PROMPT_ENQUEUED if ok else PROMPT_REJECTED)
             return
         bridge.event_queue.put_nowait((kind, payload))
+        await _ack_prompt(ws, msg, PROMPT_IMMEDIATE)
 
     # --- Explicit command (alternative to prefixed message) ---
     elif msg_type == "command":
@@ -3056,8 +3139,13 @@ async def _handle_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
         if text and not text.startswith("/"):
             text = "/" + text
         if text:
-            # Re-dispatch as a message.
-            await _handle_ws_message(ws, {"type": "message", "text": text})
+            # Re-dispatch as a message.  Mutate in place rather than building a
+            # new dict: the ack bookkeeping lives on the message, so a copy
+            # would be acked by the inner call and then acked *again* by this
+            # one's wrapper, and the tab would see two answers for one prompt.
+            msg["type"] = "message"
+            msg["text"] = text
+            await _handle_ws_message(ws, msg)
 
     # --- Interrupt ---
     elif msg_type == "interrupt":
