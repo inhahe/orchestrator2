@@ -161,7 +161,42 @@ async def cancel_and_join(task: asyncio.Task, what: str) -> None:
 # which would otherwise leave the UI stuck on "connecting…" forever.  When this
 # elapses we tear down the half-open client and let ``worker_loop``'s existing
 # connect-retry loop try again — a fresh spawn almost always succeeds.
-CONNECT_TIMEOUT = 45.0
+#
+# --- Why this is 180s and not 45s ----------------------------------------
+#
+# From a report: "i often get 'sdk connection failed' one or more times when
+# starting up a session ... maybe it times out too quickly?"  Correct.
+#
+# Measured over 580 connects in orchestrator2.log (time from ``connect:
+# resume=`` to the ``dispatcher start`` that immediately follows a successful
+# handshake): p50 5.3s, p90 20.4s, p98 34.9s, p99 38.2s, **max 44.7s** — with
+# 32 timeouts, 5.5% of all attempts.  A connect that genuinely hangs and one
+# that is merely slow would show up as two separate humps with a gap between
+# them; instead the successes run *continuously* into the old 45s ceiling and
+# stop there, which is the signature of a cutoff slicing a live distribution
+# rather than catching a distinct failure mode.
+#
+# The retries bear that out.  Both logged startup failures look like this::
+#
+#     19:10:50  connect: resume=424654f8..., cwd=D:\...\orchestrator2
+#     19:11:36  SDK connect timed out after 45s - retrying
+#     19:11:43  connect: resume=424654f8...          (attempt 2)
+#     19:12:05  SDK connected after 1 retries        (21.9s)
+#
+# The second attempt is not doing anything the first wasn't; it is just running
+# against a warm file cache after the first spawn paid for reading the ~100MB
+# bundled ``claude.exe`` past Windows Defender.  Killing the first attempt at
+# 45s therefore *costs* time: a teardown, a 2s backoff and a whole second spawn,
+# to reach a handshake the original was about to complete.  Hub startup makes it
+# worse by launching several sessions within a few seconds of each other, all
+# spawning CLIs at once.
+#
+# So the ceiling is set where it belongs — as a backstop against a genuine hang,
+# ~4.7x p99 and far above the observed maximum, rather than as a de-facto
+# performance budget.  A hang now shows "connecting..." for longer, but that
+# state is honest and visible: the timer keeps running and typed prompts land in
+# the pending panel rather than vanishing.
+CONNECT_TIMEOUT = 180.0
 
 # --- Why the bg-done bell waits before it rings ---------------------------
 #
@@ -603,6 +638,13 @@ class SDKBridge:
             # pointing at an unusable client).
             try:
                 await asyncio.wait_for(self.client.connect(), timeout=CONNECT_TIMEOUT)
+                # Log the handshake cost on *success* too.  Only failures used
+                # to log, so the question "is CONNECT_TIMEOUT above the real
+                # distribution or inside it?" could only be answered by
+                # correlating two unrelated INFO lines by timestamp.  It is the
+                # one number needed to tune this, so record it directly.
+                log.info("SDK connected in %.1fs (timeout %.0fs)",
+                         time.monotonic() - started, CONNECT_TIMEOUT)
             except BaseException as exc:
                 if isinstance(exc, asyncio.TimeoutError):
                     log.error("SDK connect timed out after %.0fs — retrying",
@@ -2201,38 +2243,6 @@ class SDKBridge:
         # it will call ScheduleWakeup again before this turn ends.
         self._cancel_wakeup()
 
-        self.interrupt_event.clear()
-        self._cancel_bg_done_bell()
-        state.busy = True
-        state.turn_started_at = time.monotonic()
-        # A compaction cannot span a turn boundary, so anything left here is
-        # stale — e.g. the CLI died mid-compaction and never sent the clearing
-        # status.  Without this the bar would read "compacting" forever.
-        state.cli_status = None
-        state.cli_status_started_at = None
-        state.compact_during_last_turn = False
-        state.current_turn_tool_seqs = []
-
-        # Route SDK messages to turn_msg_queue.
-        self.turn_active.set()
-
-        # Diagnostic: every turn entry, so we can correlate the "silent
-        # idle" symptom with the prompt that started the turn.  Confirm
-        # turn_active really was set (defensive — a False here would
-        # immediately explain the symptom).
-        log.info(
-            "run_turn enter: turns=%d drained=%d ta.is_set=%s prompt=%r",
-            state.turns, drained, self.turn_active.is_set(), _prompt_preview,
-        )
-
-        await self.broadcast({"type": "turn_start", "prompt": prompt_text})
-        # Flip the toolbar to "working" immediately instead of waiting up to
-        # ~2s for the next status-ticker cycle (state.busy is already True).
-        await self._broadcast_status()
-
-        # Send the prompt.
-        await self.client.query(prompt_text)
-
         assistant_text = ""
         interrupted = False
         current_streaming_text = ""
@@ -2267,16 +2277,20 @@ class SDKBridge:
                 "data": {"message": "Interrupting…"},
             })
 
-        async def _finish_interrupt() -> None:
-            """Emit the interrupted turn_end marker at the true stop point."""
+        async def _finish_interrupt(started_at: float | None = None) -> None:
+            """Emit the interrupted turn_end marker at the true stop point.
+
+            *started_at* is passed by the ``finally`` block, which has already
+            cleared ``state.turn_started_at`` by the time it calls us — without
+            it every abnormal turn ended reported a duration of ``0:00``.
+            """
             nonlocal interrupt_finished
             if interrupt_finished:
                 return
             interrupt_finished = True
             try:
-                duration = time.monotonic() - (
-                    state.turn_started_at or time.monotonic()
-                )
+                base = started_at if started_at is not None else state.turn_started_at
+                duration = time.monotonic() - (base or time.monotonic())
             except Exception:
                 duration = 0.0
             await self.broadcast({
@@ -2286,7 +2300,62 @@ class SDKBridge:
                 "turns": state.turns,
             })
 
+        # --- Everything that marks the session "working" goes inside the try ---
+        #
+        # These eight lines used to sit *above* it, and the one at the bottom —
+        # ``client.query()`` — is the one that raises.  A CLI that died between
+        # turns (drive full; ``exit code 2147483651`` = STATUS_BREAKPOINT) makes
+        # the SDK's ``write()`` throw ``CLIConnectionError`` synchronously, two
+        # milliseconds after ``run_turn enter``::
+        #
+        #     03:09:52,548  run_turn enter: turns=234 ...
+        #     03:09:52,550  run_turn failed: Cannot write to terminated process
+        #
+        # — with no ``run_turn finally`` line between them, because the guard
+        # started one statement later.  ``state.busy`` stayed True and
+        # ``turn_started_at`` kept running: the session read "working" for the
+        # next 16 hours.  ``turn_active`` stayed set too, which is worse than
+        # cosmetic — the dispatcher keeps routing SDK output to
+        # ``turn_msg_queue``, which now has no reader.
+        #
+        # The ``finally`` below was already written to be total ("ensures
+        # state.busy can never get stuck True"); it just wasn't reached.  Any
+        # failure between here and the first ``await`` on the message queue is
+        # now cleaned up like any other.
         try:
+            self.interrupt_event.clear()
+            self._cancel_bg_done_bell()
+            state.busy = True
+            state.turn_started_at = time.monotonic()
+            # A compaction cannot span a turn boundary, so anything left here is
+            # stale — e.g. the CLI died mid-compaction and never sent the
+            # clearing status.  Without this the bar would read "compacting"
+            # forever.
+            state.cli_status = None
+            state.cli_status_started_at = None
+            state.compact_during_last_turn = False
+            state.current_turn_tool_seqs = []
+
+            # Route SDK messages to turn_msg_queue.
+            self.turn_active.set()
+
+            # Diagnostic: every turn entry, so we can correlate the "silent
+            # idle" symptom with the prompt that started the turn.  Confirm
+            # turn_active really was set (defensive — a False here would
+            # immediately explain the symptom).
+            log.info(
+                "run_turn enter: turns=%d drained=%d ta.is_set=%s prompt=%r",
+                state.turns, drained, self.turn_active.is_set(), _prompt_preview,
+            )
+
+            await self.broadcast({"type": "turn_start", "prompt": prompt_text})
+            # Flip the toolbar to "working" immediately instead of waiting up to
+            # ~2s for the next status-ticker cycle (state.busy is already True).
+            await self._broadcast_status()
+
+            # Send the prompt.
+            await self.client.query(prompt_text)
+
             while True:
                 # In drain mode (post-interrupt) bound the wait so a CLI
                 # that went quiet without a ResultMessage can't hang us.
@@ -2680,6 +2749,10 @@ class SDKBridge:
             # ensures state.busy can never get stuck True when the loop
             # has stopped.
             exit_exc = sys.exc_info()[1]
+            # Captured before the cleanup below nulls it — the two turn_end
+            # markers this block can emit both need the turn's start time, and
+            # reading it afterwards made every abnormal turn report ``0:00``.
+            _started_at = state.turn_started_at
             # Diagnostic: log entry into finally *before* any cleanup,
             # so that even if a subsequent line throws (unlikely but
             # possible) we still have proof the finally ran.  Critical
@@ -2721,7 +2794,7 @@ class SDKBridge:
             # turn ended as interrupted.
             if interrupted and not interrupt_finished:
                 try:
-                    await _finish_interrupt()
+                    await _finish_interrupt(_started_at)
                 except BaseException as bx:
                     log.warning("deferred interrupt turn_end failed: %r", bx)
 
@@ -2735,7 +2808,7 @@ class SDKBridge:
                     if exit_exc is not None else "no exception"
                 )
                 try:
-                    duration = time.monotonic() - (state.turn_started_at or time.monotonic())
+                    duration = time.monotonic() - (_started_at or time.monotonic())
                 except Exception:
                     duration = 0.0
                 # Broadcast each piece independently — a failure on one
@@ -2981,7 +3054,16 @@ class SDKBridge:
                 return
             except Exception as exc:
                 _connect_attempt += 1
-                log.error("SDK connect failed (attempt %d): %s", _connect_attempt, exc)
+                # ``str(TimeoutError())`` is the empty string, so both the log
+                # line and the message below read "failed: " with nothing after
+                # it — the single most useful fact about the failure, that it
+                # was a timeout rather than a refusal, was the one thing not
+                # reported.  Name it explicitly.
+                _why = (f"timed out after {CONNECT_TIMEOUT:.0f}s"
+                        if isinstance(exc, asyncio.TimeoutError)
+                        else (str(exc) or type(exc).__name__))
+                log.error("SDK connect failed (attempt %d): %s",
+                          _connect_attempt, _why)
 
                 if _connect_attempt >= _MAX_CONNECT_ATTEMPTS:
                     # If the user queued prompt(s) while we were retrying,
@@ -2999,7 +3081,7 @@ class SDKBridge:
                         await self.broadcast({
                             "type": "system_msg",
                             "subtype": "error",
-                            "data": {"message": f"Still can't connect ({exc}). Retrying every {_MAX_CONNECT_DELAY:.0f}s\u2026"},
+                            "data": {"message": f"Still can't connect ({_why}). Retrying every {_MAX_CONNECT_DELAY:.0f}s\u2026"},
                         })
                         try:
                             await asyncio.wait_for(
@@ -3023,7 +3105,7 @@ class SDKBridge:
                     await self.broadcast({
                         "type": "system_msg",
                         "subtype": "error",
-                        "data": {"message": f"SDK connection failed after {_connect_attempt} attempts: {exc}. {_retry_hint}"},
+                        "data": {"message": f"SDK connection failed after {_connect_attempt} attempts: {_why}. {_retry_hint}"},
                     })
                     # Fall back to manual retry.  A user message restarts the
                     # auto-retry loop; so does an explicit /connect — the natural
@@ -3067,7 +3149,7 @@ class SDKBridge:
                 await self.broadcast({
                     "type": "system_msg",
                     "subtype": "error",
-                    "data": {"message": f"SDK connection failed (attempt {_connect_attempt}/{_MAX_CONNECT_ATTEMPTS}), retrying in {_connect_delay:.0f}s\u2026"},
+                    "data": {"message": f"SDK connection failed (attempt {_connect_attempt}/{_MAX_CONNECT_ATTEMPTS}: {_why}), retrying in {_connect_delay:.0f}s\u2026"},
                 })
                 # Drain any user messages that arrived during the wait
                 # so they're not lost.
