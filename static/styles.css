@@ -1390,6 +1390,14 @@ html, body {
     font-size: 28px;
     padding: 6px 12px;
   }
+  /* No hover on touch, so the per-session × must be visible unconditionally —
+     otherwise the only way to close a session on a phone would be to shut the
+     whole server down.  Sized as a real touch target. */
+  .lobby-card-close {
+    opacity: 1;
+    font-size: 22px;
+    padding: 4px 10px 6px;
+  }
 
   /* Tool/code blocks: prevent horizontal overflow */
   .tool-detail pre, pre, code {
@@ -1700,6 +1708,46 @@ html, body {
   padding: 0 6px;
   flex: 0 0 auto;
 }
+/* Per-session close (×).  Deliberately quiet until the card is hovered: it
+   stops a live Claude process, so it shouldn't compete for attention with the
+   card itself, but it must be obvious once you're looking at that card.  Touch
+   devices have no hover, so the mobile block above keeps it always visible. */
+.lobby-card-close {
+  flex: 0 0 auto;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-size: 17px;
+  line-height: 1;
+  padding: 1px 6px 3px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s, color 0.12s, border-color 0.12s, background 0.12s;
+}
+.lobby-card:hover .lobby-card-close,
+.lobby-card-close:focus-visible {
+  opacity: 1;
+}
+.lobby-card-close:hover {
+  color: var(--indicator-error, #e06c75);
+  border-color: var(--indicator-error, #e06c75);
+  background: var(--bg-panel);
+}
+.lobby-card-close:disabled {
+  cursor: default;
+  opacity: 1;
+  color: var(--text-muted);
+  border-color: transparent;
+  background: none;
+}
+/* Between the click and the server's next session_list the card is on its way
+   out; dim it so a slow CLI shutdown doesn't look like a dead button. */
+.lobby-card.closing {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
 .lobby-card-cwd {
   font-family: var(--font-mono);
   font-size: 11px;

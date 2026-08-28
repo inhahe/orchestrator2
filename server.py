@@ -943,6 +943,21 @@ async def _create_runtime(
     resolved_cwd = (
         str(Path(cwd).resolve(strict=False)) if cwd else config.cwd
     )
+    # ``resolve(strict=False)`` will happily invent a path rather than fail: on
+    # Windows it anchors a POSIX-looking absolute path to the current drive, so
+    # "/mnt/d/mypage/inhahe.com" becomes "D:\mnt\d\mypage\inhahe.com".  Handed
+    # to the SDK that is only ever seen as "[WinError 267] The directory name is
+    # invalid" — an error that doesn't even name the directory — retried ten
+    # times.  Refuse it here, where both the requested and resolved forms are
+    # still in hand and the caller can fall back to its own server.
+    if not Path(resolved_cwd).is_dir():
+        detail = repr(resolved_cwd)
+        if cwd and str(Path(cwd)) != resolved_cwd:
+            detail = f"{cwd!r} (resolved to {resolved_cwd!r})"
+        raise NotADirectoryError(
+            f"working directory {detail} does not exist on this host "
+            f"({_path_namespace()})"
+        )
     overrides: dict[str, Any] = {
         "cwd": resolved_cwd,
         "resume": resume,
@@ -1041,18 +1056,41 @@ async def _load_runtime_title(
         log.debug("title publish failed for %s", sid, exc_info=True)
 
 
-async def _teardown_runtime(rt: SessionRuntime) -> None:
+async def _teardown_runtime(rt: SessionRuntime, *, force: bool = False) -> None:
     """Stop a runtime's bridge and drop it from the registry.
 
     The default runtime is the process's primary session and is never torn
-    down here — the server-level auto-shutdown handles the whole-process case.
+    down by the *automatic* paths (the idle timer) — the server-level
+    auto-shutdown handles the whole-process case.
+
+    ``force=True`` is the user explicitly closing a session from the lobby, and
+    that does apply to the primary session too.  Refusing there would make the
+    close button useless in exactly the common case — a hub launched in one
+    folder, hosting one session, which is the session you want to stop.  So the
+    primary is instead **demoted**: the hub carries on with no primary, which
+    every ``_default_runtime`` consumer already handles (they all guard for
+    ``None``), and the two legacy module-level shadows of it are cleared with
+    it so nothing is left pointing at a stopped session's state or bridge.
+
+    A forced close can also happen while tabs are watching, so their viewers
+    are sent back to the lobby *before* the bridge is stopped: shutting a CLI
+    down can take seconds, and a tab left staring at a session that no longer
+    exists (still able to type into it) is the worse failure.
     """
-    if rt is _default_runtime:
+    global _default_runtime, state, bridge
+    if rt is _default_runtime and not force:
         return
     if runtimes.get(rt.rid) is not rt:
         return  # already gone
     runtimes.pop(rt.rid, None)
     _cancel_idle_timer(rt)
+    if rt is _default_runtime:
+        _default_runtime = None
+        if state is rt.state:
+            state = None
+        if bridge is rt.bridge:
+            bridge = None
+    await _evacuate_viewers(rt)
     if rt.bridge is not None:
         try:
             await rt.bridge.stop()
@@ -1071,6 +1109,52 @@ async def _teardown_runtime(rt: SessionRuntime) -> None:
                         rt.rid, exc_info=True)
     log.info("runtime %s torn down", rt.rid)
     await _push_session_list()
+
+
+async def _evacuate_viewers(rt: SessionRuntime) -> None:
+    """Send every tab viewing *rt* back to the lobby, and say why.
+
+    Called from ``_teardown_runtime`` once the runtime has already been popped
+    from ``runtimes``, so the session list these tabs receive no longer lists
+    it.  The idle path never has viewers to move, so in practice this is the
+    user-initiated close: the tab that pressed the button (plus any other tab
+    on the same session) drops its now-meaningless transcript, leaves landing
+    mode, and gets a visible banner instead of silently keeping a chat box
+    pointed at a session whose CLI is being killed.
+    """
+    for ws in list(rt.clients):
+        try:
+            await send_to(ws, {"type": "clear_screen"})
+            await send_to(ws, {
+                "type": "session_closed",
+                "rid": rt.rid,
+                "message": "That session was closed. Pick another below, or "
+                           "reopen it from Recent — its history is kept.",
+            })
+            await _enter_lobby(ws)
+        except Exception:
+            log.debug("could not return a viewer of %s to the lobby",
+                      rt.rid, exc_info=True)
+        finally:
+            rt.discard_client(ws)
+
+
+async def close_runtime(rid: str | None) -> dict[str, Any]:
+    """Stop one live session by rid — the lobby's per-session close button.
+
+    Distinct from ``/api/shutdown`` (which kills the whole process and every
+    session with it): this stops exactly one session's CLI and leaves the hub
+    serving the rest.  The session's JSONL is untouched, so the session can be
+    reopened later from the lobby's Recent list.
+    """
+    rt = _runtime_by_rid(rid) if rid else None
+    if rt is None:
+        return {"ok": False, "error": "no such session"}
+    title = (getattr(rt.state, "session_title", None)
+             or getattr(rt.state, "session_id", None) or rt.rid)
+    log.info("runtime %s (%s) closed on request", rt.rid, title)
+    await _teardown_runtime(rt, force=True)
+    return {"ok": True, "rid": rt.rid, "title": title}
 
 
 def _cancel_idle_timer(rt: SessionRuntime) -> None:
@@ -1110,9 +1194,19 @@ def _maybe_start_idle_timer(rt: SessionRuntime) -> None:
     """Start the idle-teardown countdown for a viewer-less runtime.
 
     No-op for the default runtime (never idle-torn-down), for runtimes that
-    still have viewers, or when idle teardown is disabled (timeout <= 0).
+    still have viewers, for runtimes that are no longer registered, or when
+    idle teardown is disabled (timeout <= 0).
+
+    The "no longer registered" case is not hypothetical: closing a session
+    evacuates its viewers via ``_enter_lobby``, which arms the idle timer of
+    the runtime each tab is leaving — the one being torn down.  Arming a
+    countdown to tear down something already torn down would leave a live task
+    holding a reference to a dead runtime, and log a second "tearing down" for
+    a session the user has already closed.
     """
     if rt is _default_runtime or rt.clients:
+        return
+    if runtimes.get(rt.rid) is not rt:
         return
     timeout = getattr(config, "session_idle_timeout", 300) if config else 300
     if timeout <= 0:
@@ -1853,13 +1947,39 @@ async def api_ready() -> dict[str, Any]:
     return {"ready": True}
 
 
+def _path_namespace() -> str:
+    """Identity of the filesystem namespace this process interprets paths in.
+
+    Two processes sharing this string resolve any absolute path to the same
+    place; two that don't, don't — and hub reuse hands over nothing *but*
+    absolute paths (``cwd``, ``config_dir``, session files).
+
+    This is not hypothetical. WSL2 shares ``localhost`` with Windows, so a
+    ``python3 server.py`` inside WSL probes port 8240, finds the *Windows* hub,
+    and posts it ``cwd=/mnt/d/mypage/inhahe.com``. The Windows hub then does
+    ``Path(...).resolve()``, which anchors a POSIX-looking absolute path to the
+    current drive and silently invents ``D:\\mnt\\d\\mypage\\inhahe.com`` — a
+    directory that has never existed. See known-issues.md.
+
+    WSL distributions are separated too: they share ``/mnt/d`` but not ``/home``,
+    so a hub in one cannot host a session rooted in another's home directory.
+    """
+    if sys.platform == "win32":
+        return "win32"
+    distro = os.environ.get("WSL_DISTRO_NAME")
+    if distro:
+        return f"wsl:{distro}"
+    return sys.platform
+
+
 @_route("get", "/api/whoami")
 async def api_whoami() -> dict[str, Any]:
     """Identify this server so a new launch can decide whether to reuse it.
 
     A launcher probes this before binding a port: if a live orchestrator2 is
     already serving, the launch joins it — even across accounts — instead of
-    starting a second server.
+    starting a second server. Accounts are shareable; *path namespaces* are not,
+    hence ``namespace``.
     """
     return {
         "app": "orchestrator2",
@@ -1867,7 +1987,31 @@ async def api_whoami() -> dict[str, Any]:
         "account": os.environ.get("CLAUDE_CONFIG_DIR") or "",
         "port": getattr(config, "port", None) if config else None,
         "sessions": len(runtimes),
+        "namespace": _path_namespace(),
     }
+
+
+@_route("post", "/api/session/close", response_model=None)
+async def api_session_close(body: dict[str, Any]) -> dict[str, Any]:
+    """Stop one live session by ``rid``, leaving the hub and its other
+    sessions running.
+
+    The HTTP twin of the lobby's per-session close button, so a session can
+    also be stopped from a script or a terminal::
+
+        curl -X POST http://localhost:8420/api/session/close \\
+             -H "Content-Type: application/json" -d '{"rid": "s3"}'
+
+    Contrast ``/api/shutdown``, which stops the whole process.
+
+    **Answers only once the CLI has actually stopped**, so a caller learns the
+    process is really gone rather than that a teardown was scheduled.  An idle
+    session takes well under a second; one interrupted mid-turn takes around
+    five (the turn is cancelled, then the subprocess is disconnected), so give
+    the client a generous timeout — ``curl --max-time 5`` reports an empty
+    reply for a busy session that is nonetheless closing fine.
+    """
+    return await close_runtime((body or {}).get("rid"))
 
 
 @_route("post", "/api/session/launch", response_model=None)
@@ -2149,9 +2293,25 @@ async def _enqueue_prompt(
     Enqueue time is the one moment we still know who produced the prompt.
 
     Returns False if the runtime has no bridge yet (caller should fall back to
-    the pending queue).
+    the pending queue), or if the session is parked unable to connect (the
+    prompt is rejected with the real reason rather than dropped onto an
+    event_queue nobody is reading).
     """
     if rt is None or rt.bridge is None:
+        return False
+    # Session refused to connect (e.g. already open in another process) and is
+    # parked waiting for /connect.  Enqueuing here would land the prompt on an
+    # event_queue the parked worker isn't draining as a turn, so the tab's
+    # watchdog would wrongly report "worker may be wedged".  Reject it and
+    # re-surface the actual reason (also covers a tab that attached after the
+    # original broadcast and never saw it).
+    _blocked = getattr(rt.state, "connect_blocked_msg", None) if rt.state else None
+    if _blocked:
+        await rt.broadcast({
+            "type": "system_msg",
+            "subtype": "error",
+            "data": {"message": _blocked},
+        })
         return False
     # If the previous turn ended on a compaction its "Turn N completed" marker
     # is still pending; emit it before this prompt so the transcript doesn't
@@ -2663,6 +2823,19 @@ async def _send_initial_state(ws: WebSocket) -> None:
     else:
         log.info("[history] no session_id on state (rt=%s)", rt.rid)
 
+    # If this session is parked unable to connect (already open elsewhere), the
+    # reason was broadcast once when the worker gave up — a tab that attaches
+    # afterward would otherwise never see it and, on sending a prompt, get only
+    # the generic "worker may be wedged" watchdog.  Replay it last so it sits
+    # below the history as the most recent, actionable message.
+    _blocked = getattr(state, "connect_blocked_msg", None)
+    if _blocked:
+        await send_to(ws, {
+            "type": "system_msg",
+            "subtype": "error",
+            "data": {"message": _blocked},
+        })
+
 
 async def _do_switch(ws: WebSocket, msg: dict[str, Any]) -> None:
     """Copy this tab's current session into another account and attach here.
@@ -2830,6 +3003,19 @@ async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
             await _push_session_list(ws)
             return True
         await _attach_ws(ws, rt)
+        return True
+
+    if msg_type == "close":
+        result = await close_runtime(msg.get("rid"))
+        if not result.get("ok"):
+            # Already gone (idle teardown, a second click, a stale list).  Not
+            # an error worth a banner — the refreshed list below says so.
+            await _push_session_list(ws)
+            return True
+        # The teardown broadcast a new list to every lobby target; this tab may
+        # not be one (it could be viewing another session with the overlay up),
+        # so make sure *it* sees the session disappear.
+        await _push_session_list(ws)
         return True
 
     if msg_type == "new":
@@ -3365,6 +3551,62 @@ def _try_shutdown_old_server(port: int) -> None:
             pass
 
 
+# Third-party modules the serving process cannot start without, mapped to the
+# distribution that provides them.  ``graphifyy`` is deliberately absent: it is
+# named in a prompt for the agent to run, never imported here.
+_REQUIRED_MODULES = {
+    "fastapi": "fastapi",
+    "uvicorn": "uvicorn",
+    "websockets": "websockets",
+    "psutil": "psutil",
+    "claude_agent_sdk": "claude-agent-sdk",
+}
+
+
+def _require_dependencies() -> None:
+    """Fail with an actionable message, not a traceback, if deps are missing.
+
+    ``fastapi``/``uvicorn`` are imported deep inside ``main()`` (see the note at
+    the top of this file), so a Python without them gets ~40 lines of startup
+    output and then a bare ``ModuleNotFoundError: No module named 'uvicorn'`` —
+    with nothing to say *which* interpreter lacked it. That is the whole
+    question when several Pythons can run this file: a WSL ``python3`` and a
+    Windows ``D:\\python314\\python.exe`` are different environments, and until
+    the path-namespace check was added a WSL launch never reached this code at
+    all, because it silently joined the Windows hub and exited (see
+    known-issues.md). "It worked yesterday" was that join, not a working
+    install.
+
+    Checked with ``find_spec``, which locates without importing, so this costs
+    nothing measurable and does not undo the lazy-import optimisation. All
+    missing packages are reported at once — fixing them one traceback at a time
+    is several minutes of nothing.
+    """
+    import importlib.util
+
+    missing: list[str] = []
+    for mod, dist in _REQUIRED_MODULES.items():
+        try:
+            found = importlib.util.find_spec(mod) is not None
+        except (ImportError, ValueError):
+            found = False
+        if not found:
+            missing.append(dist)
+    if not missing:
+        return
+
+    print(f"orchestrator2 can't start: missing {len(missing)} required "
+          f"package(s): {', '.join(missing)}")
+    print(f"  Interpreter: {sys.executable}")
+    print(f"  Install with: {sys.executable} -m pip install -r "
+          f"{Path(__file__).resolve().parent / 'requirements.txt'}")
+    if sys.platform != "win32":
+        print("  (This is not the Windows Python. If you meant to use the "
+              "Windows install, run it from Windows — a server started here "
+              "cannot share paths or sessions with that one.)")
+    sys.exit(1)
+
+
 def _probe_hub(port: int) -> dict | None:
     """Return a running orchestrator2 hub's ``/api/whoami`` on *port*, or None.
 
@@ -3406,6 +3648,22 @@ def _probe_hub(port: int) -> dict | None:
             ) as resp:
                 data = json.loads(resp.read().decode("utf-8", "replace"))
             if not isinstance(data, dict) or data.get("app") != "orchestrator2":
+                return None
+            # Reuse is only sound if the hub reads paths the way we write them.
+            # A WSL launch reaching the Windows hub over shared loopback would
+            # otherwise hand it a POSIX cwd it can only mis-resolve — see
+            # _path_namespace().  An older hub predates the key; treat it as
+            # matching so a routine same-OS relaunch isn't split onto a second
+            # port, and rely on the server-side cwd check in _create_runtime()
+            # to reject the cross-namespace case.
+            theirs = data.get("namespace")
+            ours = _path_namespace()
+            if theirs is not None and theirs != ours:
+                print(f"A different orchestrator2 ({theirs}) is on port {port}; "
+                      f"this one is {ours} and can't share its paths — "
+                      f"starting a separate server.")
+                log.info("hub on port %d is namespace %r, we are %r — not joining",
+                         port, theirs, ours)
                 return None
             return data
         except Exception as exc:
@@ -3452,6 +3710,12 @@ def _launch_into_hub(
         return None
     if not isinstance(data, dict) or not data.get("ok"):
         log.warning("hub session launch rejected: %s", data)
+        # The caller only prints a generic "couldn't open the session", which
+        # hides the one sentence that explains why — e.g. that the hub can't
+        # see this directory at all.
+        reason = (data or {}).get("error") if isinstance(data, dict) else None
+        if reason:
+            print(f"Hub refused the session: {reason}")
         return None
     return data.get("rid")
 
@@ -4072,6 +4336,15 @@ def main() -> None:
 
         print(f"Port {config.port} in use — using {actual_port} instead.")
         config = dataclasses.replace(config, port=actual_port)
+
+    # Pre-flight the heavy dependencies HERE — after every path that exits
+    # without serving (the hub join above, --detach, and the port-in-use
+    # re-join), and before the splash pre-server thread starts.  Joining a hub
+    # needs none of these (see the lazy-import NOTE at the top of this file),
+    # so checking earlier would reject launches that would have worked; and
+    # checking later would leave a splash page listening on a bound socket
+    # while the real import dies with a traceback behind it.
+    _require_dependencies()
 
     url = f"http://localhost:{actual_port}"
     msg = f"orchestrator2 starting on {url}"

@@ -747,7 +747,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
     ap.add_argument(
         "--auto-reconnect",
         action="store_true",
-        help="Reconnect and auto-continue on CLI crash.",
+        help=(
+            "Reconnect after *any* failed turn. A CLI that exits is always "
+            "recovered from automatically; this widens it to turns that "
+            "failed for other reasons."
+        ),
     )
     ap.add_argument(
         "--no-wakeup",

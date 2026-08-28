@@ -15,6 +15,7 @@ import re
 import sys
 import time
 import traceback
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
@@ -39,6 +40,16 @@ try:
 except ImportError:
     PermissionResultAllow = None  # type: ignore
     PermissionResultDeny = None  # type: ignore
+
+# Used to recognise a dead CLI subprocess (see _is_transport_death).  Optional
+# so a future SDK that moves or renames it degrades to the text match rather
+# than failing to import.
+try:
+    from claude_agent_sdk._errors import (  # type: ignore
+        CLIConnectionError as _CLIConnectionError,
+    )
+except Exception:  # pragma: no cover - depends on SDK internals
+    _CLIConnectionError = None  # type: ignore
 
 try:
     from claude_agent_sdk import ThinkingBlock  # type: ignore
@@ -225,6 +236,134 @@ CONNECT_TIMEOUT = 180.0
 # because a bell that is a few seconds late costs nothing and a bell that
 # should never have rung costs the user's attention.
 BG_DONE_BELL_GRACE = 10.0
+
+# --- Recovering from a dead CLI subprocess ---------------------------------
+#
+# When ``claude.exe`` dies the session becomes a zombie: state is clean, the
+# status bar reads "idle", and every later prompt fails identically forever,
+# because ``self.client`` points at a corpse.  From a report: *"i got 'Turn
+# failed: Cannot write to terminated process (exit code: 2147483651)' in
+# session OSb … i closed the window, ran orchestrator2 in that directory again,
+# told claude to continue, and got the same api error again."*
+#
+# The log has the whole story.  The CLI died at 15:03:25 and we *saw* it::
+#
+#     15:03:25  Fatal error in message reader: Command failed with exit code 2147483651
+#     15:03:25  dispatcher crashed: gen=1 Command failed with exit code 2147483651
+#     15:03:25  run_turn failed: SDK dispatcher died mid-turn
+#
+# …and then did nothing, because recovery was gated on ``--auto-reconnect``,
+# which defaults off.  The runtime sat dead for **5h21m** until the user typed
+# "Continue" at 20:24:48, which failed on the first write.  Relaunching didn't
+# help either: the hub was still up, so the launch reattached to the same
+# runtime holding the same dead client, and the retry failed identically 36
+# seconds later.
+#
+# A dead subprocess is not a policy question — there is nothing left to talk to
+# and no prompt can ever succeed again — so recovery is now unconditional
+# rather than opt-in.  What still needs bounding is a CLI that dies *on every
+# connect*: reconnecting forever would spin, spawning a process per attempt.
+# Hence a budget, after which we stop and say so and ``/connect`` is the manual
+# way back.  The window is generous because the failure it must not mask is a
+# CLI crashing repeatedly within minutes, not one that dies twice a day.
+TRANSPORT_DEATH_MAX_RECOVERIES = 3
+TRANSPORT_DEATH_WINDOW = 600.0
+
+# ``("connect", …)`` payload marking a reconnect we asked for ourselves after
+# the CLI died, as opposed to the user's ``/connect`` (payload "").
+_CONNECT_TRANSPORT_DEAD = "transport-dead"
+
+# --- Keeping the CLI's dying words ------------------------------------------
+#
+# The exit code these crashes carry — 2147483651 = 0x80000003 = STATUS_BREAKPOINT
+# — is Bun's panic handler, not a Windows debugger break.  ``claude.exe`` is a
+# Bun standalone executable, and one earlier crash *did* get its report into our
+# log before the race below started winning::
+#
+#     [cli stderr] oh no: Bun has crashed. This indicates a bug in Bun, not your code.
+#     [cli stderr] https://bun.report/1.3.13/e_11b55f1dmgggEuhogC2qj71Co1/...
+#
+# That URL is the whole diagnosis — it decodes to a stack trace — and it only
+# ever appears on the CLI's stderr.  The 2026-08-25 death logged *zero* stderr
+# lines despite the callback being wired, because of a race inside the SDK: it
+# raises ``ProcessError`` the moment stdout closes and ``wait()`` returns
+# non-zero, with the placeholder text "Check stderr output for details" and
+# without draining stderr; then ``close()`` does
+# ``self._stderr_task_group.cancel_scope.cancel()``, throwing away every line
+# the reader hadn't got to yet.  A panic report is several KB, so it loses that
+# race essentially always.
+#
+# Recovering from the death *tightens* the race, since it calls ``close()``
+# sooner than a human would have.  So before disconnecting we let the SDK's
+# stderr reader run to quiet.  The process is already dead, so its stderr hits
+# EOF as soon as the pipe buffer is drained — the wait is naturally short and
+# the cap is only there so a wedged pipe can't park the recovery.
+STDERR_DRAIN_QUIET = 0.30
+STDERR_DRAIN_MAX = 3.0
+
+# How many recent stderr lines to keep for the post-mortem log line.  A Bun
+# panic report is ~20 lines (banner, URL, versions, memory, features); 60 keeps
+# it whole plus whatever preceded it.
+STDERR_TAIL_LINES = 60
+
+
+class UnusableCwd(Exception):
+    """The session's working directory does not exist. Retrying cannot help.
+
+    Distinguished from every other connect failure because the connect loop's
+    whole design — ten attempts with backoff, then *keep* retrying forever if
+    the user has queued a prompt — assumes the failure is transient. For a
+    missing directory that is five minutes of respawning a subprocess that
+    cannot possibly start, and then an unbounded loop, all reported as
+    "[WinError 267] The directory name is invalid" with no path in it.
+
+    The usual cause is not a typo. It is a launch from one path namespace
+    joining a hub in another (WSL → the Windows hub over shared loopback),
+    where ``Path.resolve()`` turns ``/mnt/d/mypage/inhahe.com`` into
+    ``D:\\mnt\\d\\mypage\\inhahe.com``. See ``server._path_namespace``.
+    """
+
+    def __init__(self, cwd: str) -> None:
+        self.cwd = cwd
+        super().__init__(f"working directory does not exist: {cwd}")
+
+
+def _is_transport_death(exc: BaseException) -> bool:
+    """Does *exc* mean the CLI subprocess is gone, rather than a bad turn?
+
+    The distinction decides whether we tear the connection down and rebuild it,
+    so it must not fire on an ordinary turn error — reconnecting on every
+    failure would discard a healthy CLI over, say, a rendering bug of ours.
+
+    Matched on the *text*, not just the type: ``CLIConnectionError`` also covers
+    "not connected yet" and similar recoverable states, whereas the SDK's
+    transport uses these exact phrasings when the process has exited
+    (``subprocess_cli.write()`` and ``_internal/query.py``'s message reader).
+    """
+    text = str(exc) or ""
+    if "terminated process" in text or "exit code" in text:
+        return True
+    if _CLIConnectionError is not None and isinstance(exc, _CLIConnectionError):
+        return "not connected" not in text.lower()
+    return False
+
+
+def _exc_reason(exc: BaseException) -> str:
+    """A human-readable reason for *exc* that is never the empty string.
+
+    ``str(asyncio.TimeoutError())`` is ``""``, and several SDK errors raise with
+    no text either — which is why the reported failure surfaced as "SDK
+    connection failed" with nothing after the colon.  Falls back to the class
+    name, and squashes the SDK's multi-line "Error output: …" tail so the
+    message stays one line in the transcript.
+    """
+    if isinstance(exc, asyncio.TimeoutError):
+        return f"timed out after {CONNECT_TIMEOUT:.0f}s"
+    text = (str(exc) or "").strip()
+    if not text:
+        return type(exc).__name__
+    return text.splitlines()[0].strip()
+
 
 # Broadcaster type: async function that sends a dict to all WS clients.
 Broadcaster = Callable[[dict[str, Any]], Awaitable[None]]
@@ -425,6 +564,19 @@ class SDKBridge:
         self._wakeup_fire_at: float | None = None  # monotonic deadline, for logs
         # Deferred ``bg-done`` bell.  See _arm_bg_done_bell().
         self._bg_done_bell_task: asyncio.Task | None = None
+        # Set the moment we learn the CLI subprocess is gone (dispatcher crash,
+        # or a write to a terminated process).  Cleared by a successful
+        # connect().  See _note_transport_death().
+        self._transport_dead = False
+        # Monotonic timestamps of the auto-reconnects we started because of a
+        # dead transport, newest last.  Bounds the recovery so a CLI that dies
+        # on every connect can't spin.  See _may_auto_reconnect().
+        self._transport_death_times: list[float] = []
+        # The CLI subprocess's most recent stderr lines, and when the last one
+        # arrived.  Both exist so that when the process dies we can log what it
+        # said on the way out — see STDERR_TAIL_LINES and _drain_stderr().
+        self._stderr_tail: deque[str] = deque(maxlen=STDERR_TAIL_LINES)
+        self._stderr_last_at: float = 0.0
         # Generation counter for dispatcher tasks.  Each connect() bumps
         # this so we can tell live dispatchers apart in logs and detect
         # orphaned ones (stale tasks that survived a reconnect).
@@ -461,6 +613,11 @@ class SDKBridge:
         line = (line or "").rstrip()
         if line:
             log.warning("[cli stderr] %s", line)
+            # Also keep it in memory: when the process dies, the log line for
+            # the death should carry its last words rather than making someone
+            # correlate timestamps across a 365k-line file.
+            self._stderr_tail.append(line)
+            self._stderr_last_at = time.monotonic()
             # A connect-time auth failure (dead OAuth session) only ever shows
             # up here — it never reaches a turn's ResultMessage.  Flag it so
             # `/login` forces a re-auth instead of reporting "already signed in".
@@ -580,6 +737,16 @@ class SDKBridge:
         )
         self._initial_resume_id = None  # one-time use
 
+        # A working directory that doesn't exist is not something a retry can
+        # cure, and the SDK reports it uselessly: ``anyio.open_process`` raises
+        # "[WinError 267] The directory name is invalid" — which does not name
+        # the directory — and the connect loop then repeats that ten times over
+        # five minutes.  Check it ourselves so the message says which path, and
+        # so the loop can stop immediately.  See UnusableCwd.
+        cwd = getattr(options, "cwd", None)
+        if cwd and not Path(cwd).is_dir():
+            raise UnusableCwd(cwd)
+
         # Refuse to become the second agent on a session someone else is
         # already driving.  The job object (proc_guard) stops *us* leaking
         # orphans, but it can't retroactively clean up one left by a server
@@ -612,6 +779,11 @@ class SDKBridge:
                 old_task.get_name(),
             )
             await cancel_and_join(old_task, "orphan dispatcher")
+
+        # The tail belongs to the process we're replacing; a new one must not
+        # inherit its dying words and report them as its own next time.
+        self._stderr_tail.clear()
+        self._stderr_last_at = 0.0
 
         self.client = ClaudeSDKClient(options=options)
 
@@ -665,10 +837,21 @@ class SDKBridge:
         # auth line on stderr — will re-set it.
         self.state.auth_error = False
 
+        # We got a live connection, so we are demonstrably no longer blocked by
+        # another process holding this session (that raises DuplicateSessionError
+        # above, before here).  Clear the parked-reason flag — covers both the
+        # worker's give-up park and any reconnect() path.
+        self.state.connect_blocked_msg = None
+
         # A fresh CLI is not compacting, whatever the last one was doing when
         # it died.
         self.state.cli_status = None
         self.state.cli_status_started_at = None
+
+        # A live subprocess again.  Cleared here rather than in reconnect() so
+        # a *failed* reconnect leaves the flag set and the next detection is
+        # still recognised as a death rather than a first one.
+        self._transport_dead = False
 
         # Anything the user typed during the connect went to
         # ``state.queued_prompts`` (that is what ``state.connecting`` routes),
@@ -868,6 +1051,179 @@ class SDKBridge:
             "".join(traceback.format_stack()),
         )
 
+    # ------------------------------------------------------------------
+    # A dead CLI subprocess
+    # ------------------------------------------------------------------
+
+    def _note_transport_death(self, why: str) -> None:
+        """Record that the CLI subprocess is gone, and ask for a reconnect.
+
+        Two independent detectors reach this, because the CLI can die at either
+        end of the pipe and only one of them fires depending on what we were
+        doing at the time:
+
+        * ``_message_dispatcher`` — the read side.  ``receive_messages()``
+          raises with the process's exit code.  This is the *earliest* signal
+          and the only one that fires while the session is parked, which is
+          exactly the 5-hour window the reported zombie sat in.
+        * ``run_turn`` — the write side.  ``client.query()`` raises
+          ``CLIConnectionError`` synchronously.  This only ever fires because
+          the read-side signal was missed or the process died between turns.
+
+        Only *asking* happens here.  The reconnect itself must run on the worker
+        task (the SDK transport's anyio cancel scope belongs to whoever entered
+        it — see :meth:`_warn_if_foreign_task`), and the dispatcher is not that
+        task, so the request goes through ``event_queue`` like every other
+        outside-initiated connect.
+        """
+        if self._transport_dead:
+            return  # already known; don't queue a second connect
+        self._transport_dead = True
+        log.error("transport dead: %s — requesting reconnect", why)
+        if self.stop_event.is_set():
+            return
+        # If a turn is live, ``run_turn`` is about to raise and worker_loop
+        # handles recovery inline; queueing a connect as well would reconnect
+        # twice.  Parked is the case that needs the poke.
+        if self.turn_active.is_set():
+            return
+        try:
+            # The payload distinguishes this from a user's ``/connect``, which
+            # is a deliberate act and so neither budget-limited nor in need of
+            # an explanation in the transcript.
+            self.event_queue.put_nowait(("connect", _CONNECT_TRANSPORT_DEAD))
+        except Exception:
+            log.exception("could not queue reconnect after transport death")
+
+    def _may_auto_reconnect(self) -> bool:
+        """Is there budget left to recover from a dead CLI automatically?
+
+        Unconditional recovery is right for a CLI that dies once; it is wrong
+        for one that dies on every connect, which would spawn a process per
+        attempt forever.  Records this attempt and reports whether it is inside
+        :data:`TRANSPORT_DEATH_MAX_RECOVERIES` within
+        :data:`TRANSPORT_DEATH_WINDOW`.
+        """
+        now = time.monotonic()
+        cutoff = now - TRANSPORT_DEATH_WINDOW
+        self._transport_death_times = [
+            t for t in self._transport_death_times if t >= cutoff
+        ]
+        self._transport_death_times.append(now)
+        return len(self._transport_death_times) <= TRANSPORT_DEATH_MAX_RECOVERIES
+
+    async def _drain_stderr(self) -> None:
+        """Let the SDK's stderr reader catch up before we close the transport.
+
+        The reader is a task inside the SDK's own task group, so it makes
+        progress while we merely await.  ``close()`` cancels that group, which
+        is what destroyed the Bun panic report described at
+        :data:`STDERR_DRAIN_QUIET`; waiting for the stream to go quiet first is
+        the whole fix.
+
+        Returns once :data:`STDERR_DRAIN_QUIET` has passed with no new line,
+        and never takes longer than :data:`STDERR_DRAIN_MAX`.
+
+        The quiet period is measured from the *later* of the last line and the
+        moment draining started, so it always waits at least once even when we
+        have seen nothing yet.  That case is not "the CLI was silent" — it is
+        precisely the failure being fixed: a panic report sitting unread in the
+        pipe while our tail is still empty.  Returning immediately on an empty
+        tail would reintroduce the bug in the code written to cure it.
+        """
+        started = time.monotonic()
+        deadline = started + STDERR_DRAIN_MAX
+        while True:
+            last = max(self._stderr_last_at, started)
+            quiet_for = time.monotonic() - last
+            if quiet_for >= STDERR_DRAIN_QUIET:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log.warning(
+                    "stderr still arriving after %.1fs — closing anyway",
+                    STDERR_DRAIN_MAX,
+                )
+                return
+            await asyncio.sleep(min(STDERR_DRAIN_QUIET - quiet_for, remaining))
+
+    def _log_stderr_tail(self, why: str) -> None:
+        """Log the dead CLI's last stderr lines as one block.
+
+        One record, not N, so the post-mortem survives log rotation and is
+        greppable as a unit.  Silent when the process said nothing — which is
+        itself worth knowing, and is stated rather than left ambiguous.
+        """
+        tail = list(self._stderr_tail)
+        if not tail:
+            log.error("transport dead: %s — CLI wrote nothing to stderr", why)
+            return
+        log.error(
+            "transport dead: %s — last %d stderr line(s) from the CLI:\n%s",
+            why, len(tail), "\n".join(tail),
+        )
+
+    async def _recover_dead_transport(self, why: str) -> bool:
+        """Reconnect after the CLI subprocess died.  **Worker task only.**
+
+        Returns True if the session is usable again.  On failure — including
+        running out of budget — says so in the transcript rather than letting
+        the status bar drop back to a normal-looking "idle", which is what sent
+        the reporter off to restart a hub that then handed him the same dead
+        runtime back.
+        """
+        # Before anything that could close the transport — including giving up,
+        # which leaves it open but unattended — collect what the process said as
+        # it died.  This is the only chance: reconnect() → disconnect() →
+        # close() cancels the SDK's stderr reader mid-stream.
+        await self._drain_stderr()
+        self._log_stderr_tail(why)
+
+        if not self._may_auto_reconnect():
+            log.error(
+                "transport dead: %s — giving up after %d recoveries in %.0fs",
+                why, TRANSPORT_DEATH_MAX_RECOVERIES, TRANSPORT_DEATH_WINDOW,
+            )
+            await self.broadcast({
+                "type": "system_msg",
+                "subtype": "error",
+                "data": {"message": (
+                    f"The Claude CLI keeps dying ({why}). Gave up after "
+                    f"{TRANSPORT_DEATH_MAX_RECOVERIES} attempts — this session "
+                    f"can't run prompts until it connects. Use /connect to try "
+                    f"again."
+                )},
+            })
+            return False
+
+        await self.broadcast({
+            "type": "system_msg",
+            "subtype": "warning",
+            "data": {"message": (
+                f"The Claude CLI exited ({why}). Reconnecting…"
+            )},
+        })
+        try:
+            await self.reconnect()
+        except Exception as exc:
+            log.exception("auto-reconnect after transport death failed: %s", exc)
+            await self.broadcast({
+                "type": "system_msg",
+                "subtype": "error",
+                "data": {"message": (
+                    f"Reconnect failed: {exc or type(exc).__name__}. "
+                    f"Use /connect to try again."
+                )},
+            })
+            return False
+        log.info("recovered from transport death: %s", why)
+        await self.broadcast({
+            "type": "system_msg",
+            "subtype": "info",
+            "data": {"message": "Reconnected. Re-send your last prompt to continue."},
+        })
+        return True
+
     async def reconnect(self) -> None:
         """Disconnect and reconnect with current session ID.
 
@@ -952,6 +1308,12 @@ class SDKBridge:
             log.exception("dispatcher crashed: gen=%d %s", gen, exc)
             if self.turn_active.is_set():
                 await self.turn_msg_queue.put(DISPATCHER_DEAD)
+            # The read side going down means the subprocess is gone: the SDK
+            # raises out of receive_messages() carrying the CLI's exit code.
+            # Only act for the *current* dispatcher — an orphan from a previous
+            # generation dying says nothing about the client we hold now.
+            if self._dispatcher_gen == gen:
+                self._note_transport_death(_exc_reason(exc))
         else:
             log.info(
                 "dispatcher exit: gen=%d msgs=%d (receive_messages returned)",
@@ -2353,8 +2715,18 @@ class SDKBridge:
             # ~2s for the next status-ticker cycle (state.busy is already True).
             await self._broadcast_status()
 
-            # Send the prompt.
-            await self.client.query(prompt_text)
+            # Send the prompt.  A write to a CLI that has already exited raises
+            # CLIConnectionError synchronously from the SDK's transport, which
+            # is the write-side twin of the dispatcher's read-side detection —
+            # and the one the user hits, because it is what a typed prompt runs
+            # into once the process is gone.  Flag it here so worker_loop can
+            # tell "the CLI is dead" apart from "this turn went wrong".
+            try:
+                await self.client.query(prompt_text)
+            except Exception as exc:
+                if _is_transport_death(exc):
+                    self._note_transport_death(_exc_reason(exc))
+                raise
 
             while True:
                 # In drain mode (post-interrupt) bound the wait so a CLI
@@ -3012,6 +3384,31 @@ class SDKBridge:
     # worker_loop() — main turn driver
     # ------------------------------------------------------------------
 
+    async def _wait_for_reconnect_trigger(self) -> bool:
+        """Park until the user asks to reconnect, or we're told to stop.
+
+        Used by the ``DuplicateSessionError`` give-up path, which must keep the
+        worker alive (so a later ``/connect`` can recover once the other process
+        closes) without hammering the process scan on a backoff.  Returns True
+        if the worker should stop (quit/shutdown), False to re-attempt connect.
+
+        Only ``connect`` and ``message`` re-trigger a connect; a ``message`` is
+        re-queued so it still runs once we're through (though while blocked the
+        server rejects typed prompts up front, so in practice the trigger is an
+        explicit ``/connect``).  Wakeups and other kinds are ignored.
+        """
+        while not self.stop_event.is_set():
+            kind, payload = await self.event_queue.get()
+            if kind in ("quit", "force-quit"):
+                return True
+            if kind == "connect":
+                return False
+            if kind == "message":
+                self.event_queue.put_nowait((kind, payload))
+                return False
+            # Ignore anything else (wakeups, stray pokes) and keep waiting.
+        return True
+
     async def worker_loop(self, *, skip_connect: bool = False) -> None:
         """Main loop: connect, run turns, handle auto-continue.
 
@@ -3039,19 +3436,33 @@ class SDKBridge:
                     })
                 break
             except proc_guard.DuplicateSessionError as exc:
-                # Not transient — retrying just delays a message the user has
-                # to act on (kill the other process).  Stop cleanly and leave
-                # the explanation on screen instead of burying it under ten
-                # backoff attempts.
+                # Not transient — retrying on a backoff just delays a message the
+                # user has to act on (close the other process).  But we must NOT
+                # exit the worker: a dead worker leaves every later prompt
+                # falling into an event_queue nobody reads, which the tab
+                # surfaces as the misleading "worker may be wedged" watchdog
+                # (and a tab that attaches after this broadcast never even sees
+                # the real reason).  So record the reason, explain it, and park
+                # *alive* until the user closes the other process and runs
+                # /connect.  See known-issues.md.
                 state.connecting = False
                 state.connect_started_at = None
+                state.connect_blocked_msg = str(exc)
                 await self._broadcast_status()
                 await self.broadcast({
                     "type": "system_msg",
                     "subtype": "error",
                     "data": {"message": str(exc)},
                 })
-                return
+                if await self._wait_for_reconnect_trigger():
+                    return                      # stop_event / quit
+                # /connect (or a message that slipped through) — re-attempt.
+                _connect_attempt = 0
+                _connect_delay = 2.0
+                state.connecting = True
+                state.connect_started_at = time.monotonic()
+                await self._broadcast_status()
+                continue
             except Exception as exc:
                 _connect_attempt += 1
                 # ``str(TimeoutError())`` is the empty string, so both the log
@@ -3059,17 +3470,22 @@ class SDKBridge:
                 # it — the single most useful fact about the failure, that it
                 # was a timeout rather than a refusal, was the one thing not
                 # reported.  Name it explicitly.
-                _why = (f"timed out after {CONNECT_TIMEOUT:.0f}s"
-                        if isinstance(exc, asyncio.TimeoutError)
-                        else (str(exc) or type(exc).__name__))
+                _why = _exc_reason(exc)
                 log.error("SDK connect failed (attempt %d): %s",
                           _connect_attempt, _why)
 
-                if _connect_attempt >= _MAX_CONNECT_ATTEMPTS:
+                # Some failures are settled, not transient.  Backing off and
+                # trying again can only reproduce them, so skip straight to the
+                # give-up branch — and, importantly, past the "keep retrying
+                # while prompts are queued" case below, which would otherwise
+                # spin forever on a directory that is never going to appear.
+                _fatal = isinstance(exc, UnusableCwd)
+
+                if _fatal or _connect_attempt >= _MAX_CONNECT_ATTEMPTS:
                     # If the user queued prompt(s) while we were retrying,
                     # that's a clear signal to keep trying rather than make
                     # them re-type — restart the auto-retry (capped delay).
-                    if state.queued_prompts:
+                    if state.queued_prompts and not _fatal:
                         _connect_attempt = 0
                         _connect_delay = _MAX_CONNECT_DELAY
                         # Stay "connecting" so further typed prompts keep
@@ -3098,14 +3514,26 @@ class SDKBridge:
                     state.connecting = False
                     state.connect_started_at = None
                     await self._broadcast_status()
-                    _retry_hint = ("Your Claude login has expired — run /login to "
-                                   "re-authenticate, then send a message."
-                                   if state.auth_error
-                                   else "Send a message to retry.")
+                    if _fatal:
+                        # No attempt count — it wasn't tried repeatedly — and no
+                        # "send a message to retry", which would be a lie.
+                        _msg = (
+                            f"Can't start this session: {_why}. Nothing here "
+                            f"can fix it — relaunch orchestrator2 from a "
+                            f"directory this server can see. (If you launched "
+                            f"from WSL, the hub answering this port is the "
+                            f"Windows one and cannot read WSL paths.)"
+                        )
+                    else:
+                        _retry_hint = ("Your Claude login has expired — run /login to "
+                                       "re-authenticate, then send a message."
+                                       if state.auth_error
+                                       else "Send a message to retry.")
+                        _msg = f"SDK connection failed after {_connect_attempt} attempts: {_why}. {_retry_hint}"
                     await self.broadcast({
                         "type": "system_msg",
                         "subtype": "error",
-                        "data": {"message": f"SDK connection failed after {_connect_attempt} attempts: {_why}. {_retry_hint}"},
+                        "data": {"message": _msg},
                     })
                     # Fall back to manual retry.  A user message restarts the
                     # auto-retry loop; so does an explicit /connect — the natural
@@ -3208,17 +3636,7 @@ class SDKBridge:
                 log.warning("run_turn cancelled — worker_loop exiting")
                 raise
             except Exception as exc:
-                log.exception("run_turn failed: %s", exc)
-                await self.broadcast({
-                    "type": "system_msg",
-                    "subtype": "error",
-                    "data": {"message": f"Turn failed: {exc}"},
-                })
-                if config.auto_reconnect:
-                    try:
-                        await self.reconnect()
-                    except Exception:
-                        pass
+                await self._handle_turn_failure(exc)
                 # Fall through to await next input.
 
             # --- Between-turn processing ---
@@ -3232,6 +3650,39 @@ class SDKBridge:
             "data": {},
         })
 
+    async def _handle_turn_failure(self, exc: BaseException) -> None:
+        """Report a turn that raised, and recover the session if it has to.
+
+        Split out of ``worker_loop`` so the decision can be exercised directly:
+        the whole bug was in this branch, and reaching it through the real
+        worker needs a live SDK connection.
+
+        A dead CLI is recovered from **unconditionally**.  ``self.client``
+        points at a corpse, so every later prompt in the session fails
+        identically forever, while the status bar returns to an ordinary-looking
+        "idle" in between — which is how the reported session sat dead for five
+        hours and survived a restart. That is not a preference to gate behind
+        ``--auto-reconnect``; it is the only state from which the session can do
+        anything at all.
+        """
+        log.exception("run_turn failed: %s", exc)
+        await self.broadcast({
+            "type": "system_msg",
+            "subtype": "error",
+            "data": {"message": f"Turn failed: {_exc_reason(exc)}"},
+        })
+        # ``_transport_dead`` is set by whichever detector fired — the
+        # dispatcher's read side, or ``query()``'s write side.
+        if self._transport_dead:
+            await self._recover_dead_transport(_exc_reason(exc))
+        elif self.config.auto_reconnect:
+            # Broader opt-in: rebuild the connection after *any* failed turn,
+            # not just a death.
+            try:
+                await self.reconnect()
+            except Exception:
+                log.exception("auto-reconnect after failed turn failed")
+
     async def _between_turns(
         self,
         assistant_text: str,
@@ -3244,6 +3695,7 @@ class SDKBridge:
         # Drain queued commands.
         has_compact = False
         reconnect_needed = False
+        recovering_dead = False
         quit_requested = False
 
         while not self.event_queue.empty():
@@ -3288,6 +3740,10 @@ class SDKBridge:
                 return await self._await_next_prompt()
             elif kind == "connect":
                 reconnect_needed = True
+                if payload == _CONNECT_TRANSPORT_DEAD:
+                    recovering_dead = True
+                else:
+                    self._transport_death_times.clear()
             elif kind in ("quit", "force-quit"):
                 quit_requested = True
             elif kind == "btw":
@@ -3298,7 +3754,12 @@ class SDKBridge:
             return None
 
         if reconnect_needed:
-            await self.reconnect()
+            # A reconnect asked for by _note_transport_death takes the bounded,
+            # announced path; a config command's takes the plain one.
+            if recovering_dead:
+                await self._recover_dead_transport("CLI exited")
+            else:
+                await self.reconnect()
 
         # --- Interrupted ---
         if interrupted:
@@ -3437,7 +3898,16 @@ class SDKBridge:
             await self.reconnect()
             return True
         if kind == "connect":
-            await self.reconnect()
+            if payload == _CONNECT_TRANSPORT_DEAD:
+                # Queued by _note_transport_death because the CLI died while we
+                # were parked — the case the reported zombie sat in for five
+                # hours.  Goes through the bounded, announced path.
+                await self._recover_dead_transport("CLI exited")
+            else:
+                # A deliberate /connect is the documented way back after we give
+                # up, so it clears the recovery budget as well as reconnecting.
+                self._transport_death_times.clear()
+                await self.reconnect()
             return True
         if kind == "clear-context":
             await self._clear_context()

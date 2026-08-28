@@ -8,6 +8,7 @@ window trim, and markdown export.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from tool_manager import format_tool_header
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -529,6 +532,113 @@ def read_session_title(session_id: str, config_dir: str | None = None) -> str | 
     return _resolve_title(project / f"{session_id}.jsonl")
 
 
+def heal_tail_before_append(jsonl: Path) -> dict[str, int]:
+    """Make a session JSONL safe to append to, and say what had to go.
+
+    THE BUG THIS EXISTS TO STOP
+    --------------------------
+    Three NUL runs were found buried in a 1.29 GB SlateOS session — 124,834,
+    13,564 and 893 bytes — and every one of them sat *immediately before* a
+    93-byte ``custom-title`` record, which is the only thing this process ever
+    writes to a session file.  That is the whole story:
+
+      1. The CLI is killed (a session close, a reconnect, a bridge restart)
+         while a write is in flight.  Windows had already extended the file
+         *size*, but the data never became valid, so the tail reads as zeros.
+      2. We come along and append the title with ``O_APPEND``, which writes at
+         the file size — i.e. *after* the zeros.
+      3. The zeros are now in the middle of the file instead of at the end.
+         The CLI's reader stops there on the next resume, re-attaches to the
+         last record it could parse, and starts a sibling branch.  Silent
+         amnesia, weeks of it, while the browser (which reads linearly) keeps
+         showing a complete transcript.
+
+    So the damage is not the kill and it is not the append — it is the append
+    *landing after* a dirty tail and cementing it mid-file.  Whoever writes
+    next is the one who can still fix it, and that is us.
+
+    NOT A FIX: routing this through the SDK's ``rename_session``.  That helper
+    is ``os.open(O_WRONLY | O_APPEND)`` + ``os.write`` of the same 93 bytes
+    (``claude_agent_sdk/_internal/session_mutations.py``), so it lands in
+    exactly the same place.
+
+    WHY THE TRUNCATION IS SAFE
+    --------------------------
+    Both things removed here are at EOF, so nothing can reference them:
+
+      * a trailing NUL run is filler by construction — no record follows it;
+      * a trailing fragment with no newline is a half-written record.  It is
+        not valid JSON and the CLI's line reader would choke on it anyway.
+
+    A *complete* last line is never touched, and the file is left ending in a
+    newline so the appended record starts cleanly.
+    """
+    removed = {"nuls": 0, "partial": 0}
+    size = jsonl.stat().st_size
+    if size == 0:
+        return removed
+
+    # Walk backwards for the last non-NUL byte. Chunked because the run can be
+    # large (the worst one seen was 124 KB) but is not bounded in principle.
+    chunk = 1 << 16
+    end = size
+    with jsonl.open("rb") as f:
+        while end > 0:
+            start = max(0, end - chunk)
+            f.seek(start)
+            buf = f.read(end - start)
+            stripped = buf.rstrip(b"\x00")
+            if stripped:
+                end = start + len(stripped)
+                break
+            end = start
+    removed["nuls"] = size - end
+    if end == 0:
+        # Nothing but NULs: refuse rather than empty someone's history.
+        return removed
+
+    # Now make sure what's left ends on a record boundary.
+    if end > 0:
+        with jsonl.open("rb") as f:
+            back = min(end, 1 << 20)
+            f.seek(end - back)
+            tail = f.read(back)
+        if not tail.endswith(b"\n"):
+            nl = tail.rfind(b"\n")
+            if nl >= 0:
+                frag = tail[nl + 1:]
+                try:
+                    json.loads(frag.decode("utf-8"))
+                except Exception:
+                    # Half a record, or a record whose newline was lost with
+                    # the killed write. Either way it cannot be parsed and
+                    # cannot be completed, so it goes.
+                    removed["partial"] = len(frag)
+                    end = end - len(frag)
+                else:
+                    # A complete record that merely lost its newline; keep it
+                    # and let the newline be re-added below.
+                    pass
+
+    if removed["nuls"] or removed["partial"]:
+        with jsonl.open("r+b") as f:
+            f.truncate(end)
+        log.warning(
+            "session %s: healed a dirty tail before appending "
+            "(%d NUL bytes, %d bytes of a half-written record) — a CLI was "
+            "almost certainly killed mid-write",
+            jsonl.stem, removed["nuls"], removed["partial"])
+
+    # Guarantee the appended record starts on its own line.
+    with jsonl.open("rb") as f:
+        f.seek(max(0, end - 1))
+        last = f.read(1)
+    if last and last != b"\n":
+        with jsonl.open("ab") as f:
+            f.write(b"\n")
+    return removed
+
+
 def write_session_title(
     session_id: str, title: str, config_dir: str | None = None
 ) -> None:
@@ -565,6 +675,10 @@ def write_session_title(
         sdk_ok = False
         try:
             from claude_agent_sdk import rename_session as _sdk_rename  # type: ignore
+            # The SDK appends with O_APPEND exactly as we do, so it lands after
+            # a dirty tail exactly as we would. Heal first either way.
+            if jsonl is not None and jsonl.exists():
+                heal_tail_before_append(jsonl)
             _sdk_rename(session_id, title)
             sdk_ok = True
         except (ImportError, AttributeError):
@@ -592,6 +706,7 @@ def write_session_title(
         "customTitle": title,
         "sessionId": session_id,
     }
+    heal_tail_before_append(jsonl)
     with jsonl.open("a", encoding="utf-8") as f:
         # Compact separators, byte-identical to the CLI's own JSON.stringify
         # output.  Its external-writer check is
@@ -617,15 +732,29 @@ def write_session_title(
 #   * **The CLI** rebuilds the model's context by taking the last message and
 #     walking ``parentUuid`` back to the root.
 #
-# Those agree only while the chain is intact.  On 2026-07-24 a lost write left a
-# run of NUL bytes in the middle of two different session files (both within
-# three minutes — one machine-level event, not a per-session bug: the file size
-# was committed but the data never reached disk, so NTFS returned zeros).  The
-# record in that hole was the ``tool_result`` for the preceding ``tool_use``,
-# which makes the chain unusable from that point on, so every subsequent resume
-# silently restarted from the last intact node — 2026-07-24 — and appended a
-# *new branch* there.  Three weeks later the raytracer session had 27 sibling
-# branches off that one node: 26 of them abandoned, 1,581 records of real work.
+# Those agree only while the chain is intact, and a run of NUL bytes in the
+# middle of the file breaks it: the CLI's reader stops there, so every resume
+# afterwards restarts from the last record it could parse and appends a *new
+# branch*.  The raytracer session had 27 sibling branches off one node three
+# weeks later, 26 of them abandoned, 1,581 records of real work.
+#
+# WHERE THE NULS COME FROM — established later, and it is our own doing.  The
+# first theory here was "a lost write, one machine-level event".  It is not: all
+# three holes in the 1.29 GB SlateOS session (124,834 / 13,564 / 893 bytes) sat
+# *immediately before* a 93-byte ``custom-title`` record, which is the only
+# thing this process ever appends to a session file, and each was at an idle
+# boundary where a CLI had been shut down.  The sequence is:
+#
+#   1. the CLI is killed mid-write; Windows had already extended the file size
+#      but the data never became valid, so the tail reads back as zeros;
+#   2. we append the title with ``O_APPEND``, which writes at the file size —
+#      i.e. *after* the zeros;
+#   3. the zeros are now in the middle of the file rather than at the end of it,
+#      and they stay there.
+#
+# ``heal_tail_before_append`` closes that: see its docstring.  This detector is
+# the second line of defence, for files damaged before the fix and for whatever
+# else can put a hole in one.
 #
 # Nothing anywhere noticed.  The browser kept showing the full transcript,
 # because we read the file linearly; the model kept getting July 24, because it
@@ -731,6 +860,61 @@ def find_nul_hole(path: Path, start: int = 0) -> int | None:
                 pos += len(chunk)
     except OSError:
         return None
+
+
+def find_nul_holes(path: Path, start: int = 0) -> list[int]:
+    """Offsets of the start of every NUL *run* in *path* at or after *start*.
+
+    ``find_nul_hole`` only ever reported the first one, and the index only ever
+    stored that one, so a file with several holes looked exactly like a file
+    with one — the SlateOS session carried three (124,834, 13,564 and 893
+    bytes) and only the first was ever recorded.  That mattered once a repair
+    removed the first: the incremental scan resumed past the others and the
+    session looked clean while two holes were still in it.
+    """
+    holes: list[int] = []
+    try:
+        with path.open("rb") as f:
+            f.seek(start)
+            pos = start
+            in_run = False
+            while True:
+                chunk = f.read(1 << 22)
+                if not chunk:
+                    return holes
+                i = 0
+                while i < len(chunk):
+                    if chunk[i] == 0:
+                        if not in_run:
+                            holes.append(pos + i)
+                            in_run = True
+                        # Skip to the end of this run in one step.
+                        j = i
+                        while j < len(chunk) and chunk[j] == 0:
+                            j += 1
+                        if j < len(chunk):
+                            in_run = False
+                        i = j
+                    else:
+                        in_run = False
+                        nxt = chunk.find(b"\x00", i)
+                        if nxt == -1:
+                            break
+                        i = nxt
+                pos += len(chunk)
+    except OSError:
+        return holes
+
+
+def _file_fingerprint(path: Path) -> list[int]:
+    """(size, mtime_ns) — enough to tell "grew" from "was rewritten".
+
+    Size alone is not enough.  A relink rewrites one ``parentUuid`` in place
+    and both uuids are 36 characters, so the file is repaired without changing
+    length by a single byte; only the mtime moves.
+    """
+    st = path.stat()
+    return [st.st_size, st.st_mtime_ns]
 
 
 def analyze_session_chain(path: Path) -> dict[str, Any]:
@@ -898,32 +1082,55 @@ def check_session_integrity(
     with _integrity_lock:
         index = _load_integrity_index()
         entry = index.get(session_id) if isinstance(index.get(session_id), dict) else None
-        if entry and not force:
-            if entry.get("abandoned_records"):
-                # Known-amnesiac.  Abandoned work in the prefix cannot un-abandon
-                # itself, so re-report the stored finding without re-walking.
-                return {**entry, "path": str(path), "session_id": session_id}
-            if entry.get("scanned") == size:
-                return None
-        scanned = int(entry.get("scanned", 0)) if entry and not force else 0
+        try:
+            fingerprint = _file_fingerprint(path)
+        except OSError:
+            return None
 
-        hole = find_nul_hole(path, scanned)
-        if hole is None and entry:
-            hole = entry.get("hole_at")
-        if hole is None:
-            index[session_id] = {"scanned": size, "hole_at": None}
+        # A cached verdict — positive or negative — is only good while the file
+        # is untouched.  The previous version returned a stored *positive*
+        # unconditionally, on the reasoning that abandoned work cannot
+        # un-abandon itself.  That is true of the records but not of the
+        # verdict: repairing the file is exactly the case where the finding
+        # becomes wrong, and it was the case that mattered, because the warning
+        # would have kept firing after the repair with no way to clear it.
+        if entry and not force and entry.get("fingerprint") == fingerprint:
+            if entry.get("abandoned_records"):
+                return {**entry, "path": str(path), "session_id": session_id}
+            return None
+
+        # Otherwise decide whether the previous scan can be extended or has to
+        # be thrown away.  Only strict growth is an append; equal-size-but-
+        # different-mtime is an in-place rewrite (a relink) and same-or-smaller
+        # is a rewrite too, and in both cases every earlier finding is suspect.
+        prev_size = (entry or {}).get("fingerprint") or [None]
+        appended = (
+            entry is not None and not force
+            and isinstance(prev_size[0], int) and size > prev_size[0]
+        )
+        if appended:
+            scanned = int(entry.get("scanned") or 0)
+            holes = [h for h in (entry.get("holes") or []) if isinstance(h, int)]
+        else:
+            scanned, holes = 0, []
+        holes = holes + find_nul_holes(path, scanned)
+
+        if not holes:
+            index[session_id] = {"scanned": size, "holes": [], "hole_at": None,
+                                 "fingerprint": fingerprint}
             _save_integrity_index(index)
             return None
 
         # A hole is present.  Whether it *currently* costs the model anything
         # depends on where the live chain runs, and that changes as the session
         # grows — a compaction can heal it, a resume onto the old node can
-        # re-break it — so this re-walks whenever the file has grown.  It is the
-        # expensive path, but it only runs for a file that has a hole at all
+        # re-break it — so this re-walks whenever the file has changed.  It is
+        # the expensive path, but it only runs for a file that has a hole at all
         # (2 of 48 here), and the caller runs it off the connect path.
         report = analyze_session_chain(path)
-        report["hole_at"] = hole
-        index[session_id] = {**report, "scanned": size}
+        report["holes"] = holes
+        report["hole_at"] = holes[0]
+        index[session_id] = {**report, "scanned": size, "fingerprint": fingerprint}
         _save_integrity_index(index)
         if not report.get("abandoned_records"):
             return None

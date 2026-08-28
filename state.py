@@ -524,6 +524,14 @@ class State:
     busy: bool = False
     connecting: bool = False
     connect_started_at: float | None = None
+    # Set when the worker gave up connecting for a reason the user has to act on
+    # (currently only DuplicateSessionError: the session is already open in
+    # another process).  Unlike a transient connect failure, the worker parks
+    # itself alive waiting for /connect rather than exiting — so this string is
+    # both the status-bar reason and what a late-attaching tab is replayed, and
+    # what a typed prompt is rejected with, instead of the misleading generic
+    # "worker may be wedged" watchdog.  Cleared on the next successful connect.
+    connect_blocked_msg: str | None = None
 
     # What the *CLI* says it is doing, from ``system``/``status`` messages.
     # Today the only value is ``"compacting"`` (set when the CLI starts an
@@ -733,6 +741,11 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         busy_class = "error"
     elif state.needs_user_attention == "api-error":
         busy_label = "api error"
+        busy_class = "error"
+    elif state.connect_blocked_msg:
+        # Parked alive after refusing to connect (session already open
+        # elsewhere).  Not "idle" — nothing here can run until the user acts.
+        busy_label = "already open elsewhere"
         busy_class = "error"
     else:
         busy_label = "idle"

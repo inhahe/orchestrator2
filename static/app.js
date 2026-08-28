@@ -429,6 +429,21 @@ const App = (() => {
       return;
     }
 
+    // Lobby: the session this tab was viewing has been closed (its × was
+    // pressed here or in another tab).  Drop the ?rid= from the URL first —
+    // it now names a session that no longer exists, so a refresh would land
+    // in the lobby with a confusing "the server was restarted" banner instead
+    // of simply showing the session list.
+    if (type === 'session_closed') {
+      try {
+        const u = new URL(location.href);
+        u.searchParams.delete('rid');
+        history.replaceState(null, '', u.toString());
+      } catch (_) {}
+      Lobby.onSessionClosed(msg.rid || '', msg.message || '');
+      return;
+    }
+
     // Lobby: this tab is now attached to (viewing) a specific session.
     // Clears any leftover chat before the fresh history/status arrives.
     if (type === 'attached') {
