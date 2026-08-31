@@ -13,6 +13,10 @@ const App = (() => {
   let reconnectAttempt = 0;
   let _isBusy = false;
   let _serverShutdown = false;
+  // Did _we_ give up, as opposed to the server telling us it was going away?
+  // Both latch _serverShutdown, but only our own impatience is ours to reverse
+  // when the window is shown again.  See _onVisibilityChange.
+  let _retriesExhausted = false;
   let _didLaunchRequest = false;   // sent the one-shot ?open/?new request?
   let _promptWatchdog = null;      // detects a prompt that got no server reply
   let _promptSeq = 0;              // per-tab counter behind each prompt_id
@@ -47,6 +51,10 @@ const App = (() => {
 
     // Connect WebSocket.
     _connect();
+
+    // Recover a socket that died while nobody was looking. See
+    // _onVisibilityChange.
+    document.addEventListener('visibilitychange', _onVisibilityChange);
 
     // Focus input.
     Commands.focus();
@@ -207,6 +215,7 @@ const App = (() => {
 
     if (reconnectAttempt > MAX_RECONNECT_ATTEMPTS) {
       _serverShutdown = true;
+      _retriesExhausted = true;
       Status.update({ busy_label: 'disconnected', busy_class: 'shutdown' });
       Chat.handleMessage({
         type: 'system_msg',
@@ -311,6 +320,7 @@ const App = (() => {
       return;
     }
     _serverShutdown = false;
+    _retriesExhausted = false;
     reconnectAttempt = 0;
     reconnectDelay = 1000;
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
@@ -319,6 +329,42 @@ const App = (() => {
     if (ws && ws.readyState === WebSocket.CONNECTING) return;
     Status.update({ busy_label: 'reconnecting', busy_class: 'reconnecting' });
     _connect();
+  }
+
+  /* Reconnect the moment the window is shown, rather than on the backoff's
+   * schedule.
+   *
+   * A hidden window is the worst possible place to run a retry budget.  Its
+   * setTimeout is clamped to one second, then to one *minute* once Chrome's
+   * intensive throttling starts five minutes in, so the 20-attempt budget that
+   * spans ~7.5 minutes while visible can burn down over ~20 minutes of throttled
+   * ticks with nobody watching -- and then latch off permanently.  A laptop
+   * suspend/resume drops the socket almost by definition, and it happens while
+   * hidden almost by definition, so this is the common case and not an exotic
+   * one.  The user comes back to a dead transcript that will never refill, which
+   * looks exactly like "the window isn't updated while it's not in focus".
+   *
+   * So: on becoming visible with a socket that is not up, reconnect now.  This
+   * also short-circuits an ordinary backoff that still has up to 30s to run --
+   * the user is here, waiting out a timer helps nobody.
+   *
+   * The one thing it must not do is overrule the *server*.  A server_shutdown
+   * means the server deliberately went away and reconnecting would just fail
+   * noisily; a server_restart means Lobby is already polling and will reload the
+   * page itself, so opening a socket underneath it would race that.  Both latch
+   * _serverShutdown.  Only _retriesExhausted -- our own patience running out --
+   * is ours to reverse.
+   *
+   * An OPEN socket returns early because reconnect() treats that case as a
+   * *server-side* SDK-bridge reconnect and sends /connect; firing that on every
+   * tab focus would be a command the user never typed.  A CONNECTING socket
+   * needs no check here -- reconnect() already refuses to open a second one.
+   */
+  function _onVisibilityChange() {
+    if (document.hidden) return;
+    if (ws && ws.readyState === WebSocket.OPEN) return;
+    if (_serverShutdown && !_retriesExhausted) return;
+    reconnect();
   }
 
   /* Watch one specific prompt until the session reaches a state that explains it.
@@ -426,6 +472,13 @@ const App = (() => {
     // Forces the lobby open so the message isn't hidden behind the chat.
     if (type === 'lobby_notice') {
       Lobby.showNotice(msg.message || '');
+      return;
+    }
+
+    // Lobby: the session this tab tried to open is already live in another hub
+    // window (opening it here would fork a duplicate).  Offer to go there.
+    if (type === 'session_elsewhere') {
+      Lobby.onSessionElsewhere(msg);
       return;
     }
 

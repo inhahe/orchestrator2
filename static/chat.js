@@ -242,6 +242,10 @@ const Chat = (() => {
 
     _initAudioUnlock();
 
+    // Frame-driven work stops dead while the window is hidden, so the
+    // transition itself has to be an event we handle.  See _onVisibilityChange.
+    document.addEventListener('visibilitychange', _onVisibilityChange);
+
     // Auto-scroll tracking: only scroll if user is near bottom.
     // Throttled to avoid layout thrashing on every pixel of scroll.
     let _scrollThrottle = null;
@@ -299,6 +303,18 @@ const Chat = (() => {
   // --- Scrolling ---
 
   function _scrollToBottom() {
+    // Reading scrollHeight (and the gap maintenance below, which reads more)
+    // forces a synchronous layout of the whole message list.  In a hidden
+    // window nothing is painted, so that cost buys nothing — and it is paid
+    // once per arriving message, over a list that is growing the entire time.
+    // Defer to the moment the window is shown again, where one scroll write
+    // settles the whole backlog.  Trimming still runs: keeping the list capped
+    // is exactly what stops the catch-up being expensive.
+    if (_hidden()) {
+      _scrollPendingOnShow = true;
+      _maybeTrimOldMessages();
+      return;
+    }
     if (_gapActive) {
       _maintainGap();
       _maybeTrimOldMessages();
@@ -371,6 +387,70 @@ const Chat = (() => {
     elMessages.style.paddingBottom = '';
   }
 
+  // --- Hidden windows ---
+  //
+  // From a report: *"sometimes the window isn't updated while it's not in
+  // focus, and once it's put into focus, it takes a long time to get up to
+  // speed because it only adds a few lines per second."*
+  //
+  // A hidden window — another window covering this one, minimised, or a
+  // background tab — gets **no animation frames at all**, and its timers are
+  // clamped to one second (then to one *minute* once Chrome's "intensive
+  // throttling" starts, five minutes in). WebSocket delivery is not throttled,
+  // so messages keep arriving and keep being appended while everything
+  // scheduled on a frame is frozen. Any "already scheduled, skip" latch guarding
+  // an rAF therefore stays latched for as long as the window stays hidden.
+  //
+  // That is the whole bug. `_trimPending` latched true, its callback never ran,
+  // and the transcript stopped being capped — so the message list grew without
+  // bound while hidden, and every append kept doing `scrollTop = scrollHeight`,
+  // which forces a synchronous layout of the entire list. Layout is O(nodes),
+  // so the append rate decayed as the list grew and *stayed* decayed after
+  // focus, because the DOM was still enormous. Hence "a few lines per second".
+  //
+  // It also explains the "sometimes": a window that is merely unfocused but
+  // still visible keeps getting frames, so none of this happens — which is the
+  // case where the transcript is already up to date on focus.
+  //
+  // The rule this establishes: **nothing that must keep working may be gated on
+  // a frame.** None of the callbacks below are animations; they are bookkeeping.
+  function _hidden() {
+    return typeof document !== 'undefined' && document.hidden === true;
+  }
+
+  // Run *fn* on the next frame when there is one, and immediately when there
+  // is not.  A hidden window has no next frame, so scheduling onto one is
+  // indistinguishable from dropping the work.
+  function _onNextFrame(fn) {
+    if (_hidden()) { fn(); return null; }
+    return requestAnimationFrame(fn);
+  }
+
+  // Scroll writes deferred because the window was hidden when they were asked
+  // for.  Collapsed into a single catch-up when it is shown again.
+  let _scrollPendingOnShow = false;
+
+  function _onVisibilityChange() {
+    if (_hidden()) {
+      // The collapse gaps exist to hold a *visible* reading position steady;
+      // with nothing painted they hold nothing.  They must not be left open,
+      // because an open gap disables the trimmer — which is precisely the
+      // unbounded-growth case this whole section is about.
+      _cancelGap();
+      _cancelShortGap();
+      // Likewise a trim that was already waiting on a frame: that frame is now
+      // never coming.  See _reclaimStrandedTrim.
+      _reclaimStrandedTrim();
+      return;
+    }
+    // One catch-up scroll for the whole backlog, instead of the one-per-message
+    // the hidden path skipped.
+    if (_scrollPendingOnShow) {
+      _scrollPendingOnShow = false;
+      if (_autoScroll) elMessages.scrollTop = elMessages.scrollHeight;
+    }
+  }
+
   // --- DOM trimming ---
   // Remove oldest messages when the container exceeds a threshold to
   // prevent unbounded DOM growth from degrading performance.
@@ -381,6 +461,26 @@ const Chat = (() => {
 
   function setMaxDomMessages(n) { _maxDomChildren = n; }
 
+  // Idempotent on purpose: it re-reads the list and re-checks the cap, so it is
+  // safe to run twice, and safe to run from a frame that was scheduled long
+  // ago.  That is what lets _reclaimStrandedTrim below simply run it early and
+  // leave the orphaned frame to fire harmlessly, instead of tracking rAF ids.
+  // Without the re-check a late frame would compute a positive removal count
+  // against a list that is already under the cap and delete live messages.
+  function _trimNow() {
+    _trimPending = false;
+    const n = elMessages.children.length;
+    if (n <= _maxDomChildren) return;
+    const remove = Math.min(n - _maxDomChildren + _TRIM_BATCH, n - 1);
+    // One range deletion, not `remove` separate removeChild calls.  Under the
+    // old bug this list could reach tens of thousands of nodes, and removing
+    // them one at a time is what turns the catch-up into a visible freeze.
+    const range = document.createRange();
+    range.setStartBefore(elMessages.firstChild);
+    range.setEndBefore(elMessages.children[remove]);
+    range.deleteContents();
+  }
+
   function _maybeTrimOldMessages() {
     if (_trimPending) return;
     if (_gapActive) return;             // don't move the frozen scroll anchor
@@ -388,15 +488,22 @@ const Chat = (() => {
     if (_maxDomChildren === 0) return;  // trimming disabled
     if (elMessages.children.length <= _maxDomChildren) return;
     _trimPending = true;
-    requestAnimationFrame(() => {
-      _trimPending = false;
-      const n = elMessages.children.length;
-      if (n <= _maxDomChildren) return;
-      const remove = Math.min(n - _maxDomChildren + _TRIM_BATCH, n - 1);
-      for (let i = 0; i < remove; i++) {
-        elMessages.removeChild(elMessages.firstChild);
-      }
-    });
+    // Deliberately not a bare requestAnimationFrame: see _onNextFrame.  The cap
+    // has to hold while the window is hidden, because that is when the DOM
+    // grows fastest and with nobody watching it.
+    _onNextFrame(_trimNow);
+  }
+
+  // Being hidden is not the only way to strand the trimmer.  A trim scheduled
+  // while the window was *visible* is waiting on a frame; hide the window
+  // before that frame is delivered and it never arrives, so `_trimPending`
+  // stays true and `_maybeTrimOldMessages` returns early for the whole hidden
+  // period — the original unbounded-growth bug, entered through the door of
+  // having been visible at the moment the cap was crossed.  Run the trim now
+  // instead; the orphaned frame, if it is ever delivered, is a no-op (see
+  // _trimNow).
+  function _reclaimStrandedTrim() {
+    if (_trimPending) _trimNow();
   }
 
   // --- Message dispatch ---
@@ -565,6 +672,15 @@ const Chat = (() => {
 
   // Debounced live markdown render for the in-flight streaming element.
   // Coalesces bursts of deltas arriving in the same frame into one render.
+  //
+  // This one stays a bare requestAnimationFrame — do not "fix" it to match the
+  // trimmer.  It latches while hidden exactly like the trimmer did, but it is
+  // harmless there and _onNextFrame would make it worse: it re-renders the
+  // *entire* accumulated `_streamingText`, so the single frame that runs when
+  // the window is shown again produces the fully caught-up text, whereas
+  // running it eagerly would re-render the whole markdown body once per delta
+  // for nobody.  (`_flushStreaming` cancels it and renders synchronously, so a
+  // turn that ends while hidden still lands its text.)
   function _scheduleStreamRender() {
     if (_streamRenderRaf != null) return;
     _streamRenderRaf = requestAnimationFrame(() => {
@@ -1052,26 +1168,36 @@ const Chat = (() => {
     let idx = 0;
 
     function _renderBatch() {
-      const end = Math.min(idx + BATCH, messages.length);
-      for (; idx < end; idx++) {
-        const m = messages[idx];
-        const type = m.type || m.role;
-        if (type === 'user' || type === 'human') {
-          _addUserMessage(m.content || m.text || '');
-        } else if (type === 'injected_prompt') {
-          _addInjectedPrompt({ content: m.content || m.text || '' });
-        } else if (type === 'assistant') {
-          _addAssistantText({ content: m.content || m.text || '', delta: false });
-        } else if (type === 'tool_use') {
-          _addToolUse(m);
-        } else if (type === 'tool_result') {
-          _addToolResult(m);
-        } else if (type === 'thinking') {
-          _addThinking(m);
-        } else if (type === 'system' || type === 'system_msg') {
-          _addSystemMsg(m);
+      // Batching exists to keep the browser responsive *for someone watching*.
+      // A hidden window clamps setTimeout to one second — one minute once
+      // intensive throttling starts — which would stretch a few thousand
+      // history messages into an hour of drip-feed, and is the second way the
+      // reported "a few lines per second" could happen. With nothing painting,
+      // run straight through instead; live messages arriving meanwhile are
+      // queued in _pendingMessages either way. Written as a loop, not
+      // recursion: a large history would otherwise blow the stack.
+      do {
+        const end = Math.min(idx + BATCH, messages.length);
+        for (; idx < end; idx++) {
+          const m = messages[idx];
+          const type = m.type || m.role;
+          if (type === 'user' || type === 'human') {
+            _addUserMessage(m.content || m.text || '');
+          } else if (type === 'injected_prompt') {
+            _addInjectedPrompt({ content: m.content || m.text || '' });
+          } else if (type === 'assistant') {
+            _addAssistantText({ content: m.content || m.text || '', delta: false });
+          } else if (type === 'tool_use') {
+            _addToolUse(m);
+          } else if (type === 'tool_result') {
+            _addToolResult(m);
+          } else if (type === 'thinking') {
+            _addThinking(m);
+          } else if (type === 'system' || type === 'system_msg') {
+            _addSystemMsg(m);
+          }
         }
-      }
+      } while (idx < messages.length && _hidden());
 
       if (idx < messages.length) {
         // Yield to the event loop, then continue.

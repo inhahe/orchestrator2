@@ -3063,6 +3063,25 @@ async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
                 "That session could no longer be found on disk — it may have "
                 "been deleted or moved. Pick a session below to continue."))
             return True
+        # Don't fork a doomed duplicate.  If another hub (or a stray
+        # ``claude --resume``) already holds this session, resuming it here would
+        # only hit DuplicateSessionError on connect and park unable to run.  Tell
+        # the tab where it's already open so it can focus that window instead.
+        holder = await asyncio.to_thread(
+            proc_guard.find_foreign_session_holder, sid)
+        if holder is not None and not (
+                config and getattr(config, "allow_duplicate_session", False)):
+            await send_to(ws, {
+                "type": "session_elsewhere",
+                "session_id": sid,
+                "holder_pid": holder.holder_pid,
+                "started": holder.started,
+                "port": holder.port,          # None => not a focusable hub
+                "cwd": msg.get("cwd") or "",
+                "account": account or "",
+            })
+            await _push_session_list(ws)      # so declining lands on the list
+            return True
         cwd = msg.get("cwd") or find_session_cwd(sid, account) or default_cwd
         try:
             rt = await _create_runtime(cwd=cwd, resume=sid, config_dir=account)

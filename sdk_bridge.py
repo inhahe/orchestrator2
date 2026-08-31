@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import sys
 import time
 import traceback
 from collections import deque
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
@@ -207,7 +209,110 @@ async def cancel_and_join(task: asyncio.Task, what: str) -> None:
 # performance budget.  A hang now shows "connecting..." for longer, but that
 # state is honest and visible: the timer keeps running and typed prompts land in
 # the pending panel rather than vanishing.
+#
+# --- Why one flat number is still not enough ------------------------------
+#
+# From a report: "i resumed three sessions under ..\os, two of them took a long
+# time to connect, the third hasn't connected yet and is on its 8th attempt."
+# The 180s above was never reached, because it is not the only deadline in the
+# handshake and it is not the smaller one.  ``ClaudeSDKClient.connect()`` waits
+# on its ``initialize`` control request with
+#
+#     initialize_timeout = max(int(os.environ.get(
+#         "CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "60000")) / 1000.0, 60.0)
+#
+# so out of the box the *SDK* gives up at 60s, ours never fires, and the error
+# surfaces as ``Control request timeout: initialize``.  Every one of those nine
+# failures was 65.3s +/- 0.1s apart -- a fixed cutoff, not a variable fault.
+#
+# The cost being cut off is real work: on resume the CLI reads and parses the
+# whole session JSONL to rebuild the conversation, so the handshake is O(file).
+# Measured directly, uncontended, on the three sessions in that report:
+#
+#     348 MB  ->  ~58s  (connected, on the second try)
+#     452 MB  ->  ~58s  (connected)
+#    1293 MB  ->  148s  (never connected: 60s ceiling, 10 attempts, all 65.3s)
+#
+# ~115 s/GB.  The 1.29 GB session was not slow, or hung, or broken -- it was
+# structurally impossible, and no amount of retrying could have changed that.
+# A fixed budget is the wrong shape for a cost that scales with a file we can
+# simply measure, so the budget is derived from the file instead: small sessions
+# keep the tight 180s backstop, and only a session that has earned more gets it.
+#
+# The per-GB slope is ~3x the measured rate.  That is deliberate headroom for a
+# cold file cache and for whatever else the machine is doing; the number this
+# guards against is a *hang*, which is unbounded, so being generous costs
+# nothing while being tight costs the session entirely.
 CONNECT_TIMEOUT = 180.0
+CONNECT_TIMEOUT_PER_GB = 360.0
+CONNECT_TIMEOUT_MAX = 1800.0
+
+_GB = 1024.0 ** 3
+
+
+def connect_timeout_for(session_bytes: int | None) -> float:
+    """Connect budget for a session whose JSONL is *session_bytes* long.
+
+    ``None``/0 (a fresh session, or a resume whose file we cannot find) gets the
+    flat backstop -- there is nothing to read, so there is nothing to wait for.
+    """
+    if not session_bytes or session_bytes < 0:
+        return CONNECT_TIMEOUT
+    return min(CONNECT_TIMEOUT + CONNECT_TIMEOUT_PER_GB * (session_bytes / _GB),
+               CONNECT_TIMEOUT_MAX)
+
+
+def _raise_sdk_initialize_ceiling() -> None:
+    """Lift the SDK's own ``initialize`` deadline above ours.
+
+    The SDK reads ``CLAUDE_CODE_STREAM_CLOSE_TIMEOUT`` (milliseconds) from
+    *this* process's ``os.environ`` -- not from ``options.env`` -- on every
+    ``connect()``, and floors it at 60s.  Left alone it pre-empts every budget
+    computed above, so the one knob that decides whether a large session can
+    resume at all is an environment variable we never set.
+
+    Set once, flat, above ``CONNECT_TIMEOUT_MAX``: it exists only so that it is
+    never the deadline that fires.  ``connect_timeout_for()`` stays the
+    discriminating one, because it is the one that knows how big the file is.
+    An existing larger value is left alone -- someone raising it by hand meant
+    it, and this only ever needs to move the ceiling up.
+    """
+    want_ms = int((CONNECT_TIMEOUT_MAX + 60.0) * 1000)
+    key = "CLAUDE_CODE_STREAM_CLOSE_TIMEOUT"
+    try:
+        have_ms = int(os.environ.get(key, "0"))
+    except ValueError:
+        have_ms = 0
+    if have_ms < want_ms:
+        os.environ[key] = str(want_ms)
+
+
+_raise_sdk_initialize_ceiling()
+
+
+# Resuming a session re-reads its whole JSONL, so two large sessions connecting
+# at once do not go twice as fast -- they contend for the same disk and each
+# takes about twice as long, which is how a startup that seeds several sessions
+# turns a comfortable handshake into a timed-out one.  In the report above all
+# three CLIs spawned within 0.1s of each other and the two that succeeded landed
+# at 58.5s and 58.3s: all but identical, and both a hair under the 60s ceiling
+# they were racing.  Serialising them costs nothing in total (the disk does the
+# same work either way) and lets each finish as early as it can, so none of them
+# is pushed over its budget by the others.
+#
+# Only *large* resumes take the lock.  A small session's handshake is not
+# disk-bound and queueing it behind a multi-minute read would be a pure
+# regression, so the threshold is set where the read starts to dominate.
+HEAVY_CONNECT_BYTES = 128 * 1024 * 1024
+_heavy_connect_lock: asyncio.Lock | None = None
+
+
+def _heavy_lock() -> asyncio.Lock:
+    """Process-wide lock, created lazily so it binds to the running loop."""
+    global _heavy_connect_lock
+    if _heavy_connect_lock is None:
+        _heavy_connect_lock = asyncio.Lock()
+    return _heavy_connect_lock
 
 # --- Why the bg-done bell waits before it rings ---------------------------
 #
@@ -348,7 +453,7 @@ def _is_transport_death(exc: BaseException) -> bool:
     return False
 
 
-def _exc_reason(exc: BaseException) -> str:
+def _exc_reason(exc: BaseException, budget: float = CONNECT_TIMEOUT) -> str:
     """A human-readable reason for *exc* that is never the empty string.
 
     ``str(asyncio.TimeoutError())`` is ``""``, and several SDK errors raise with
@@ -356,9 +461,14 @@ def _exc_reason(exc: BaseException) -> str:
     connection failed" with nothing after the colon.  Falls back to the class
     name, and squashes the SDK's multi-line "Error output: …" tail so the
     message stays one line in the transcript.
+
+    *budget* is the deadline that actually applied, which since
+    ``connect_timeout_for()`` is no longer ``CONNECT_TIMEOUT`` for every session.
+    Reporting the constant instead of the real one would tell the user a number
+    that never elapsed.
     """
     if isinstance(exc, asyncio.TimeoutError):
-        return f"timed out after {CONNECT_TIMEOUT:.0f}s"
+        return f"timed out after {budget:.0f}s"
     text = (str(exc) or "").strip()
     if not text:
         return type(exc).__name__
@@ -577,6 +687,10 @@ class SDKBridge:
         # said on the way out — see STDERR_TAIL_LINES and _drain_stderr().
         self._stderr_tail: deque[str] = deque(maxlen=STDERR_TAIL_LINES)
         self._stderr_last_at: float = 0.0
+        # The connect budget the last attempt actually ran under.  It varies
+        # with session size, so the failure message has to read it rather than
+        # quote the constant.
+        self._last_connect_budget: float = CONNECT_TIMEOUT
         # Generation counter for dispatcher tasks.  Each connect() bumps
         # this so we can tell live dispatchers apart in logs and detect
         # orphaned ones (stale tasks that survived a reconnect).
@@ -721,6 +835,25 @@ class SDKBridge:
     # Connect / disconnect / reconnect
     # ------------------------------------------------------------------
 
+    def _resume_jsonl_size(self, resume_sid: str | None) -> int:
+        """Size in bytes of the JSONL this connect will make the CLI re-read.
+
+        0 when there is nothing to resume, or when the file cannot be located --
+        both mean "no measured reason to extend the budget", which correctly
+        falls back to the flat ``CONNECT_TIMEOUT``.  Never raises: this only
+        decides how long to wait, so a stat failure must not fail the connect.
+        """
+        if not resume_sid:
+            return 0
+        try:
+            project = find_session_dir(resume_sid,
+                                       getattr(self.config, "config_dir", None))
+            if project is None:
+                return 0
+            return (project / f"{resume_sid}.jsonl").stat().st_size
+        except Exception:
+            return 0
+
     async def connect(self, resume_id: str | None = None) -> None:
         """Create SDK client, connect, and start the message dispatcher.
 
@@ -797,36 +930,68 @@ class SDKBridge:
             pass
 
         self.state.connecting = True
-        started = time.monotonic()
-        self.state.connect_started_at = started
+        # Not the connect clock — see the lock below.  This only makes the UI's
+        # "connecting (Ns)" timer start running now, so a session sitting in the
+        # queue behind a large read still looks alive rather than frozen.
+        queued_at = time.monotonic()
+        self.state.connect_started_at = queued_at
         await self.broadcast({"type": "status_update",
                               "status": state_to_status_dict(self.state, self.config)})
 
+        # Budget from the file the CLI is about to re-read, not from a constant
+        # that cannot know how big it is.  See connect_timeout_for().
+        jsonl_bytes = self._resume_jsonl_size(getattr(options, "resume", None))
+        budget = connect_timeout_for(jsonl_bytes)
+        self._last_connect_budget = budget
+
         try:
-            # Bound the connect so a hung CLI handshake can't wedge the UI on
-            # "connecting…" indefinitely.  On timeout/failure, tear down the
-            # half-open client so the retry starts from a clean slate (a
-            # timed-out connect can leave a dead subprocess and ``self.client``
-            # pointing at an unusable client).
-            try:
-                await asyncio.wait_for(self.client.connect(), timeout=CONNECT_TIMEOUT)
-                # Log the handshake cost on *success* too.  Only failures used
-                # to log, so the question "is CONNECT_TIMEOUT above the real
-                # distribution or inside it?" could only be answered by
-                # correlating two unrelated INFO lines by timestamp.  It is the
-                # one number needed to tune this, so record it directly.
-                log.info("SDK connected in %.1fs (timeout %.0fs)",
-                         time.monotonic() - started, CONNECT_TIMEOUT)
-            except BaseException as exc:
-                if isinstance(exc, asyncio.TimeoutError):
-                    log.error("SDK connect timed out after %.0fs — retrying",
-                              CONNECT_TIMEOUT)
+            # A large resume is a long sequential read; two of them at once just
+            # halve each other's speed and push both towards their deadline, so
+            # they queue instead.  Small sessions skip the lock entirely.
+            heavy = jsonl_bytes >= HEAVY_CONNECT_BYTES
+            lock = _heavy_lock() if heavy else None
+            if lock is not None and lock.locked():
+                log.info("connect: waiting for another large session to finish "
+                         "loading (%.0f MB to read)", jsonl_bytes / (1024 * 1024))
+            async with nullcontext() if lock is None else lock:
+                # The one and only connect clock, and it starts *after* the
+                # queue: time spent waiting for another session's read is not
+                # time this CLI spent hanging, and charging it to the budget
+                # would time out the sessions at the back of the queue for the
+                # sin of being in it.  There is deliberately no other
+                # ``started =`` in this method — see the test that checks it.
+                started = time.monotonic()
+                if lock is not None:
+                    log.info("connect: %.0f MB session cleared the queue after "
+                             "%.1fs", jsonl_bytes / (1024 * 1024),
+                             started - queued_at)
+                # Bound the connect so a hung CLI handshake can't wedge the UI
+                # on "connecting…" indefinitely.  On timeout/failure, tear down
+                # the half-open client so the retry starts from a clean slate (a
+                # timed-out connect can leave a dead subprocess and
+                # ``self.client`` pointing at an unusable client).
                 try:
-                    await self.client.disconnect()
-                except Exception:
-                    pass
-                self.client = None
-                raise
+                    await asyncio.wait_for(self.client.connect(), timeout=budget)
+                    # Log the handshake cost on *success* too.  Only failures
+                    # used to log, so the question "is the budget above the real
+                    # distribution or inside it?" could only be answered by
+                    # correlating two unrelated INFO lines by timestamp.  It is
+                    # the one number needed to tune this, so record it directly
+                    # — with the session size, which is what sets the budget.
+                    log.info("SDK connected in %.1fs (budget %.0fs, %.0f MB)",
+                             time.monotonic() - started, budget,
+                             jsonl_bytes / (1024 * 1024))
+                except BaseException as exc:
+                    if isinstance(exc, asyncio.TimeoutError):
+                        log.error("SDK connect timed out after %.0fs "
+                                  "(%.0f MB session) — retrying",
+                                  budget, jsonl_bytes / (1024 * 1024))
+                    try:
+                        await self.client.disconnect()
+                    except Exception:
+                        pass
+                    self.client = None
+                    raise
         finally:
             self.state.connecting = False
             self.state.connect_started_at = None
@@ -3470,7 +3635,12 @@ class SDKBridge:
                 # it — the single most useful fact about the failure, that it
                 # was a timeout rather than a refusal, was the one thing not
                 # reported.  Name it explicitly.
-                _why = _exc_reason(exc)
+                # Report the budget that actually applied to *this* session,
+                # not the constant — a 1.29 GB resume is given minutes and
+                # saying "timed out after 180s" would name a deadline that
+                # never elapsed.
+                _why = _exc_reason(exc, getattr(self, "_last_connect_budget",
+                                                CONNECT_TIMEOUT))
                 log.error("SDK connect failed (attempt %d): %s",
                           _connect_attempt, _why)
 
