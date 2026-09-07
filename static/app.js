@@ -164,7 +164,7 @@ const App = (() => {
       // The server drops this ws from its lobby-watcher set on disconnect, so
       // forget any prior subscription — the next render()/show() must re-send
       // lobby_watch to resume live updates on this fresh socket.
-      if (window.Lobby && Lobby.onReconnect) Lobby.onReconnect();
+      if (typeof Lobby !== 'undefined' && Lobby.onReconnect) Lobby.onReconnect();
       // Flush any prompts the user typed while the socket was down.
       _flushPending();
       // Drive an open/new request once (only on the first connect, not on
@@ -478,7 +478,10 @@ const App = (() => {
     // Lobby: the session this tab tried to open is already live in another hub
     // window (opening it here would fork a duplicate).  Offer to go there.
     if (type === 'session_elsewhere') {
-      Lobby.onSessionElsewhere(msg);
+      // Async now (it probes whether the other hub is reachable before
+      // offering to navigate). Fire-and-forget, but never as an
+      // unhandled rejection.
+      Promise.resolve(Lobby.onSessionElsewhere(msg)).catch(() => {});
       return;
     }
 
@@ -515,27 +518,27 @@ const App = (() => {
         } catch (_) {}
       }
       Lobby.onAttached(msg.session);
-      // A /switch that finished lands here (server re-attached this socket to
-      // the copied session's runtime) — close the switch overlay.
-      if (window.Switch) Switch.close();
+      // A /move that finished lands here (server re-attached this socket to
+      // the copied session's runtime) — close the move overlay.
+      if (typeof Move !== 'undefined') Move.close();
       return;
     }
 
-    // /switch: account list for the picker overlay.
-    if (type === 'switch_accounts') {
-      if (window.Switch) Switch.renderAccounts(msg);
+    // /move: account list for the picker overlay.
+    if (type === 'move_accounts') {
+      if (typeof Move !== 'undefined') Move.renderAccounts(msg);
       return;
     }
 
-    // /switch: the copy/switch failed — show it in the overlay.
-    if (type === 'switch_error') {
-      if (window.Switch) Switch.error(msg);
+    // /switch: the copy/move failed — show it in the overlay.
+    if (type === 'move_error') {
+      if (typeof Move !== 'undefined') Move.error(msg);
       return;
     }
 
-    // /switch: server accepted the copy; `attached` will follow and close the
+    // /move: server accepted the copy; `attached` will follow and close the
     // overlay.  No action needed here (kept for protocol clarity).
-    if (type === 'switch_done') {
+    if (type === 'move_done') {
       return;
     }
 
@@ -598,7 +601,7 @@ const App = (() => {
     if (type === 'server_restart') {
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       _serverShutdown = true;  // suppress the normal auto-reconnect
-      if (window.Lobby && Lobby.showReloadingAndPoll) Lobby.showReloadingAndPoll();
+      if (typeof Lobby !== 'undefined' && Lobby.showReloadingAndPoll) Lobby.showReloadingAndPoll();
       return;
     }
 

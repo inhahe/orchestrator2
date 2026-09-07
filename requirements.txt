@@ -1,6 +1,12 @@
-claude-agent-sdk>=0.1.59
+claude-agent-sdk>=0.2.151
 fastapi>=0.115
 graphifyy>=0.9.13
 psutil>=5.9
 uvicorn>=0.34
 websockets>=15.0
+
+# Only the session-picker TUI (copy_session_tui.py, reached via --resume /
+# --copy / `python copy_session.py`) needs this.  Everything else -- including
+# the hub's own account discovery and /switch -- imports copy_session.py, which
+# deliberately does not.  Without it you lose the picker and nothing more.
+textual>=0.80

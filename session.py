@@ -71,7 +71,25 @@ def _sanitize_cwd(cwd: str) -> str:
 # it to a small JSON file so it survives a server restart.  It's stored under
 # the active config dir (account-scoped, like sessions) but *outside* the
 # ``projects/`` tree so it can never be mistaken for Claude session data.
+#
+# **A queue belongs to a session, not to a directory.**  It used to be keyed by
+# cwd alone and restored unconditionally, which meant a *brand-new* session
+# started in a directory inherited whatever an older session had left queued
+# there -- and because ``connect()`` ends by calling
+# ``_poke_for_queued_prompt()``, that inherited prompt was sent immediately, as
+# a real turn, with no user action.  Reported 2026-09-03: a fresh
+# ``--no-continue`` session in a directory re-ran a prompt from a previous
+# session and had to be aborted.  An 18-day-old queue file was still on disk
+# waiting to do it again.
+#
+# So the file is keyed by session id and only ever restored into that same
+# session, with an age cap as a second line of defence.  See
+# known-issues.md, "A new session inherited an old session's queued prompt".
 # ---------------------------------------------------------------------------
+
+# A queue is meant to survive a server restart, not a week.  Anything older is
+# a prompt the user has long since re-typed, re-thought, or forgotten.
+QUEUE_MAX_AGE_S = 24 * 3600
 
 def _orch2_state_dir() -> Path:
     """Return ``<config-dir>/orchestrator2`` (config-dir = CLAUDE_CONFIG_DIR or ~/.claude)."""
@@ -80,36 +98,91 @@ def _orch2_state_dir() -> Path:
     return root / "orchestrator2"
 
 
-def queue_file_for_cwd(cwd: str) -> Path:
-    """Path to the persisted queue file for *cwd* (account + cwd scoped)."""
+def queue_file_for_cwd(cwd: str, session_id: str | None = None) -> Path:
+    """Path to the persisted queue file for a session working in *cwd*.
+
+    Scoped by account (the config dir), *cwd* and **session id**.  The session
+    id is in the filename rather than only inside the file so that two sessions
+    open on the same directory cannot overwrite each other's queue -- the hub
+    hosts several at once, and both would otherwise save to one path and the
+    last writer would win.
+
+    A session with no id yet is not persisted at all -- see
+    :func:`save_persisted_queue` -- so the id is always present in practice;
+    the ``None`` case exists only so the path is still computable for tests
+    and diagnostics.
+    """
     try:
         resolved = str(Path(cwd).resolve(strict=False))
     except OSError:
         resolved = cwd
-    return _orch2_state_dir() / "queues" / f"{_sanitize_cwd(resolved)}.json"
+    slot = _sanitize_cwd(session_id) if session_id else "new"
+    return _orch2_state_dir() / "queues" / f"{_sanitize_cwd(resolved)}__{slot}.json"
 
 
-def load_persisted_queue(cwd: str) -> list[str]:
-    """Load the persisted pending-prompt queue for *cwd* (empty on any error)."""
-    path = queue_file_for_cwd(cwd)
+def load_persisted_queue(cwd: str, session_id: str | None = None, *,
+                         max_age_s: float = QUEUE_MAX_AGE_S) -> list[str]:
+    """Load the pending-prompt queue *session_id* left in *cwd*.
+
+    Returns ``[]`` for anything that is not unambiguously this session's own
+    recent work.  Three independent gates, because restoring the wrong queue is
+    not a cosmetic bug -- the restored prompt is *sent*, as a turn, without the
+    user asking:
+
+    * **the file is session-scoped** (see :func:`queue_file_for_cwd`), so a
+      different session in the same directory reads a different path;
+    * **the recorded id must still match**, which catches a file left behind by
+      an older session that happened to reuse the slot;
+    * **the queue must be fresh** (``max_age_s``, 24 h by default) -- a queue
+      exists to survive a server restart, and one from last week is a prompt
+      the user has long since moved on from.
+
+    Legacy files written before the id scoping are simply never found, which is
+    the intended outcome: they are exactly the ones that caused the bug.
+    """
+    if session_id is None:
+        # No session, nothing to restore *into*.  This is the load-bearing half
+        # of the fix: it makes "start fresh" safe at the one place that reads
+        # the file, instead of depending on every call site to ask correctly.
+        # A --no-continue session has no id, so it can never inherit anything.
+        return []
+    path = queue_file_for_cwd(cwd, session_id)
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
         return []
-    items = data.get("queue") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return []
+    if data.get("session_id") != session_id:
+        return []
+    saved_at = data.get("saved_at")
+    if not isinstance(saved_at, (int, float)):
+        return []
+    if max_age_s > 0 and (time.time() - saved_at) > max_age_s:
+        return []
+    items = data.get("queue")
     if not isinstance(items, list):
         return []
     return [x for x in items if isinstance(x, str)]
 
 
-def save_persisted_queue(cwd: str, items: Any) -> None:
-    """Atomically write the pending-prompt queue for *cwd* to disk.
+def save_persisted_queue(cwd: str, items: Any,
+                         session_id: str | None = None) -> None:
+    """Atomically write *session_id*'s pending-prompt queue for *cwd* to disk.
 
     When *items* is empty the file is removed so stale empties don't linger.
     Failures are swallowed — persistence must never break queue operations.
+
+    *session_id* is read at save time rather than bound once, so a session
+    acquires persistence the moment it has an identity, without extra plumbing.
+    Before that there is nothing to save *for*: a queue that could not be
+    restored into anything is litter at best, and something another session
+    might pick up at worst.
     """
-    path = queue_file_for_cwd(cwd)
+    if session_id is None:
+        return
+    path = queue_file_for_cwd(cwd, session_id)
     lst = [str(x) for x in items]
     try:
         if not lst:
@@ -121,13 +194,14 @@ def save_persisted_queue(cwd: str, items: Any) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"cwd": cwd, "queue": lst, "saved_at": time.time()}, f)
+            json.dump({"cwd": cwd, "session_id": session_id,
+                       "queue": lst, "saved_at": time.time()}, f)
         os.replace(tmp, path)
     except OSError:
         pass
 
 
-def _normalize_path_for_compare(p: str) -> str:
+def normalize_path_for_compare(p: str) -> str:
     """Normalise paths for comparison (backslash → slash, lowercase on Win)."""
     s = p.replace("\\", "/").rstrip("/")
     if sys.platform == "win32":
@@ -162,7 +236,7 @@ def find_project_for_cwd(cwd: str) -> Path | None:
         target = str(Path(cwd).resolve(strict=False))
     except OSError:
         target = cwd
-    target_norm = _normalize_path_for_compare(target)
+    target_norm = normalize_path_for_compare(target)
     projects = claude_projects_dir()
     if not projects.exists():
         return None
@@ -171,7 +245,7 @@ def find_project_for_cwd(cwd: str) -> Path | None:
             continue
         for jsonl in project.glob("*.jsonl"):
             stored = sniff_session_cwd(jsonl)
-            if stored and _normalize_path_for_compare(stored) == target_norm:
+            if stored and normalize_path_for_compare(stored) == target_norm:
                 return project
             break  # only check one jsonl per project
     return None
@@ -1542,6 +1616,12 @@ def list_sessions_for_project(project_dir: Path) -> list[dict[str, Any]]:
 # Session history — structured for the web frontend
 # ---------------------------------------------------------------------------
 
+#: Hard ceiling on a tail read, regardless of what the line-size estimate
+#: suggests.  See the arithmetic in _tail_read_jsonl: without it the "tail" is
+#: half the file, so a 1.4 GB transcript read 724 MB to show a screenful.
+MAX_TAIL_BYTES = 32 * 1024 * 1024
+
+
 def _tail_read_jsonl(
     jsonl: Path,
     max_records: int,
@@ -1588,10 +1668,28 @@ def _tail_read_jsonl(
         return records, 0
 
     # Large file — binary seek to approximate tail position.
-    # Over-read by 4x the average line estimate to ensure we get enough.
-    # Average JSONL line in our sessions is ~2-10 KB; budget generously.
+    #
+    # The estimate below derives the average line size *from the file size*,
+    # which makes ``seek_bytes`` come out at exactly ``max_records * 4 / (
+    # max_records * 8)`` = **half the file, whatever its size**:
+    #
+    #     1448 MB transcript -> 724 MB read      603 MB -> 302 MB
+    #      588 MB transcript -> 294 MB read      ... always 50%
+    #
+    # That is not a tail read, and on a multi-session launch several of them
+    # at once moved ~4 GB and turned a 5 s attach into 42 s.  It also missed
+    # its own target: 294 MB of that file yielded 693 records against a
+    # ``max_records`` of 2000, because these transcripts carry enormous tool
+    # results.
+    #
+    # So the estimate is kept as a *lower* bound and capped absolutely.  A
+    # bounded read is the point: whatever the average line turns out to be, the
+    # cost of opening a session must not scale with the size of its history.
+    # Fewer records than ``max_records`` is an acceptable outcome — the newest
+    # ones are the ones anybody looks at, and MAX_TAIL_BYTES is chosen to cover
+    # a screenful many times over even at the pathological line sizes above.
     avg_line_bytes = max(file_size // max(max_records * 8, 1), 2048)
-    seek_bytes = min(max_records * avg_line_bytes * 4, file_size)
+    seek_bytes = min(max_records * avg_line_bytes * 4, file_size, MAX_TAIL_BYTES)
 
     records = []
     try:
@@ -1630,14 +1728,58 @@ def _tail_read_jsonl(
     return records, skipped
 
 
+def last_todos_from_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The plan as of the most recent ``TodoWrite`` in *records*, or ``[]``.
+
+    ``TodoWrite`` is the **only** tool that writes the todo list — verified
+    against three live transcripts, whose tails contain ``TodoWrite`` and
+    nothing else touching todos (``TaskOutput``/``TaskStop`` belong to the
+    background-task system).  There is no separate "mark it done" call: each
+    write carries the *entire* list, every item tagged
+    ``pending`` / ``in_progress`` / ``completed``, and the strikethrough in the
+    panel is that ``completed`` status being rendered.  So the last write is
+    authoritative on its own, including which items are struck out, and there
+    is nothing further to scan for.
+
+    Returned verbatim, completed items included, because that is exactly what
+    the panel was showing before the restart — and ``/api/todos/clear`` already
+    exists for anyone who wants them gone.
+
+    Takes records the caller has *already* read: the transcript this seeds from
+    can be 600 MB and take ~40 s to walk, so a second pass over it just for
+    todos would be worse than the blank panel it fixes.
+    """
+    todos: list[dict[str, Any]] = []
+    for rec in records:
+        msg = rec.get("message")
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("name") == "TodoWrite"):
+                items = (block.get("input") or {}).get("todos")
+                if isinstance(items, list):
+                    todos = [t for t in items if isinstance(t, dict)]
+    return todos
+
+
 def render_session_history(
     jsonl: Path,
     *,
     max_history: int = 2000,
-) -> tuple[int, list[dict[str, Any]], list[str]]:
+) -> tuple[int, list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     """Build structured history for the frontend.
 
-    Returns ``(message_count, messages, orphan_ids)``.
+    Returns ``(message_count, messages, orphan_ids, todos)``.
+
+    *todos* is the plan as of the last ``TodoWrite`` in the records read — see
+    :func:`last_todos_from_records`.  It rides along on this call because the
+    read is the expensive part (a 600 MB transcript takes ~40 s) and doing it
+    twice to recover a side-panel would cost more than the panel is worth.
 
     Reads the JSONL, keeps the last *max_history* records, and emits
     structured messages the frontend can render.  tool_use and
@@ -1658,7 +1800,7 @@ def render_session_history(
             "subtype": "error",
             "content": f"Failed to open {jsonl.name}: {e}",
             "is_history": True,
-        }], []
+        }], [], []
 
     # --- Emit structured messages ---
     messages: list[dict[str, Any]] = []
@@ -1772,7 +1914,7 @@ def render_session_history(
                         })
             rendered += 1
 
-    return rendered, messages, []
+    return rendered, messages, [], last_todos_from_records(records)
 
 
 # ---------------------------------------------------------------------------

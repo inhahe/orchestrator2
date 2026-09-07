@@ -144,6 +144,12 @@
       <span class="status-sep">|</span>
       <span class="status-label">ctx</span>
       <span id="status-context" class="status-field" title="Context tokens">--</span>
+      <!-- CLI subprocess memory.  Hidden until it is worth looking at (see
+           status.js) — the bundled claude.exe leaks committed memory per
+           turn and gets recycled at the threshold. -->
+      <span class="status-sep" id="status-climem-sep" hidden>|</span>
+      <span class="status-label" id="status-climem-label" hidden>cli</span>
+      <span id="status-climem" class="status-field" title="CLI subprocess memory" hidden>--</span>
       <span class="status-sep">|</span>
       <span class="status-label">rate</span>
       <span id="status-ratelimit" class="status-field" title="Rate limits">--</span>
@@ -185,7 +191,7 @@
   <script src="/static/commands.js"></script>
   <script src="/static/chat.js"></script>
   <script src="/static/lobby.js"></script>
-  <script src="/static/switch.js"></script>
+  <script src="/static/move.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

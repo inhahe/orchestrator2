@@ -158,12 +158,24 @@ def classify(line: str) -> tuple[str, str]:
         return "autocompact", arg
     if cmd in ("max-context", "maxcontext", "max-ctx"):
         return "max-context", arg
+    if cmd == "recycle":
+        # ``now`` is the only form that needs the SDK, so it is the only one
+        # that gets queued for the worker; the rest are settings/reporting and
+        # answer immediately.
+        if arg.strip().lower() in ("now", "!"):
+            return "recycle", ""
+        return "recycle-show", arg
     if cmd == "bell":
         return "bell", arg
     if cmd == "mcp":
         return "mcp", arg
     if cmd == "queue":
         return "queue", arg
+    if cmd == "loop":
+        # Needs the *bridge* (the wakeup timer lives there, not on State), so
+        # unlike /queue it is handled in server.py rather than by the immediate
+        # dispatch table below.
+        return "loop", arg
     if cmd == "graphify":
         sub = arg.split(None, 1)[0].lower() if arg.strip() else ""
         if sub in _GRAPHIFY_CLI_SUBCOMMANDS:
@@ -210,6 +222,7 @@ _IMMEDIATE_HANDLERS: dict[str, str] = {
     "collapse-threshold": "_cmd_collapse_threshold",
     "autocompact":     "_cmd_autocompact",
     "max-context":     "_cmd_max_context",
+    "recycle-show":    "_cmd_recycle_show",
     "bell":            "_cmd_bell",
     "queue":           "_cmd_queue",
     "history":         "_cmd_history",
@@ -265,7 +278,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         ("/connect",                     "reconnect (revives a dropped browser socket, or the SDK)"),
         ("/resume [id|title]",           "resume a session (or open picker)"),
         ("/rename <name>",               "set a custom session title"),
-        ("/switch",                      "copy this session to another account & continue here"),
+        ("/move [path]",                 "copy this session to another account and/or directory, and continue it here"),
         ("/export [path]",               "save conversation as markdown"),
         ("/btw <question>",              "side question (separate context)"),
         ("/graphify [path] [flags]",     "build a knowledge graph (graphify)"),
@@ -276,6 +289,8 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         ("/collapse-threshold N",        "blocks shown before collapsing"),
         ("/autocompact [on|off|N]",      "auto-compact threshold"),
         ("/max-context [off|N]",         "cap context tokens"),
+        ("/loop [off|on|<seconds>]",     "show/stop/arm the self-paced wakeup loop"),
+        ("/recycle [now|off|<GiB>]",     "swap the CLI subprocess for a fresh one (reclaims its memory leak)"),
         ("/bell ...",                    "ring on these events (see /bell for details)"),
         ("/mcp [reconnect|enable|disable <server>]", "list/manage MCP servers"),
         ("/queue [N|send|drop N|clear]", "manage queued prompts"),
@@ -315,9 +330,29 @@ def _cmd_status(_payload: str, state: State, config: Config) -> CommandResult:
         "thinking": "on" if state.thinking_enabled else "off",
         "last_result": state.last_result_subtype,
         "last_usage": state.last_usage,
+        # Whether this hub is reachable from outside the LAN, and if not, how to
+        # make it so.  Surfaced here because /status is where people actually
+        # look; --help only helps someone who already suspects the flag exists.
+        "external_access": _external_access_summary(config),
         "status": status,
     }
     return CommandResult(messages=[_data_msg(info, label="status")])
+
+
+def _external_access_summary(config: Config) -> str:
+    """One line describing non-LAN reachability, with the fix when it's off."""
+    try:
+        import server
+        policy = server._resolve_external_auth(config)
+    except Exception:
+        return "unknown"
+    if policy.enabled:
+        return "on (password required for non-LAN clients)"
+    if policy.warn:
+        return ("ON BUT REFUSED — no password set. Set "
+                "--external-password / ORCH2_EXTERNAL_PASSWORD")
+    return ("off (LAN/loopback only). Enable with --external-access on "
+            "--external-password \"<pw>\"")
 
 
 def _cmd_login(payload: str, state: State, config: Config) -> CommandResult:
@@ -442,7 +477,8 @@ def _cmd_history(payload: str, state: State, config: Config) -> CommandResult:
             return CommandResult(messages=[_msg("N must be positive.", level="error")])
 
     try:
-        _count, history_msgs, _orphans = render_session_history(jsonl, max_history=limit)
+        _count, history_msgs, _orphans, _todos = render_session_history(
+            jsonl, max_history=limit)
     except Exception as e:
         return CommandResult(messages=[_msg(f"History load failed: {e}", level="error")])
 
@@ -639,6 +675,74 @@ def _cmd_max_context(payload: str, state: State, config: Config) -> CommandResul
     return CommandResult(
         messages=[_msg(f"max context → ~{n} tok (rolling-window trim)")],
         state_updates={"max_context_tokens": n},
+    )
+
+
+def _fmt_gib(n: int | None) -> str:
+    return "?" if n is None else f"{n / (1024 ** 3):.2f} GiB"
+
+
+def _cmd_recycle_show(payload: str, state: State, config: Config) -> CommandResult:
+    """View or change the CLI-recycling threshold.
+
+    Recycling swaps the bundled ``claude.exe`` for a fresh one resumed on the
+    same session, to reclaim the upstream per-turn commit leak.  See
+    ``SDKBridge._maybe_recycle_cli``.  ``/recycle now`` is handled by the
+    worker, not here, because it needs the SDK connection.
+    """
+    p = (payload or "").strip().lower()
+    cur = state.cli_recycle_at
+    if cur is None:
+        cur = float(getattr(config, "cli_recycle_at", 0.0) or 0.0)
+
+    if not p:
+        limit = "off" if cur <= 0 else f"{cur:g} GiB"
+        base = state.cli_mem_baseline
+        grown = ""
+        if state.cli_mem is not None and base is not None:
+            grown = f", +{_fmt_gib(state.cli_mem - base)} above baseline"
+        when = ""
+        if state.cli_recycled_at:
+            when = time.strftime(" at %H:%M:%S",
+                                 time.localtime(state.cli_recycled_at))
+        return CommandResult(messages=[_msg(
+            f"CLI recycling: limit {limit} · now {_fmt_gib(state.cli_mem)} "
+            f"(baseline {_fmt_gib(base)}{grown}) · "
+            f"{state.cli_recycles} recycle(s) this session{when}\n"
+            f"Usage: /recycle [now|off|<GiB>]"
+        )])
+
+    if p in ("off", "none", "0", "never"):
+        state.cli_recycle_at = 0.0
+        return CommandResult(
+            messages=[_msg("CLI recycling: off")],
+            state_updates={"cli_recycle_at": 0.0},
+        )
+    if p in ("on", "auto", "default"):
+        state.cli_recycle_at = None
+        d = float(getattr(config, "cli_recycle_at", 0.0) or 0.0)
+        return CommandResult(
+            messages=[_msg(f"CLI recycling → {d:g} GiB (startup default)")],
+            state_updates={"cli_recycle_at": d},
+        )
+    num = p
+    for suffix in ("gib", "gb", "g"):
+        if num.endswith(suffix):
+            num = num[: -len(suffix)].strip()
+            break
+    try:
+        gib = float(num)
+    except ValueError:
+        return CommandResult(messages=[_msg(
+            "Usage: /recycle [now|off|<GiB>]", level="error")])
+    if gib <= 0:
+        return CommandResult(messages=[_msg(
+            "/recycle <GiB> must be positive (use /recycle off to disable)",
+            level="error")])
+    state.cli_recycle_at = gib
+    return CommandResult(
+        messages=[_msg(f"CLI recycling → {gib:g} GiB")],
+        state_updates={"cli_recycle_at": gib},
     )
 
 

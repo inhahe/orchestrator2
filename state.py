@@ -636,6 +636,19 @@ class State:
     bell_events: set[str] = field(default_factory=set)
     pending_bell: str | None = None
 
+    # CLI subprocess memory (see SDKBridge._maybe_recycle_cli).  ``cli_mem``
+    # is the newest private-bytes reading of our ``claude.exe``,
+    # ``cli_mem_baseline`` what it read just after the last connect, and
+    # ``cli_recycles`` how many times this bridge has swapped the process out
+    # to reclaim the upstream per-turn commit leak.  None means "not measured"
+    # — never zero, which would read as "the CLI uses no memory".
+    cli_mem: int | None = None
+    cli_mem_baseline: int | None = None
+    cli_recycled_at: float | None = None    # wall-clock time.time() of the last
+    cli_recycles: int = 0
+    # Runtime override of config.cli_recycle_at (GiB), set by /recycle.
+    cli_recycle_at: float | None = None
+
     # Rate limits
     rate_limit_utils: dict[str, float] = field(default_factory=dict)
     rate_limit_status: str | None = None
@@ -864,6 +877,17 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         # Display gate for --show-thinking: thinking blocks are always sent in
         # full, this only decides whether they start expanded.
         "show_thinking": state.show_thinking,
+        # CLI subprocess memory.  Bytes (or None when unmeasured), plus the
+        # effective recycle limit in GiB so the UI can say how close it is.
+        # See SDKBridge._maybe_recycle_cli / /recycle.
+        "cli_mem": state.cli_mem,
+        "cli_mem_baseline": state.cli_mem_baseline,
+        "cli_recycles": state.cli_recycles,
+        "cli_recycle_at": (
+            state.cli_recycle_at
+            if state.cli_recycle_at is not None
+            else float(getattr(config, "cli_recycle_at", 0.0) or 0.0)
+        ),
     }
 
 

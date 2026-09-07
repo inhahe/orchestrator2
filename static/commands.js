@@ -253,10 +253,17 @@ const Commands = (() => {
     elInput.value = '';
     elInput.style.height = 'auto';
     _hideAc();
-    // `/switch` is a client-driven overlay (account picker → name → copy),
-    // not a backend slash command, so intercept it here.
-    if (text === '/switch' || text.startsWith('/switch ')) {
-      Switch.open();
+    // `/move` is a client-driven overlay (account picker → destination →
+    // copy), not a backend slash command, so intercept it here.  An argument
+    // is taken as the destination *directory* and prefills that field —
+    // `/move D:\some\project` is the fast path for the common case of moving
+    // a session to another project without changing account.
+    //
+    // The `=== '/move' || startsWith('/move ')` shape rather than a bare
+    // prefix test: `/moved` is a different command (an unknown one, which the
+    // server should say so about) and must not be swallowed here.
+    if (text === '/move' || text.startsWith('/move ')) {
+      Move.open(text.slice('/move'.length).trim());
       return;
     }
     // `/connect` (`/reconnect`) must work even when the browser↔server socket

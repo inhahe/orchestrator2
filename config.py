@@ -49,6 +49,14 @@ WAKEUP_MIN_DELAY = 60.0
 WAKEUP_MAX_DELAY = 3600.0
 WAKEUP_DEFAULT_DELAY = 60.0
 
+# How many times a fired wakeup may be pushed back because a turn is still
+# running before it is dropped.  The deferral exists so a wakeup that lands
+# mid-turn is not lost; it is not a licence to re-arm forever.  Unbounded, it
+# produced a loop nothing could end -- a busy session re-armed itself every 60s
+# indefinitely (reported 2026-09-06).  A working session is not a stalled one,
+# so after this many tries the nudge is simply unnecessary.
+WAKEUP_MAX_DEFERS = 10
+
 # Prompts the model passes verbatim to ScheduleWakeup for an autonomous loop with
 # no user task.  The runtime is expected to "resolve" these sentinels back to the
 # autonomous-loop instructions at fire time; since orchestrator2 owns the timer,
@@ -75,10 +83,11 @@ SLASH_COMMANDS = [
     "/help", "/history", "/status", "/debug", "/cost", "/cwd", "/clear", "/cls",
     "/interrupt", "/i", "/compact", "/effort", "/thinking", "/model",
     "/login", "/logout",
-    "/connect", "/reconnect", "/resume", "/rename", "/switch", "/export", "/models",
-    "/btw", "/graphify", "/autocompact", "/max-context", "/bell", "/mcp",
+    "/connect", "/reconnect", "/resume", "/rename", "/move", "/export",
+    "/models",
+    "/btw", "/graphify", "/autocompact", "/max-context", "/recycle", "/bell", "/mcp",
     "/collapse", "/collapse-threshold", "/show-thinking",
-    "/queue", "/quit", "/exit",
+    "/queue", "/loop", "/quit", "/exit",
     "/quit!", "/exit!",
 ]
 
@@ -155,11 +164,21 @@ INTERRUPT_SENTINEL = object()
 # Default server port.
 DEFAULT_PORT = 8420
 
-# Password required for connections from outside the LAN when neither
-# ``--external-password`` nor ``ORCH2_EXTERNAL_PASSWORD`` is set.  LAN/loopback
-# clients never need it.  Pass ``--external-password ""`` to disable external
-# access entirely.
-DEFAULT_EXTERNAL_PASSWORD = "uncommon11"
+# External (non-LAN) access is OFF unless the operator turns it on *and* sets a
+# password.  There is deliberately **no built-in default password**: shipping one
+# means every install is reachable from the internet with a secret that is not a
+# secret -- it is in the source.  This used to be ``"uncommon11"``, applied
+# automatically whenever the flag and env var were unset.
+#
+# Two independent knobs, because "on with no password" has to be a *refusal*
+# rather than an accident:
+#   * ``--external-access on|off`` / ``ORCH2_EXTERNAL_ACCESS`` -- the switch.
+#   * ``--external-password PW``   / ``ORCH2_EXTERNAL_PASSWORD`` -- the secret.
+# On + a password  -> allowed.  On + no password -> warned, and kept disabled.
+# Off (the default) -> blocked, quietly; that is the intended state.
+# LAN/loopback clients never need either.
+EXTERNAL_ACCESS_CHOICES = ("on", "off")
+DEFAULT_EXTERNAL_ACCESS = "off"
 
 # ---------------------------------------------------------------------------
 # Model / context-window helpers
@@ -450,6 +469,31 @@ class Config:
     # Bell
     bell_on: str = DEFAULT_BELL_EVENTS
 
+    # CLI memory recycling.
+    #
+    # Anthropic's bundled ``claude.exe`` leaks committed private bytes per
+    # turn: measured 2026-09-01, five idle-to-busy sessions held 173.6 GiB of
+    # *private* bytes against 12.2 GiB of working set (14.2x), and the excess
+    # was charged against Windows' commit limit while living neither in RAM
+    # nor in the pagefile.  Idle sampling showed flat deltas for idle
+    # processes and +21.9 MiB over 25 s for the one taking turns, so the
+    # growth is per-turn work in the CLI, not the orchestrator and not the
+    # browser.  Since the charge is against the *system* commit limit it
+    # starves unrelated programs (it blocked a 7 GiB render allocation on a
+    # box with 21 GiB of RAM free).
+    #
+    # The workaround is to periodically disconnect the CLI and reconnect with
+    # ``--resume <session>``, which starts a fresh process at its baseline.
+    # Only ever done at a turn boundary with no background tasks outstanding
+    # -- see SDKBridge._maybe_recycle_cli().
+    cli_recycle_at: float = 8.0        # GiB of CLI private bytes; 0 disables
+    cli_recycle_cooldown: int = 600    # min secs between recycles
+    # Don't recycle unless at least this much is expected back, measured
+    # against the private bytes seen just after the last connect.  Stops a
+    # session whose *baseline* already exceeds the limit (a huge transcript)
+    # from recycling on every single turn and never getting under it.
+    cli_recycle_min_reclaim: float = 1.0   # GiB
+
     # Misc
     append_system_prompt: str | None = None
     mcp_config: str | None = None
@@ -464,7 +508,10 @@ class Config:
     auto_shutdown: bool = False        # shut down when all browser tabs close
     session_idle_timeout: int = 300    # secs a viewer-less session lingers before teardown
     standalone: bool = False           # don't reuse a running hub; force a separate server
-    external_password: str | None = None  # non-LAN password; None = unspecified (→ env var, else DEFAULT_EXTERNAL_PASSWORD); "" = block all external
+    external_password: str | None = None  # non-LAN password; None = unspecified (→ env var); "" = no password
+    external_access: str | None = None    # "on"/"off"; None = unspecified (→ env var, else off)
+    resume_interrupted_turn: bool = True   # finish a turn the CLI reports as interrupted
+    agent_name: str | None = None          # cross-account agent identity (agent-comms spec §3)
     config_dir: str | None = None      # CLAUDE_CONFIG_DIR override
     skip_auto_login: bool = False      # internal: child skips the login check
     wait_port: bool = False            # internal: retry binding --port while an old instance releases it (restart)
@@ -754,6 +801,34 @@ def parse_args(argv: list[str] | None = None) -> Config:
         ),
     )
     ap.add_argument(
+        "--cli-recycle-at",
+        type=float,
+        default=8.0,
+        metavar="GIB",
+        help=(
+            "Recycle the bundled claude.exe (disconnect + resume) once its "
+            "private bytes reach this many GiB. Works around an upstream "
+            "per-turn commit leak in the CLI. Only ever fires at a turn "
+            "boundary with no background tasks running. Default: 8. "
+            "0 disables."
+        ),
+    )
+    ap.add_argument(
+        "--no-cli-recycle",
+        action="store_true",
+        help="Never recycle the CLI on memory growth (same as --cli-recycle-at 0).",
+    )
+    ap.add_argument(
+        "--cli-recycle-cooldown",
+        type=int,
+        default=600,
+        metavar="SECS",
+        help=(
+            "Minimum seconds between CLI recycles. Default: 600 (10 min). "
+            "Resuming a large transcript is not free, so this bounds the cost."
+        ),
+    )
+    ap.add_argument(
         "--no-wakeup",
         dest="wakeup_enabled",
         action="store_false",
@@ -844,15 +919,58 @@ def parse_args(argv: list[str] | None = None) -> Config:
         ),
     )
     ap.add_argument(
+        "--agent-name",
+        default=None,
+        metavar="NAME",
+        help=(
+            "This session's identity in the cross-account agent registry, so "
+            "other Claude sessions on this machine can address it (see "
+            "specs/agent-comms-spec.md).  Assigned, not derived: stable across "
+            "restarts.  When omitted it is inherited on resume, adopted if "
+            "exactly one non-live identity is registered for this directory, "
+            "or created; if several are registered the session REFUSES to "
+            "guess and lists them, because adopting the wrong one silently "
+            "inherits another agent's messages and halt state.  Falls back to "
+            "the ORCH2_AGENT_NAME environment variable."
+        ),
+    )
+    ap.add_argument(
+        "--no-resume-interrupted-turn",
+        dest="resume_interrupted_turn",
+        action="store_false",
+        help=(
+            "When resuming a session whose last turn was cut off mid-flight, "
+            "do NOT finish it.  By default orchestrator2 sets "
+            "CLAUDE_CODE_RESUME_INTERRUPTED_TURN so the agent picks the turn "
+            "back up; without it the CLI leaves a synthetic 'Continue from "
+            "where you left off.' prompt in the transcript, answers it with "
+            "'No response requested.', and abandons the work.  Turn this off "
+            "if you would rather open an interrupted session without it "
+            "immediately starting to act."
+        ),
+    )
+    ap.add_argument(
+        "--external-access",
+        choices=EXTERNAL_ACCESS_CHOICES,
+        default=None,
+        help=(
+            "Allow connections from outside the LAN.  Default: off — public "
+            "IPs are refused outright.  Turning it on ALSO requires a password "
+            "(--external-password / ORCH2_EXTERNAL_PASSWORD); on without one is "
+            "refused with a warning rather than left open.  Falls back to the "
+            "ORCH2_EXTERNAL_ACCESS env var when omitted.  Private/loopback "
+            "clients are unaffected and never need a password."
+        ),
+    )
+    ap.add_argument(
         "--external-password",
         default=None,
         help=(
-            "Password for non-LAN access.  Connections from private/loopback "
-            "IPs are always allowed; connections from public IPs require HTTP "
-            "Basic Auth with this password (leave the username blank).  When "
-            "omitted it falls back to the ORCH2_EXTERNAL_PASSWORD env var, then "
-            "to the built-in default 'uncommon11'.  Pass an empty string "
-            "(--external-password \"\") to block all external access."
+            "Password for non-LAN access, required by --external-access on.  "
+            "Connections from private/loopback IPs are always allowed; public "
+            "IPs need HTTP Basic Auth with this password (leave the username "
+            "blank).  Falls back to the ORCH2_EXTERNAL_PASSWORD env var.  There "
+            "is no built-in default: a shipped password is not a secret."
         ),
     )
     ap.add_argument(
@@ -926,6 +1044,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         append_system_prompt=args.append_system_prompt,
         mcp_config=args.mcp_config,
         auto_reconnect=args.auto_reconnect,
+        cli_recycle_at=(0.0 if args.no_cli_recycle else max(0.0, args.cli_recycle_at)),
+        cli_recycle_cooldown=max(0, args.cli_recycle_cooldown),
         wakeup_enabled=args.wakeup_enabled,
         debug=args.debug,
         log_file=args.log_file,
@@ -939,6 +1059,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
         session_idle_timeout=args.session_idle_timeout,
         standalone=args.standalone,
         external_password=args.external_password,
+        external_access=args.external_access,
+        resume_interrupted_turn=args.resume_interrupted_turn,
+        agent_name=args.agent_name,
         config_dir=args.config_dir,
         skip_auto_login=args.skip_auto_login,
         wait_port=args.wait_port,

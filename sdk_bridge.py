@@ -58,10 +58,29 @@ try:
 except ImportError:
     ThinkingBlock = None  # type: ignore[assignment]
 
+# The cross-account agent registry (specs/agent-comms-spec.md).  Optional on
+# purpose: a coordination convenience must never be the reason a session
+# refuses to run, so every call site degrades to a no-op when it is absent.
+try:
+    import agent_comms
+except Exception:  # pragma: no cover - defensive
+    agent_comms = None  # type: ignore[assignment]
+
+try:
+    import agent_tools
+except Exception:  # pragma: no cover - defensive
+    agent_tools = None  # type: ignore[assignment]
+
+#: How often to look for pending agent traffic.  Not every tick: the ticker
+#: runs per runtime every 2 s and this touches a shared SQLite store that
+#: several accounts write to.
+AGENT_POLL_INTERVAL = 5.0
+
 from config import (
     DISPATCHER_DEAD,
     INTERRUPT_SENTINEL,
     WAKEUP_DEFAULT_DELAY,
+    WAKEUP_MAX_DEFERS,
     WAKEUP_MAX_DELAY,
     WAKEUP_MIN_DELAY,
     WAKEUP_RESOLVED_PROMPT,
@@ -672,6 +691,12 @@ class SDKBridge:
         # a fresh turn.  A new turn (or stop) cancels any pending timer.
         self._wakeup_task: asyncio.Task | None = None
         self._wakeup_fire_at: float | None = None  # monotonic deadline, for logs
+        # How many times the current wakeup has been pushed back because a turn
+        # was running.  Bounded: see _wakeup_timer.
+        self._wakeup_defers = 0
+        # Set by ScheduleWakeup(stop=true) or /loop off, so the UI can say the
+        # loop was stopped rather than merely "nothing armed".
+        self._loop_stopped = False
         # Deferred ``bg-done`` bell.  See _arm_bg_done_bell().
         self._bg_done_bell_task: asyncio.Task | None = None
         # Set the moment we learn the CLI subprocess is gone (dispatcher crash,
@@ -698,6 +723,30 @@ class SDKBridge:
         # Session-integrity warning is announced once per bridge, not once per
         # reconnect — the condition is permanent and unfixable mid-session.
         self._integrity_warned = False
+
+        # CLI memory recycling.  The readings themselves live on ``state``
+        # (``cli_mem``, ``cli_mem_baseline``, ``cli_recycles``) because the
+        # status bar and ``/recycle`` both read them; only the cooldown clock
+        # is private, since it is a monotonic timestamp that means nothing
+        # outside this process.  See _maybe_recycle_cli().
+        self._cli_recycled_at: float = 0.0
+
+        # A reconnect a config command asked for that we declined to do
+        # immediately because background tasks were running — see
+        # _reconnect_or_defer().  Holds the human-readable reason ("model →
+        # opus") so the deferred application can name itself; None when nothing
+        # is pending.  Cleared by *any* reconnect, since the new CLI is built
+        # from current state and therefore satisfies whatever was waiting.
+        self._deferred_reconnect: str | None = None
+
+        # Cross-account agent identity (specs/agent-comms-spec.md).  Resolved
+        # once, on the first connect, and then stable for the life of the
+        # session; None means the registry is unavailable and every comms
+        # operation degrades to a no-op rather than blocking the session.
+        self.agent_identity: str | None = None
+        self._agent_repo: str = ""
+        self._agent_hb_at: float = 0.0
+        self._agent_poll_at: float = 0.0
 
         # Any mutation of the pending-prompt queue pokes the worker.  See
         # _poke_for_queued_prompt() for why this is wired to the *container*
@@ -771,6 +820,30 @@ class SDKBridge:
         if getattr(self.config, "disable_prompt_cache", False):
             kwargs["env"]["DISABLE_PROMPT_CACHING"] = "1"
 
+        # Finish a turn that was cut off mid-flight.
+        #
+        # When the CLI resumes a session whose last turn was interrupted (the
+        # process died, the machine was restarted, a recycle landed badly), its
+        # conversationRecovery layer appends a *synthetic* user message,
+        # "Continue from where you left off.", flagged ``isMeta``, plus an
+        # assistant sentinel "No response requested." so the transcript stays
+        # API-valid if nothing acts on it.
+        #
+        # In an interactive terminal the user is offered the choice and, on
+        # accepting, the CLI deletes that pair and re-enqueues it as a real
+        # prompt.  Non-interactively there is no chooser, so **without this env
+        # var the pair simply stays**: the session shows a prompt the user
+        # never typed, answered by a refusal to do anything, and the
+        # interrupted work is silently abandoned.  Reported 2026-09-06 across
+        # three restarted sessions.
+        #
+        # ``CLAUDE_CODE_RESUME_INTERRUPTED_TURN`` is the supported opt-in for
+        # exactly this path (cli/print.ts): remove the synthetic pair and
+        # re-enqueue it once, so the agent actually continues.  Doing neither
+        # is the one option with no upside, which is why this defaults on.
+        if getattr(self.config, "resume_interrupted_turn", True):
+            kwargs["env"]["CLAUDE_CODE_RESUME_INTERRUPTED_TURN"] = "1"
+
         # Session resume / continue logic.
         # Always prefer an explicit session id (from cwd lookup or --resume)
         # over the SDK's global continue_conversation, which ignores cwd.
@@ -811,8 +884,29 @@ class SDKBridge:
         # option is named ``mcp_servers`` and accepts a dict of server configs,
         # a path to a JSON file, or an inline JSON string; all forms are passed
         # through to the CLI's ``--mcp-config``.
+        servers: dict[str, Any] = {}
         if self.config.mcp_config:
-            kwargs["mcp_servers"] = self.config.mcp_config
+            if isinstance(self.config.mcp_config, dict):
+                servers.update(self.config.mcp_config)
+            else:
+                # A path or inline JSON: pass it through untouched, and give up
+                # on adding ours rather than trying to merge into a string.
+                kwargs["mcp_servers"] = self.config.mcp_config
+                servers = {}
+
+        # The one agent-facing tool the comms addendum asks for (§2): raising
+        # and lifting a halt must be *discoverable in the tool list*, because
+        # an agent cannot use what it does not know exists -- while messaging
+        # deliberately gets no new tool, since ListAgents/SendMessage already
+        # advertise it and only needed the registry scope widened.
+        if agent_tools is not None and "mcp_servers" not in kwargs:
+            srv = agent_tools.build_server(
+                identity_getter=lambda: self.agent_identity,
+                cwd_getter=lambda: getattr(self.config, "cwd", ""))
+            if srv is not None:
+                servers["agent-halt"] = srv
+        if servers:
+            kwargs["mcp_servers"] = servers
 
         # System prompt extension.
         if self.config.append_system_prompt:
@@ -1018,6 +1112,11 @@ class SDKBridge:
         # still recognised as a death rather than a first one.
         self._transport_dead = False
 
+        # Join the cross-account agent registry now that the session id is
+        # known: a resumed session inherits its prior identity by that id,
+        # which is the one case the spec calls unambiguous by definition.
+        await self.register_agent()
+
         # Anything the user typed during the connect went to
         # ``state.queued_prompts`` (that is what ``state.connecting`` routes),
         # and the poke it fired was declined because the client wasn't usable
@@ -1066,6 +1165,12 @@ class SDKBridge:
             self._message_dispatcher(gen=gen),
             name=f"sdk-dispatcher-{gen}",
         )
+
+        # What this session costs with a *fresh* CLI.  Sampled here, after the
+        # resume has been read, so it includes the transcript — the recycle
+        # policy compares against it to tell a leak from an honestly large
+        # session.  See _maybe_recycle_cli().
+        await self._note_cli_memory_baseline()
 
         # Every connect is a *resume*, and a resume is the moment a broken
         # parentUuid chain silently costs the model its history.  Check it here
@@ -1119,6 +1224,196 @@ class SDKBridge:
         proc = getattr(getattr(self.client, "_transport", None), "_process", None)
         pid = getattr(proc, "pid", None)
         return pid if isinstance(pid, int) and pid > 0 else None
+
+    # ------------------------------------------------------------------
+    # CLI memory recycling
+    # ------------------------------------------------------------------
+
+    async def _measure_cli_memory(self) -> int | None:
+        """Private bytes of our ``claude.exe``, or None if unmeasurable.
+
+        Records the reading in ``state.cli_mem`` so the status bar and
+        ``/recycle`` can show it without taking their own sample.  psutil
+        touches the OS, so it runs off the event loop.
+        """
+        pid = self._cli_pid()
+        if pid is None:
+            return None
+        try:
+            val = await asyncio.to_thread(proc_guard.private_bytes, pid)
+        except Exception:                     # a gauge must never break a turn
+            log.debug("CLI memory probe failed", exc_info=True)
+            return None
+        if val is not None:
+            self.state.cli_mem = val
+        return val
+
+    async def _note_cli_memory_baseline(self) -> None:
+        """Remember what this session costs with a *fresh* CLI."""
+        val = await self._measure_cli_memory()
+        self.state.cli_mem_baseline = val
+        if val is not None:
+            log.info("CLI pid %s baseline: %.2f GiB private",
+                     self._cli_pid(), val / _GB)
+
+    def _cli_recycle_limit(self) -> float:
+        """Effective private-bytes limit in GiB (0 = disabled).
+
+        ``/recycle`` writes a runtime override onto state; the flag is the
+        fallback, mirroring how ``_max_context_tokens`` and ``_compact_at``
+        already shadow their config values.
+        """
+        override = getattr(self.state, "cli_recycle_at", None)
+        if override is not None:
+            return max(0.0, float(override))
+        return max(0.0, float(getattr(self.config, "cli_recycle_at", 0.0) or 0.0))
+
+    async def _maybe_recycle_cli(self, *, force: bool = False) -> bool:
+        """Swap the CLI subprocess out if it has leaked past the limit.
+
+        **Why this exists.**  Anthropic's bundled ``claude.exe`` leaks
+        *committed* memory per turn.  Measured 2026-09-01 across five live
+        sessions: 173.6 GiB of private bytes against 12.2 GiB of working set
+        (14.2x), with 184.7 GiB of the machine's 254.6 GiB commit charge
+        residing neither in RAM nor in the pagefile — i.e. reserved and never
+        touched.  Sampling the processes across an idle gap showed flat or
+        negative deltas for the idle ones and +21.9 MiB over 25 s for the one
+        taking a turn, which places the growth in per-turn CLI work rather than
+        in this orchestrator or the browser.  Windows does not overcommit, so
+        that charge is deducted from a system-wide limit and starves unrelated
+        programs: it is what refused a 7 GiB allocation on a box with 21 GiB of
+        RAM free.
+
+        **The fix.**  A CLI's leak is bounded by its lifetime, so end its
+        lifetime.  ``reconnect()`` already disconnects, reaps the process and
+        its orphaned MCP servers, and reconnects with ``--resume <session>`` —
+        the new process starts at its baseline with the same transcript.  The
+        conversation is unaffected; the session id, history and cwd all
+        survive, because that is the identical path ``/model`` and ``/effort``
+        take on every use.
+
+        **When it is safe.**  Three conditions, all required:
+
+        * *No turn in flight.*  A recycle mid-turn discards the in-flight tool
+          result.  Guaranteed by the call site — this runs from
+          :meth:`_between_turns`, after the queued-prompt and compact branches.
+        * *No background tasks.*  The CLI's task registry is in-memory
+          (``AppStateStore``'s ``tasks: {}``) and ``--resume`` does not
+          rehydrate it, so a recycle loses the completion notification and the
+          ``TaskOutput`` handle for anything still running.  The OS processes
+          themselves survive — they are in no job object and the CLI's
+          shutdown path reaps no children — so this costs bookkeeping, not
+          work, but it is still a loss and worth waiting out.
+        * *Growth above the baseline.*  See ``cli_recycle_min_reclaim``.
+
+        Plus a cooldown, because resuming a large transcript is not free —
+        ``connect_timeout_for()`` budgets minutes for a multi-hundred-MB
+        session, and that cost would otherwise be paid every turn.
+
+        *force* (``/recycle now``) skips the limit, the growth check and the
+        cooldown — the user has asked for it explicitly — but **not** the
+        safety conditions, which exist to protect work in flight rather than to
+        ration recycles.
+
+        Returns True if a recycle happened.
+        """
+        config = self.config
+        state = self.state
+        limit_gib = self._cli_recycle_limit()
+        if limit_gib <= 0 and not force:
+            return False
+
+        # Safety conditions — never skipped, not even by ``force``.
+        if self.turn_active.is_set() or state.background_tasks or state.queued_prompts:
+            if force:
+                await self.broadcast({
+                    "type": "system_msg", "subtype": "error",
+                    "data": {"message": (
+                        "Not recycling: work is still in flight (a turn, a "
+                        "queued prompt, or a background task). Try again when "
+                        "the session is idle."
+                    )},
+                })
+            return False
+        if (self._transport_dead or self.client is None
+                or state.connecting or self.stop_event.is_set()):
+            if force:
+                await self.broadcast({
+                    "type": "system_msg", "subtype": "error",
+                    "data": {"message": "Not recycling: no live CLI connection "
+                                        "to replace."},
+                })
+            return False
+
+        now = time.monotonic()
+        cur = await self._measure_cli_memory()
+
+        if not force:
+            cooldown = float(getattr(config, "cli_recycle_cooldown", 0) or 0)
+            if self._cli_recycled_at and now - self._cli_recycled_at < cooldown:
+                return False
+            if cur is None:
+                return False
+            if cur < limit_gib * _GB:
+                return False
+            # Growth check.  Without it, a session whose fresh-CLI cost already
+            # exceeds the limit would recycle every single turn and never once
+            # get under it — paying a full resume each time to reclaim nothing.
+            base = state.cli_mem_baseline
+            min_reclaim = float(
+                getattr(config, "cli_recycle_min_reclaim", 1.0)) * _GB
+            if base is not None and cur - base < min_reclaim:
+                log.debug(
+                    "CLI at %.2f GiB (limit %.2f) but only %.2f GiB above its "
+                    "%.2f GiB baseline — not worth a resume",
+                    cur / _GB, limit_gib, (cur - base) / _GB, base / _GB,
+                )
+                return False
+
+        base = state.cli_mem_baseline
+        log.warning(
+            "recycling claude.exe pid %s: %s private (limit %.2f GiB, "
+            "baseline %s)%s",
+            self._cli_pid(),
+            "unknown" if cur is None else f"{cur / _GB:.2f} GiB",
+            limit_gib,
+            "unknown" if base is None else f"{base / _GB:.2f} GiB",
+            " [forced]" if force else "",
+        )
+        grew = "" if cur is None else (
+            f" — it had grown to {cur / _GB:.1f} GiB of committed memory")
+        await self.broadcast({
+            "type": "system_msg",
+            "subtype": "info",
+            "data": {"message": (
+                f"Recycling the CLI subprocess{grew}. "
+                f"The conversation is unaffected."
+            )},
+        })
+        self._cli_recycled_at = now
+        state.cli_recycled_at = time.time()
+        state.cli_recycles += 1
+        try:
+            await self.reconnect()
+        except Exception:
+            # A failed recycle must not end the turn loop: the old CLI is gone
+            # either way, and the worker's own reconnect handling (and the
+            # user's /connect) can still recover.  Re-raising here would
+            # propagate out of _between_turns and kill the worker.
+            log.exception("CLI recycle failed")
+            await self.broadcast({
+                "type": "system_msg",
+                "subtype": "error",
+                "data": {"message": "CLI recycle failed to reconnect — "
+                                    "use /connect to retry."},
+            })
+            return False
+        after = state.cli_mem
+        log.info("CLI recycled (#%d): %s → %s",
+                 state.cli_recycles,
+                 "unknown" if cur is None else f"{cur / _GB:.2f} GiB",
+                 "unknown" if after is None else f"{after / _GB:.2f} GiB")
+        return True
 
     async def disconnect(self) -> None:
         """Shut down client and dispatcher, and make sure the CLI is dead.
@@ -1359,6 +1654,12 @@ class SDKBridge:
                     f"again."
                 )},
             })
+            # Giving up is the one path here that does *not* go through
+            # reconnect(), so it is the one path that would leave the registry
+            # populated against a process that no longer exists — and
+            # _between_turns would then park in bg-wait for a wakeup nothing
+            # can send.  Same loss, so the same announcement.
+            await self._orphan_bg_tasks("the CLI exiting for good")
             return False
 
         await self.broadcast({
@@ -1389,19 +1690,137 @@ class SDKBridge:
         })
         return True
 
+    def _bg_task_labels(self) -> list[str]:
+        """Human-readable names for the running background tasks.
+
+        Used only for warnings, so it never raises on a half-populated entry:
+        a task registered from a ``ToolUseBlock`` we couldn't parse still has to
+        be *countable* and *nameable*, or the warning that it was lost is less
+        informative than the loss.
+        """
+        labels = []
+        for task_id, info in self.state.background_tasks.items():
+            label = (info.get("name") or info.get("command")
+                     or info.get("task_type"))
+            labels.append(str(label).strip() if label else f"task {task_id}")
+        return labels
+
+    async def _orphan_bg_tasks(self, why: str) -> int:
+        """Drop the background-task registry, and *say so*.
+
+        Every reconnect kills the CLI subprocess, and the CLI's task registry
+        is in-memory: ``--resume`` restores the transcript but not the running
+        tasks, so their completion notifications and ``TaskOutput`` handles are
+        gone.  We therefore have to clear our mirror of it or the panel would
+        show tasks that can never complete — and, worse,
+        :meth:`_between_turns` would keep parking in bg-wait for a
+        ``bg-all-done`` wakeup that nothing can ever send.
+
+        This used to be a bare ``log.info`` into a file nobody reads, which
+        made the loss invisible: an autonomous session parked on background
+        work would silently stop waiting and drop to idle, while the OS
+        processes it had spawned carried on running unattended.  Losing the
+        bookkeeping is sometimes unavoidable (the CLI died; the user asked for
+        a reconnect) — losing it *quietly* never is.
+
+        Returns the number of tasks orphaned.
+        """
+        labels = self._bg_task_labels()
+        if not labels:
+            return 0
+        self.state.background_tasks.clear()
+        self.state.completed_panel_bg.clear()
+        log.warning("orphaned %d bg task(s) on %s: %s",
+                    len(labels), why, ", ".join(labels))
+        shown = ", ".join(labels[:5])
+        if len(labels) > 5:
+            shown += f", and {len(labels) - 5} more"
+        plural = "" if len(labels) == 1 else "s"
+        await self.broadcast({
+            "type": "system_msg",
+            "subtype": "warning",
+            "data": {"message": (
+                f"{len(labels)} background task{plural} orphaned by {why} "
+                f"({shown}). The processes themselves may still be running, "
+                f"but the new CLI cannot see them — their results and "
+                f"completion notices are lost. Re-run anything you still need."
+            )},
+        })
+        return len(labels)
+
+    async def _reconnect_or_defer(self, reason: str) -> bool:
+        """Reconnect now, or wait for a quiescent point if work is in flight.
+
+        A ``/model``, ``/effort`` or ``/thinking`` change is *discretionary*:
+        the user wants it to take effect, but not at the price of orphaning
+        running background tasks (see :meth:`_orphan_bg_tasks`).  So when
+        background tasks are running we record the request and apply it the
+        moment they drain — which is exactly the trade :meth:`_maybe_recycle_cli`
+        already makes for the same reason.  Involuntary reconnects (a dead
+        transport, an explicit ``/connect``) do **not** come through here:
+        there is nothing to defer to when the CLI is already gone, and an
+        explicit ``/connect`` is the user overruling us on purpose.
+
+        Returns True if the reconnect happened now.
+        """
+        if not self.state.background_tasks:
+            await self.reconnect()
+            return True
+        n = len(self.state.background_tasks)
+        plural = "" if n == 1 else "s"
+        self._deferred_reconnect = reason
+        log.info("deferring reconnect (%s): %d bg task(s) running", reason, n)
+        await self.broadcast({
+            "type": "system_msg",
+            "subtype": "info",
+            "data": {"message": (
+                f"{reason} — takes effect once the {n} running background "
+                f"task{plural} finish{'es' if n == 1 else ''}. Reconnecting "
+                f"now would orphan {'it' if n == 1 else 'them'}. "
+                f"Use /connect to apply it immediately anyway."
+            )},
+        })
+        return False
+
+    async def _flush_deferred_reconnect(self) -> bool:
+        """Apply a reconnect :meth:`_reconnect_or_defer` postponed, if it is now safe.
+
+        Called from the two places the session can become quiescent: the top of
+        :meth:`_between_turns` (background tasks drained during a turn) and the
+        wakeup branch of :meth:`_await_next_prompt` (they drained while we were
+        parked, which is the common case — ``bg-all-done`` fires exactly then).
+        Cheap and idempotent, so extra call sites cost nothing.
+        """
+        reason = self._deferred_reconnect
+        if reason is None:
+            return False
+        if (self.state.background_tasks or self.turn_active.is_set()
+                or self.state.connecting):
+            return False
+        await self.broadcast({
+            "type": "system_msg",
+            "subtype": "info",
+            "data": {"message": f"Background tasks finished — applying {reason}."},
+        })
+        await self.reconnect()
+        return True
+
     async def reconnect(self) -> None:
         """Disconnect and reconnect with current session ID.
 
         **Must run on the worker task.**  See :meth:`_warn_if_foreign_task`.
         Outside callers push ``("connect", "")`` onto :attr:`event_queue`.
+
+        Any pending deferred reconnect is satisfied here: the new CLI is built
+        from *current* state, so whatever a ``/model`` switch was waiting to
+        apply has now applied.  Leaving the flag set would reconnect a second
+        time for no reason.
         """
         sid = self.state.session_id
-        # Purge stale bg tasks — old CLI subprocess is dead.
-        n_stale = len(self.state.background_tasks)
-        if n_stale:
-            self.state.background_tasks.clear()
-            self.state.completed_panel_bg.clear()
-            log.info("cleared %d stale bg task(s) on reconnect", n_stale)
+        self._deferred_reconnect = None
+        # The old CLI subprocess is about to die, taking its task registry with
+        # it.  Warn rather than log — see _orphan_bg_tasks().
+        await self._orphan_bg_tasks("the reconnect")
         await self.broadcast({
             "type": "system_msg",
             "subtype": "reconnecting",
@@ -1812,6 +2231,23 @@ class SDKBridge:
         if name != "ScheduleWakeup":
             return
 
+        # ``stop: true`` ends the loop.  This is the tool's documented way out
+        # ("call this tool with stop: true (omit every other field) -- the loop
+        # ends immediately and no further wakeups fire"), and it used to fall
+        # straight through to the arming code below: with every other field
+        # omitted, ``delaySeconds`` defaulted to 60 and the prompt resolved to
+        # the autonomous-loop text, so **asking to stop armed a fresh wakeup**.
+        # An agent that stopped its loop twice armed it twice, and reported
+        # wakeups "coming from outside my control" -- correctly, because
+        # nothing it could do would end them (2026-09-06).
+        if bool(inp.get("stop")):
+            had = self._wakeup_fire_at is not None
+            self._cancel_wakeup()
+            log.info("wakeup loop stopped by ScheduleWakeup(stop=true)%s",
+                     "" if had else " (none was armed)")
+            self._loop_stopped = True
+            return
+
         raw_delay = inp.get("delaySeconds", WAKEUP_DEFAULT_DELAY)
         try:
             delay = float(raw_delay)
@@ -1830,8 +2266,62 @@ class SDKBridge:
 
         self._arm_wakeup(delay, resolved)
 
-    def _arm_wakeup(self, delay: float, prompt: str) -> None:
-        """(Re)start the wakeup timer for *delay* seconds carrying *prompt*."""
+    # ------------------------------------------------------------------
+    # /loop -- operator control over the wakeup loop
+    # ------------------------------------------------------------------
+
+    def loop_status(self) -> dict[str, Any]:
+        """What the wakeup loop is doing, for ``/loop``.
+
+        The loop had no surface at all until an agent reported wakeups it could
+        not stop and asked the operator to "end the /loop on your end" -- with
+        no way for either of them to see whether one was armed, let alone end
+        it.  A background process that injects prompts into a conversation must
+        be inspectable by the person whose conversation it is.
+        """
+        fire_at = self._wakeup_fire_at
+        return {
+            "armed": fire_at is not None,
+            "seconds_left": (max(0.0, fire_at - time.monotonic())
+                             if fire_at is not None else None),
+            "defers": self._wakeup_defers,
+            "max_defers": WAKEUP_MAX_DEFERS,
+            "stopped": self._loop_stopped,
+            "enabled": bool(getattr(self.config, "wakeup_enabled", True)),
+        }
+
+    def stop_loop(self) -> bool:
+        """Cancel any pending wakeup.  True if one was armed.
+
+        Also latches ``_loop_stopped`` so the next ``/loop`` can say "stopped"
+        rather than the ambiguous "nothing armed" -- which is what an operator
+        sees both when they have just stopped it and when it never existed.
+        """
+        was = self._wakeup_fire_at is not None
+        self._cancel_wakeup()
+        self._wakeup_defers = 0
+        self._loop_stopped = True
+        log.info("wakeup loop stopped by /loop off%s",
+                 "" if was else " (none was armed)")
+        return was
+
+    def start_loop(self, delay: float, prompt: str | None = None) -> float:
+        """Arm a wakeup in *delay* seconds, clamped like the tool's own."""
+        delay = max(WAKEUP_MIN_DELAY, min(WAKEUP_MAX_DELAY, float(delay)))
+        self._arm_wakeup(delay, prompt or WAKEUP_RESOLVED_PROMPT)
+        return delay
+
+    def _arm_wakeup(self, delay: float, prompt: str,
+                    *, _keep_defers: bool = False) -> None:
+        """(Re)start the wakeup timer for *delay* seconds carrying *prompt*.
+
+        *_keep_defers* is set only by the mid-turn deferral, which is the same
+        wakeup being pushed back rather than a new one -- resetting the counter
+        there would make the bound meaningless.
+        """
+        if not _keep_defers:
+            self._wakeup_defers = 0
+            self._loop_stopped = False
         self._cancel_wakeup()
         self._wakeup_fire_at = time.monotonic() + delay
         self._wakeup_task = asyncio.create_task(
@@ -1881,11 +2371,27 @@ class SDKBridge:
         # live turn.  Defer instead of dropping — a turn that ends without the
         # model re-arming would otherwise strand the loop for good.
         if self.state.busy:
+            # Bounded, not indefinite.  This used to re-arm unconditionally, so
+            # a session that stayed busy re-armed itself every 60s forever --
+            # a loop nothing could end, since the agent's own stop was being
+            # swallowed too.  A deferral exists to survive a turn that happens
+            # to be in flight, not to outlive the loop it belongs to.
+            self._wakeup_defers += 1
+            if self._wakeup_defers > WAKEUP_MAX_DEFERS:
+                log.warning(
+                    "wakeup deferred %d times while busy — dropping it; the "
+                    "session is working, so the loop is not stalled",
+                    self._wakeup_defers)
+                self._wakeup_task = None
+                self._wakeup_fire_at = None
+                self._wakeup_defers = 0
+                return
             log.info(
-                "wakeup fired mid-turn — deferring %.0fs (turn still running)",
-                WAKEUP_MIN_DELAY,
+                "wakeup fired mid-turn — deferring %.0fs (turn still running, "
+                "defer %d/%d)",
+                WAKEUP_MIN_DELAY, self._wakeup_defers, WAKEUP_MAX_DEFERS,
             )
-            self._arm_wakeup(WAKEUP_MIN_DELAY, prompt)
+            self._arm_wakeup(WAKEUP_MIN_DELAY, prompt, _keep_defers=True)
             return
 
         # Self-clear: this task is firing, so it's no longer "pending".
@@ -3866,7 +4372,13 @@ class SDKBridge:
         has_compact = False
         reconnect_needed = False
         recovering_dead = False
+        # True when the reconnect is not ours to postpone: an explicit
+        # /connect, or a transport we already know is dead.  See
+        # _reconnect_or_defer().
+        reconnect_forced = False
+        reconnect_reason = "the reconnect"
         quit_requested = False
+        recycle_requested = False
 
         while not self.event_queue.empty():
             try:
@@ -3882,6 +4394,7 @@ class SDKBridge:
             elif kind == "effort":
                 state.effort = None if payload == "auto" else payload
                 reconnect_needed = True
+                reconnect_reason = f"effort → {payload}"
                 await self.broadcast({
                     "type": "system_msg", "subtype": "info",
                     "data": {"message": f"effort → {payload}"},
@@ -3889,6 +4402,7 @@ class SDKBridge:
             elif kind == "model":
                 state.model = payload
                 reconnect_needed = True
+                reconnect_reason = f"model → {payload}"
                 await self.broadcast({
                     "type": "system_msg", "subtype": "info",
                     "data": {"message": f"model → {payload}"},
@@ -3901,6 +4415,8 @@ class SDKBridge:
                 else:
                     state.thinking_enabled = not state.thinking_enabled
                 reconnect_needed = True
+                reconnect_reason = (
+                    f"thinking → {'on' if state.thinking_enabled else 'off'}")
                 await self.broadcast({
                     "type": "system_msg", "subtype": "info",
                     "data": {"message": f"thinking → {'on' if state.thinking_enabled else 'off'}"},
@@ -3910,10 +4426,22 @@ class SDKBridge:
                 return await self._await_next_prompt()
             elif kind == "connect":
                 reconnect_needed = True
+                # Not deferrable either way: the transport-death path has no
+                # CLI left to protect the tasks' registry, and an explicit
+                # /connect is the user asking for one now, having been told
+                # (by _reconnect_or_defer) what it costs.
+                reconnect_forced = True
                 if payload == _CONNECT_TRANSPORT_DEAD:
                     recovering_dead = True
                 else:
                     self._transport_death_times.clear()
+            elif kind == "recycle":
+                # ``/recycle now`` issued mid-turn.  Deferred to the quiescent
+                # point at the bottom of this method rather than done here:
+                # the queued-prompt and /compact branches below can still
+                # return early with work to do, and a recycle must not land in
+                # front of it.
+                recycle_requested = True
             elif kind in ("quit", "force-quit"):
                 quit_requested = True
             elif kind == "btw":
@@ -3925,11 +4453,20 @@ class SDKBridge:
 
         if reconnect_needed:
             # A reconnect asked for by _note_transport_death takes the bounded,
-            # announced path; a config command's takes the plain one.
+            # announced path; a config command's takes the plain one — or waits
+            # for the background tasks to drain, if any are running.
             if recovering_dead:
                 await self._recover_dead_transport("CLI exited")
-            else:
+            elif reconnect_forced:
                 await self.reconnect()
+            else:
+                await self._reconnect_or_defer(reconnect_reason)
+        else:
+            # The turn we just finished may have been the one that drained the
+            # background tasks a previous /model switch was waiting on.  Apply
+            # it *here*, above the queued-prompt branch, so the next prompt runs
+            # under the settings the user asked for rather than one turn late.
+            await self._flush_deferred_reconnect()
 
         # --- Interrupted ---
         if interrupted:
@@ -3972,8 +4509,16 @@ class SDKBridge:
             return prompt
 
         # --- Context trim (rolling window) ---
+        # Skipped while background tasks are running.  This one cannot use
+        # _reconnect_or_defer: trim_session() has already minted a *new*
+        # session id by the time we would reconnect, so postponing the
+        # reconnect would leave state.session_id pointing at a session the live
+        # CLI is not resumed on.  Declining to trim at all keeps the two in
+        # agreement, and costs nothing — a session parked in bg-wait is not
+        # accumulating context, and the check runs again after the next turn.
         max_ctx = getattr(state, "_max_context_tokens", config.max_context_tokens)
-        if max_ctx > 0 and state.context_tokens > max_ctx and state.session_id:
+        if (max_ctx > 0 and state.context_tokens > max_ctx and state.session_id
+                and not state.background_tasks):
             proj = project_dir_for_cwd(config.cwd)
             new_sid = trim_session(state.session_id, proj, max_ctx)
             if new_sid:
@@ -4023,6 +4568,21 @@ class SDKBridge:
         # in _await_next_prompt).  Any other attention flag is cleared here.
         if state.needs_user_attention != "api-error":
             state.needs_user_attention = None
+
+        # The quiescent point of the whole loop: the turn is over, no prompt is
+        # queued, no /compact is pending and no background task is running — so
+        # this is the one moment a CLI swap costs nothing.  Recycling it here
+        # bounds the upstream per-turn commit leak.  We are on the worker task,
+        # which is what the SDK's anyio cancel scope requires (see
+        # _warn_if_foreign_task); _await_next_prompt below drains any prompt
+        # that arrived during the reconnect, exactly as it does for /model.
+        #
+        # A reconnect that already happened above (a /model switch, a recovered
+        # transport death) has just given us a fresh CLI, so the measurement
+        # would be a baseline and the policy declines on its own — no special
+        # case needed.
+        await self._maybe_recycle_cli(force=recycle_requested)
+
         return await self._await_next_prompt()
 
     async def _apply_idle_config_command(self, kind: str, payload: str) -> bool:
@@ -4036,24 +4596,26 @@ class SDKBridge:
         True when *kind* was handled, False for anything else so the caller can
         deal with messages / quit / wakeups itself.
 
-        Note for callers: every branch here reconnects, and ``state.connecting``
-        is True for the duration — so a prompt typed during one is routed to
-        ``state.queued_prompts``, not to the event_queue.  A caller that returns
-        to waiting without draining that queue strands the prompt.  There is
-        exactly one such caller (``_await_next_prompt``), and it drains.
+        Note for callers: every branch here reconnects (except when
+        ``_reconnect_or_defer`` postpones one because background tasks are
+        running), and ``state.connecting`` is True for the duration — so a
+        prompt typed during one is routed to ``state.queued_prompts``, not to
+        the event_queue.  A caller that returns to waiting without draining that
+        queue strands the prompt.  There is exactly one such caller
+        (``_await_next_prompt``), and it drains.
         """
         state = self.state
         if kind == "model":
             state.model = payload
             await self.broadcast({"type": "system_msg", "subtype": "info",
                                   "data": {"message": f"model → {payload}"}})
-            await self.reconnect()
+            await self._reconnect_or_defer(f"model → {payload}")
             return True
         if kind == "effort":
             state.effort = None if payload == "auto" else payload
             await self.broadcast({"type": "system_msg", "subtype": "info",
                                   "data": {"message": f"effort → {payload}"}})
-            await self.reconnect()
+            await self._reconnect_or_defer(f"effort → {payload}")
             return True
         if kind == "thinking":
             if payload == "on":
@@ -4065,7 +4627,8 @@ class SDKBridge:
             await self.broadcast({"type": "system_msg", "subtype": "info",
                                   "data": {"message":
                                            f"thinking → {'on' if state.thinking_enabled else 'off'}"}})
-            await self.reconnect()
+            await self._reconnect_or_defer(
+                f"thinking → {'on' if state.thinking_enabled else 'off'}")
             return True
         if kind == "connect":
             if payload == _CONNECT_TRANSPORT_DEAD:
@@ -4081,6 +4644,11 @@ class SDKBridge:
             return True
         if kind == "clear-context":
             await self._clear_context()
+            return True
+        if kind == "recycle":
+            # ``/recycle now``.  Idle is exactly when this is safe, so the
+            # forced path can run straight away.
+            await self._maybe_recycle_cli(force=True)
             return True
         return False
 
@@ -4174,6 +4742,11 @@ class SDKBridge:
                     self.event_queue.put_nowait(
                         ("wakeup", self.QUEUE_POKE_DEFERRED))
                     continue
+                # "bg-all-done" arrives exactly when the last background task
+                # finishes, which is the moment a /model switch we postponed
+                # (see _reconnect_or_defer) becomes free.  Do it before popping
+                # a queued prompt, so the prompt runs under the new settings.
+                await self._flush_deferred_reconnect()
                 prompt = await self._pop_queued_prompt()
                 if prompt is not None:
                     return prompt
@@ -4200,6 +4773,13 @@ class SDKBridge:
         state = self.state
         # A scheduled wakeup belongs to the session we're wiping — drop it.
         self._cancel_wakeup()
+        # ...as does a reconnect we were holding for the background tasks: the
+        # settings it carried are applied by the connect() at the bottom.
+        self._deferred_reconnect = None
+        # Wiping the session discards the running tasks along with everything
+        # else.  That is what /clear means, but the user should still be told
+        # which tasks went with it — the bulk clear below is silent.
+        await self._orphan_bg_tasks("/clear")
         await self.disconnect()
         state.session_id = None
         state.session_title = None
@@ -4401,6 +4981,159 @@ class SDKBridge:
             _safe_worker(), name="sdk-worker",
         )
 
+    # ------------------------------------------------------------------
+    # Cross-account agent comms (specs/agent-comms-spec.md)
+    # ------------------------------------------------------------------
+
+    def _agent_enabled(self) -> bool:
+        return agent_comms is not None
+
+    async def register_agent(self) -> None:
+        """Resolve this session's identity and self-register it (spec §3, §4.2).
+
+        Called once the session id is known, because a *resumed* session
+        inherits its prior identity by that id -- the one case §3.3 calls
+        unambiguous by definition.
+
+        Every failure here is swallowed into a warning.  The registry is a
+        coordination convenience; a session that cannot reach it must still
+        run.  The single exception is :class:`IdentityRefused`, which is
+        surfaced to the user, because it is not a malfunction: it is the
+        system declining to guess which agent this is, and only the operator
+        can answer.
+        """
+        if not self._agent_enabled() or self.agent_identity:
+            return
+        cwd = getattr(self.config, "cwd", "") or os.getcwd()
+        explicit = (getattr(self.config, "agent_name", None)
+                    or os.environ.get("ORCH2_AGENT_NAME") or "").strip() or None
+        try:
+            ident, how = await asyncio.to_thread(
+                lambda: agent_comms.resolve_identity(
+                    cwd=cwd, session_id=self.state.session_id, explicit=explicit))
+        except agent_comms.IdentityRefused as exc:
+            log.warning("agent identity refused: %s", exc)
+            await self.broadcast({
+                "type": "system_msg", "subtype": "warning",
+                "data": {"message": (
+                    f"{exc}\n\nThis session is running normally, but it is not "
+                    f"in the cross-account agent registry, so other sessions "
+                    f"cannot address it and it will not receive halts."
+                )},
+            })
+            return
+        except Exception:
+            log.warning("agent registry unavailable", exc_info=True)
+            return
+        try:
+            repo = await asyncio.to_thread(agent_comms.repo_key, cwd)
+            await asyncio.to_thread(lambda: agent_comms.register(
+                ident, cwd=cwd, session_id=self.state.session_id,
+                account=getattr(self.config, "config_dir", None), repo=repo))
+        except Exception:
+            log.warning("agent registration failed", exc_info=True)
+            return
+        self.agent_identity = ident
+        self._agent_repo = repo
+        self._agent_hb_at = time.monotonic()
+        log.info("agent identity: %s (%s) repo=%s", ident, how, repo)
+        if how == "adopted":
+            # §3.3 asks for this to be said out loud: adoption is a decision
+            # the operator should be able to audit after the fact.
+            await self.broadcast({
+                "type": "system_msg", "subtype": "info",
+                "data": {"message": (
+                    f"Adopted the agent identity '{ident}' — it was the only "
+                    f"one registered for this directory and was not live."
+                )},
+            })
+
+    async def poll_agent_comms(self) -> None:
+        """Heartbeat, and queue anything pending for delivery (§5.1, §6.1).
+
+        Pending traffic is appended to ``state.queued_prompts`` rather than
+        injected directly.  That is not a shortcut -- it is what makes the
+        spec's "at turn boundary, queued, not mid-turn" true for free: a queued
+        prompt is drained by ``_between_turns`` at the end of a turn and by
+        ``_await_next_prompt`` when idle, is visible in the queue panel, and
+        can never land in the middle of a half-finished edit.
+
+        Delivery is recorded *before* the prompt is queued, so a crash between
+        the two loses a message rather than repeating it forever.  For a halt
+        that matters especially: it stays in force until lifted, and
+        re-announcing it every turn would be exactly the noise §6 says agents
+        learn to skip.
+        """
+        if not self._agent_enabled() or not self.agent_identity:
+            return
+        now = time.monotonic()
+        if now - self._agent_hb_at >= agent_comms.HEARTBEAT_INTERVAL:
+            self._agent_hb_at = now
+            try:
+                await asyncio.to_thread(lambda: agent_comms.heartbeat(
+                    self.agent_identity, session_id=self.state.session_id))
+            except Exception:
+                log.debug("agent heartbeat failed", exc_info=True)
+        if now - self._agent_poll_at < AGENT_POLL_INTERVAL:
+            return
+        self._agent_poll_at = now
+        try:
+            parts = await asyncio.to_thread(self._collect_agent_comms)
+        except Exception:
+            log.debug("agent comms poll failed", exc_info=True)
+            return
+        for text in parts:
+            if text not in self.state.queued_prompts:
+                self.state.queued_prompts.append(text)
+
+    def _collect_agent_comms(self) -> list[str]:
+        """**Blocking** -- runs in a thread.  Returns prompts to queue."""
+        ident = self.agent_identity
+        cwd = getattr(self.config, "cwd", "") or ""
+        out: list[str] = []
+        conn = agent_comms.connect()
+        try:
+            halt = agent_comms.pending_halt_for(ident, repo=self._agent_repo,
+                                                conn=conn)
+            if halt is not None:
+                agent_comms.mark_halt_delivered(halt.id, ident, conn=conn)
+                out.append(
+                    f"[agent-comms] HALT raised by {halt.raised_by} "
+                    f"({halt.scope_kind} scope): {halt.reason}\n\n"
+                    f"Stop taking new work. Finish or safely abandon what you "
+                    f"are holding, commit and push it, and do not start "
+                    f"another long task. The halt stays in force until it is "
+                    f"lifted explicitly — check with:\n"
+                    f"  python tools/agents.py check-halt --scope "
+                    f"{halt.scope_kind}\n"
+                    f"Reply to the operator confirming you have stopped."
+                )
+            msgs = agent_comms.pending_messages(
+                ident, repo=self._agent_repo, cwd=cwd, conn=conn)
+            for m in msgs:
+                agent_comms.mark_delivered(m.id, ident, conn=conn)
+                target = m.to_identity or f"{m.scope_kind} broadcast"
+                out.append(
+                    f"[agent-comms] message from {m.from_identity} "
+                    f"(to {target}):\n\n{m.body}\n\n"
+                    f"This is operational traffic from another Claude session "
+                    f"on this machine. It is one-way and expects no reply "
+                    f"unless it asks for one."
+                )
+        finally:
+            conn.close()
+        return out
+
+    async def deregister_agent(self) -> None:
+        """Drop this session's registration on clean exit (§4.2)."""
+        if not self._agent_enabled() or not self.agent_identity:
+            return
+        ident, self.agent_identity = self.agent_identity, None
+        try:
+            await asyncio.to_thread(lambda: agent_comms.deregister(ident))
+        except Exception:
+            log.debug("agent deregistration failed", exc_info=True)
+
     async def stop(self) -> None:
         """Gracefully shut down.
 
@@ -4427,6 +5160,10 @@ class SDKBridge:
             self._cancel_compact_turn_end_timer()
             self._cancel_wakeup()
             self._cancel_bg_done_bell()
+            # Leave the registry before the slow part of the teardown: a clean
+            # exit should not look "live" to a sibling for the seconds it takes
+            # to reap a CLI (spec §4.2).
+            await self.deregister_agent()
             self.event_queue.put_nowait(("quit", ""))
             try:
                 if self._worker_task and not self._worker_task.done():

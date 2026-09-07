@@ -9,6 +9,7 @@ const Status = (() => {
   let elIndicator, elState, elConfigDir, elAccount, elSession, elCwd, elTurns, elPlan;
   let elModel, elEffort, elThinking;
   let elContext, elRateLimit;
+  let elCliMem, elCliMemSep, elCliMemLabel;
   let elCollapseCheck;
 
   // CSS class → colour mapping for the state text.
@@ -38,6 +39,9 @@ const Status = (() => {
     elThinking  = document.getElementById('status-thinking');
     elContext   = document.getElementById('status-context');
     elRateLimit = document.getElementById('status-ratelimit');
+    elCliMem      = document.getElementById('status-climem');
+    elCliMemSep   = document.getElementById('status-climem-sep');
+    elCliMemLabel = document.getElementById('status-climem-label');
     elCollapseCheck = document.getElementById('collapse-tools-check');
     if (elCollapseCheck) {
       // Restore persisted value.
@@ -209,6 +213,9 @@ const Status = (() => {
       _set(elContext, 'textContent', '--');
     }
 
+    // CLI subprocess memory.
+    _updateCliMem(status);
+
     // Rate limits.
     _updateRateLimits(status.rate_limits);
 
@@ -236,6 +243,47 @@ const Status = (() => {
     if (status.max_dom_messages != null && _prev.maxDom !== status.max_dom_messages) {
       Chat.setMaxDomMessages(status.max_dom_messages);
       _prev.maxDom = status.max_dom_messages;
+    }
+  }
+
+  // CLI subprocess memory.
+  //
+  // The bundled claude.exe leaks committed private bytes per turn, and the
+  // backend recycles it (disconnect + --resume) once it crosses the limit.
+  // This field is a gauge on that, but it is *noise* for the 99% of the time
+  // the process is small — so it stays hidden until it reaches half the
+  // recycle threshold, i.e. only once it's genuinely on its way there.
+  function _updateCliMem(status) {
+    if (!elCliMem) return;
+    const bytes = status.cli_mem;
+    const limitGiB = status.cli_recycle_at || 0;
+    const gib = bytes != null ? bytes / (1024 ** 3) : null;
+    const show = gib != null && limitGiB > 0 && gib >= limitGiB / 2;
+
+    if (_prev.cliMemShown !== show) {
+      for (const el of [elCliMem, elCliMemSep, elCliMemLabel]) {
+        if (el) el.hidden = !show;
+      }
+      _prev.cliMemShown = show;
+    }
+    if (!show) return;
+
+    const text = gib.toFixed(1) + 'G';
+    if (_prev.cliMemText !== text) {
+      elCliMem.textContent = text;
+      _prev.cliMemText = text;
+    }
+    const base = status.cli_mem_baseline;
+    const parts = [
+      `CLI subprocess: ${gib.toFixed(2)} GiB committed`,
+      `recycles at ${limitGiB} GiB`,
+    ];
+    if (base != null) parts.push(`baseline ${(base / (1024 ** 3)).toFixed(2)} GiB`);
+    if (status.cli_recycles) parts.push(`${status.cli_recycles} recycle(s) so far`);
+    const title = parts.join(' · ');
+    if (_prev.cliMemTitle !== title) {
+      elCliMem.title = title;
+      _prev.cliMemTitle = title;
     }
   }
 

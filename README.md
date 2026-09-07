@@ -43,7 +43,7 @@ The server starts serving and the browser opens **immediately**; the status bar 
 - Type while Claude is busy to **queue** follow-up prompts (they run in order).
 - The **status bar** (above the input) shows state, **config dir**, account, session, **working directory (full path)**, turns, model, effort, context usage, and rate limits.
 - The **sidebar panels** show active tools, background tasks, the pending queue, and the current plan/todos.
-- **Slash commands** start with `/` — type `/help` for the full list. Common ones: `/status`, `/cwd <path>` (switch project), `/model`, `/effort`, `/resume`, `/rename`, `/switch` (move this session to another account), `/login`, `/clear`, `/interrupt`.
+- **Slash commands** start with `/` — type `/help` for the full list. Common ones: `/status`, `/cwd <path>` (switch project), `/model`, `/effort`, `/resume`, `/rename`, `/move` (copy this session to another account and/or another project directory), `/login`, `/clear`, `/interrupt`.
 
 Sessions are stored the same way Claude Code stores them — under `<config-dir>/projects/<cwd>/` — so a conversation is interchangeable with `claude --continue` / `claude --resume` **as long as both use the same `CLAUDE_CONFIG_DIR`** (account). See [Choosing a Claude account](#choosing-a-claude-account).
 
@@ -81,11 +81,29 @@ Claude account on the machine (each is tagged with its account), so a session
 started under a different `CLAUDE_CONFIG_DIR` still shows up and reopens under
 the right account.
 
+A session running in **another orchestrator2 window** (the hub reuses one
+server per account/port, so a machine driving several accounts has several)
+is listed as running too, on a dashed card tagged `other window :<port>`. This
+window can't drive or close it, so it has no **×**; clicking it offers to go to
+the window that does. Its busy dot and viewer count come from *that* hub —
+orchestrator2 asks it directly — so a session working away in another window
+looks busy here. When the owning hub can't be asked (it didn't answer, or the
+session is held by a bare `claude --resume` in a terminal, which has no API),
+the dot becomes a **hollow ring** meaning *unknown* rather than claiming the
+session is idle; hover it for which of the two it is.
+
 On a desktop browser each session gets its **own tab** — picking one focuses
 that tab, or opens a new one. On **mobile** (where a page can't raise another
 tab to the foreground) the lobby instead switches the *current* tab to the
 session you picked, updating the address bar to `?rid=<rid>` so a refresh
 returns to the same session.
+
+If the hub has been running long enough that its own source has changed on disk
+since it started, the lobby says so in a band above the session lists — **"This
+hub is running older code"** — naming the changed files and how long it has been
+up. Python is loaded once at import, so a long-lived server keeps executing the
+version it started with; restart to pick changes up. Only `.py` files count: JS
+and CSS are re-read per request, so those just need a browser refresh.
 
 The lobby header also has **⟳ Restart server** and **⏛ Shut down server**
 buttons. Restart spawns a fresh server process (picking up code changes) that
@@ -103,6 +121,26 @@ the same port. Notes:
   this account, the launch starts its own server on an auto-selected free port.
 - A session with zero viewers is torn down after `--session-idle-timeout`
   seconds (default 300; `0` disables); the hub itself keeps running.
+
+### A second hub, with several sessions in it
+
+The **port is the hub's identity** — a launch looks for a hub on `--port` and
+joins it if there is one. So starting a second hub and filling it needs no
+special mechanism, just a port of its own:
+
+```bash
+python server.py --standalone --port 8421 --cwd D:\projA   # new hub on 8421
+python server.py --port 8421 --cwd D:\projB                # joins that hub
+python server.py --port 8421 --cwd D:\projC                # …and again
+```
+
+The original hub on 8420 is untouched throughout. Without `--port 8421` the
+second and third launches would join **8420** instead, which is the default and
+usually what you want.
+
+Simpler, if you're already looking at the new hub in a browser: its lobby's
+**+ New session** button (with a working directory) adds a session to *that*
+hub — same result, no command line.
 
 ### Session safety
 
@@ -170,10 +208,34 @@ Use `localport=<port>` to match a non-default `--port`.
 `192.168.x`, `127.x`, IPv6 link-local) pass through with no credentials — the
 LAN workflow stays frictionless. Connections from any other (public) address
 require a password, entered in the browser's sign-in prompt (leave the username
-blank; only the password is checked). The default password is `uncommon11`; set
-your own with `--external-password <pw>` or the `ORCH2_EXTERNAL_PASSWORD`
-environment variable, or pass `--external-password ""` to block all external
-access outright. After the page authenticates, an `HttpOnly` cookie carries the
+blank; only the password is checked).
+
+**External access is off by default, and there is no built-in password.** To
+reach the hub from outside the LAN you must set *both* the switch and a
+password — either as flags:
+
+```
+--external-access on --external-password "<your password>"
+```
+
+or as environment variables (handy from a launcher script):
+
+```
+ORCH2_EXTERNAL_ACCESS=on
+ORCH2_EXTERNAL_PASSWORD=<your password>
+```
+
+Setting only one keeps external access **disabled**: turning it on without a
+password is refused with a warning (in the startup log, in `/status`, and in
+the page served to the refused client) rather than left open. A blank or
+whitespace-only password does not count as one. `/status` always reports the
+current state and how to change it.
+
+> Earlier versions shipped a default password of `uncommon11`, used whenever
+> the flag and env var were unset. That made every install reachable from the
+> internet with a password published in the source; it has been removed.
+
+After the page authenticates, an `HttpOnly` cookie carries the
 credential to the WebSocket automatically (browsers don't resend Basic-Auth
 headers on socket upgrades), so live streaming works from outside the LAN too.
 
@@ -185,7 +247,15 @@ for an exponentially growing window (2 s, doubling each further failure up to
 password is even checked — so the whole hub allows only a handful of guesses per
 escalating window no matter how many machines are trying. A single correct
 password clears the counter. (LAN/loopback always bypasses the throttle, so a
-lockout only affects remote access, and the 5-min cap bounds it.) Password and
+lockout only affects remote access, and the 5-min cap bounds it.)
+
+Only a password that is **presented and wrong** counts as an attempt. A request
+carrying no credentials at all — the first hit on a page, its static assets, a
+WebSocket retry — is not a guess and costs nothing; counting those used to make
+an ordinary first visit report "too many failed attempts" while the *correct*
+password was being typed. An already-authenticated cookie is also honoured
+during a lockout, so a stranger guessing from elsewhere can't shut the owner
+out of their own remote session. Password and
 cookie-token comparisons run in constant time (`hmac.compare_digest`) so the
 secret can't be recovered by response-timing analysis.
 
@@ -214,7 +284,7 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 - **Auto-compact** -- automatic context compaction when token usage gets high
 - **Readable post-compact summary** -- after a compact, the harness-injected summary that becomes the new conversation's starting context is shown as a collapsed box you can click to expand and read in full (Claude Code hides this prompt from the user)
 - **Background tasks** -- track and inspect agent-spawned background work
-- **Autonomous-loop heartbeat** -- honours the model's `ScheduleWakeup` tool calls: when the agent schedules a self-paced wake-up (e.g. a 60s autonomous-loop tick), the orchestrator re-injects the scheduled prompt as a fresh turn after the requested delay, even while a background task is still running. Disable with `--no-wakeup`
+- **Autonomous-loop heartbeat** -- honours the model's `ScheduleWakeup` tool calls: when the agent schedules a self-paced wake-up (e.g. a 60s autonomous-loop tick), the orchestrator re-injects the scheduled prompt as a fresh turn after the requested delay, even while a background task is still running. `ScheduleWakeup(stop=true)` ends the loop, and a wakeup that keeps landing mid-turn is deferred at most 10 times before being dropped rather than re-arming forever. Inspect and control it from either side with **`/loop`**; disable it for the whole session with `--no-wakeup`
 - **Pending queue** -- type messages while Claude is busy; they queue and execute in order. Interrupting (Ctrl+C, the ■ button, or `/interrupt`) sends the next queued prompt straight away -- typing a correction and then hitting Ctrl+C is the "stop, do this instead" gesture. This holds whether a turn was running or the session was parked waiting on background tasks. An interrupt never triggers auto-continue, and with an empty queue it won't start a turn on its own
 - **Queue management** -- edit or delete queued prompts from the sidebar
 - **Prompt history** -- Ctrl+Up/Down to recall previous prompts (persisted across sessions)
@@ -226,6 +296,7 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 - **Multi-tab support** -- multiple browser tabs receive synchronized updates
 - **Bell notifications** -- configurable audible alerts for key events
 - **API stall detection** -- monitors retry patterns and polls Anthropic's status page
+- **CLI memory recycling** -- Anthropic's bundled `claude.exe` leaks *committed* memory once per turn (measured at 0.08--0.65 GiB/h per session, private bytes ~14x its working set). Because Windows never overcommits, that leak eats the system-wide commit limit without ever appearing in RAM or the pagefile, and eventually allocations start failing machine-wide while gigabytes of RAM sit free. The orchestrator watches the subprocess's private bytes and, once past `--cli-recycle-at` (8 GiB by default), swaps it for a fresh CLI that resumes the same session. It only fires at a genuinely quiet moment -- no turn in flight, no background task, no queued prompt -- so it never interrupts work, and it declines when the process is merely holding a large transcript rather than leaking. Inspect or override per-session with `/recycle`
 - **API-error loop breaker** -- a turn that ends in an inline API error (e.g. `API Error: 400 …`) is now marked `error` in the turn marker instead of the misleading `success`, and the status bar shows `api error`. When the *same* error repeats two turns in a row — the classic "poisoned history" case where a bad block deep in the resumed conversation (e.g. an unsupported image) is re-sent every turn and never clears — the orchestrator posts a one-time recovery hint (start a fresh session, or trim the conversation) and pauses auto-continue so it won't keep hammering the failing request
 - **Theme system** -- 70+ color tokens configurable via file, presets, or the settings page
 - **Export** -- save conversations as markdown
@@ -333,7 +404,21 @@ At runtime, use the `/bell` slash command to view or change the bell events with
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--auto-reconnect` | off | Reconnect and auto-continue on CLI crash |
+| `--cli-recycle-at GIB` | 8.0 | Swap `claude.exe` for a fresh one once its committed (private) memory passes this many GiB |
+| `--no-cli-recycle` | off | Never recycle the CLI subprocess, however large it grows |
+| `--cli-recycle-cooldown SECS` | 600 | Minimum seconds between automatic recycles |
 | `--no-wakeup` | off | Disable honouring the model's `ScheduleWakeup` tool calls (autonomous-loop heartbeat) |
+
+**Why `--cli-recycle-at` exists.** Anthropic's bundled `claude.exe` leaks *committed*
+memory once per turn — measured at 0.08–0.65 GiB/h per session, with private bytes
+running ~14× its working set. Commit is a promise Windows never overcommits, so the
+leak consumes the system commit limit (RAM + pagefile) without ever touching RAM or
+the pagefile, and eventually allocations start failing machine-wide while gigabytes
+of RAM sit free. Recycling swaps the subprocess for a fresh one that resumes the same
+session, reclaiming the leak. It only fires when nothing is in flight — no turn, no
+background task, no queued prompt — so it never interrupts work, and it declines when
+the process is merely holding a genuinely large transcript rather than leaking.
+The status bar grows a `cli` field once memory approaches the threshold.
 
 ### Server
 
@@ -362,7 +447,8 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/history [N]` | Clear output and replay session history (last N records; default 2000) |
 | `/cwd [path]` | Show current working directory, or switch to a new one and reconnect |
 | `/rename [name]` | Set a custom session title |
-| `/switch` | Copy this session into another Claude account and continue it in the same window (opens an account picker, then asks for a new session name) |
+| `/move` | Copy this session to another Claude account **and/or another project directory**, and continue it in the same window. Opens a picker: choose the account (the current one included, if you only want to change directory), then the destination directory and a name for the copy. Leave either as-is to change only the other. Directories Claude already knows about are offered as one-click fills, but any existing directory works |
+| `/move <path>` | Same, with the destination directory prefilled |
 | `/export [path]` | Save conversation as markdown |
 | `/login [force]` | Show sign-in status, or launch the Claude login flow. Automatically re-authenticates when the last turn failed with a 401; `/login force` re-authenticates even when it thinks you're already signed in (use this if you hit auth errors but it insists you're logged in). After you finish signing in the browser, it confirms the signed-in account by email and updates the status bar's **account** field, then prompts you to `/connect`. |
 | `/logout` | Sign the active account out |
@@ -389,12 +475,67 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/models` | Alias for `/model` |
 | `/effort [level]` | Show or set effort (`auto`/`low`/`medium`/`high`/`max`) |
 | `/thinking [on\|off]` | Toggle extended thinking (API-level — reconnects) |
+
+`/model`, `/effort` and `/thinking` take effect by reconnecting the CLI, and a
+reconnect loses the harness's view of any **running background task** (the CLI's
+task registry is in-memory and `--resume` does not restore it). So while
+background tasks are running, these three are **applied when the tasks finish**
+rather than immediately — you're told so, and `/connect` reconnects right away
+if you'd rather not wait. Any reconnect that does orphan tasks now says which.
+
 | `/show-thinking [on\|off]` | Show or set whether thinking blocks start expanded (display only, no reconnect) |
 | `/btw <question>` | Side question in separate context |
 | `/graphify [path] [flags]` | Build a knowledge graph ([graphify](https://github.com/safishamsi/graphify)) |
 | `/graphify explain <node>` | Explain a graph node + neighbors (runs directly, no LLM turn) |
 | `/graphify path <A> <B>` | Shortest path between two graph nodes (quote names with spaces) |
 | `/graphify diagnose` | Report multigraph edge-collapse risk in the graph |
+
+### Talking to the other sessions on this machine
+
+Several Claude sessions can now address each other **across accounts** — the
+session registry was scoped per `CLAUDE_CONFIG_DIR`, so sessions under
+different accounts were mutually invisible to one another.
+
+```
+python tools/agents.py list                        # live sessions, all accounts
+python tools/agents.py send "stop soon" --to lane-b
+python tools/agents.py broadcast "tree is moving"  # everyone in this repo
+python tools/agents.py halt "migrating to E:"      # ask everyone to stop
+python tools/agents.py lift                        # explicit, never a timer
+python tools/agents.py check-halt --scope repo     # 0 = clear, non-zero = halted
+```
+
+Agents themselves need none of that: their existing `ListAgents` and
+`SendMessage` tools now simply work across accounts. The registry the CLI uses
+(`<config-dir>/sessions/*.json`) was per-account, so sessions under different
+accounts were invisible to each other even though the peer transport — a named
+pipe — is machine-global. orchestrator2 mirrors each live session's entry into
+every config directory, which makes the tool description agents already have
+("other local Claude sessions on this machine") true. Measured here:
+`ListAgents` went from 1 peer to 4.
+
+Agents can also raise and lift a halt through `RaiseHalt` / `LiftHalt`, which
+appear in their tool list.
+
+The commands above are the operator/script surface. Messages arrive at the
+addressee's **next turn boundary**, as a queued prompt — never mid-turn, so
+they cannot interrupt a half-finished edit.
+
+`check-halt` is the enforcement half: a long job calls it before starting and
+refuses if a halt is in force. Nothing tries to guess which jobs are expensive
+— the job about to spend three hours is the one that knows, and it alone knows
+where its safe abort points are. It is cooperative by design: a job that does
+not check cannot be stopped.
+
+A session's identity is a **name**, not something derived from its account or
+directory: set it with `--agent-name` (or `ORCH2_AGENT_NAME`). It is inherited
+on resume. If a session starts in a directory where several identities are
+registered and none was given, it **refuses and lists them** rather than
+guessing — adopting the wrong one would silently inherit another agent's
+messages and halt state, and neither session could tell.
+
+`python tools/agents.py --self-test` exercises the whole thing (31 fixtures,
+both directions of every rule).
 
 ### Display
 
@@ -403,6 +544,13 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/collapse [on\|off]` | Toggle activity collapsing (tools, thinking, turn markers between messages) |
 | `/autocompact [on\|off\|N]` | Control auto-compact |
 | `/max-context [off\|N]` | Cap context tokens |
+| `/loop` | Show whether a self-paced wakeup loop is armed, when it next fires, and how many times it has been deferred because a turn was running |
+| `/loop off` | Stop it (`stop`, `cancel`, `end` and `0` all work). Broadcast to every tab, since it changes what the session does next |
+| `/loop on` / `/loop <seconds>` | Arm one yourself, clamped to the 60–3600s range the `ScheduleWakeup` tool documents (it tells you when it clamped) |
+| `/recycle` | Report CLI subprocess memory, threshold and recycle count |
+| `/recycle now` | Recycle the CLI subprocess immediately (waits for a quiet moment if busy) |
+| `/recycle off` / `/recycle on` | Disable recycling for this session / restore the `--cli-recycle-at` default |
+| `/recycle <GiB>` | Set this session's recycle threshold |
 | `/bell` | Show current bell events and usage |
 | `/bell <events>` | Ring on ONLY these events (replaces current set) |
 | `/bell all` / `/bell none` | Enable every event / disable the bell |

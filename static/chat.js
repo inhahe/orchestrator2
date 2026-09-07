@@ -13,6 +13,13 @@
 
 const Chat = (() => {
   let elMessages;
+  // How many older history messages are still to be backfilled above the
+  // first slice.  Non-zero means _replayHistory must not write the
+  // "Session history" separator, because it is not the top yet.
+  let _moreAbove = 0;
+  // Messages rendered by the first history frame, so the separator the
+  // backfill writes can report the true total.
+  let _historyShown = 0;
   let _autoScroll = true;
 
   // --- Collapse gap (scroll-anchored collapse) ---
@@ -511,7 +518,8 @@ const Chat = (() => {
   function handleMessage(msg) {
     // Queue real-time messages while history replay is still rendering
     // (batched via setTimeout) so they don't get interleaved mid-history.
-    if (_replayInProgress && msg.type !== 'history') {
+    if (_replayInProgress && msg.type !== 'history'
+        && msg.type !== 'history_prepend') {
       _pendingMessages.push(msg);
       return;
     }
@@ -537,7 +545,8 @@ const Chat = (() => {
       case 'command_data':    _addCommandData(msg); break;
       case 'modal':           _openModal(msg); break;
       case 'bell':            _playBell(); break;
-      case 'history':         _replayHistory(msg.messages); break;
+      case 'history':         _replayHistory(msg.messages, msg.more_above); break;
+      case 'history_prepend': _prependHistory(msg.messages); break;
       default:
         console.warn('[chat] unhandled message type:', msg.type, msg);
         break;
@@ -1058,7 +1067,7 @@ const Chat = (() => {
   function _openModal(msg) {
     const title = msg.title || 'Detail';
     const content = msg.content || '';
-    if (window.App && typeof App.openModal === 'function') {
+    if (typeof App !== 'undefined' && typeof App.openModal === 'function') {
       App.openModal(title, content);
     } else {
       // Fallback: render inline as a system message so it isn't lost.
@@ -1148,7 +1157,31 @@ const Chat = (() => {
 
   // --- History replay ---
 
-  function _replayHistory(messages) {
+  // One history record -> one rendered message.  Extracted so the initial
+  // replay and the older-message backfill cannot drift apart in what they
+  // know how to draw.
+  function _renderHistoryMessage(m) {
+    const type = m.type || m.role;
+    if (type === 'user' || type === 'human') {
+      _addUserMessage(m.content || m.text || '');
+    } else if (type === 'injected_prompt') {
+      _addInjectedPrompt({ content: m.content || m.text || '' });
+    } else if (type === 'assistant') {
+      _addAssistantText({ content: m.content || m.text || '', delta: false });
+    } else if (type === 'tool_use') {
+      _addToolUse(m);
+    } else if (type === 'tool_result') {
+      _addToolResult(m);
+    } else if (type === 'thinking') {
+      _addThinking(m);
+    } else if (type === 'system' || type === 'system_msg') {
+      _addSystemMsg(m);
+    }
+  }
+
+  function _replayHistory(messages, moreAbove) {
+    _moreAbove = moreAbove || 0;
+    _historyShown = (messages && messages.length) || 0;
     console.log('[history] _replayHistory called, messages:', messages ? messages.length : 0);
     _setSessionLoading(false);   // history is here — drop the placeholder
     if (!messages || !messages.length) return;
@@ -1157,10 +1190,14 @@ const Chat = (() => {
 
     // Add history separator (marked as boundary so activity-collapse
     // doesn't swallow it into a group).
-    const sep = document.createElement('div');
-    sep.className = 'msg msg-system activity-boundary';
-    sep.textContent = `--- Session history (${messages.length} messages) ---`;
-    elMessages.appendChild(sep);
+    // Only label the top when this really is the top.  When older messages
+    // are still coming, _prependHistory writes the separator above them.
+    if (!_moreAbove) {
+      const sep = document.createElement('div');
+      sep.className = 'msg msg-system activity-boundary';
+      sep.textContent = `--- Session history (${messages.length} messages) ---`;
+      elMessages.appendChild(sep);
+    }
 
     // Render in batches via setTimeout so the browser stays responsive
     // and WebSocket messages (status ticker, etc.) can still be processed.
@@ -1179,23 +1216,7 @@ const Chat = (() => {
       do {
         const end = Math.min(idx + BATCH, messages.length);
         for (; idx < end; idx++) {
-          const m = messages[idx];
-          const type = m.type || m.role;
-          if (type === 'user' || type === 'human') {
-            _addUserMessage(m.content || m.text || '');
-          } else if (type === 'injected_prompt') {
-            _addInjectedPrompt({ content: m.content || m.text || '' });
-          } else if (type === 'assistant') {
-            _addAssistantText({ content: m.content || m.text || '', delta: false });
-          } else if (type === 'tool_use') {
-            _addToolUse(m);
-          } else if (type === 'tool_result') {
-            _addToolResult(m);
-          } else if (type === 'thinking') {
-            _addThinking(m);
-          } else if (type === 'system' || type === 'system_msg') {
-            _addSystemMsg(m);
-          }
+          _renderHistoryMessage(messages[idx]);
         }
       } while (idx < messages.length && _hidden());
 
@@ -1222,6 +1243,61 @@ const Chat = (() => {
     }
 
     _renderBatch();
+  }
+
+  // Insert older history *above* what is already rendered.
+  //
+  // The first frame carries only the newest slice so the user sees their
+  // conversation immediately; this fills in the rest behind it.
+  //
+  // The message builders all append to ``elMessages``, so rather than
+  // duplicating seventeen of them for a different parent, we point that
+  // variable at a detached container for the duration and move the finished
+  // nodes across.
+  //
+  // This runs to completion synchronously, which is the only reason the swap
+  // is safe: nothing else can observe the detached container in between. (An
+  // earlier version also raised ``_replayInProgress`` here "so live messages
+  // queue instead of landing in the scratch node" -- but a live message cannot
+  // arrive mid-function in a single-threaded runtime, and a mutation sweep
+  // duly showed no test could tell the flag from its absence. Removed rather
+  // than kept as reassuring but inert.)
+  function _prependHistory(messages) {
+    if (!messages || !messages.length) { _moreAbove = 0; return; }
+    const real = elMessages;
+    const scratch = document.createElement('div');
+    elMessages = scratch;
+    try {
+      const sep = document.createElement('div');
+      sep.className = 'msg msg-system activity-boundary';
+      sep.textContent = `--- Session history (${messages.length + _historyShown} messages) ---`;
+      scratch.appendChild(sep);
+      for (const m of messages) _renderHistoryMessage(m);
+    } finally {
+      elMessages = real;
+      _moreAbove = 0;
+    }
+
+    // Anchor the viewport: inserting content above shifts everything down by
+    // exactly the height added, so add that back to scrollTop or the user's
+    // position jumps to older text they were not reading.
+    const before = real.scrollHeight;
+    const atBottom = _autoScroll;
+    real.insertBefore(scratch.firstChild ? _drain(scratch) : document.createDocumentFragment(),
+                      real.firstChild);
+    if (atBottom) {
+      _scrollToBottom();
+    } else {
+      real.scrollTop += (real.scrollHeight - before);
+    }
+    _maybeTrimOldMessages();
+  }
+
+  // Move every child of *node* into a fragment (leaves *node* empty).
+  function _drain(node) {
+    const frag = document.createDocumentFragment();
+    while (node.firstChild) frag.appendChild(node.firstChild);
+    return frag;
   }
 
   // --- Bell ---

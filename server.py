@@ -28,6 +28,9 @@ import atexit
 import base64
 import hashlib
 import hmac
+import datetime
+import functools
+import io
 import ipaddress
 import json
 import logging
@@ -37,7 +40,7 @@ import socket as _socket
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import unquote
 
 import dataclasses
@@ -64,8 +67,10 @@ if TYPE_CHECKING:  # pragma: no cover
     from sdk_bridge import SDKBridge  # noqa: F401
 
 from config import (
+    WAKEUP_DEFAULT_DELAY,
+    WAKEUP_MAX_DELAY,
+    WAKEUP_MIN_DELAY,
     Config,
-    DEFAULT_EXTERNAL_PASSWORD,
     DEFAULT_PORT,
     MODEL_CACHE_TTL,
     _PICKER_SENTINEL,
@@ -89,6 +94,7 @@ from session import (
     list_projects,
     list_sessions_for_project,
     load_persisted_queue,
+    normalize_path_for_compare,
     read_session_title,
     render_session_history,
     save_persisted_queue,
@@ -269,6 +275,240 @@ def _recent_disk_sessions(limit: int = 40) -> list[dict[str, Any]]:
     return out
 
 
+#: Cache for the foreign-holder process scan.  A cold ``process_iter`` walk
+#: measured 13 s on this machine (0.4 s warm), and the lobby ticker refreshes
+#: every 2 s while an overlay is open, so this is not optional.
+_holders_cache: tuple[float, dict[str, Any]] | None = None
+_HOLDERS_CACHE_TTL = 8.0
+
+#: mtime of every project ``.py`` this process has loaded, as of the moment it
+#: was first seen.  Python code is read once at import, so a hub goes on
+#: running whatever was on disk when it started — indefinitely, and silently.
+#:
+#: This cost a real misdiagnosis (known-issues, "a background task completed
+#: and did not wake the model"): the hub in question had been up since
+#: 2026-09-01 22:59, one day before the very bug being reported was fixed, and
+#: nothing anywhere said so. The evidence was a log line that no longer exists
+#: in the source. Six days of a fixed bug still happening, with the fix sitting
+#: on disk unread.
+_source_baseline: dict[str, float] = {}
+_stale_cache: tuple[float, dict[str, Any]] | None = None
+_STALE_CACHE_TTL = 10.0
+#: When this process started, so it can say how old the code it runs is.
+_started_at = time.time()
+
+#: Cache for the peer-hub `/api/running` probe, keyed by port.  Separate from
+#: the holder cache above because the two answer questions with very different
+#: volatility: *who owns which session* changes when a session starts or stops,
+#: while *is it working right now* changes several times a minute — which is
+#: the whole reason to ask.  So this TTL is short.
+_hub_probe_cache: dict[int, tuple[float, dict[str, Any] | None]] = {}
+_HUB_PROBE_TTL = 2.0
+#: A hub that failed to answer is not retried for this long.  Without it, one
+#: wedged peer adds `_HUB_PROBE_TIMEOUT` to *every* lobby tick, for everyone —
+#: the lobby would be made slow by the very condition it is trying to report.
+_HUB_PROBE_FAIL_TTL = 30.0
+#: Loopback, so this is generous.  It bounds how long a hung peer can delay
+#: the session list; it must stay well under the 2 s lobby tick.
+_HUB_PROBE_TIMEOUT = 1.0
+
+
+def _foreign_holders() -> dict[str, Any]:
+    """``{session_id: ForeignHolder}`` for sessions live in *other* processes.
+
+    **Blocking** — only ever called in an executor.  Cached, because the scan
+    is expensive and its answer changes on the timescale of starting or
+    stopping a session, not of a 2-second UI tick.
+    """
+    global _holders_cache
+    now = time.monotonic()
+    if _holders_cache is not None:
+        stamp, cached = _holders_cache
+        if now - stamp < _HOLDERS_CACHE_TTL:
+            return cached
+    try:
+        holders = proc_guard.map_foreign_session_holders()
+    except Exception:
+        log.warning("foreign-holder scan failed", exc_info=True)
+        holders = {}
+    _holders_cache = (now, holders)
+    return holders
+
+
+def _project_modules() -> list[tuple[str, Path]]:
+    """Loaded modules whose source lives in this project.
+
+    Third-party and stdlib modules are excluded deliberately: upgrading them
+    does not make *this* hub stale, and their files change for reasons the
+    operator did not cause and cannot act on from here.
+    """
+    root = Path(__file__).resolve().parent
+    out: list[tuple[str, Path]] = []
+    for name, mod in list(sys.modules.items()):
+        f = getattr(mod, "__file__", None)
+        if not f or not f.endswith(".py"):
+            continue
+        try:
+            p = Path(f).resolve()
+            p.relative_to(root)
+        except (ValueError, OSError):
+            continue
+        out.append((name, p))
+    return out
+
+
+def snapshot_sources() -> int:
+    """Record the current mtimes as "what this process is running".
+
+    Called once the serving process has finished importing (``sdk_bridge`` and
+    friends load lazily, so an import-time snapshot would miss them).  Anything
+    imported even later is baselined on first sighting by ``stale_sources``,
+    which is the honest answer for a module whose code we only just read.
+    """
+    for _name, path in _project_modules():
+        try:
+            _source_baseline.setdefault(str(path), path.stat().st_mtime)
+        except OSError:
+            continue
+    return len(_source_baseline)
+
+
+def stale_sources() -> dict[str, Any]:
+    """Which loaded source files have changed on disk since we read them.
+
+    **Blocking** (a few dozen ``stat`` calls) but trivially cheap, and cached
+    for ``_STALE_CACHE_TTL`` because the lobby asks on every tick.
+
+    Only ``.py`` counts. Templates, CSS and JS are re-read per request, so a
+    browser refresh picks them up and a restart would be the wrong advice —
+    telling someone to restart for a CSS edit trains them to ignore the notice.
+    """
+    global _stale_cache
+    now = time.monotonic()
+    if _stale_cache is not None and now - _stale_cache[0] < _STALE_CACHE_TTL:
+        return _stale_cache[1]
+    changed: list[str] = []
+    newest = 0.0
+    for _name, path in _project_modules():
+        try:
+            m = path.stat().st_mtime
+        except OSError:
+            continue
+        key = str(path)
+        base = _source_baseline.setdefault(key, m)
+        if m > base:
+            changed.append(path.name)
+            newest = max(newest, m)
+    info = {
+        "count": len(changed),
+        "files": sorted(changed)[:12],
+        "newest": newest or None,
+        "started_at": _started_at,
+    }
+    _stale_cache = (now, info)
+    return info
+
+
+def _probe_hub_running(port: int) -> dict[str, Any] | None:
+    """Ask the hub on *port* for its live registry: ``{session_id: meta}``.
+
+    **Blocking** — only ever called in an executor.  ``None`` means "could not
+    ask", which is different from "asked and it has no sessions" and must stay
+    distinguishable: the first is ignorance, the second is knowledge.
+
+    Loopback only, and loopback bypasses the external-auth middleware, so no
+    credentials are involved.  ``urllib`` rather than a new dependency: one
+    tiny GET against 127.0.0.1 does not justify pulling in an HTTP client.
+    """
+    now = time.monotonic()
+    hit = _hub_probe_cache.get(port)
+    if hit is not None:
+        stamp, cached = hit
+        ttl = _HUB_PROBE_TTL if cached is not None else _HUB_PROBE_FAIL_TTL
+        if now - stamp < ttl:
+            return cached
+    result: dict[str, Any] | None = None
+    try:
+        import urllib.request
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/running",
+                timeout=_HUB_PROBE_TIMEOUT) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+        result = {m["session_id"]: m for m in body.get("running", [])
+                  if isinstance(m, dict) and m.get("session_id")}
+    except Exception as exc:
+        # Expected whenever a peer is starting, stopping, wedged, or simply is
+        # not one of ours — debug, not warning, or the log fills with noise
+        # about a condition the UI already reports honestly as "unknown".
+        log.debug("hub probe on port %s failed: %s", port, exc)
+    _hub_probe_cache[port] = (now, result)
+    return result
+
+
+def _probe_foreign_hubs(holders: dict[str, Any]) -> dict[str, Any]:
+    """``{session_id: peer_meta}`` for every foreign session we can ask about.
+
+    **Blocking** — executor only.  Deduplicated **by port**: several sessions
+    commonly live in one peer hub, and that is one question, not four.
+    """
+    live: dict[str, Any] = {}
+    ports = {getattr(h, "port", None) for h in holders.values()}
+    for port in sorted(p for p in ports if p):
+        peer = _probe_hub_running(port)
+        if not peer:
+            continue
+        for sid, meta in peer.items():
+            live[sid] = meta
+    return live
+
+
+def _foreign_running_entry(sess: dict[str, Any], holder: Any,
+                           live: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Shape a disk session held by another hub like a running-card meta.
+
+    Mirrors ``SessionRuntime.meta()`` so the lobby's running renderer needs no
+    special case beyond the ``foreign`` flag: this session *is* running, just
+    not by us, and showing it under "recent" was the bug.
+
+    A process scan can see that something holds the session and where it runs.
+    It cannot see whether a turn is in flight, how many tabs are watching, or
+    what the session has since been renamed to.  Those used to be filled in
+    with ``busy: False`` / ``viewers: 0`` and rendered as an idle dot and a
+    viewer count — placeholders presented as measurements.
+
+    *live* is the owning hub's own meta for this session, from
+    ``/api/running``, when it could be reached.  With it, the card states
+    facts.  Without it — the holder is not one of our hubs (a bare
+    ``claude --resume`` in a terminal has no API), or the hub did not answer —
+    the unknowable fields are ``None``, which the UI renders as *unknown*
+    rather than inventing a value.
+    """
+    live = live or {}
+    return {
+        "rid": None,                      # not ours; nothing here to attach to
+        "session_id": sess.get("session_id"),
+        "title": (live.get("title")
+                  or sess.get("title") or sess.get("first_user_msg")),
+        "cwd": live.get("cwd") or sess.get("cwd"),
+        "account": sess.get("account"),
+        # None means "we could not ask", NOT "no". See the docstring.
+        "busy": live.get("busy") if live else None,
+        "viewers": live.get("viewers") if live else None,
+        "created_at": live.get("created_at"),
+        "last_activity": live.get("last_activity") or sess.get("mtime", 0),
+        "idle_deadline": live.get("idle_deadline"),
+        "foreign": True,
+        # True once the owning hub has confirmed it; the card says so, because
+        # "we asked and it is idle" and "we could not ask" look identical
+        # otherwise and only one of them is worth trusting.
+        "live_known": bool(live),
+        "holder_pid": getattr(holder, "holder_pid", None),
+        "port": getattr(holder, "port", None),
+        "started": getattr(holder, "started", "") or "",
+        "age": sess.get("age"),
+    }
+
+
 async def _session_list_payload(include_recent: bool = True) -> dict[str, Any]:
     """The ``session_list`` message: running runtimes + recent disk sessions.
 
@@ -284,19 +524,56 @@ async def _session_list_payload(include_recent: bool = True) -> dict[str, Any]:
     """
     running = [rt.meta() for rt in runtimes.values()]
     running.sort(key=lambda m: m.get("last_activity", 0), reverse=True)
+    # Cheap (cached stats) and it rides every payload, including the fast one:
+    # a hub running stale code is exactly the thing you want to learn about
+    # *before* you start reading its session list for clues.
+    stale = stale_sources()
     if not include_recent:
         return {
             "type": "session_list",
             "running": running,
             "recent": [],
             "recent_pending": True,
+            "stale": stale,
         }
     loop = asyncio.get_running_loop()
     recent = await loop.run_in_executor(None, _recent_disk_sessions)
+
+    # A session live in *another* hub process is running — it just isn't ours.
+    # ``runtimes`` only knows this process, so those sessions fell through to
+    # the disk scan and were listed under "recent" while actively working
+    # (reported 2026-09-03: OSb, OSc and Good Photons all shown as recent).
+    # Promote them, flagged, so the list tells the truth about what is alive.
+    holders = await loop.run_in_executor(None, _foreign_holders)
+    if holders:
+        # The scan says *who* holds each session; the owning hub is the only
+        # thing that knows what that session is *doing*.  Ask it (one request
+        # per peer hub, cached, with a short timeout and a failure backoff so a
+        # wedged peer cannot slow this list down).
+        live_by_sid = await loop.run_in_executor(
+            None, _probe_foreign_hubs, holders)
+        mine = {rt.state.session_id for rt in runtimes.values()
+                if getattr(rt.state, "session_id", None)}
+        still_recent = []
+        for sess in recent:
+            sid = sess.get("session_id")
+            holder = holders.get(sid) if sid else None
+            # ``mine`` is belt and braces: proc_guard already excludes our own
+            # process tree, but a stale cache entry must never be able to
+            # relabel one of our own live sessions as somebody else's.
+            if holder is not None and sid not in mine:
+                running.append(_foreign_running_entry(
+                    sess, holder, live_by_sid.get(sid)))
+            else:
+                still_recent.append(sess)
+        recent = still_recent
+        running.sort(key=lambda m: m.get("last_activity", 0), reverse=True)
+
     return {
         "type": "session_list",
         "running": running,
         "recent": recent,
+        "stale": stale,
     }
 
 
@@ -331,7 +608,7 @@ def _account_email_for(claude_dir: Path) -> str | None:
     """Read the signed-in email for a ``.claude`` account directory.
 
     Mirrors ``state.detect_account_info`` but for an *arbitrary* config dir
-    (not just the process env), so ``/switch`` can label each account.
+    (not just the process env), so ``/move`` can label each account.
     """
     try:
         with open(claude_dir / ".claude.json", encoding="utf-8") as f:
@@ -440,8 +717,8 @@ async def _watch_login(rt: "SessionRuntime") -> None:
     })
 
 
-def _switch_accounts_payload(current_cfg: str | None) -> list[dict[str, Any]]:
-    """Build the account list for the ``/switch`` picker.
+def _move_accounts_payload(current_cfg: str | None) -> list[dict[str, Any]]:
+    """Build the account list for the ``/move`` picker.
 
     Each entry: ``{config_dir, name, email, is_current}``.  Scans the same
     ``.claude*`` directories the copy TUI discovers, reusing
@@ -459,6 +736,50 @@ def _switch_accounts_payload(current_cfg: str | None) -> list[dict[str, Any]]:
             and os.path.normpath(str(d)) == cur_norm,
         })
     return accounts
+
+
+def _move_dirs_payload(limit: int = 40) -> list[dict[str, Any]]:
+    """Directories to offer as ``/move`` destinations, most recent first.
+
+    Every project directory Claude knows about, across *every* account —
+    the destination is chosen independently of the account, so scoping the
+    list to one of them would hide the obvious targets.  A directory that no
+    longer exists is dropped rather than offered: the copy would be refused
+    anyway, and a stale entry in a picker reads as an endorsement.
+
+    This is a *convenience* list, not the set of legal destinations — the
+    input is free text, so a directory Claude has never been run in is
+    perfectly valid and is exactly how a session gets moved somewhere new.
+    """
+    try:
+        from copy_session import discover_claude_dirs
+        config_dirs = [str(p) for p in discover_claude_dirs()]
+    except Exception:
+        log.warning("switch: failed to discover Claude config dirs", exc_info=True)
+        config_dirs = [None]
+
+    best: dict[str, dict[str, Any]] = {}
+    for cdir in config_dirs:
+        try:
+            projects = list_projects(config_dir=cdir)
+        except Exception:
+            log.warning("switch: failed to scan projects in %s", cdir, exc_info=True)
+            continue
+        for proj in projects:
+            cwd = proj.get("cwd")
+            if not cwd:
+                continue
+            key = normalize_path_for_compare(cwd)
+            mtime = proj.get("newest_mtime", 0)
+            prev = best.get(key)
+            # The same directory shows up once per account; keep the entry
+            # whose newest session is newest overall so the ordering reflects
+            # "where I was working", not "which account I happened to scan".
+            if prev is None or mtime > prev["mtime"]:
+                best[key] = {"path": cwd, "mtime": mtime}
+    out = sorted(best.values(), key=lambda d: d["mtime"], reverse=True)
+    alive = [d for d in out if os.path.isdir(d["path"])]
+    return alive[:limit]
 
 # Background tasks for periodic updates.
 _ticker_task: asyncio.Task | None = None
@@ -631,6 +952,13 @@ def _enrich_panels(panels: dict[str, Any]) -> dict[str, Any]:
 _STATUS_HEARTBEAT_SECONDS = 30.0
 
 
+#: Throttle for the cross-account peer-registry mirror.  Sessions start and
+#: stop on a human timescale, so a few seconds of lag costs nothing and a
+#: per-tick filesystem walk would.
+MIRROR_INTERVAL = 15.0
+_mirror_at = 0.0
+
+
 async def _tick_runtime(rt: SessionRuntime) -> bool:
     """One ticker pass over a single runtime.  Returns True if it broadcast.
 
@@ -674,6 +1002,35 @@ async def _tick_runtime(rt: SessionRuntime) -> bool:
         await rt.broadcast(msg)
         sent = True
 
+    # Keep every live session visible from every account (addendum §1).  This
+    # is what makes the *already shipped* ListAgents/SendMessage description
+    # true -- "other local Claude sessions on this machine" -- rather than
+    # adding a second messaging tool nobody would know about.  Cheap and
+    # idempotent, but not free (it stats session files), so it is throttled.
+    global _mirror_at
+    _now = time.monotonic()
+    if _now - _mirror_at >= MIRROR_INTERVAL:
+        _mirror_at = _now
+        try:
+            import agent_comms as _ac
+            added, removed = await asyncio.to_thread(_ac.mirror_peer_registries)
+            if added or removed:
+                log.info("peer registry mirror: +%d -%d", added, removed)
+        except Exception:
+            log.debug("peer registry mirror failed", exc_info=True)
+
+    # Cross-account agent comms: heartbeat, and queue anything a sibling
+    # session has sent us (specs/agent-comms-spec.md).  Driven from the ticker
+    # because an *idle* agent is at a turn boundary too -- delivering only in
+    # _between_turns would leave a halt undelivered until the agent happened to
+    # do something, which is the opposite of what a halt is for.  The bridge
+    # rate-limits both the heartbeat and the poll internally.
+    if rt.bridge is not None:
+        try:
+            await rt.bridge.poll_agent_comms()
+        except Exception:
+            log.debug("agent comms poll failed", exc_info=True)
+
     # Catch-all bell flush: bells rung from sync contexts (e.g. rate-limit
     # hits) set state.pending_bell but have no async path to broadcast it.
     # Flush here so they reach the frontend within one tick instead of
@@ -712,24 +1069,51 @@ async def _status_ticker() -> None:
 # Queued-prompt disk persistence
 # ---------------------------------------------------------------------------
 
-def _attach_queue_persistence(st, cwd: str) -> None:
-    """Load any queue persisted for *cwd* into *st.queued_prompts*, then wire
-    the deque's on_change callback so future mutations are saved to disk.
+def _attach_queue_persistence(st, cwd: str) -> int:
+    """Wire *st.queued_prompts* to disk, restoring this session's own queue.
 
     Persisting the queue lets typed-but-not-yet-run prompts survive a full
-    server restart (browser reload already survives via server-side state).
+    server restart (a browser reload already survives via server-side state).
+
+    **Restoring is gated on the session, not the directory.**  A restored
+    prompt is not merely displayed -- ``connect()`` finishes by calling
+    ``_poke_for_queued_prompt()``, so the worker pops it and *sends* it as a
+    real turn without the user doing anything.  Handing that to the wrong
+    session means a brand-new session silently re-runs an old one's prompt,
+    which is what happened (see known-issues.md, "A new session inherited an
+    old session's queued prompt").
+
+    **``st.session_id`` must already be seeded when this is called.**  It is the
+    only thing that decides which queue is eligible: :func:`load_persisted_queue`
+    returns nothing at all for a session with no id, and otherwise nothing that
+    is not that exact session's own recent work.  So a ``--no-continue`` session
+    -- which has no id by definition -- cannot inherit anything, and the three
+    call sites need no flag to say so; they only need to run *after* seeding.
+    That ordering is what the original bug got wrong, and it is pinned by a test.
+
+    The save side is always wired, including when nothing was restored: a fresh
+    session still deserves to have its own queue survive a restart, from the
+    moment it has an identity to restore it into.  Returns the number of
+    prompts restored.
     """
+    saved: list[str] = []
     try:
-        saved = load_persisted_queue(cwd)
+        saved = load_persisted_queue(cwd, st.session_id)
     except Exception:
         saved = []
     if saved:
         # Populate before wiring on_change so the initial load doesn't trigger
         # a redundant re-save of what we just read.
         st.queued_prompts.extend(saved)
+        log.info("restored %d queued prompt(s) for session %s in %s",
+                 len(saved), (st.session_id or "?")[:8], cwd)
+    # ``st.session_id`` is read at save time, not captured now, so a session
+    # that gains an id on its first turn re-keys its file from the "__new" slot
+    # to its own instead of stranding it under a name nothing will look up.
     st.queued_prompts.on_change = (
-        lambda: save_persisted_queue(cwd, list(st.queued_prompts))
+        lambda: save_persisted_queue(cwd, list(st.queued_prompts), st.session_id)
     )
+    return len(saved)
 
 
 # ---------------------------------------------------------------------------
@@ -763,7 +1147,6 @@ async def lifespan(app: FastAPI):
     if config is None:
         config = parse_args()
     state = init_state_from_config(config)
-    _attach_queue_persistence(state, config.cwd)
     theme = load_theme()
 
     # The default session runtime wraps the process-wide globals and is the
@@ -818,6 +1201,12 @@ async def lifespan(app: FastAPI):
     # --resume title to a real UUID via dataclasses.replace).  Re-point the
     # default runtime at the finalized config so its ``config`` isn't stale.
     _default_runtime.config = config
+
+    # Only *now* is it known which session this process is continuing, and that
+    # is what selects the queue to restore.  Wiring this before the block above
+    # is what let a --no-continue session inherit (and immediately send) a
+    # prompt left by an older session in the same directory.
+    _attach_queue_persistence(state, config.cwd)
 
     # If --resume was passed without an argument, defer SDK start until the
     # user picks a session from the graphical picker.
@@ -888,6 +1277,12 @@ async def _deferred_bridge_startup(*, start: bool) -> None:
         log.exception("deferred bridge startup failed")
     finally:
         _bridge_ready.set()
+        # Everything heavy is now imported, so this is the first moment the
+        # snapshot covers the whole process.  Taken here rather than in
+        # `lifespan` for exactly that reason: sdk_bridge and its dependencies
+        # are loaded *by this function*, and a baseline that missed them would
+        # never notice a change to the file where most of the logic lives.
+        log.info("source snapshot: %d loaded project modules", snapshot_sources())
 
 
 # ---------------------------------------------------------------------------
@@ -979,7 +1374,6 @@ async def _create_runtime(
     # cross-account session shows the hub account's email/subscription.
     with _env_config_dir(config_dir):
         st = init_state_from_config(cfg)
-        _attach_queue_persistence(st, cfg.cwd)
     rt = SessionRuntime(config=cfg, state=st)
     runtimes[rt.rid] = rt
 
@@ -1001,6 +1395,12 @@ async def _create_runtime(
         if seed_id:
             st.session_id = seed_id
             br._initial_resume_id = seed_id
+        # After the seeding above, never before: st.session_id is what selects
+        # the queue.  ``no_continue`` leaves it None, which is precisely the
+        # "start fresh" case that must not inherit an older session's pending
+        # prompt -- a restored prompt is *sent*, not merely shown (connect()
+        # ends by poking the worker), so inheriting one silently re-runs work.
+        _attach_queue_persistence(st, cfg.cwd)
 
     if seed_id:
         # Read the display title in the background.  Scanning the session's
@@ -1337,9 +1737,15 @@ class _ExternalAuthMiddleware:
     _BASE_LOCKOUT = 2.0         # seconds for the first lockout past the threshold
     _MAX_LOCKOUT = 300.0        # cap on the lockout window (5 min)
 
-    def __init__(self, app: Any, *, password: str | None) -> None:
+    def __init__(self, app: Any, *, password: str | None,
+                 disabled_message: str | None = None) -> None:
         self.app = app
         self.password = password
+        # Shown to a refused external client when no password is in force.
+        # Carries EXTERNAL_HOWTO so someone who reaches the server from outside
+        # and gets a wall of "no" is told, on the spot, how to say yes.
+        self.disabled_message = disabled_message or (
+            "External access is disabled on this server.\n\n" + EXTERNAL_HOWTO)
         # Deterministic token derived from the password: lets the cookie
         # authenticate without carrying the literal secret.
         self.token = (
@@ -1358,22 +1764,12 @@ class _ExternalAuthMiddleware:
             if not _is_private_ip(client_ip):
                 # External connection — check credentials.
                 if self.password is None:
-                    # No password configured → external access is off.  Don't
-                    # send a Basic-Auth challenge (it would prompt for a
-                    # password that can never work); just refuse.
+                    # No password in force → external access is off (either the
+                    # default, or "on" with no password, which is refused).
+                    # Don't send a Basic-Auth challenge: it would prompt for a
+                    # password that can never work.
                     await self._reject(scope, receive, send,
-                                       "External access is disabled.",
-                                       challenge=False)
-                    return
-                # Locked out? Refuse before touching the password so a guesser
-                # gets nothing (not even a timing signal) during the window.
-                retry_after = self._lockout_remaining()
-                if retry_after > 0:
-                    await self._reject(
-                        scope, receive, send,
-                        f"Too many failed attempts. Try again in "
-                        f"{int(retry_after) + 1}s.",
-                        challenge=False, status=429, retry_after=retry_after)
+                                       self.disabled_message, challenge=False)
                     return
                 headers = dict(scope.get("headers", []))
                 auth = headers.get(b"authorization", b"").decode("utf-8", "replace")
@@ -1384,11 +1780,45 @@ class _ExternalAuthMiddleware:
                 if pw_param is not None:
                     pw_param = unquote(pw_param)
                 cookie_ok = self._cookie_ok(headers.get(b"cookie", b""))
+
+                # An already-authenticated client is let through even mid
+                # lockout.  Its cookie is proof of a *past success*, not a
+                # guess, so honouring it costs an attacker nothing — and it
+                # removes the one real bite of a global counter: a stranger
+                # guessing from anywhere could otherwise lock the owner out of
+                # their own remote session for up to five minutes.
+                if cookie_ok:
+                    self._record_success()
+                    await self.app(scope, receive, send)
+                    return
+
+                # Locked out? Refuse before comparing the password so a guesser
+                # gets nothing (not even a timing signal) during the window.
+                retry_after = self._lockout_remaining()
+                if retry_after > 0:
+                    await self._reject(
+                        scope, receive, send,
+                        f"Too many failed password attempts. Try again in "
+                        f"{int(retry_after) + 1}s.",
+                        challenge=False, status=429, retry_after=retry_after)
+                    return
+
                 header_ok = self._check_basic_auth(auth)
                 param_ok = pw_param is not None and hmac.compare_digest(
                     pw_param, self.password)
-                if not (header_ok or param_ok or cookie_ok):
-                    self._record_failure()
+                if not (header_ok or param_ok):
+                    # **Only a wrong credential counts as an attempt.**  A
+                    # request that carried none is not a guess — it is a browser
+                    # that has not been asked yet, and counting it was this
+                    # throttle's central bug: one ordinary first visit fires a
+                    # document request, a dozen static assets and (via app.js's
+                    # 20-try reconnect loop) a stream of WebSocket upgrades, all
+                    # credential-less.  Five of those armed the lockout, so the
+                    # user was told "too many failed attempts" while typing the
+                    # *correct* password for the first time, and a reload fixed
+                    # it only because by then the cookie existed.
+                    if auth or pw_param is not None:
+                        self._record_failure()
                     await self._reject(scope, receive, send,
                                        "Authentication required.")
                     return
@@ -1522,30 +1952,103 @@ def build_app() -> Any:
         app.add_api_websocket_route(path, fn)
 
     # Wrap the app with authentication for external connections.
-    app = _ExternalAuthMiddleware(app, password=_resolve_external_password(config))
+    _ext = _resolve_external_auth(config)
+    # Always say which of the three states we're in.  Silence here is how an
+    # operator ends up believing remote access works when it doesn't — or, far
+    # worse, not noticing that it does.
+    if _ext.warn:
+        log.warning("SECURITY: %s", _ext.warn)
+    elif _ext.enabled:
+        log.info("external access: ON — non-LAN clients must supply the "
+                 "configured password")
+    else:
+        log.info("external access: off (LAN/loopback only). %s",
+                 EXTERNAL_HOWTO.replace("\n", " "))
+    app = _ExternalAuthMiddleware(
+        app, password=_ext.password,
+        disabled_message=(
+            ("External access is enabled but NO PASSWORD is set, so every "
+             "non-LAN connection is refused.\n\n" + EXTERNAL_HOWTO)
+            if _ext.warn else
+            ("External access is disabled on this server.\n\n"
+             + EXTERNAL_HOWTO)))
 
     return app
 
 
-def _resolve_external_password(config: Config | None) -> str | None:
-    """Resolve the non-LAN password from CLI flag, env var, then built-in default.
+#: How to turn external access on, quoted verbatim wherever we have to explain
+#: it — startup log, refusal body, ``/status``.  One string so the instructions
+#: cannot drift apart between the places a user might actually read them.
+EXTERNAL_HOWTO = (
+    "To allow access from outside the LAN, set BOTH a password and the switch:\n"
+    "  --external-access on --external-password \"<your password>\"\n"
+    "or the equivalent environment variables:\n"
+    "  ORCH2_EXTERNAL_ACCESS=on\n"
+    "  ORCH2_EXTERNAL_PASSWORD=<your password>"
+)
 
-    Precedence:
-      1. ``--external-password <pw>`` → use it verbatim.  An explicit empty
-         string (``--external-password ""``) disables external access → None.
-      2. ``ORCH2_EXTERNAL_PASSWORD`` env var (only when the flag wasn't given).
-      3. the built-in default ``DEFAULT_EXTERNAL_PASSWORD``.
 
-    The CLI flag defaults to None ("unspecified"), which is what lets us tell
-    "not passed" (→ env/default) apart from "passed empty" (→ disable).
+class ExternalAuthPolicy(NamedTuple):
+    """The resolved non-LAN access decision.
+
+    *password* is None whenever external access is refused, which is what the
+    middleware keys off — so a policy that is off, or on-but-passwordless,
+    cannot accidentally authenticate anyone.  *warn* is set only for the
+    misconfiguration (on, no password): "off" is the intended default and must
+    not nag.
+    """
+
+    enabled: bool
+    password: str | None
+    warn: str | None
+
+
+def _resolve_external_auth(config: Config | None) -> ExternalAuthPolicy:
+    """Decide whether non-LAN clients are allowed in, and with what password.
+
+    Two independent inputs, because the dangerous state has to be *reachable
+    and refused* rather than unreachable:
+
+    * the switch — ``--external-access on|off``, else ``ORCH2_EXTERNAL_ACCESS``,
+      else **off**;
+    * the password — ``--external-password``, else ``ORCH2_EXTERNAL_PASSWORD``,
+      else none.  **There is no built-in default.**  Shipping one (this was
+      ``"uncommon11"``) means every install is reachable from the internet with
+      a password published in the source.
+
+    Outcomes:
+
+    * off → refused.  The default, and silent: it is what the user asked for.
+    * on + password → allowed.
+    * on + no password → **refused, with a warning.**  Turning the switch on is
+      a clear statement of intent, so failing open would be indefensible and
+      failing silently would be baffling; the operator is told, and stays shut.
+
+    A whitespace-only password counts as no password: it is a typo or an empty
+    environment variable, never a deliberate secret.
     """
     cfg_pw = getattr(config, "external_password", None) if config is not None else None
     if cfg_pw is None:
-        return ((os.environ.get("ORCH2_EXTERNAL_PASSWORD") or "").strip()
-                or DEFAULT_EXTERNAL_PASSWORD)
-    if cfg_pw == "":
-        return None   # explicitly disabled
-    return cfg_pw
+        cfg_pw = os.environ.get("ORCH2_EXTERNAL_PASSWORD")
+    password = (cfg_pw or "").strip() or None
+
+    cfg_access = getattr(config, "external_access", None) if config is not None else None
+    if cfg_access is None:
+        cfg_access = (os.environ.get("ORCH2_EXTERNAL_ACCESS") or "").strip().lower()
+    enabled = cfg_access in ("on", "1", "true", "yes")
+
+    if not enabled:
+        return ExternalAuthPolicy(False, None, None)
+    if password is None:
+        return ExternalAuthPolicy(False, None, (
+            "external access is ON but no password is set — refusing all "
+            "non-LAN connections.\n" + EXTERNAL_HOWTO))
+    return ExternalAuthPolicy(True, password, None)
+
+
+def _resolve_external_password(config: Config | None) -> str | None:
+    """The password the middleware should enforce, or None to refuse everyone."""
+    return _resolve_external_auth(config).password
 
 
 # ---------------------------------------------------------------------------
@@ -1683,7 +2186,6 @@ async def _reconfigure(
     # --- Reinitialise state + bridge ---
     from sdk_bridge import SDKBridge  # already imported once by now; cheap
     state = init_state_from_config(config)
-    _attach_queue_persistence(state, config.cwd)
     _bcast = _default_runtime.broadcast if _default_runtime is not None else broadcast
     bridge = SDKBridge(config=config, state=state, broadcaster=_bcast)
     _bridge_ready.set()
@@ -1716,6 +2218,10 @@ async def _reconfigure(
                 state.session_id = recent.stem
                 state.session_title = read_session_title(recent.stem, config.config_dir)
                 bridge._initial_resume_id = recent.stem
+
+    # Same rule as startup: the queue follows the session, so this has to run
+    # after the two branches above have decided which one (if any) we are on.
+    _attach_queue_persistence(state, config.cwd)
 
     _picker_mode = False
     await bridge.start()
@@ -1988,6 +2494,31 @@ async def api_whoami() -> dict[str, Any]:
         "port": getattr(config, "port", None) if config else None,
         "sessions": len(runtimes),
         "namespace": _path_namespace(),
+    }
+
+
+@_route("get", "/api/running")
+async def api_running() -> dict[str, Any]:
+    """This hub's live session registry — the metas the lobby renders.
+
+    Exists so *another* hub can ask.  A machine runs one hub per account/port,
+    and a session live in one of the others is invisible to
+    ``runtimes``: the lobby learns it exists from a process scan
+    (``proc_guard.map_foreign_session_holders``), which can see the cwd and the
+    holder's pid but nothing about the conversation.  Everything a scan cannot
+    observe — whether a turn is running, how many tabs are watching, the
+    current title — used to be filled in with placeholders and rendered as
+    fact.  Asking the hub that actually owns the session is the only way to
+    know, and it already has the answer in memory.
+
+    Deliberately no disk access and no locks: it is polled by peer hubs on
+    their lobby tick, so it must be trivially cheap and must never be able to
+    block on anything the caller can't see.  ``/api/status`` is not a
+    substitute — it reports the *primary* session only, not the registry.
+    """
+    return {
+        "running": [rt.meta() for rt in runtimes.values()],
+        "port": getattr(config, "port", None) if config else None,
     }
 
 
@@ -2271,14 +2802,15 @@ async def _enqueue_prompt(
     rt: SessionRuntime | None,
     prompt: str,
     *,
-    client_echoed: bool = False,
+    echoed_by: Any = None,
 ) -> bool:
     """Hand a user prompt to a runtime's bridge, echoing it to the transcript.
 
     Every prompt the user causes to run has to appear as a "you:" message, and
     there is exactly one producer that echoes on its own: the browser's
     optimistic echo in ``app.js send()``, which fires only when it believes the
-    session is idle and reports itself via ``client_echoed``.  Everything else
+    session is idle and reports itself via ``client_echoed``; the handler turns
+    that into ``echoed_by=<that socket>``.  Everything else
     that puts ``("message", …)`` on the event queue — the queue panel's green
     send arrow and ``/queue send`` (both of which *remove* the prompt from the
     queue, so the panel stops showing it too), ``/graphify``, any command
@@ -2317,8 +2849,17 @@ async def _enqueue_prompt(
     # is still pending; emit it before this prompt so the transcript doesn't
     # read "you: … / Turn N completed".  See SDKBridge.flush_pending_turn_end.
     await rt.bridge.flush_pending_turn_end()
-    if not client_echoed:
-        await rt.broadcast({"type": "user_message", "content": prompt})
+    # Tell every viewer about the prompt, skipping only the socket that already
+    # drew it optimistically.  This used to be a boolean ``client_echoed`` that
+    # suppressed the broadcast outright, which meant "the sender rendered it"
+    # was read as "everyone has it": with the session open in two tabs the
+    # prompt appeared only where it was typed, while both tabs went on to show
+    # the reply to it (reported 2026-09-06).
+    #
+    # One socket rather than a flag, so "echoed, but by whom?" — the state that
+    # made that bug expressible — cannot be represented at all.
+    await rt.broadcast({"type": "user_message", "content": prompt},
+                       exclude=echoed_by)
     rt.bridge.event_queue.put_nowait(("message", prompt))
     return True
 
@@ -2730,6 +3271,77 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         _maybe_start_shutdown_timer()
 
 
+#: How many of the newest history messages are sent in the first frame.  The
+#: rest follow as ``history_prepend`` and are inserted above.  Sized to cover a
+#: tall screen several times over, so the visible transcript is complete before
+#: the backfill lands.
+HISTORY_FIRST_SLICE = 200
+
+
+async def _handle_loop(ws: WebSocket, bridge, payload: str) -> None:
+    """``/loop`` -- show, stop or arm the autonomous wakeup loop.
+
+    The loop had no operator surface at all.  It exists because the CLI does
+    not honour ``ScheduleWakeup`` in streaming mode, so orchestrator2 runs the
+    timer itself and injects the prompt -- which means the loop is *outside*
+    the agent's conversation, and until now outside anybody's view.  An agent
+    reported wakeups it could not stop and asked the operator to "end the /loop
+    on your end"; the operator had no way to do that either.
+    """
+    arg = (payload or "").strip().lower()
+
+    def _fmt(st: dict) -> str:
+        if not st["enabled"]:
+            return "Wakeup loop: disabled for this session (--no-wakeup)."
+        if not st["armed"]:
+            return ("Wakeup loop: not armed"
+                    + (" (stopped)." if st["stopped"] else "."))
+        left = st["seconds_left"] or 0.0
+        extra = ""
+        if st["defers"]:
+            extra = (f", deferred {st['defers']}/{st['max_defers']} times "
+                     f"while a turn was running")
+        return (f"Wakeup loop: armed, fires in {left:.0f}s{extra}.\n"
+                f"Stop it with /loop off.")
+
+    if arg in ("", "status", "show"):
+        await send_to(ws, {"type": "system_msg", "subtype": "info",
+                           "data": {"message": _fmt(bridge.loop_status())}})
+        return
+
+    if arg in ("off", "stop", "cancel", "end", "0"):
+        was = bridge.stop_loop()
+        await broadcast({
+            "type": "system_msg", "subtype": "info",
+            "data": {"message": (
+                "Wakeup loop stopped — no further scheduled prompts will be "
+                "injected." if was else
+                "No wakeup loop was armed; it is now explicitly off.")},
+        })
+        return
+
+    if arg in ("on", "start"):
+        d = bridge.start_loop(WAKEUP_DEFAULT_DELAY)
+        await broadcast({"type": "system_msg", "subtype": "info",
+                         "data": {"message": f"Wakeup loop armed: fires in {d:.0f}s."}})
+        return
+
+    try:
+        seconds = float(arg)
+    except ValueError:
+        await send_to(ws, {"type": "system_msg", "subtype": "error",
+                           "data": {"message": (
+                               "usage: /loop [status|off|on|<seconds>]")}})
+        return
+    d = bridge.start_loop(seconds)
+    note = ""
+    if abs(d - seconds) > 0.5:
+        note = (f" (clamped from {seconds:.0f}s to the tool's documented "
+                f"{WAKEUP_MIN_DELAY:.0f}-{WAKEUP_MAX_DELAY:.0f}s range)")
+    await broadcast({"type": "system_msg", "subtype": "info",
+                     "data": {"message": f"Wakeup loop armed: fires in {d:.0f}s{note}."}})
+
+
 async def _send_initial_state(ws: WebSocket) -> None:
     """Send session history, status, panels, and completions on attach.
 
@@ -2796,18 +3408,68 @@ async def _send_initial_state(ws: WebSocket) -> None:
             log.info("[history] find_session_dir → %s", session_dir)
             if session_dir:
                 jsonl = session_dir / f"{state.session_id}.jsonl"
-                _count, history_msgs, _orphans = await loop.run_in_executor(
-                    None, render_session_history, jsonl,
-                )
+                # Take a turn in the same queue the CLI resume reads use.
+                # Both read the *same* transcript, and they used to do it
+                # concurrently: on a three-session launch that meant six
+                # readers moving ~4 GB at once, which stretched a 5 s attach
+                # to 42 s.  Serialising costs a little waiting and saves a lot
+                # of thrashing.  Small sessions skip the lock entirely, so the
+                # ordinary case is unaffected.
+                # Imported here, not at module scope: sdk_bridge pulls in the
+                # Agent SDK (and mcp), which the deferred-startup design keeps
+                # off the ``import server`` path.  By now the bridge is running,
+                # so this is a sys.modules hit.
+                _hist_lock = None
+                try:
+                    import sdk_bridge as _sb
+                    if jsonl.stat().st_size >= _sb.HEAVY_CONNECT_BYTES:
+                        _hist_lock = _sb._heavy_lock()
+                except (OSError, ImportError):
+                    pass
+                if _hist_lock is not None and _hist_lock.locked():
+                    log.info("[history] waiting for a large session read to "
+                             "finish before loading %s", state.session_id)
+                async with contextlib.nullcontext() if _hist_lock is None else _hist_lock:
+                    _count, history_msgs, _orphans, _todos = await loop.run_in_executor(
+                        None, render_session_history, jsonl,
+                    )
+                # Seed the plan panel from the transcript.  ``current_todos``
+                # is otherwise written only by a *live* TodoWrite, so after a
+                # restart the panel sat empty until the agent happened to
+                # rewrite its list — even though the CLI had rebuilt its own
+                # todo state from this same transcript, so Claude still knew
+                # the plan and only the user's view of it was missing.
+                # Don't clobber a list a live TodoWrite has already provided.
+                if _todos and not state.current_todos:
+                    state.current_todos = _todos
+                    log.info("[history] seeded %d todo(s) for %s",
+                             len(_todos), state.session_id)
                 log.info("[history] rendered %d msgs (%d records) for %s",
                          len(history_msgs), _count, state.session_id)
                 if history_msgs:
+                    # Newest first, older backfilled above.
+                    #
+                    # Reading the transcript is only half the wait: building a
+                    # thousand-odd DOM nodes takes real time too, and the user
+                    # is staring at an empty chat for all of it.  Only the last
+                    # screenful is worth anything at that moment, so send it on
+                    # its own and let the rest arrive behind it.
+                    tail = history_msgs[-HISTORY_FIRST_SLICE:]
+                    head = history_msgs[:-len(tail)] if tail else history_msgs
                     await send_to(ws, {
                         "type": "history",
-                        "messages": history_msgs,
+                        "messages": tail,
+                        "more_above": len(head),
                     })
-                    log.info("[history] sent %d history messages for %s",
-                             len(history_msgs), state.session_id)
+                    if head:
+                        await send_to(ws, {
+                            "type": "history_prepend",
+                            "messages": head,
+                        })
+                    log.info("[history] sent %d history messages for %s "
+                             "(%d immediate, %d backfilled)",
+                             len(history_msgs), state.session_id,
+                             len(tail), len(head))
                 else:
                     log.info("[history] no messages to send for %s",
                              state.session_id)
@@ -2837,35 +3499,43 @@ async def _send_initial_state(ws: WebSocket) -> None:
         })
 
 
-async def _do_switch(ws: WebSocket, msg: dict[str, Any]) -> None:
-    """Copy this tab's current session into another account and attach here.
+async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
+    """Copy this tab's session to another account and/or directory, and attach.
 
-    The ``/switch`` flow: copy the live session's JSONL into the chosen
+    The ``/move`` flow: copy the live session's JSONL into the chosen
     account's projects tree under a *fresh* session id (so it never collides
     with an existing one), set the entered name as its custom title, spin up a
     runtime bound to that account resuming the copy, and attach THIS socket to
-    it — so the conversation seamlessly continues in the current window under
-    the new account.  Reuses ``copy_session.copy_session_file`` (which rewrites
-    the ``sessionId`` fields so the copy resumes cleanly).
+    it — so the conversation seamlessly continues in the current window.
+    Reuses ``copy_session.copy_session_file`` (which rewrites the ``sessionId``
+    fields so the copy resumes cleanly).
+
+    The destination is an **account and a directory**, either of which may be
+    left as it is.  Moving directory is not just a matter of where the copy is
+    written: the project *slug* is derived from the cwd, and the records carry
+    the cwd (and git branch) themselves, so both have to be rewritten or the
+    copy would contradict the directory it lives in — see
+    ``copy_session_file``.
     """
     import uuid
-    from copy_session import copy_session_file
+    from copy_session import copy_session_file, git_branch_for, _sanitize_cwd
 
     rt = _ws_runtime.get(ws) or _runtime_for_ws(ws)
     if rt is None or rt.state is None or rt.config is None \
             or not rt.state.session_id:
-        await send_to(ws, {"type": "switch_error",
+        await send_to(ws, {"type": "move_error",
                            "message": "No active session to switch."})
         return
 
     target_cfg = (msg.get("config_dir") or "").strip()
     new_name = (msg.get("new_name") or "").strip()
+    want_cwd = (msg.get("cwd") or "").strip()
     if not target_cfg:
-        await send_to(ws, {"type": "switch_error",
+        await send_to(ws, {"type": "move_error",
                            "message": "No target account selected."})
         return
     if not new_name:
-        await send_to(ws, {"type": "switch_error",
+        await send_to(ws, {"type": "move_error",
                            "message": "Please enter a name for the new session."})
         return
 
@@ -2874,14 +3544,39 @@ async def _do_switch(ws: WebSocket, msg: dict[str, Any]) -> None:
     cwd = rt.config.cwd
     loop = asyncio.get_running_loop()
 
+    # Resolve the destination directory.  Blank means "leave it where it is",
+    # which is the old behaviour and still the common case.
+    dest_cwd = cwd
+    if want_cwd:
+        try:
+            resolved = Path(os.path.expanduser(os.path.expandvars(want_cwd)))
+            resolved = resolved.resolve(strict=False)
+        except OSError as exc:
+            await send_to(ws, {"type": "move_error",
+                               "message": f"Bad directory: {exc}"})
+            return
+        if not await asyncio.to_thread(resolved.is_dir):
+            await send_to(ws, {"type": "move_error",
+                               "message": (f"No such directory: {resolved}\n"
+                                           "Create it first, then switch.")})
+            return
+        dest_cwd = str(resolved)
+    dir_changed = normalize_path_for_compare(dest_cwd) \
+        != normalize_path_for_compare(cwd)
+
     # Locate the source JSONL under the current account.
     src_dir = await loop.run_in_executor(None, find_session_dir, sid, src_cfg)
     if src_dir is None:
-        await send_to(ws, {"type": "switch_error",
+        await send_to(ws, {"type": "move_error",
                            "message": "Couldn't find this session's file on disk."})
         return
     src_jsonl = src_dir / f"{sid}.jsonl"
-    slug = src_dir.name           # same project-slug under the new account
+    # Staying put reuses the source dir's *actual* name, which is not always
+    # the sanitised cwd (a session found by the cwd-sniffing fallback can live
+    # under a slug that no longer matches).  A move has no such history to
+    # preserve, so it uses the slug the CLI will compute for the new cwd —
+    # which is the only place `claude --resume` will look from there.
+    slug = _sanitize_cwd(dest_cwd) if dir_changed else src_dir.name
     dest_proj = Path(target_cfg) / "projects" / slug
     # Fresh session id — regenerate on the (astronomically unlikely) chance the
     # id already exists, so a switch NEVER overwrites an existing session file.
@@ -2891,13 +3586,20 @@ async def _do_switch(ws: WebSocket, msg: dict[str, Any]) -> None:
         new_id = str(uuid.uuid4())
         dest_jsonl = dest_proj / f"{new_id}.jsonl"
 
-    # Copy (rewrites sessionId → new_id) off the event loop — the JSONL can be
-    # hundreds of MB, which would otherwise freeze every tab and the ticker.
+    new_branch = (await asyncio.to_thread(git_branch_for, dest_cwd)
+                  if dir_changed else None)
+
+    # Copy (rewrites sessionId → new_id, and cwd/gitBranch on a move) off the
+    # event loop — the JSONL can be hundreds of MB, which would otherwise
+    # freeze every tab and the ticker.
     try:
         await loop.run_in_executor(
-            None, copy_session_file, src_jsonl, dest_jsonl, new_id)
+            None,
+            functools.partial(copy_session_file, src_jsonl, dest_jsonl, new_id,
+                              new_cwd=dest_cwd if dir_changed else None,
+                              new_branch=new_branch))
     except OSError as exc:
-        await send_to(ws, {"type": "switch_error",
+        await send_to(ws, {"type": "move_error",
                            "message": f"Copy failed: {exc}"})
         return
 
@@ -2909,22 +3611,25 @@ async def _do_switch(ws: WebSocket, msg: dict[str, Any]) -> None:
         log.warning("switch: failed to set title on copied session",
                     exc_info=True)
 
-    # Spin up a runtime bound to the target account, resuming the copy.
+    # Spin up a runtime bound to the target account *and directory*, resuming
+    # the copy.  `dest_cwd` is `cwd` unless the switch moved it.
     try:
         new_rt = await _create_runtime(
-            cwd=cwd, resume=new_id, config_dir=target_cfg)
+            cwd=dest_cwd, resume=new_id, config_dir=target_cfg)
     except Exception as exc:
         log.exception("switch: failed to start runtime for copied session")
-        await send_to(ws, {"type": "switch_error",
+        await send_to(ws, {"type": "move_error",
                            "message": f"Couldn't start the switched session: {exc}"})
         return
+    log.info("switch: %s → %s (account %s, cwd %s)", sid[:8], new_id[:8],
+             Path(target_cfg).name, dest_cwd)
 
     # Reflect the just-written title immediately (the background title read in
     # _create_runtime may not have completed the JSONL scan yet).
     if new_rt.state is not None and not new_rt.state.session_title:
         new_rt.state.session_title = new_name
 
-    await send_to(ws, {"type": "switch_done", "rid": new_rt.rid})
+    await send_to(ws, {"type": "move_done", "rid": new_rt.rid})
     # Attach THIS socket to the new runtime → history + status flow into the
     # current window, continuing the conversation under the new account.
     await _attach_ws(ws, new_rt)
@@ -2972,25 +3677,30 @@ async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
         await _enter_lobby(ws)
         return True
 
-    if msg_type == "switch_list":
-        # /switch step 1: send the available accounts (name + email), marking
-        # the one this tab's session currently runs under.
+    if msg_type == "move_list":
+        # /move step 1: send the available accounts (name + email) and the
+        # directories worth offering, marking the account and cwd this tab's
+        # session currently runs under.
         cur = _ws_runtime.get(ws) or _runtime_for_ws(ws)
         cur_cfg = getattr(cur.config, "config_dir", None) if cur and cur.config else None
         cur_sid = getattr(cur.state, "session_id", None) if cur and cur.state else None
         cur_title = getattr(cur.state, "session_title", None) if cur and cur.state else None
-        accounts = await asyncio.to_thread(_switch_accounts_payload, cur_cfg)
+        cur_cwd = getattr(cur.config, "cwd", None) if cur and cur.config else None
+        accounts = await asyncio.to_thread(_move_accounts_payload, cur_cfg)
+        dirs = await asyncio.to_thread(_move_dirs_payload)
         await send_to(ws, {
-            "type": "switch_accounts",
+            "type": "move_accounts",
             "accounts": accounts,
+            "dirs": dirs,
             "current_session_id": cur_sid,
             "current_title": cur_title,
+            "current_cwd": cur_cwd,
             "has_session": bool(cur_sid),
         })
         return True
 
-    if msg_type == "switch_do":
-        await _do_switch(ws, msg)
+    if msg_type == "move_do":
+        await _do_move(ws, msg)
         return True
 
     if msg_type == "attach":
@@ -3222,6 +3932,10 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             await _do_interrupt(bridge, broadcast)
             return
 
+        if kind == "loop":
+            await _handle_loop(ws, bridge, payload)
+            return
+
         if kind in ("quit", "force-quit"):
             await bridge.stop()
             await send_to(ws, {"type": "system_msg", "subtype": "shutdown",
@@ -3244,7 +3958,7 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
                 await _send_initial_state(ws)
             else:
                 await send_to(ws, {"type": "system_msg", "subtype": "error",
-                                   "data": {"message": f"Switch failed: {err}"}})
+                                   "data": {"message": f"Move failed: {err}"}})
             return
 
         if kind == "resume-pick":
@@ -3331,7 +4045,8 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
         # went via ``client_echoed``.
         if kind == "message":
             ok = await _enqueue_prompt(
-                rt, payload, client_echoed=bool(msg.get("client_echoed")))
+                rt, payload,
+                echoed_by=ws if msg.get("client_echoed") else None)
             await _ack_prompt(
                 ws, msg, PROMPT_ENQUEUED if ok else PROMPT_REJECTED)
             return
@@ -3982,7 +4697,10 @@ def _run_launch_picker(mode: str, launch_cwd: str | None = None) -> dict | None:
         # POSIX: only a real terminal can host the TUI; run it in-process.
         if _stdin_is_tty():
             try:
-                from copy_session import pick_session_for_launch
+                # The TUI half lives in its own module so importing the
+                # discovery half never drags `textual` in — see
+                # copy_session_tui's docstring.
+                from copy_session_tui import pick_session_for_launch
                 return pick_session_for_launch(mode, launch_cwd)
             except Exception:
                 log.exception("launch picker failed")
@@ -4047,12 +4765,135 @@ def _run_launch_picker(mode: str, launch_cwd: str | None = None) -> dict | None:
             pass
 
 
+LAUNCH_ERROR_LOG = Path(__file__).resolve().parent / "launch-error.log"
+
+
+def _report_launch_failure(message: str) -> None:
+    """Make a startup argument error visible when nothing else can be.
+
+    ``orch2.bat`` starts the server via ``start /MIN`` + ``tray_minimizer``,
+    which gives it a real console and then hides the window.  argparse writes
+    "unrecognized arguments" to *that* console and exits with status 2 —
+    before ``--log-file`` has even been read, so there is no log line either.
+    The net effect is that a mistyped flag makes the launch do **nothing, in
+    complete silence**.
+
+    Reported 2026-09-03: ``orch2c --noresume`` (the real flag is
+    ``--no-continue``) appeared to "not resume", when in fact that launch never
+    started at all — the session the user ended up looking at came from a
+    different launch, under an account with no session for that directory. An
+    invisible failure is worse than a loud one precisely because it gets
+    attributed to whatever *did* happen next.
+
+    So: always leave a file, and pop a dialog when the console is hidden, which
+    is exactly the case where stderr goes nowhere a human will look.
+    """
+    text = message.strip() or "Invalid command-line arguments."
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    body = f"orchestrator2 could not start.\n\n{text}\n\nCommand line:\n  {' '.join(sys.argv)}"
+    try:
+        with open(LAUNCH_ERROR_LOG, "a", encoding="utf-8") as fh:
+            fh.write(f"--- {stamp} ---\n{body}\n\n")
+    except OSError:
+        pass
+    if _console_is_hidden() and not os.environ.get("ORCH2_NO_DIALOG"):
+        _show_error_dialog("orchestrator2 — launch failed", body)
+
+
+def _console_is_hidden() -> bool:
+    """True only for the tray case: a console exists, but its window is hidden.
+
+    Deliberately *narrower* than ``not _console_is_visible()``.  "No console at
+    all" — a piped/redirected run, a test harness, CI — also has no visible
+    console, but it is not a human sitting in front of a launcher, and popping
+    a modal dialog there hangs the process until somebody clicks it.  (Which is
+    exactly what happened the first time this was written: a piped run blocked
+    forever on a MessageBox nobody was looking for.)
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        u = ctypes.windll.user32
+        k.GetConsoleWindow.restype = ctypes.c_void_p
+        hwnd = k.GetConsoleWindow()
+        if not hwnd:
+            return False                      # no console: not the tray case
+        return not bool(u.IsWindowVisible(ctypes.c_void_p(hwnd)))
+    except Exception:
+        return False
+
+
+def _show_error_dialog(title: str, body: str, timeout_ms: int = 120_000) -> None:
+    """Modal error box that cannot wedge the process forever.
+
+    Prefers ``MessageBoxTimeoutW`` (present in user32 since XP, undocumented
+    but stable) so an unattended launch eventually gives up and exits instead
+    of leaving an invisible process pinned on a dialog nobody sees.
+    """
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        flags = 0x10 | 0x10000               # MB_ICONERROR | MB_SETFOREGROUND
+        fn = getattr(u, "MessageBoxTimeoutW", None)
+        if fn is not None:
+            fn(None, body, title, flags, 0, timeout_ms)
+        else:
+            u.MessageBoxW(None, body, title, flags)
+    except Exception:
+        pass
+
+
+def _parse_args_or_report():
+    """``parse_args()``, but a rejected argument does not die unseen.
+
+    argparse's own message is still written to stderr unchanged (a visible
+    console keeps behaving exactly as before); it is *also* captured so
+    :func:`_report_launch_failure` can put it somewhere a hidden-console launch
+    can actually be read from.  ``--help`` / ``--version`` exit 0 and are not
+    failures, so they pass straight through.
+    """
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(_Tee(sys.stderr, buf)):
+            return parse_args()
+    except SystemExit as exc:
+        if exc.code not in (0, None):
+            _report_launch_failure(buf.getvalue())
+        raise
+
+
+class _Tee:
+    """Write to two streams at once (real stderr + a capture buffer)."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, s):
+        for st in self._streams:
+            try:
+                st.write(s)
+            except Exception:
+                pass
+        return len(s)
+
+    def flush(self):
+        for st in self._streams:
+            try:
+                st.flush()
+            except Exception:
+                pass
+
+
 def main() -> None:
     """Launch the server."""
     global config
 
     # Parse args early so we can get the port and store for startup().
-    config = parse_args()
+    # Via _parse_args_or_report so a bad flag cannot fail silently under the
+    # tray launcher — see _report_launch_failure.
+    config = _parse_args_or_report()
 
     # Set CLAUDE_CONFIG_DIR before any SDK or session code runs.  When
     # --config-dir is passed it wins; otherwise the SDK/CLI use whatever
