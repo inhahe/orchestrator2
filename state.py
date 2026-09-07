@@ -649,6 +649,20 @@ class State:
     # Runtime override of config.cli_recycle_at (GiB), set by /recycle.
     cli_recycle_at: float | None = None
 
+    # Self-paced wakeup loop (SDKBridge._arm_wakeup / /loop).  The timer itself
+    # lives on the bridge; these mirror it into State so the status bar can see
+    # it, since ``state_to_status_dict`` has no bridge.
+    #
+    # A **wall-clock epoch**, not the bridge's ``time.monotonic()`` deadline:
+    # it crosses to a browser, which can only compare it against its own clock.
+    # The frontend then ticks the countdown locally rather than depending on
+    # how often a status_update happens to arrive.
+    wakeup_at: float | None = None
+    # Consecutive mid-turn deferrals. Non-zero means the wakeup keeps landing
+    # while a turn is running and is being pushed back; at WAKEUP_MAX_DEFERS it
+    # is dropped. Surfaced because "armed" alone would imply it will fire.
+    wakeup_defers: int = 0
+
     # Rate limits
     rate_limit_utils: dict[str, float] = field(default_factory=dict)
     rate_limit_status: str | None = None
@@ -871,6 +885,11 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         "todos_in_progress": in_prog_label,
         "bg_count": len(state.background_tasks),
         "queued_count": len(state.queued_prompts),
+        # Self-paced wakeup loop: a wall-clock deadline the frontend counts
+        # down against its own clock, so the display stays smooth between
+        # status pushes.  None when nothing is armed.
+        "wakeup_at": state.wakeup_at,
+        "wakeup_defers": state.wakeup_defers,
         "collapse_tools": state.collapse_tools,
         "collapse_threshold": state.collapse_threshold,
         "max_dom_messages": state.max_dom_messages,

@@ -150,6 +150,14 @@
       <span class="status-sep" id="status-climem-sep" hidden>|</span>
       <span class="status-label" id="status-climem-label" hidden>cli</span>
       <span id="status-climem" class="status-field" title="CLI subprocess memory" hidden>--</span>
+      <!-- Self-paced wakeup loop (/loop, and the model's own ScheduleWakeup).
+           Hidden unless one is actually armed: most sessions never use it, and
+           a permanent "loop --" would be noise in a bar that is already full.
+           Counted down locally against the deadline, like the lobby's
+           idle-teardown badge. -->
+      <span class="status-sep" id="status-loop-sep" hidden>|</span>
+      <span class="status-label" id="status-loop-label" hidden>loop</span>
+      <span id="status-loop" class="status-field" title="Scheduled wakeup" hidden>--</span>
       <span class="status-sep">|</span>
       <span class="status-label">rate</span>
       <span id="status-ratelimit" class="status-field" title="Rate limits">--</span>

@@ -1320,6 +1320,7 @@ async def _create_runtime(
     effort: str | None = None,
     config_dir: str | None = None,
     bell_on: str | None = None,
+    session_note: str | None = None,
 ) -> SessionRuntime:
     """Spin up a fresh live session runtime (config clone + state + bridge).
 
@@ -1330,6 +1331,9 @@ async def _create_runtime(
       silently inherits the *hub process's* bell set, which is wrong whenever
       the hub was started before (or with different flags than) this launch.
     * ``config_dir`` — ``CLAUDE_CONFIG_DIR`` override for cross-account sessions.
+    * ``session_note`` — one-shot note prepended to this session's next prompt
+      (``SDKBridge._with_session_note``).  Used by ``/move`` to tell a copy
+      that it moved.
     * otherwise — continue the most recent session in *cwd*.
 
     Registers the runtime, starts its bridge, and refreshes the lobby.
@@ -1367,6 +1371,8 @@ async def _create_runtime(
         overrides["config_dir"] = config_dir
     if bell_on:
         overrides["bell_on"] = bell_on
+    if session_note:
+        overrides["session_note"] = session_note
     cfg = dataclasses.replace(config, **overrides)
     # Build the state *inside* the session's config-dir scope so account
     # detection (detect_account_info / detect_subscription*) reads the
@@ -3611,15 +3617,40 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
         log.warning("switch: failed to set title on copied session",
                     exc_info=True)
 
+    # A copy keeps every absolute path in its transcript, and on a same-machine
+    # move those paths still *resolve* — the source tree is still there.  So
+    # nothing about the copy reveals that it moved, and the model has no reason
+    # to suspect it.  On a drive migration that produced the same one-line fix
+    # twice (committed on the new drive, left uncommitted on the old) and an
+    # agent answering a peer's question by running git against the stale copy.
+    # Tell it, once, at the top of its next turn.
+    note = None
+    if dir_changed or normalize_path_for_compare(target_cfg or "") != \
+            normalize_path_for_compare(src_cfg or ""):
+        parts = []
+        if dir_changed:
+            parts.append(f"from {cwd} to {dest_cwd}")
+        if normalize_path_for_compare(target_cfg or "") != \
+                normalize_path_for_compare(src_cfg or ""):
+            parts.append(f"into the {Path(target_cfg).name} account")
+        note = (
+            "This session was copied " + " and ".join(parts) + ". "
+            "Absolute paths earlier in this transcript refer to the old "
+            "location, which still exists — re-check any path you carry "
+            "forward from before this line. The original session is still "
+            "there and may still be running."
+        )
+
     # Spin up a runtime bound to the target account *and directory*, resuming
-    # the copy.  `dest_cwd` is `cwd` unless the switch moved it.
+    # the copy.  `dest_cwd` is `cwd` unless the move moved it.
     try:
         new_rt = await _create_runtime(
-            cwd=dest_cwd, resume=new_id, config_dir=target_cfg)
+            cwd=dest_cwd, resume=new_id, config_dir=target_cfg,
+            session_note=note)
     except Exception as exc:
-        log.exception("switch: failed to start runtime for copied session")
+        log.exception("move: failed to start runtime for copied session")
         await send_to(ws, {"type": "move_error",
-                           "message": f"Couldn't start the switched session: {exc}"})
+                           "message": f"Couldn't start the moved session: {exc}"})
         return
     log.info("switch: %s → %s (account %s, cwd %s)", sid[:8], new_id[:8],
              Path(target_cfg).name, dest_cwd)

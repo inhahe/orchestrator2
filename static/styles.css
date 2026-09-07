@@ -125,6 +125,11 @@ html, body {
 .status-field { color: var(--text-dim); }
 .status-label { color: var(--text-muted); font-size: 10px; }
 .status-sep   { color: var(--text-muted); font-size: 10px; }
+/* The scheduled-wakeup countdown.  Tinted like the bg-wait indicator because
+   it states the same kind of fact: something outside this turn is going to act
+   on the session.  Hidden entirely when nothing is armed (see index.html). */
+#status-loop { color: var(--indicator-bg-wait); }
+
 .status-checkbox {
   display: inline-flex;
   align-items: center;

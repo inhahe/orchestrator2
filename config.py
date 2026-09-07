@@ -512,6 +512,10 @@ class Config:
     external_access: str | None = None    # "on"/"off"; None = unspecified (→ env var, else off)
     resume_interrupted_turn: bool = True   # finish a turn the CLI reports as interrupted
     agent_name: str | None = None          # cross-account agent identity (agent-comms spec §3)
+    # One-shot note prepended to the next prompt (see SDKBridge._with_session_note).
+    session_note: str | None = None
+    # Free-form labels for the agent registry (see --agent-label).
+    agent_labels: dict[str, str] = field(default_factory=dict)
     config_dir: str | None = None      # CLAUDE_CONFIG_DIR override
     skip_auto_login: bool = False      # internal: child skips the login check
     wait_port: bool = False            # internal: retry binding --port while an old instance releases it (restart)
@@ -530,6 +534,22 @@ def config_to_dict(config: Config) -> dict:
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
+
+def _parse_labels(pairs: list[str] | None) -> dict[str, str]:
+    """``["lane=b", "role=x"]`` -> ``{"lane": "b", "role": "x"}``.
+
+    A bare word with no ``=`` becomes ``{word: ""}`` rather than an error: the
+    labels are for humans and peers to read, and refusing to start a session
+    over the shape of an annotation would be out of all proportion.
+    """
+    out: dict[str, str] = {}
+    for raw in pairs or []:
+        k, sep, v = str(raw).partition("=")
+        k = k.strip()
+        if k:
+            out[k] = v.strip() if sep else ""
+    return out
+
 
 def parse_args(argv: list[str] | None = None) -> Config:
     """Parse CLI flags and return an immutable Config."""
@@ -919,6 +939,29 @@ def parse_args(argv: list[str] | None = None) -> Config:
         ),
     )
     ap.add_argument(
+        "--agent-label",
+        action="append",
+        default=None,
+        metavar="KEY=VALUE",
+        help=(
+            "Attach a label to this session's entry in the cross-account "
+            "agent registry; repeatable. Shown by `tools/agents.py list`, so "
+            "a peer can tell which session is which without messaging it to "
+            "find out. The registry never interprets these -- e.g. "
+            "--agent-label lane=b --agent-label role=reviewer."
+        ),
+    )
+    ap.add_argument(
+        "--session-note",
+        default=None,
+        help=(
+            "One-line note prepended to this session's NEXT prompt, once. "
+            "Used by /move to tell a copied session that it moved: its "
+            "transcript still holds absolute paths into the old directory, "
+            "and those paths still resolve, so nothing else would reveal it."
+        ),
+    )
+    ap.add_argument(
         "--agent-name",
         default=None,
         metavar="NAME",
@@ -1062,6 +1105,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         external_access=args.external_access,
         resume_interrupted_turn=args.resume_interrupted_turn,
         agent_name=args.agent_name,
+        session_note=args.session_note,
+        agent_labels=_parse_labels(args.agent_label),
         config_dir=args.config_dir,
         skip_auto_login=args.skip_auto_login,
         wait_port=args.wait_port,

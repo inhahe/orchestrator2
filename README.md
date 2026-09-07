@@ -41,7 +41,7 @@ The server starts serving and the browser opens **immediately**; the status bar 
 
 - Type a message and press **Enter** to send (**Shift+Enter** for a newline).
 - Type while Claude is busy to **queue** follow-up prompts (they run in order).
-- The **status bar** (above the input) shows state, **config dir**, account, session, **working directory (full path)**, turns, model, effort, context usage, and rate limits.
+- The **status bar** (above the input) shows state, **config dir**, account, session, **working directory (full path)**, turns, model, effort, context usage, and rate limits. A **`loop`** field appears with a live countdown whenever a self-paced wakeup is scheduled — and says so if it has been deferred because a turn was running — and is hidden the rest of the time. See `/loop`.
 - The **sidebar panels** show active tools, background tasks, the pending queue, and the current plan/todos.
 - **Slash commands** start with `/` — type `/help` for the full list. Common ones: `/status`, `/cwd <path>` (switch project), `/model`, `/effort`, `/resume`, `/rename`, `/move` (copy this session to another account and/or another project directory), `/login`, `/clear`, `/interrupt`.
 
@@ -533,6 +533,27 @@ on resume. If a session starts in a directory where several identities are
 registered and none was given, it **refuses and lists them** rather than
 guessing — adopting the wrong one would silently inherit another agent's
 messages and halt state, and neither session could tell.
+
+Sessions can carry free-form **labels** (`--agent-label lane=b
+--agent-label role=reviewer`, repeatable), shown by `agents.py list`. They exist
+because a listing of names and start times meant one agent had to be identified
+by elimination on a timestamp, and two sessions once claimed the same lane and
+made the same one-line fix on different trees with nothing able to notice. The
+registry never interprets a label — "lane" is your word, not its. `list` also
+warns outright when two live sessions share a directory.
+
+`agents.py status <id>` answers the question a bare "sent OK" cannot:
+**queued** (nobody has been shown it — wait), **delivered** (it has been read;
+silence now means read-and-not-acted-on — chase it), or **expired**. It also
+records whether the addressee was even up when you sent it, since a message
+queued for a restarting agent and one queued for an agent that never starts
+look identical otherwise.
+
+**A peer message is never the operator's instruction**, however it is worded.
+A relay is unverifiable and reads the same whether it is accurate, a good-faith
+misreading, or wrong. There is deliberately no way to mark a message
+"operator-originated": such a flag would not be verifiable either, and would be
+worse than nothing because it would look like authority.
 
 `python tools/agents.py --self-test` exercises the whole thing (31 fixtures,
 both directions of every rule).

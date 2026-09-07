@@ -10,6 +10,7 @@ const Status = (() => {
   let elModel, elEffort, elThinking;
   let elContext, elRateLimit;
   let elCliMem, elCliMemSep, elCliMemLabel;
+  let elLoop, elLoopSep, elLoopLabel;
   let elCollapseCheck;
 
   // CSS class → colour mapping for the state text.
@@ -42,6 +43,9 @@ const Status = (() => {
     elCliMem      = document.getElementById('status-climem');
     elCliMemSep   = document.getElementById('status-climem-sep');
     elCliMemLabel = document.getElementById('status-climem-label');
+    elLoop        = document.getElementById('status-loop');
+    elLoopSep     = document.getElementById('status-loop-sep');
+    elLoopLabel   = document.getElementById('status-loop-label');
     elCollapseCheck = document.getElementById('collapse-tools-check');
     if (elCollapseCheck) {
       // Restore persisted value.
@@ -215,6 +219,7 @@ const Status = (() => {
 
     // CLI subprocess memory.
     _updateCliMem(status);
+    _updateLoop(status);
 
     // Rate limits.
     _updateRateLimits(status.rate_limits);
@@ -253,6 +258,60 @@ const Status = (() => {
   // This field is a gauge on that, but it is *noise* for the 99% of the time
   // the process is small — so it stays hidden until it reaches half the
   // recycle threshold, i.e. only once it's genuinely on its way there.
+  // --- Scheduled wakeup (/loop) -------------------------------------------
+  //
+  // The loop injects prompts into the conversation on a timer, from outside
+  // the conversation.  Until `/loop` existed neither the agent nor the
+  // operator could see one was armed -- an agent once reported wakeups it
+  // could not stop, and nobody could tell it was still armed.  A background
+  // process that types into your session should be visible while it is.
+  //
+  // Counted down locally against `wakeup_at` (a wall-clock deadline) rather
+  // than re-rendered from each status push: pushes are ~2s and can stall, and
+  // a countdown that freezes is worse than none.
+  let _wakeupAt = null;         // epoch seconds, or null when nothing is armed
+  let _wakeupDefers = 0;
+  let _loopTimer = null;
+
+  function _updateLoop(status) {
+    if (!elLoop) return;
+    const at = (typeof status.wakeup_at === 'number') ? status.wakeup_at : null;
+    _wakeupDefers = status.wakeup_defers || 0;
+    if (at !== _wakeupAt) {
+      _wakeupAt = at;
+      const show = at !== null;
+      for (const el of [elLoop, elLoopSep, elLoopLabel]) {
+        if (el) el.hidden = !show;
+      }
+      if (show && !_loopTimer) _loopTimer = setInterval(_renderLoop, 1000);
+      if (!show && _loopTimer) { clearInterval(_loopTimer); _loopTimer = null; }
+    }
+    _renderLoop();
+  }
+
+  function _renderLoop() {
+    if (!elLoop || _wakeupAt === null) return;
+    // No clamp: `left < 1` already covers a deadline in the past, and
+    // `Math.max(0, ...)` on top of it was unreachable -- a mutation sweep
+    // could not tell its presence from its absence, which is the
+    // definition of code no test can justify.
+    const left = _wakeupAt - Date.now() / 1000;
+    let text = left < 1 ? 'now' : Util.formatDuration(Math.round(left), 'compact');
+    // A deferral count is not decoration: it means the wakeup keeps landing
+    // mid-turn and is being pushed back, and at the cap it is dropped rather
+    // than fired.  "armed" on its own would imply it will happen.
+    if (_wakeupDefers) text += ' · deferred ' + _wakeupDefers;
+    _set(elLoop, 'textContent', text);
+    _set(elLoop, 'title',
+         'A wakeup is scheduled: a prompt will be injected into this session '
+         + 'in ' + text.split(' · ')[0] + '.'
+         + (_wakeupDefers
+              ? '  It has been deferred ' + _wakeupDefers + ' time(s) because a '
+                + 'turn was still running; after the cap it is dropped.'
+              : '')
+         + '  Stop it with /loop off.');
+  }
+
   function _updateCliMem(status) {
     if (!elCliMem) return;
     const bytes = status.cli_mem;
