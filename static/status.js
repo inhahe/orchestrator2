@@ -11,6 +11,7 @@ const Status = (() => {
   let elContext, elRateLimit;
   let elCliMem, elCliMemSep, elCliMemLabel;
   let elLoop, elLoopSep, elLoopLabel;
+  let elToggleCount;
   let elCollapseCheck;
 
   // CSS class → colour mapping for the state text.
@@ -46,6 +47,7 @@ const Status = (() => {
     elLoop        = document.getElementById('status-loop');
     elLoopSep     = document.getElementById('status-loop-sep');
     elLoopLabel   = document.getElementById('status-loop-label');
+    elToggleCount = document.getElementById('sidebar-toggle-count');
     elCollapseCheck = document.getElementById('collapse-tools-check');
     if (elCollapseCheck) {
       // Restore persisted value.
@@ -220,6 +222,7 @@ const Status = (() => {
     // CLI subprocess memory.
     _updateCliMem(status);
     _updateLoop(status);
+    _updateToggleCount(status);
 
     // Rate limits.
     _updateRateLimits(status.rate_limits);
@@ -272,6 +275,26 @@ const Status = (() => {
   let _wakeupAt = null;         // epoch seconds, or null when nothing is armed
   let _wakeupDefers = 0;
   let _loopTimer = null;
+
+  // How many prompts are waiting, shown on the panels toggle.
+  //
+  // On a phone the side panels are behind that toggle, and nothing else on
+  // screen says the queue has anything in it -- the status bar announces
+  // "bg wait (1)" but has never mentioned queued prompts.  Reported
+  // 2026-09-14 as "i can't see any of the side panes including queued
+  // prompts": the panes were one tap away, and nothing gave a reason to tap.
+  //
+  // Only the queue, not a sum across panels: a single number standing for
+  // several different things is a number you cannot act on.
+  function _updateToggleCount(status) {
+    if (!elToggleCount) return;
+    const n = status.queued_count || 0;
+    if (_prev.toggleCount === n) return;
+    _prev.toggleCount = n;
+    elToggleCount.hidden = n === 0;
+    elToggleCount.textContent = String(n);
+    elToggleCount.title = n === 1 ? '1 queued prompt' : n + ' queued prompts';
+  }
 
   function _updateLoop(status) {
     if (!elLoop) return;

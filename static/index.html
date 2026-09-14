@@ -110,8 +110,10 @@
       <!-- Input bar (inside chat-area so it aligns naturally) -->
       <div id="input-bar">
     <div id="status-bar">
-      <button id="sidebar-toggle" class="sidebar-toggle" title="Toggle panels">&#9881;</button>
-      <button id="sessions-btn" class="sessions-btn" title="Browse sessions (lobby)">&#9776; Sessions</button>
+      <button id="sidebar-toggle" class="sidebar-toggle"
+              title="Show the side panels: tools, background tasks, queued prompts, todos">&#9881;<span class="sidebar-toggle-label"> Panels</span><span id="sidebar-toggle-count" class="sidebar-toggle-count" hidden>0</span></button>
+      <a id="sessions-btn" class="sessions-btn" href="/?lobby=1"
+         title="Browse sessions (lobby). Long-press or ctrl-click to open it in a new tab.">&#9776; Sessions</a>
       <span class="status-sep">|</span>
       <span id="status-indicator" class="indicator idle"></span>
       <span id="status-state" class="status-field status-state-text" title="Current state">idle</span>

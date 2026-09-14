@@ -1289,6 +1289,8 @@ html, body {
 
 .sidebar-toggle {
   display: none;              /* hidden on desktop */
+  align-items: center;
+  gap: 4px;
   font-size: 14px;
   color: var(--text-dim);
   background: var(--bg-panel);
@@ -1298,6 +1300,27 @@ html, body {
   cursor: pointer;
   flex-shrink: 0;
 }
+/* The label is what makes the control legible.  On a phone this sits next to
+   "☰ Sessions", and an unlabelled glyph beside a labelled sibling reads as
+   decoration -- which is exactly how it was read: reported 2026-09-14 as "i
+   can't see any of the side panes", when the panes were one tap away behind a
+   bare cog. */
+.sidebar-toggle-label { display: none; }
+
+/* A count of what is waiting in the panels.  The status bar already says
+   "bg wait (1)" out loud, so the one thing it never surfaced was the queue --
+   which is what the report named.  Shown only when non-zero: a permanent "0"
+   is not a reason to look. */
+.sidebar-toggle-count {
+  background: var(--panel-count-active-bg);
+  color: var(--text-bright);
+  font-size: 10px;
+  line-height: 1;
+  border-radius: 8px;
+  padding: 2px 5px;
+}
+.sidebar-toggle-count[hidden] { display: none; }
+
 .sidebar-toggle:hover {
   color: var(--text-bright);
   background: var(--bg-tool-hover);
@@ -1332,8 +1355,16 @@ html, body {
   }
   #sidebar-backdrop.visible { display: block; }
 
-  /* Show the gear toggle button */
-  .sidebar-toggle { display: inline-flex; }
+  /* Show the panels toggle, labelled and as a real touch target.  Every
+     other control in this block is already sized for a finger (44px); this
+     one was missed, which left the panels behind a 30x25 cog. */
+  .sidebar-toggle {
+    display: inline-flex;
+    min-height: 32px;
+    padding: 4px 10px;
+    font-size: 12px;
+  }
+  .sidebar-toggle-label { display: inline; }
 
   /* Main layout is just the chat area (full width) */
   #main-container { flex-direction: column; }
@@ -1428,6 +1459,11 @@ html, body {
    =================================================================== */
 
 .sessions-btn {
+  /* An anchor, not a button, so the browser's own "open in new tab" works on
+     it -- the only way to get a second orchestrator2 tab on a phone, where
+     the page cannot focus or raise one itself. */
+  display: inline-block;
+  text-decoration: none;
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-dim);
@@ -1704,6 +1740,25 @@ html, body {
   background: transparent;
   box-shadow: inset 0 0 0 1.5px var(--indicator-idle);
 }
+.lobby-hint {
+  margin: 0 0 10px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+/* The titles are anchors so the browser can offer "open in new tab" (a
+   long-press on mobile, ctrl/middle-click on a desktop).  They must not *look*
+   like links: the whole card is already the click target, and underlining one
+   word of it would imply the rest does something different. */
+.lobby-card-title,
+.lobby-item-title {
+  text-decoration: none;
+  cursor: pointer;
+}
+.lobby-card-title:hover,
+.lobby-item-title:hover { text-decoration: none; }
+
 .lobby-card-title {
   font-size: 14px;
   font-weight: 600;

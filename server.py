@@ -36,6 +36,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import socket as _socket
 import sys
 import time
@@ -1563,6 +1564,36 @@ async def close_runtime(rid: str | None) -> dict[str, Any]:
     return {"ok": True, "rid": rt.rid, "title": title}
 
 
+#: Sockets whose client looks like a phone or tablet.  Recorded at accept from
+#: the upgrade request's User-Agent, **not** asked of the page: the fact is
+#: needed at the moment the socket *dies*, which on a sleeping phone is exactly
+#: when the page is no longer running to be asked.
+_mobile_ws: set[Any] = set()
+
+#: Mirrors `lobby.js`'s `_isMobile()` regex, deliberately.  The two decide the
+#: same thing about the same client and disagreeing would be worse than either
+#: being wrong.  Known blind spot, shared with the frontend: iPadOS Safari
+#: reports a desktop UA by default, so an iPad is treated as a desktop.
+_MOBILE_UA_RE = re.compile(
+    r"Android|iPhone|iPad|iPod|Mobile|Silk|Kindle|BlackBerry|Opera Mini|IEMobile",
+    re.I,
+)
+
+
+def _ws_looks_mobile(ws: Any) -> bool:
+    """Best-effort: is this socket's client a device that sleeps?
+
+    Never raises — a missing or unreadable header just means "assume desktop",
+    which is the conservative answer (the session is still reaped on the
+    ordinary clock rather than living forever).
+    """
+    try:
+        ua = ws.headers.get("user-agent") or ""
+    except Exception:
+        return False
+    return bool(_MOBILE_UA_RE.search(ua))
+
+
 def _cancel_idle_timer(rt: SessionRuntime) -> None:
     """Cancel a runtime's pending idle-teardown timer, if any.
 
@@ -1586,6 +1617,11 @@ def _cancel_idle_timer(rt: SessionRuntime) -> None:
     timer = rt.idle_timer
     rt.idle_timer = None
     rt.idle_deadline = None
+    # `idle_mobile` is deliberately *not* reset here.  Its only reader is the
+    # `departing is None` branch of `_maybe_start_idle_timer`, which runs only
+    # from a deferral -- i.e. only after an arm that just wrote it.  A reset
+    # would be code no test could distinguish from its absence, which a sweep
+    # duly proved.
     if timer is None:
         return
     try:
@@ -1596,7 +1632,8 @@ def _cancel_idle_timer(rt: SessionRuntime) -> None:
         timer.cancel()
 
 
-def _maybe_start_idle_timer(rt: SessionRuntime) -> None:
+def _maybe_start_idle_timer(rt: SessionRuntime,
+                            departing: WebSocket | None = None) -> None:
     """Start the idle-teardown countdown for a viewer-less runtime.
 
     No-op for the default runtime (never idle-torn-down), for runtimes that
@@ -1609,15 +1646,36 @@ def _maybe_start_idle_timer(rt: SessionRuntime) -> None:
     countdown to tear down something already torn down would leave a live task
     holding a reference to a dead runtime, and log a second "tearing down" for
     a session the user has already closed.
+
+    **A phone going to sleep is not a viewer leaving.**  When the last socket
+    to go was a mobile one, the countdown uses ``--mobile-idle-timeout``
+    instead, which defaults to *never*.  Phones suspend their browser within
+    a minute or two of the screen locking, so the ordinary 5-minute clock
+    reaps a session its only viewer is still using — they unlock the phone,
+    the tab reconnects (``app.js`` does that on ``visibilitychange``), and the
+    session it reconnects to is gone.  "No socket is open" is a bad proxy for
+    "nobody is watching" on a device that closes sockets to save battery.
     """
     if rt is _default_runtime or rt.clients:
         return
     if runtimes.get(rt.rid) is not rt:
         return
-    timeout = getattr(config, "session_idle_timeout", 300) if config else 300
+    # `departing is None` is the re-arm after a deferral, which must keep the
+    # grace it was armed with rather than quietly dropping to the short one.
+    mobile = (rt.idle_mobile if departing is None
+              else departing in _mobile_ws)
+    if mobile:
+        timeout = int(getattr(config, "mobile_idle_timeout", 0) or 0
+                      if config else 0)
+    else:
+        timeout = getattr(config, "session_idle_timeout", 300) if config else 300
     if timeout <= 0:
+        if mobile:
+            log.info("runtime %s: last viewer was mobile — no idle teardown",
+                     rt.rid)
         return
     _cancel_idle_timer(rt)
+    rt.idle_mobile = mobile
     rt.idle_deadline = time.time() + timeout
     rt.idle_timer = asyncio.create_task(
         _idle_teardown_after(rt, timeout), name=f"idle-{rt.rid}",
@@ -1625,14 +1683,40 @@ def _maybe_start_idle_timer(rt: SessionRuntime) -> None:
 
 
 async def _idle_teardown_after(rt: SessionRuntime, timeout: int) -> None:
-    """Wait out the idle grace period, then tear the runtime down."""
+    """Wait out the idle grace period, then tear the runtime down.
+
+    **A session that is working is not idle.**  The timer only ever meant "no
+    socket is open", so a turn started and then left to run — close the tab,
+    lock the phone — was killed mid-edit five minutes later, along with any
+    background tasks it had spawned.  That is the opposite of what a
+    server-side agent is for: you close the tab *because* it keeps working.
+    So a busy runtime re-arms instead of tearing down, and is reaped on the
+    first pass after it goes quiet.
+
+    Deliberately unbounded, unlike the wakeup deferral: a wakeup that keeps
+    landing mid-turn has already failed at its job, whereas a session that
+    keeps working is succeeding at its. A genuinely wedged one is still
+    closable from the lobby, and the countdown badge shows it is being
+    deferred.
+    """
     try:
         await asyncio.sleep(timeout)
     except asyncio.CancelledError:
         return
-    if not rt.clients and runtimes.get(rt.rid) is rt:
-        log.info("runtime %s idle for %ds — tearing down", rt.rid, timeout)
-        await _teardown_runtime(rt)
+    if rt.clients or runtimes.get(rt.rid) is not rt:
+        return
+    st = getattr(rt, "state", None)
+    busy = bool(getattr(st, "busy", False)) if st is not None else False
+    bg = len(getattr(st, "background_tasks", ()) or ()) if st is not None else 0
+    if busy or bg:
+        log.info("runtime %s idle for %ds but still %s — deferring teardown",
+                 rt.rid, timeout,
+                 "working" if busy else f"running {bg} background task(s)")
+        rt.idle_timer = None
+        _maybe_start_idle_timer(rt, departing=None)
+        return
+    log.info("runtime %s idle for %ds — tearing down", rt.rid, timeout)
+    await _teardown_runtime(rt)
 
 
 # ---------------------------------------------------------------------------
@@ -3139,7 +3223,7 @@ async def _attach_ws(ws: WebSocket, rt: SessionRuntime) -> None:
     old = _ws_runtime.get(ws)
     if old is not None and old is not rt:
         old.discard_client(ws)
-        _maybe_start_idle_timer(old)
+        _maybe_start_idle_timer(old, departing=ws)
     lobby_clients.discard(ws)
     _cancel_idle_timer(rt)
     rt.add_client(ws)
@@ -3158,7 +3242,7 @@ async def _enter_lobby(ws: WebSocket, notice: str | None = None) -> None:
     old = _ws_runtime.pop(ws, None)
     if old is not None:
         old.discard_client(ws)
-        _maybe_start_idle_timer(old)
+        _maybe_start_idle_timer(old, departing=ws)
     lobby_clients.add(ws)
     # Paint the lobby immediately with the running sessions (in-memory, instant)
     # and mark the recent list pending; a cold-cache disk scan can take seconds,
@@ -3180,7 +3264,8 @@ def _cleanup_ws(ws: WebSocket) -> None:
     _lobby_watchers.discard(ws)
     if old is not None:
         old.discard_client(ws)
-        _maybe_start_idle_timer(old)
+        _maybe_start_idle_timer(old, departing=ws)
+    _mobile_ws.discard(ws)
 
 
 # ---------------------------------------------------------------------------
@@ -3191,6 +3276,12 @@ def _cleanup_ws(ws: WebSocket) -> None:
 async def websocket_endpoint(ws: WebSocket) -> None:
     """Handle one WebSocket client connection."""
     await ws.accept()
+
+    # Recorded now, while the request is in hand: when this socket dies the
+    # page may already be suspended, and a phone's disappearance is precisely
+    # the case the idle timer must treat differently.
+    if _ws_looks_mobile(ws):
+        _mobile_ws.add(ws)
 
     global _has_had_clients
     _cancel_shutdown_timer()

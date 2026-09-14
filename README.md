@@ -42,7 +42,7 @@ The server starts serving and the browser opens **immediately**; the status bar 
 - Type a message and press **Enter** to send (**Shift+Enter** for a newline).
 - Type while Claude is busy to **queue** follow-up prompts (they run in order).
 - The **status bar** (above the input) shows state, **config dir**, account, session, **working directory (full path)**, turns, model, effort, context usage, and rate limits. A **`loop`** field appears with a live countdown whenever a self-paced wakeup is scheduled — and says so if it has been deferred because a turn was running — and is hidden the rest of the time. See `/loop`.
-- The **sidebar panels** show active tools, background tasks, the pending queue, and the current plan/todos.
+- The **sidebar panels** show active tools, background tasks, the pending queue, and the current plan/todos. On a phone they live behind the **⚙ Panels** button in the status bar (tap outside to close); it shows a count when prompts are queued.
 - **Slash commands** start with `/` — type `/help` for the full list. Common ones: `/status`, `/cwd <path>` (switch project), `/model`, `/effort`, `/resume`, `/rename`, `/move` (copy this session to another account and/or another project directory), `/login`, `/clear`, `/interrupt`.
 
 Sessions are stored the same way Claude Code stores them — under `<config-dir>/projects/<cwd>/` — so a conversation is interchangeable with `claude --continue` / `claude --resume` **as long as both use the same `CLAUDE_CONFIG_DIR`** (account). See [Choosing a Claude account](#choosing-a-claude-account).
@@ -98,6 +98,12 @@ tab to the foreground) the lobby instead switches the *current* tab to the
 session you picked, updating the address bar to `?rid=<rid>` so a refresh
 returns to the same session.
 
+Session names in the lobby (and the **☰ Sessions** control itself) are real
+links, so the browser's own **open in new tab** works on them — long-press on
+a phone, ctrl/cmd or middle-click on a desktop. That is how you get more than
+one orchestrator2 tab on mobile, where a page cannot raise or focus another
+tab itself. A plain tap keeps the in-place behaviour described above.
+
 If the hub has been running long enough that its own source has changed on disk
 since it started, the lobby says so in a band above the session lists — **"This
 hub is running older code"** — naming the changed files and how long it has been
@@ -120,7 +126,17 @@ the same port. Notes:
 - If port 8420 is occupied by something that *isn't* an orchestrator2 hub for
   this account, the launch starts its own server on an auto-selected free port.
 - A session with zero viewers is torn down after `--session-idle-timeout`
-  seconds (default 300; `0` disables); the hub itself keeps running.
+  seconds (default 300; `0` disables); the hub itself keeps running. Two things
+  it will **not** do:
+  - **Tear down a session that is working.** A turn still running (or a
+    background task still going) defers the teardown until it finishes — you
+    close the tab *because* it keeps working.
+  - **Start the clock when the last viewer was a phone or tablet.** Phones
+    suspend their browser a minute or two after the screen locks, well inside
+    the 5-minute default, so the ordinary clock reaps a session its only viewer
+    is still using. Mobile-only sessions use `--mobile-idle-timeout`, which
+    defaults to **0 (never)**; set a positive value to reap them too. (An iPad
+    is treated as a desktop — iPadOS Safari reports a desktop User-Agent.)
 
 ### A second hub, with several sessions in it
 
@@ -431,6 +447,7 @@ The status bar grows a `cli` field once memory approaches the threshold.
 | `--no-auto-shutdown` | off | Never auto-shut-down when tabs close, even under `--open`/`--detach`; the server runs until stopped explicitly |
 | `--standalone` | off | Start a separate server instead of joining a running hub on the same port/account |
 | `--session-idle-timeout SECS` | 300 | Seconds a session with zero viewers lingers before teardown (`0` disables) |
+| `--mobile-idle-timeout SECONDS` | `0` | Idle teardown when the last viewer was a phone or tablet. `0` = never — phones sleep, and a sleeping phone is not a viewer who left |
 | `--config-dir PATH` | -- | Override `CLAUDE_CONFIG_DIR` (session/credential storage). Use to run under a different Claude account |
 | `--debug` | off | Print extra diagnostic messages |
 

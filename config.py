@@ -506,7 +506,9 @@ class Config:
     open_browser: bool = False
     detach: bool = False               # re-launch headless and exit terminal
     auto_shutdown: bool = False        # shut down when all browser tabs close
-    session_idle_timeout: int = 300    # secs a viewer-less session lingers before teardown
+    session_idle_timeout: int = 300
+    # Idle teardown when the last viewer was mobile; 0 = never.
+    mobile_idle_timeout: int = 0    # secs a viewer-less session lingers before teardown
     standalone: bool = False           # don't reuse a running hub; force a separate server
     external_password: str | None = None  # non-LAN password; None = unspecified (→ env var); "" = no password
     external_access: str | None = None    # "on"/"off"; None = unspecified (→ env var, else off)
@@ -930,6 +932,19 @@ def parse_args(argv: list[str] | None = None) -> Config:
         ),
     )
     ap.add_argument(
+        "--mobile-idle-timeout",
+        type=int,
+        default=0,
+        metavar="SECONDS",
+        help=(
+            "Idle teardown for a session whose last viewer was a phone or "
+            "tablet. Default: 0 (never). Phones suspend their browser within "
+            "a minute or two of the screen locking, so the ordinary "
+            "--session-idle-timeout reaps a session its only viewer is still "
+            "using. Set a positive value to reap mobile-only sessions too."
+        ),
+    )
+    ap.add_argument(
         "--standalone",
         action="store_true",
         help=(
@@ -1100,6 +1115,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
             and (args.auto_shutdown or args.open or args.detach)
         ),
         session_idle_timeout=args.session_idle_timeout,
+        mobile_idle_timeout=args.mobile_idle_timeout,
         standalone=args.standalone,
         external_password=args.external_password,
         external_access=args.external_access,
