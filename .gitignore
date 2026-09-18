@@ -1,0 +1,17 @@
+
+# Local-only. We publish straight from this directory now instead of copying a
+# filtered subset into D:\github.
+node_modules/
+__pycache__/
+*.pyc
+.claude/
+.orchestrator_history
+copy_to_github.bat
+go.bat
+*.log
+todo*.txt
+# Reserved Windows device name; a stray shell redirect created it
+nul
+_manual_restart.py
+copy_session.py
+copy_session_tui.py

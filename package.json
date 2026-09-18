@@ -1,0 +1,11 @@
+{
+  "name": "orchestrator2-frontend-tests",
+  "private": true,
+  "description": "Test-only manifest. The frontend ships as plain files under static/ and has no build step; jsdom exists so tests/hidden_window.test.js can drive chat.js in a real DOM. Run `npm install`, then `npm test` -- or just `pytest tests/`, which shells out to node and skips if node_modules is absent.",
+  "scripts": {
+    "test": "node tests/hidden_window.test.js"
+  },
+  "devDependencies": {
+    "jsdom": "^30.0.1"
+  }
+}
