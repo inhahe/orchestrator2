@@ -280,7 +280,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         ("/rename <name>",               "set a custom session title"),
         ("/move [path]",                 "copy this session to another account and/or directory, and continue it here"),
         ("/export [path]",               "save conversation as markdown"),
-        ("/btw <question>",              "side question (separate context)"),
+        ("/btw <question>",              "side question, answered in a fork"),
         ("/graphify [path] [flags]",     "build a knowledge graph (graphify)"),
         ("/graphify explain <node>",     "explain a graph node (instant, no turn)"),
         ("/graphify path <A> <B>",       "shortest path between two nodes"),

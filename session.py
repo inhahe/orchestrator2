@@ -201,6 +201,195 @@ def save_persisted_queue(cwd: str, items: Any,
         pass
 
 
+# ---------------------------------------------------------------------------
+# Background-task persistence
+#
+# ``State.background_tasks`` mirrors the CLI's task registry, and it dies with
+# the process. That is survivable while the session lives -- a reconnect calls
+# ``SDKBridge._orphan_bg_tasks``, which drops the mirror and says so -- but it
+# leaves nothing behind for the *next* process. A session torn down while
+# background work was running came back knowing nothing about it, so the model
+# resumed believing its tasks were still out there, waiting for notifications
+# that could never arrive.
+#
+# So the live set is mirrored to disk whenever a task starts or finishes, and
+# read back once on resume. Same three gates as the prompt queue
+# (session-scoped filename, recorded id must match, freshness cap) for the same
+# reason: acting on another session's record is worse than acting on none.
+#
+# **What is on disk means "was running when we last heard", not "failed".** A
+# completion notification can land after teardown has begun -- measured
+# 2026-09-16, two tasks logged completed 1 s and 2 s into one -- so the record
+# is a list of tasks whose outcome is *unknown*. Callers must word it that way;
+# see :func:`describe_lost_bg_tasks`.
+# ---------------------------------------------------------------------------
+
+BG_TASKS_MAX_AGE_S = 24 * 3600
+
+
+def bg_tasks_file_for_cwd(cwd: str, session_id: str | None = None) -> Path:
+    """Path to the persisted background-task record for a session in *cwd*.
+
+    Scoped exactly like :func:`queue_file_for_cwd`, and for the same reason:
+    the hub hosts several sessions on one directory at once, so a path keyed by
+    *cwd* alone would let the last writer win.
+    """
+    try:
+        resolved = str(Path(cwd).resolve(strict=False))
+    except OSError:
+        resolved = cwd
+    slot = _sanitize_cwd(session_id) if session_id else "new"
+    return _orch2_state_dir() / "bgtasks" / f"{_sanitize_cwd(resolved)}__{slot}.json"
+
+
+def bg_task_items(tasks: Any) -> list[dict]:
+    """Flatten ``State.background_tasks`` into the persisted/reportable shape.
+
+    ``started_at`` is ``time.monotonic()``, which means nothing in another
+    process, so it is converted to wall-clock here. Without that the restored
+    record could not say *how long ago* -- and "a task was running" is much
+    less useful than "a task had been running for 40 minutes".
+
+    Shared by the persistence path and the live orphan path so both report the
+    same thing; they differ only in when they run.
+    """
+    now_mono = time.monotonic()
+    now_wall = time.time()
+    items = []
+    for task_id, info in (tasks or {}).items():
+        info = info or {}
+        started = info.get("started_at")
+        started_wall = None
+        if isinstance(started, (int, float)):
+            started_wall = now_wall - max(0.0, now_mono - started)
+        items.append({
+            "task_id": str(task_id),
+            "name": str(info.get("name") or ""),
+            "task_type": str(info.get("task_type") or ""),
+            "command": str(info.get("command") or ""),
+            "started_wall": started_wall,
+        })
+    return items
+
+
+def save_persisted_bg_tasks(cwd: str, tasks: Any,
+                            session_id: str | None = None) -> None:
+    """Atomically mirror *session_id*'s live background tasks for *cwd*.
+
+    *tasks* is the ``State.background_tasks`` mapping. When it is empty the
+    file is removed, so a session that finishes its work leaves nothing to
+    report. Failures are swallowed: persistence must never break task
+    bookkeeping.
+
+    ``started_at`` is ``time.monotonic()``, which means nothing in another
+    process, so it is converted to wall-clock on the way out. Without that the
+    restored record could not say *how long ago* -- and "a task was running"
+    is much less useful than "a task had been running for 40 minutes".
+    """
+    if session_id is None:
+        return
+    path = bg_tasks_file_for_cwd(cwd, session_id)
+    items = bg_task_items(tasks)
+    try:
+        if not items:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"cwd": cwd, "session_id": session_id,
+                       "tasks": items, "saved_at": time.time()}, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def load_persisted_bg_tasks(cwd: str, session_id: str | None = None, *,
+                            max_age_s: float = BG_TASKS_MAX_AGE_S) -> list[dict]:
+    """Load the background tasks *session_id* had running when it last spoke.
+
+    Returns ``[]`` for anything that is not unambiguously this session's own
+    recent record. The gates matter more here than for the queue: this record
+    becomes a *prompt*, so a stale or misattributed one spends a turn telling
+    the model a lie about work it never started.
+    """
+    if session_id is None:
+        return []
+    path = bg_tasks_file_for_cwd(cwd, session_id)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    if data.get("session_id") != session_id:
+        return []
+    saved_at = data.get("saved_at")
+    if not isinstance(saved_at, (int, float)):
+        return []
+    if max_age_s > 0 and (time.time() - saved_at) > max_age_s:
+        return []
+    items = data.get("tasks")
+    if not isinstance(items, list):
+        return []
+    return [x for x in items if isinstance(x, dict) and x.get("task_id")]
+
+
+def clear_persisted_bg_tasks(cwd: str, session_id: str | None = None) -> None:
+    """Drop the record, so it is reported exactly once."""
+    save_persisted_bg_tasks(cwd, {}, session_id)
+
+
+def _bg_task_label(item: dict) -> str:
+    """Name a task the way its owner would recognise it."""
+    label = (item.get("name") or item.get("command")
+             or item.get("task_type") or "")
+    label = str(label).strip()
+    return label or f"task {str(item.get('task_id') or '?')[:12]}"
+
+
+def describe_lost_bg_tasks(items: list[dict], *, why: str = "this session was cut off",
+                           now: float | None = None) -> str:
+    """Word the loss for the model, without claiming to know the outcome.
+
+    The temptation is to say "your background tasks were aborted". That is a
+    guess, and often a wrong one: the CLI's completion notifications can land
+    after teardown has already started. What we actually know is narrower and
+    still actionable -- these were running, we stopped being able to hear about
+    them, so their results are gone whether or not they finished.
+    """
+    if not items:
+        return ""
+    now = time.time() if now is None else now
+    lines = []
+    for item in items:
+        label = _bg_task_label(item)
+        started = item.get("started_wall")
+        if isinstance(started, (int, float)) and started > 0:
+            mins = max(0, int((now - started) // 60))
+            lines.append(f"- {label} (running for {mins} min at that point)")
+        else:
+            lines.append(f"- {label}")
+    plural = "" if len(items) == 1 else "s"
+    was = "was" if len(items) == 1 else "were"
+    return (
+        f"[orchestrator2] {why}, and "
+        f"{len(items)} background task{plural} {was} running at the time:\n"
+        + "\n".join(lines) + "\n\n"
+        "Their results and completion notifications are lost -- the CLI that "
+        "owned them is gone, so no <task-notification> is coming and their "
+        "TaskOutput handles are dead. Whether they actually finished is "
+        "unknown: a task can complete in the seconds while a session is being "
+        "torn down. Do not assume either way. Check for their effects "
+        "(files written, commits made, processes still running) before "
+        "re-running anything, and do not wait on them."
+    )
+
+
 def normalize_path_for_compare(p: str) -> str:
     """Normalise paths for comparison (backslash → slash, lowercase on Win)."""
     s = p.replace("\\", "/").rstrip("/")

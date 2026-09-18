@@ -260,6 +260,71 @@ html, body {
 .panel-item .item-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .panel-item .item-time { font-size: 10px; color: var(--text-muted); flex-shrink: 0; }
 
+/* A background task that has stopped doing anything.  Muted rather than red:
+   it is an observation, not an error -- the task may be blocked on something
+   about to arrive, and we cannot tell the difference. */
+.panel-item .item-note {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-style: italic;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.panel-item.stalled .item-icon { opacity: 0.45; }
+.panel-item.stalled .item-name { color: var(--text-muted); }
+/* /btw — a side exchange answered in a fork of the conversation.
+   Inline, because it belongs where it was asked; visually apart, because none
+   of it is part of the conversation the session is actually having. */
+.msg-btw {
+  border-left: 3px solid var(--accent, #61afef);
+  background: color-mix(in srgb, var(--accent, #61afef) 6%, transparent);
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin: 8px 0;
+}
+.msg-btw .btw-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.msg-btw .btw-tag {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent, #61afef);
+}
+.msg-btw .btw-note { font-size: 10px; color: var(--text-muted); font-style: italic; }
+.msg-btw .btw-question { font-weight: 600; margin-bottom: 6px; white-space: pre-wrap; }
+.msg-btw .btw-answer { white-space: pre-wrap; }
+/* Until the fork answers, the block reads as empty; say it is thinking. */
+.msg-btw.pending .btw-answer::after {
+  content: 'thinking…';
+  color: var(--text-muted);
+  font-style: italic;
+}
+.msg-btw.pending .btw-answer:not(:empty)::after { content: ''; }
+.msg-btw .btw-failed { color: var(--text-muted); font-style: italic; }
+
+.bg-kill-btn {
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 4px;
+  margin-left: 2px;
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0;
+}
+.panel-item:hover .bg-kill-btn,
+.panel-item.stalled .bg-kill-btn { opacity: 1; }
+.bg-kill-btn:hover { color: var(--danger, #e06c75); border-color: var(--danger, #e06c75); }
+.bg-kill-btn:disabled { opacity: 0.4; cursor: default; }
+
 .panel-item.running  .item-icon { color: var(--icon-running); }
 .panel-item.complete .item-icon { color: var(--icon-complete); }
 .panel-item.error    .item-icon { color: var(--icon-error); }

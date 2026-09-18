@@ -237,8 +237,12 @@ const Panels = (() => {
     // the DOM directly, so it doesn't depend on a re-render.)  Expansion state
     // is deliberately excluded from the signature: after a click we've already
     // updated the DOM, and keeping the sig stable prevents a needless rebuild.
+    // The stall note is part of the signature: it is the one thing on a
+    // running row that changes without the task set changing, and a row that
+    // silently stopped updating is the bug this whole feature exists for.
     const sig = tasks.map(t =>
       `${t.task_id || ''}:${t.status || ''}:${(t.command || '').length}`
+      + `:${t.stall_note || ''}:${t.kill_note || ''}`
     ).join('|');
     if (sig === _lastBgSig) return;
     _lastBgSig = sig;
@@ -255,18 +259,32 @@ const Panels = (() => {
       const expandable = !!cmd;
       const open = expandable && _expandedBg.has(tid);
 
+      // What we observed, never what it means: "no output or CPU for 20m" is
+      // checkable by the reader, where "hung" is a conclusion we cannot prove
+      // for a task that may be blocked on something about to arrive.
+      const note = t.kill_note || t.stall_note || '';
       const itemCls = cls
         + (expandable ? ' expandable' : '')
-        + (open ? ' expanded' : '');
+        + (open ? ' expanded' : '')
+        + (t.stalled ? ' stalled' : '');
       const caret = expandable
         ? `<span class="item-caret">${open ? '\u25BC' : '\u25B6'}</span>`
+        : '';
+      const noteHtml = note
+        ? `<span class="item-note">${_esc(note)}</span>` : '';
+      // Only offer to kill what we can actually identify a process for.
+      const killHtml = (isRunning && t.killable)
+        ? `<button class="bg-kill-btn" data-bg-kill="${_esc(tid)}"
+                   title="Kill this task's process tree">\u2715</button>`
         : '';
 
       html += `<div class="panel-item ${itemCls}" data-bg-id="${_esc(tid)}"
                     title="${_esc(t.summary || t.task_type || '')}">
         <span class="item-icon">${icon}</span>
         <span class="item-name">${_esc(name)}</span>
+        ${noteHtml}
         <span class="item-time">${_esc(dur)}</span>
+        ${killHtml}
         ${caret}
       </div>`;
       if (expandable) {
@@ -274,6 +292,24 @@ const Panels = (() => {
       }
     }
     elBgBody.innerHTML = html;
+
+    elBgBody.querySelectorAll('.bg-kill-btn[data-bg-kill]').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        // The row itself toggles the command detail; killing is not that.
+        e.stopPropagation();
+        const bid = btn.dataset.bgKill;
+        if (!bid) return;
+        btn.disabled = true;
+        fetch('/api/bg/kill', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({task_id: bid, rid: _rid()}),
+        }).catch(err => {
+          console.error('bg kill error:', err);
+          btn.disabled = false;
+        });
+      });
+    });
 
     elBgBody.querySelectorAll('.panel-item[data-bg-id]').forEach(el => {
       el.addEventListener('click', () => {

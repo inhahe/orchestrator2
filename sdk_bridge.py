@@ -102,9 +102,32 @@ from state import (
     state_to_panels_dict,
     state_to_status_dict,
 )
+from btw import (
+    build_btw_options,
+    btw_prompt,
+    can_fork,
+)
+from bg_stall import (
+    BG_PROBE_INTERVAL_S,
+    STALL_AFTER_S,
+    active_tasks,
+    STALLED,
+    describe_stall,
+    find_task_process,
+    process_activity,
+    read_output_signature,
+    stall_state,
+    task_output_path,
+    update_probe,
+)
 from session import (
     _classify_user_text,
+    _bg_task_label,
+    bg_task_items,
     check_session_integrity,
+    describe_lost_bg_tasks,
+    load_persisted_bg_tasks,
+    save_persisted_bg_tasks,
     describe_integrity_problem,
     find_most_recent_session_for_cwd,
     find_session_dir,
@@ -654,6 +677,95 @@ def _build_graphify_prompt(args: str) -> str:
     )
 
 
+# A fork has to load the whole transcript before it can say anything, so it
+# gets the same generous budget a main connect does rather than a snappy one.
+BTW_CONNECT_TIMEOUT = 180.0
+
+
+def _btw_text_blocks(msg: Any) -> list[str]:
+    """The renderable text in one forked-conversation message.
+
+    Only assistant prose.  A side answer is meant to be read inline next to the
+    question, so tool calls, thinking and the result envelope are dropped rather
+    than rendered -- the fork cannot use the interesting tools anyway.
+    """
+    out: list[str] = []
+    for block in getattr(msg, "content", None) or []:
+        text = getattr(block, "text", None)
+        if isinstance(text, str) and text.strip():
+            out.append(text)
+    return out
+
+
+def _probe_bg_tasks_blocking(
+    cwd: str, session_id: str, tasks: dict[str, str], cli_pid: int | None,
+) -> dict[str, tuple[Any, float | None, int | None, int | None, float | None]]:
+    """Stat each task's output file and sample its process tree's activity.
+
+    Blocking on purpose -- the caller runs it in a thread.  The child walk is
+    done once for all tasks rather than per task: on Windows that walk is the
+    expensive part, and a session with eight background tasks would otherwise
+    pay for it eight times every poll.
+    """
+    import psutil
+
+    descendants = []
+    if cli_pid:
+        try:
+            descendants = psutil.Process(cli_pid).children(recursive=True)
+        except Exception:
+            descendants = []
+    out: dict[str, tuple[Any, float | None, int | None, int | None, float | None]] = {}
+    for tid, command in tasks.items():
+        sig = read_output_signature(task_output_path(cwd, session_id, tid))
+        proc = find_task_process(command, descendants)
+        created = None
+        if proc is not None:
+            try:
+                created = proc.create_time()
+            except Exception:
+                created = None
+        activity = process_activity(proc)
+        cpu_s, io_ops = activity if activity is not None else (None, None)
+        out[tid] = (sig, cpu_s, io_ops, getattr(proc, "pid", None), created)
+    return out
+
+
+def _kill_task_tree(pid: int, created: float | None) -> int:
+    """Kill *pid* and everything under it.  Returns how many were killed.
+
+    *created* is checked before anything dies.  Windows recycles pids
+    aggressively and this pid was recorded up to a poll interval ago, so
+    killing on the number alone could shoot an unrelated process that inherited
+    it -- the same hazard ``proc_guard.snapshot_descendants`` exists to avoid.
+    A mismatch is not an error: it means the task's process is already gone,
+    which is the outcome the caller wanted anyway.
+    """
+    import psutil
+
+    try:
+        proc = psutil.Process(pid)
+        if created is not None and abs(proc.create_time() - created) > 1.0:
+            log.info("bg kill: pid %d was recycled — nothing to kill", pid)
+            return 0
+    except Exception:
+        return 0
+    victims = []
+    try:
+        victims = list(proc.children(recursive=True))
+    except Exception:
+        pass
+    victims.append(proc)
+    killed = 0
+    for victim in victims:
+        try:
+            victim.kill()
+            killed += 1
+        except Exception:
+            continue
+    return killed
+
+
 class SDKBridge:
     """Manages the Claude Agent SDK lifecycle and message flow."""
 
@@ -680,10 +792,31 @@ class SDKBridge:
         # die instantly.  See _await_interrupt_settled().
         self._interrupt_settled = asyncio.Event()
         self._interrupt_settled.set()
+        # Set whenever no *ghost* turn is streaming.  A ghost turn owns the
+        # message stream without holding ``turn_active``, so the worker can be
+        # parked -- and therefore look idle -- while the CLI is mid-answer.
+        # See _await_ghost_settled().
+        self._ghost_settled = asyncio.Event()
+        self._ghost_settled.set()
 
         self._dispatcher_task: asyncio.Task | None = None
         self._worker_task: asyncio.Task | None = None
         self._initial_resume_id: str | None = None
+        # Monotonic stamp of the last background-task liveness probe.
+        self._bg_probe_at: float = 0.0
+        # The in-flight /btw fork, and a counter for naming them.  One at
+        # a time: each fork is a whole CLI process and a full transcript
+        # load, so letting them pile up would be a memory footgun on a
+        # runtime that already recycles the CLI for leaking.
+        self._btw_task: asyncio.Task | None = None
+        self._btw_seq: int = 0
+        # True from the moment we connect with ``resume=`` until either we
+        # send a prompt or a ghost turn starts.  A stream that arrives while
+        # this is set was not asked for by anyone here: it is the CLI
+        # continuing a turn that was interrupted before the session was last
+        # closed (CLAUDE_CODE_RESUME_INTERRUPTED_TURN).  See
+        # _begin_ghost_turn_if_needed.
+        self._unprompted_resume_pending: bool = False
         # One-shot note prepended to this session's next prompt; see
         # _with_session_note.  Set from --session-note by /move.
         self._session_note: str | None = (
@@ -876,6 +1009,10 @@ class SDKBridge:
             # SDK's global continue so it doesn't pick a random session.
             kwargs["continue_conversation"] = False
 
+        # A resumed session can start streaming with no prompt from us; arm
+        # the notice that explains that to whoever opens it.
+        self._unprompted_resume_pending = bool(kwargs.get("resume"))
+
         # Effort override.
         if self.state.effort:
             kwargs["effort"] = self.state.effort
@@ -971,6 +1108,7 @@ class SDKBridge:
         """
         self._warn_if_foreign_task("connect")
         options = self._make_options(resume_id)
+        resume_sid = getattr(options, "resume", None)
         log.info(
             "connect: resume=%s, cwd=%s",
             getattr(options, 'resume', None),
@@ -1194,6 +1332,11 @@ class SDKBridge:
         asyncio.create_task(self._report_session_integrity(),
                             name="session-integrity")
 
+        # A session cut off while background work was running comes back with
+        # no idea that the work is gone -- the process that knew died with it.
+        # Read that off disk and put it in front of the model before it acts.
+        await self._report_lost_bg_tasks(resume_sid)
+
     async def _report_session_integrity(self) -> None:
         """Warn if the session we just resumed can't reach its own history."""
         sid = self.state.session_id
@@ -1338,7 +1481,8 @@ class SDKBridge:
             return False
 
         # Safety conditions — never skipped, not even by ``force``.
-        if self.turn_active.is_set() or state.background_tasks or state.queued_prompts:
+        if (self.turn_active.is_set() or self._active_bg_tasks()
+                or state.queued_prompts):
             if force:
                 await self.broadcast({
                     "type": "system_msg", "subtype": "error",
@@ -1719,7 +1863,341 @@ class SDKBridge:
             labels.append(str(label).strip() if label else f"task {task_id}")
         return labels
 
-    async def _orphan_bg_tasks(self, why: str) -> int:
+    def _save_bg_tasks(self) -> None:
+        """Mirror the live task registry to disk.
+
+        Called on every start and finish, so the file always holds the live set
+        rather than a snapshot taken at some arbitrary moment.
+
+        Deliberately **not** called from teardown or ``_clear_context``: the
+        whole point is that the record outlives the process that wrote it, so a
+        path that wipes the in-memory registry on its way out must not take the
+        file with it.  The two places that legitimately erase it are a task
+        finishing (nothing left to report) and the record being read back
+        (reported, so never again).
+        """
+        try:
+            save_persisted_bg_tasks(
+                self.config.cwd, self.state.background_tasks,
+                self.state.session_id,
+            )
+        except Exception as exc:
+            log.debug("bg task persist failed: %r", exc)
+
+    def _queue_lost_bg_notice(self, items: list[dict], why: str) -> bool:
+        """Put the loss in front of the model, at the head of the queue.
+
+        ``appendleft`` rather than ``append`` because this is *context for
+        whatever the session does next*, not a task of its own: a prompt the
+        user queued earlier would otherwise be answered by a model still
+        believing its background work was alive, which is the one ordering
+        where knowing late costs the most.
+
+        Everything else it needs is already wired to the deque -- ``on_change``
+        persists the queue, and the listener list pokes the worker (so it is
+        sent immediately when nothing is running) and pushes the queue panel,
+        so the notice is visible in the left pane like any other queued prompt.
+        """
+        text = describe_lost_bg_tasks(items, why=why)
+        if not text:
+            return False
+        self.state.queued_prompts.appendleft(text)
+        log.warning("queued lost-bg-task notice: %d task(s) (%s)",
+                    len(items), why)
+        return True
+
+    async def _report_lost_bg_tasks(self, resume_sid: str | None) -> int:
+        """Tell a freshly resumed session that its background work is gone.
+
+        This is the half a reconnect could never cover: the process that knew
+        what was running is dead, so the knowledge has to come off disk.  A
+        session torn down mid-work (an idle teardown, a hub restart, a reboot)
+        otherwise comes back and waits for notifications that no longer have
+        anyone to send them.
+        """
+        if not resume_sid:
+            return 0
+        try:
+            items = load_persisted_bg_tasks(self.config.cwd, resume_sid)
+        except Exception as exc:
+            log.warning("could not read the lost-bg-task record: %r", exc)
+            return 0
+        if not items:
+            return 0
+        # Reported once.  Clearing *before* announcing means a crash in the
+        # announce path costs one notice, where the other order would repeat it
+        # on every resume forever.
+        try:
+            save_persisted_bg_tasks(self.config.cwd, {}, resume_sid)
+        except Exception:
+            pass
+        labels = [_bg_task_label(i) for i in items]
+        log.warning("resumed with %d lost bg task(s): %s",
+                    len(labels), ", ".join(labels[:8]))
+        shown = ", ".join(labels[:5])
+        if len(labels) > 5:
+            shown += f", and {len(labels) - 5} more"
+        plural = "" if len(labels) == 1 else "s"
+        was = "was" if len(labels) == 1 else "were"
+        try:
+            await self.broadcast({
+                "type": "system_msg",
+                "subtype": "warning",
+                "data": {"message": (
+                    f"{len(labels)} background task{plural} {was} running when "
+                    f"this session was cut off ({shown}). Their results are "
+                    f"lost; whether they finished is unknown. The session has "
+                    f"been told, at the front of its prompt queue."
+                )},
+            })
+        except Exception as exc:
+            log.warning("lost-bg-task broadcast failed: %r", exc)
+        self._queue_lost_bg_notice(
+            items, "this session was cut off and has just been resumed")
+        return len(labels)
+
+    def _active_bg_tasks(self) -> dict:
+        """Background tasks that still count as running.
+
+        Every gate that background work is allowed to hold open asks *this*
+        rather than the raw registry: an idle teardown, a deferred ``/model``, a
+        CLI recycle, the rolling context trim, and bg-wait parking.  A task
+        proven to be burning no CPU and producing no output would otherwise pin
+        all five until the hub died -- which is exactly what the stuck rows in
+        every hub process have been doing.
+
+        The registry itself is untouched.  The row stays on screen, annotated,
+        because we can prove a task is doing nothing but not that it is *over*.
+        """
+        return active_tasks(self.state.background_tasks, now=time.monotonic())
+
+    async def probe_bg_stalls(self) -> None:
+        """Refresh every live background task's liveness signals.
+
+        Cheap and rate-limited: a couple of ``stat`` calls and one walk of the
+        CLI's children, every ``BG_PROBE_INTERVAL_S``, and only while tasks
+        exist.  The 2 s status ticker drives it, so the panel's stall note is
+        never more than a poll behind what the OS says.
+
+        Runs the whole blocking part in a thread.  ``psutil`` on Windows takes
+        real time to walk a process tree, and this runs on the event loop that
+        is also streaming tokens.
+        """
+        state = self.state
+        if not state.background_tasks:
+            return
+        now = time.monotonic()
+        if (now - self._bg_probe_at) < BG_PROBE_INTERVAL_S:
+            return
+        self._bg_probe_at = now
+        sid = state.session_id
+        if not sid:
+            return
+        wanted = {
+            tid: (entry.get("command") or "")
+            for tid, entry in state.background_tasks.items()
+        }
+        try:
+            probes = await asyncio.to_thread(
+                _probe_bg_tasks_blocking, self.config.cwd, sid, wanted,
+                self._cli_pid(),
+            )
+        except Exception as exc:
+            log.debug("bg stall probe failed: %r", exc)
+            return
+        newly_stalled = []
+        for tid, (sig, cpu, io_ops, pid, created) in probes.items():
+            entry = state.background_tasks.get(tid)
+            if entry is None:
+                continue          # finished while we were probing
+            was = stall_state(entry, now=now)
+            update_probe(entry, now=now, output_sig=sig, cpu_s=cpu,
+                         io_ops=io_ops)
+            entry["stall_probed"] = True
+            entry["pid"] = pid
+            entry["pid_created"] = created
+            if was != STALLED and stall_state(entry, now=now) == STALLED:
+                newly_stalled.append((tid, entry))
+        for tid, entry in newly_stalled:
+            # Logged once, at the transition.  A stalled task stops holding the
+            # session's gates open, and a gate silently releasing is exactly the
+            # kind of thing this project has had to reconstruct from logs before.
+            log.warning(
+                "bg task %s (%s) looks stalled: %s (pid=%s) — it no longer "
+                "defers idle teardown, /model or a CLI recycle",
+                tid[:12], (entry.get("name") or "")[:40],
+                describe_stall(entry, now=now), entry.get("pid"),
+            )
+
+    async def kill_bg_task(self, task_id: str) -> bool:
+        """Kill a background task's process tree, on the user's say-so.
+
+        Only ever user-initiated.  We cannot prove a quiet task is hung -- see
+        bg_stall -- so nothing here kills on a timer; the panel says what it
+        observed and the decision stays with the person reading it.
+
+        The row is left in place for the CLI to close normally if it notices.
+        If it never does (the usual case for a task in this state), the entry is
+        marked so the panel can say the kill happened rather than looking like
+        the button did nothing.
+        """
+        entry = self.state.background_tasks.get(task_id)
+        if entry is None:
+            return False
+        pid = entry.get("pid")
+        if not pid:
+            log.info("bg task %s: no process to kill (never identified)",
+                     task_id[:12])
+            entry["kill_note"] = "no process found"
+            await self._broadcast_panels()
+            return False
+        try:
+            killed = await asyncio.to_thread(
+                _kill_task_tree, int(pid), entry.get("pid_created"))
+        except Exception as exc:
+            log.warning("bg task %s: kill failed: %r", task_id[:12], exc)
+            entry["kill_note"] = "kill failed"
+            await self._broadcast_panels()
+            return False
+        log.warning("bg task %s (%s): killed %d process(es) at the user's "
+                    "request", task_id[:12], (entry.get("name") or "")[:40],
+                    killed)
+        entry["kill_note"] = f"killed {killed} process(es)"
+        await self.broadcast({
+            "type": "system_msg",
+            "subtype": "info",
+            "data": {"message": (
+                f"Killed background task “{entry.get('name') or task_id}” "
+                f"({killed} process(es)). Its result is gone; the CLI may keep "
+                f"the row until it notices."
+            )},
+        })
+        await self._broadcast_panels()
+        return True
+
+    async def run_btw(self, question: str) -> bool:
+        """Answer a side question in a fork of this conversation.
+
+        Runs entirely outside the worker: a separate ``ClaudeSDKClient``, a
+        separate CLI process, a forked session id.  The live turn never learns
+        it happened, which is the whole point -- ``/btw`` is for asking
+        something *while* the session works, and a turn owns the one main CLI.
+
+        Returns True if the fork was started.  False means there was nothing to
+        fork (no session id yet) and the caller should fall back to queueing the
+        question as an ordinary prompt.
+        """
+        if not can_fork(self.state):
+            return False
+        if self._btw_task is not None and not self._btw_task.done():
+            await self.broadcast({
+                "type": "system_msg", "subtype": "info",
+                "data": {"message": (
+                    "A /btw is already running — wait for it to answer. "
+                    "(Each one forks a whole CLI, so they are not free.)"
+                )},
+            })
+            return True
+        self._btw_seq += 1
+        self._btw_task = asyncio.create_task(
+            self._run_btw_inner(question, self._btw_seq),
+            name=f"btw-{self._btw_seq}",
+        )
+        return True
+
+    async def _run_btw_inner(self, question: str, seq: int) -> None:
+        """The fork itself.  Never raises into the caller's task."""
+        bid = f"btw{seq}"
+        started = time.monotonic()
+        await self.broadcast({
+            "type": "btw_start", "id": bid, "question": question,
+        })
+        client = None
+        fork_sid: str | None = None
+        cli: Any = None
+        error: str | None = None
+        try:
+            options = build_btw_options(
+                ClaudeAgentOptions, config=self.config, state=self.state,
+                stderr_cb=self._on_sdk_stderr,
+            )
+            client = ClaudeSDKClient(options=options)
+            await asyncio.wait_for(client.connect(), BTW_CONNECT_TIMEOUT)
+            # Snapshot the CLI while it is alive: once it exits we cannot find
+            # its children to clean up, and its pid may be recycled.
+            pid = getattr(getattr(getattr(client, "_transport", None),
+                                  "_process", None), "pid", None)
+            if isinstance(pid, int) and pid > 0:
+                cli = await asyncio.to_thread(proc_guard.snapshot_process, pid)
+            await client.query(btw_prompt(question))
+            async for msg in client.receive_response():
+                sid = getattr(msg, "session_id", None)
+                if sid and sid != self.state.session_id:
+                    # The fork's own id, learned from its init message.  Kept so
+                    # the throwaway transcript can be thrown away.
+                    fork_sid = sid
+                for text in _btw_text_blocks(msg):
+                    await self.broadcast({
+                        "type": "btw_delta", "id": bid, "text": text,
+                    })
+        except asyncio.CancelledError:
+            error = "cancelled"
+            raise
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            log.warning("btw %s failed: %r", bid, exc)
+        finally:
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    log.debug("btw %s: disconnect failed", bid, exc_info=True)
+            if cli is not None:
+                # The SDK's disconnect usually gets it; this is the same
+                # backstop the main disconnect() keeps, for the same reason.
+                try:
+                    await asyncio.to_thread(proc_guard.reap_descendants, [cli])
+                except Exception:
+                    log.debug("btw %s: reap failed", bid, exc_info=True)
+            if fork_sid:
+                await asyncio.to_thread(self._discard_fork_transcript, fork_sid)
+            log.info("btw %s finished in %.1fs (fork=%s error=%s)",
+                     bid, time.monotonic() - started,
+                     (fork_sid or "?")[:8], error or "none")
+            try:
+                await self.broadcast({
+                    "type": "btw_end", "id": bid, "error": error,
+                })
+            except Exception:
+                log.debug("btw %s: end broadcast failed", bid, exc_info=True)
+
+    def _discard_fork_transcript(self, fork_sid: str) -> None:
+        """Delete the throwaway session the fork wrote.
+
+        A fork is a real session on disk, so without this every aside leaves a
+        stub conversation cluttering ``/resume`` and the lobby forever.
+
+        Refuses to touch anything that is not unambiguously the fork: the id
+        must differ from the live session's.  Deleting the wrong transcript
+        would destroy a conversation, so the guard is worth more than the
+        tidiness.
+        """
+        if not fork_sid or fork_sid == self.state.session_id:
+            return
+        try:
+            proj = find_session_dir(
+                fork_sid, getattr(self.config, "config_dir", None))
+            if proj is None:
+                return
+            path = proj / f"{fork_sid}.jsonl"
+            if path.exists():
+                path.unlink()
+                log.info("btw: discarded fork transcript %s", fork_sid[:8])
+        except Exception:
+            log.debug("btw: could not discard fork transcript", exc_info=True)
+
+    async def _orphan_bg_tasks(self, why: str, *,
+                               tell_model: bool = True) -> int:
         """Drop the background-task registry, and *say so*.
 
         Every reconnect kills the CLI subprocess, and the CLI's task registry
@@ -1737,13 +2215,23 @@ class SDKBridge:
         bookkeeping is sometimes unavoidable (the CLI died; the user asked for
         a reconnect) — losing it *quietly* never is.
 
+        *tell_model* is False only for ``/clear``, which wipes the
+        conversation: a model that has just lost all memory of *starting* those
+        tasks cannot act on being told they were lost, and the notice would be
+        the first thing in its brand-new context. The browser is still told,
+        because the user does need to know.
+
         Returns the number of tasks orphaned.
         """
         labels = self._bg_task_labels()
         if not labels:
             return 0
+        items = bg_task_items(self.state.background_tasks)
         self.state.background_tasks.clear()
         self.state.completed_panel_bg.clear()
+        # Reported here and now, so the on-disk record must not report the same
+        # loss again at the next resume.
+        self._save_bg_tasks()
         log.warning("orphaned %d bg task(s) on %s: %s",
                     len(labels), why, ", ".join(labels))
         shown = ", ".join(labels[:5])
@@ -1760,6 +2248,11 @@ class SDKBridge:
                 f"completion notices are lost. Re-run anything you still need."
             )},
         })
+        # The browser has been told since 2026-08; the *model* had not, in any
+        # orphan path, so it kept waiting on handles that were already dead.
+        if tell_model:
+            self._queue_lost_bg_notice(
+                items, f"this session's CLI was replaced ({why})")
         return len(labels)
 
     async def _reconnect_or_defer(self, reason: str) -> bool:
@@ -1777,10 +2270,11 @@ class SDKBridge:
 
         Returns True if the reconnect happened now.
         """
-        if not self.state.background_tasks:
+        running = self._active_bg_tasks()
+        if not running:
             await self.reconnect()
             return True
-        n = len(self.state.background_tasks)
+        n = len(running)
         plural = "" if n == 1 else "s"
         self._deferred_reconnect = reason
         log.info("deferring reconnect (%s): %d bg task(s) running", reason, n)
@@ -1808,7 +2302,7 @@ class SDKBridge:
         reason = self._deferred_reconnect
         if reason is None:
             return False
-        if (self.state.background_tasks or self.turn_active.is_set()
+        if (self._active_bg_tasks() or self.turn_active.is_set()
                 or self.state.connecting):
             return False
         await self.broadcast({
@@ -2549,13 +3043,21 @@ class SDKBridge:
         self._cancel_bg_done_bell()
         state.busy = True
         state.turn_started_at = time.monotonic()
+        self._ghost_settled.clear()
         # Reset compact flag — any prior compact has been absorbed by
         # whatever turn just closed; this is a fresh stream.
         state.compact_during_last_turn = False
+        unprompted_resume = self._unprompted_resume_pending
+        # One notice per connection: a later ghost turn in the same connection
+        # has some other cause (a background task waking the model).
+        self._unprompted_resume_pending = False
         log.warning(
             "ghost turn begin: SDK streaming without active run_turn "
-            "(session_id=%s)", (state.session_id or "?")[:12],
+            "(session_id=%s resumed_interrupted_turn=%s)",
+            (state.session_id or "?")[:12], unprompted_resume,
         )
+        if unprompted_resume:
+            await self._announce_resumed_interrupted_turn()
         try:
             await self.broadcast({
                 "type": "status_update",
@@ -2565,6 +3067,33 @@ class SDKBridge:
         except Exception as exc:
             log.warning("ghost-turn status_update broadcast failed: %r", exc)
         return True
+
+    async def _announce_resumed_interrupted_turn(self) -> None:
+        """Say out loud that the CLI is finishing an old turn by itself.
+
+        We set ``CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`` on every connect, so
+        resuming a session whose last turn was cut off makes the CLI pick that
+        turn back up.  That is the behaviour we want -- work is not silently
+        abandoned -- but until this notice existed it was completely
+        unannounced: a session opened from the lobby would start producing
+        output with nobody having typed anything, and the only trace was a
+        WARNING in the server log.  A real report ("it was apparently still
+        doing a turn, even though the tab had been closed for a long time")
+        was exactly this, after an idle teardown killed the turn mid-flight.
+        """
+        try:
+            await self.broadcast({
+                "type": "system_msg",
+                "subtype": "info",
+                "data": {"message": (
+                    "Continuing a turn that was interrupted before this "
+                    "session was last closed. Nothing was sent from here -- "
+                    "the CLI picked the unfinished turn back up on resume. "
+                    "Use the interrupt button (Ctrl+C) to stop it."
+                )},
+            })
+        except Exception as exc:
+            log.warning("resumed-turn notice broadcast failed: %r", exc)
 
     async def _end_ghost_turn(self, subtype: str) -> None:
         """Close out a ghost turn cleanly when its ResultMessage lands."""
@@ -2576,6 +3105,11 @@ class SDKBridge:
         state.busy = False
         state.turn_started_at = None
         state.active_tools.clear()
+        self._ghost_settled.set()
+        # The prompt a parked worker declined to pop while this was
+        # streaming is sendable now.  Nothing extra is needed here: the
+        # queue-edit-done poke further down already exists for exactly
+        # this, and is what makes declining safe.
 
         # Book the turn unless this was an internal compact event.
         if not was_compact:
@@ -2736,6 +3270,36 @@ class SDKBridge:
             # every future turn.
             self._interrupt_settled.set()
 
+    async def _await_ghost_settled(self, timeout: float = 1800.0) -> None:
+        """Hold a starting turn until a streaming ghost turn has finished.
+
+        Same hazard as :meth:`_await_interrupt_settled`, reached without any
+        interrupt: the terminating ResultMessage belongs to the *ghost* stream,
+        so a turn that starts first claims the message queue and dies on
+        someone else's result -- "it showed it sent as a You: message, but it
+        just kept working and never answered me".
+
+        The timeout is long because a ghost turn is real work and can run for
+        tens of minutes (the reported one ran 19), and starting early is the
+        bug.  It is finite only so a ghost turn whose terminator never lands
+        cannot wedge the session forever; that case logs loudly rather than
+        failing silently.
+        """
+        if self._ghost_settled.is_set():
+            return
+        log.info("run_turn: waiting for a ghost turn to finish before starting")
+        try:
+            await asyncio.wait_for(self._ghost_settled.wait(), timeout)
+        except asyncio.TimeoutError:
+            log.warning(
+                "run_turn: ghost turn still streaming after %.0fs — starting "
+                "anyway; this turn may consume its result", timeout,
+            )
+        finally:
+            # Either way the wait is over; a stale clear must not delay every
+            # future turn.
+            self._ghost_settled.set()
+
     async def flush_pending_turn_end(self) -> None:
         """Close out a deferred turn_end *before* echoing the next prompt.
 
@@ -2816,6 +3380,9 @@ class SDKBridge:
         known = (task_id in state.background_tasks
                  or task_id in state.current_turn_bg)
         entry = complete_bg_task(state, task_id, status, summary=summary)
+        if entry is not None:
+            # One fewer task to report if this process dies now.
+            self._save_bg_tasks()
 
         if entry is None and known:
             log.info(
@@ -2861,7 +3428,7 @@ class SDKBridge:
         if in_bg_wait(state):
             self._arm_bg_done_bell()
         # If no more bg tasks, update status immediately and queue a wakeup.
-        if not state.background_tasks:
+        if not self._active_bg_tasks():
             await self.broadcast({
                 "type": "status_update",
                 "status": state_to_status_dict(state, self.config),
@@ -2984,6 +3551,8 @@ class SDKBridge:
             # Store command on the entry for panel display.
             if cmd:
                 entry["command"] = cmd
+            # One more task that would be lost if this process died now.
+            self._save_bg_tasks()
             data = {
                 "task_id": task_id,
                 "seq": seq,
@@ -3283,6 +3852,9 @@ class SDKBridge:
         state = self.state
         config = self.config
 
+        # Whatever streams from here on was asked for.
+        self._unprompted_resume_pending = False
+
         # Diagnostic: log at the *very* top (before queue drain) so we
         # can prove this function actually started, distinct from the
         # later "enter" log that follows turn_active.set().  If a turn
@@ -3303,6 +3875,11 @@ class SDKBridge:
         # this turn.  Let it land first (and be absorbed by the between-turns
         # handler) before we claim the message queue.
         await self._await_interrupt_settled()
+
+        # Likewise a ghost turn, which owns the stream without holding
+        # ``turn_active``.  The park point already declines to pop a prompt
+        # while one is streaming; this covers every other way into run_turn.
+        await self._await_ghost_settled()
 
         # Drain stale messages from the queue.
         drained = 0
@@ -4450,6 +5027,7 @@ class SDKBridge:
         reconnect_forced = False
         reconnect_reason = "the reconnect"
         quit_requested = False
+        btw_prompts: list[str] = []
         recycle_requested = False
 
         while not self.event_queue.empty():
@@ -4517,9 +5095,26 @@ class SDKBridge:
             elif kind in ("quit", "force-quit"):
                 quit_requested = True
             elif kind == "btw":
-                # Side question — for now, queue as regular message.
-                # Full /btw implementation would run in a separate context.
-                state.queued_prompts.append(payload)
+                # Collected, not queued here: they go to the *front* below, and
+                # pushing each one as it arrives would reverse two asides typed
+                # in one turn.
+                btw_prompts.append(payload)
+        # /btw goes to the front of the queue, not the back.  A turn owns the
+        # CLI, so a /btw typed during one cannot be answered until that turn
+        # ends -- but "the moment the turn ends" and "after everything you
+        # queued earlier" are very different things, and appending made it the
+        # latter.  The idle path already returns the /btw text ahead of the
+        # queue; the same gesture made three seconds earlier must not be
+        # demoted for it.  See design.md: "/btw, whose entire purpose is to
+        # jump the queue".
+        #
+        # Reversed so that several asides keep the order they were typed in.
+        #
+        # It is still a *regular prompt in the main context*, which is not what
+        # /btw is documented to be -- see known-issues.md.
+        for text in reversed(btw_prompts):
+            state.queued_prompts.appendleft(text)
+
         if quit_requested:
             return None
 
@@ -4590,7 +5185,7 @@ class SDKBridge:
         # accumulating context, and the check runs again after the next turn.
         max_ctx = getattr(state, "_max_context_tokens", config.max_context_tokens)
         if (max_ctx > 0 and state.context_tokens > max_ctx and state.session_id
-                and not state.background_tasks):
+                and not self._active_bg_tasks()):
             proj = project_dir_for_cwd(config.cwd)
             new_sid = trim_session(state.session_id, proj, max_ctx)
             if new_sid:
@@ -4620,7 +5215,7 @@ class SDKBridge:
             return "/compact"
 
         # --- Background tasks running → wait ---
-        if state.background_tasks:
+        if self._active_bg_tasks():
             if state.needs_user_attention != "api-error":
                 state.needs_user_attention = None
             await self.broadcast({
@@ -4793,6 +5388,26 @@ class SDKBridge:
                 if self.state.connecting:
                     log.debug("queue poke while connecting — deferred to connect()")
                     continue
+                # ...or while a *ghost* turn is streaming.  A ghost turn holds
+                # no ``turn_active``, so the worker is parked right here while
+                # the CLI is mid-answer, and "we are waiting, therefore it is
+                # idle" is wrong.  Popping anyway sent the prompt into a busy
+                # CLI and left this turn to consume the *ghost* turn's
+                # terminating ResultMessage, which ended it on someone else's
+                # result with the prompt unanswered.  Reported 2026-09-16:
+                # "it showed it sent as a You: message, but it just kept
+                # working and never answered me" -- 08:56:17 ghost turn begin,
+                # 08:59:14 run_turn start with state.busy=True, 09:18:33 that
+                # turn exits on a 1159 s result that was not its own.
+                #
+                # A real ``run_turn`` can never be active here (the worker
+                # would be inside it, not parked), so ``state.busy`` at this
+                # point means precisely "a ghost turn is streaming".
+                # Declining is safe because _end_ghost_turn() re-pokes.
+                if self.state.busy:
+                    log.info("queue poke during a ghost turn — deferred to "
+                             "its end (%d queued)", len(self.state.queued_prompts))
+                    continue
                 # The queue poke is the *lowest-priority* signal here, and it
                 # is the only wakeup that can arrive without the user having
                 # asked for anything.  Everything else already on the event
@@ -4851,7 +5466,7 @@ class SDKBridge:
         # Wiping the session discards the running tasks along with everything
         # else.  That is what /clear means, but the user should still be told
         # which tasks went with it — the bulk clear below is silent.
-        await self._orphan_bg_tasks("/clear")
+        await self._orphan_bg_tasks("/clear", tell_model=False)
         await self.disconnect()
         state.session_id = None
         state.session_title = None

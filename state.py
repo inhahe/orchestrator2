@@ -13,6 +13,8 @@ import os
 import re
 import sys
 import time
+
+import bg_stall
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -930,8 +932,12 @@ def state_to_panels_dict(state: State) -> dict[str, Any]:
             "is_background": info.get("is_background", False),
         })
 
-    # Background tasks
+    # Background tasks.  Each row carries what we observed about whether it
+    # is still doing anything -- see bg_stall: a task the CLI never closes out
+    # stays here forever, and the panel is the only place that can say whether
+    # it is working or hung.
     bg_tasks_list = []
+    _mono = time.monotonic()
     for task_id, info in state.background_tasks.items():
         bg_tasks_list.append({
             "task_id": task_id,
@@ -941,6 +947,10 @@ def state_to_panels_dict(state: State) -> dict[str, Any]:
             "started_at": info.get("started_at"),
             "tool_use_id": info.get("tool_use_id"),
             "command": info.get("command"),
+            "stalled": bg_stall.stall_state(info, now=_mono) == bg_stall.STALLED,
+            "stall_note": bg_stall.describe_stall(info, now=_mono),
+            "killable": bool(info.get("pid")),
+            "kill_note": info.get("kill_note"),
         })
 
     # Completed tools still in grace period

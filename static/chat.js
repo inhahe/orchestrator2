@@ -538,6 +538,11 @@ const Chat = (() => {
       case 'turn_start':      _addTurnStart(msg); break;
       case 'turn_end':        _addTurnEnd(msg); break;
       case 'system_msg':      _addSystemMsg(msg); break;
+      // A /btw exchange is live-only: the fork writes to its own throwaway
+      // session, so nothing of it is ever in this session's history to replay.
+      case 'btw_start':       _addBtwStart(msg); break;
+      case 'btw_delta':       _addBtwDelta(msg); break;
+      case 'btw_end':         _addBtwEnd(msg); break;
       case 'bg_started':      _addBgStarted(msg); break;
       case 'bg_complete':     _addBgComplete(msg); break;
       case 'clear_screen':    clear(); break;
@@ -1059,6 +1064,64 @@ const Chat = (() => {
     el.textContent = text;
 
     elMessages.appendChild(el);
+    _scrollToBottom();
+  }
+
+  // --- /btw: a side exchange, answered in a fork of this conversation ---
+  //
+  // Rendered inline but visually apart, because that is exactly what it is: the
+  // question and its answer belong in the reading order where they were asked,
+  // while nothing in them is part of the conversation the main turn is having.
+  // A fork's answer folded into the transcript unmarked would be indisputably
+  // worse than not having the feature -- you would be reading replies to a
+  // question the session itself never saw.
+
+  const _btwEls = new Map();   // id -> {answer element}
+
+  function _addBtwStart(msg) {
+    const id = msg.id || '';
+    const el = document.createElement('div');
+    el.className = 'msg msg-btw pending';
+    el.dataset.btwId = id;
+    el.innerHTML =
+      `<div class="btw-head">
+         <span class="btw-tag">/btw</span>
+         <span class="btw-note">side question — forked conversation, not seen by this session</span>
+       </div>
+       <div class="btw-question">${_esc(msg.question || '')}</div>
+       <div class="btw-answer"></div>`;
+    elMessages.appendChild(el);
+    _btwEls.set(id, el.querySelector('.btw-answer'));
+    _scrollToBottom();
+  }
+
+  function _addBtwDelta(msg) {
+    const target = _btwEls.get(msg.id || '');
+    if (!target) return;
+    // Append rather than replace: the fork streams in blocks, and replacing
+    // would show only the last one.
+    target.textContent += msg.text || '';
+    _scrollToBottom();
+  }
+
+  function _addBtwEnd(msg) {
+    const id = msg.id || '';
+    const target = _btwEls.get(id);
+    _btwEls.delete(id);
+    const el = elMessages.querySelector(`.msg-btw[data-btw-id="${window.CSS && CSS.escape ? CSS.escape(id) : id}"]`);
+    if (el) el.classList.remove('pending');
+    if (!msg.error) return;
+    // A failed fork must say so in place.  Silently leaving an empty answer
+    // block would read as "it had nothing to say".
+    if (target && !target.textContent) {
+      target.textContent = `(no answer — ${msg.error})`;
+      target.classList.add('btw-failed');
+    } else if (el) {
+      const warn = document.createElement('div');
+      warn.className = 'btw-failed';
+      warn.textContent = `(ended early — ${msg.error})`;
+      el.appendChild(warn);
+    }
     _scrollToBottom();
   }
 

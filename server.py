@@ -42,6 +42,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, NamedTuple
+
+import bg_stall
 from urllib.parse import unquote
 
 import dataclasses
@@ -960,6 +962,24 @@ MIRROR_INTERVAL = 15.0
 _mirror_at = 0.0
 
 
+async def _probe_bg_stalls(rt: SessionRuntime) -> None:
+    """Refresh the runtime's background-task liveness signals.
+
+    Driven from the status ticker because that is the one loop guaranteed to
+    run for every live runtime; the bridge rate-limits it to
+    ``BG_PROBE_INTERVAL_S``, so the 2 s cadence costs nothing on the passes in
+    between.  Failures are swallowed -- a liveness probe must never be the
+    reason a status tick stops.
+    """
+    bridge = getattr(rt, "bridge", None)
+    if bridge is None:
+        return
+    try:
+        await bridge.probe_bg_stalls()
+    except Exception:
+        log.exception("bg stall probe error")
+
+
 async def _tick_runtime(rt: SessionRuntime) -> bool:
     """One ticker pass over a single runtime.  Returns True if it broadcast.
 
@@ -1054,6 +1074,7 @@ async def _status_ticker() -> None:
         await asyncio.sleep(2.0)
         for rt in list(runtimes.values()):
             try:
+                await _probe_bg_stalls(rt)
                 await _tick_runtime(rt)
             except Exception:
                 log.exception("ticker error")
@@ -1707,7 +1728,13 @@ async def _idle_teardown_after(rt: SessionRuntime, timeout: int) -> None:
         return
     st = getattr(rt, "state", None)
     busy = bool(getattr(st, "busy", False)) if st is not None else False
-    bg = len(getattr(st, "background_tasks", ()) or ()) if st is not None else 0
+    # Only tasks that are still *doing* something defer a teardown.  The
+    # deferral is unbounded by design -- a session that keeps working is
+    # succeeding at its job -- which is precisely why a task burning no CPU and
+    # writing nothing must not count: it would pin the runtime until the hub
+    # died.  See bg_stall.
+    bg = len(bg_stall.active_tasks(getattr(st, "background_tasks", None) or {},
+                                   now=time.monotonic())) if st is not None else 0
     if busy or bg:
         log.info("runtime %s idle for %ds but still %s — deferring teardown",
                  rt.rid, timeout,
@@ -3027,6 +3054,28 @@ async def api_queue_edit(body: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True}
 
 
+@_route("post", "/api/bg/kill")
+async def api_bg_kill(body: dict[str, Any]) -> dict[str, Any]:
+    """Kill a background task's process tree, on the user's say-so.
+
+    Deliberately manual.  We can prove a task is producing nothing and burning
+    no CPU, but not that it is *finished* -- a task blocked on something about
+    to arrive looks identical to one blocked forever.  So the panel reports
+    what it observed and the person reading it decides; nothing here fires on a
+    timer.
+    """
+    rt, st, br = _resolve_queue_rt(body)
+    if st is None or br is None:
+        return {"ok": False, "error": "not ready"}
+    task_id = (body.get("task_id") or "").strip()
+    if not task_id:
+        return {"ok": False, "error": "task_id required"}
+    if task_id not in st.background_tasks:
+        return {"ok": False, "error": "no such task"}
+    ok = await br.kill_bg_task(task_id)
+    return {"ok": ok}
+
+
 @_route("post", "/api/queue/editing")
 async def api_queue_editing(body: dict[str, Any]) -> dict[str, Any]:
     """Notify the server that the user is editing (or finished editing) a queue item.
@@ -4172,6 +4221,15 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             await _ack_prompt(
                 ws, msg, PROMPT_ENQUEUED if ok else PROMPT_REJECTED)
             return
+        # /btw forks the conversation and answers alongside the live turn, so
+        # it must not go near the worker -- the worker is busy being the turn.
+        # Falls through to the event queue when there is nothing to fork (a
+        # session with no id yet), where it behaves as it always did: an
+        # ordinary prompt at the front of the queue.
+        if kind == "btw" and await bridge.run_btw(payload):
+            await _ack_prompt(ws, msg, PROMPT_IMMEDIATE)
+            return
+
         bridge.event_queue.put_nowait((kind, payload))
         await _ack_prompt(ws, msg, PROMPT_IMMEDIATE)
 
