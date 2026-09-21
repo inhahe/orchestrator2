@@ -286,6 +286,36 @@ def test_a_session_mid_turn_is_not_torn_down():
     assert _fire(_runtime(busy=True)) is False
 
 
+def test_a_session_waiting_on_a_wakeup_is_not_torn_down():
+    """Reported 2026-09-20: two autonomous-loop sessions, OSc and OSa, showed
+    "This tab's session is no longer running" days after the user had closed
+    nothing and the hub had not restarted.
+
+    Both were reaped *between loop iterations*. From the log::
+
+        22:25:10  wakeup armed: delay=1800s  'Autonomous-loop wakeup ...'
+        22:26:45  runtime s5 idle for 300s — tearing down
+
+    Ninety-five seconds. A session waiting on a wakeup is doing exactly what it
+    was asked to -- nothing, until the wakeup fires -- and ``state.wakeup_at``
+    lives only in memory, so reaping it cancels the loop outright and for good.
+    """
+    assert _fire(_runtime(wakeup_at=time.time() + 1800)) is False
+
+
+def test_a_wakeup_that_should_already_have_fired_does_not_pin_the_runtime():
+    """Only a *future* wakeup counts. A stale past timestamp means the wakeup
+    should already have fired, and deferring on it would hold the runtime open
+    forever on a schedule nothing will honour."""
+    assert _fire(_runtime(wakeup_at=time.time() - 60)) is True
+
+
+def test_no_wakeup_is_not_mistaken_for_one():
+    """``wakeup_at`` is None on most sessions; a truthiness test would be fine
+    but a comparison against None would explode."""
+    assert _fire(_runtime(wakeup_at=None)) is True
+
+
 def test_a_session_with_background_tasks_is_not_torn_down():
     """A turn can finish while the work it spawned is still running; killing
     the runtime takes those with it."""
@@ -343,3 +373,98 @@ def test_a_runtime_already_gone_is_not_torn_down_twice():
     rt = _runtime()
     server.runtimes.clear()
     assert _fire(rt) is False
+
+# ---------------------------------------------------------------------------
+# What a stale tab is told
+# ---------------------------------------------------------------------------
+
+def test_an_unknown_rid_still_gets_the_old_guess():
+    """A rid from a previous hub, or a reboot that restored old tabs, is a case
+    we genuinely cannot explain -- so the guess stays for it, and only for it."""
+    server._teardown_reasons.clear()
+
+    notice = server._describe_missing_rid("s99")
+
+    assert "restarted" in notice
+
+
+def test_a_reaped_session_is_told_what_actually_happened(monkeypatch):
+    """The reported banner blamed "the server was restarted (or the session was
+    closed)". Both halves were wrong: the hub had been up for days and the user
+    had closed nothing. It had been reaped for being idle."""
+    server._teardown_reasons.clear()
+    rt = _runtime(session_title="E OSc")
+
+    server._record_teardown(rt, "was closed after 5 minutes with no tab connected")
+    notice = server._describe_missing_rid(rt.rid)
+
+    assert "E OSc" in notice, "the banner does not say which session"
+    assert "5 minutes with no tab connected" in notice
+    assert "restarted" not in notice, "it still blames a restart that never happened"
+
+
+def test_the_banner_says_the_conversation_survived():
+    """The session file is untouched by a teardown; without saying so the
+    banner reads like the work was lost."""
+    server._teardown_reasons.clear()
+    rt = _runtime(session_title="E OSa")
+    server._record_teardown(rt, "was closed")
+
+    notice = server._describe_missing_rid(rt.rid).lower()
+
+    assert "safe" in notice or "reopen" in notice
+
+
+def test_the_record_is_bounded():
+    """A courtesy for reconnecting tabs, not a log."""
+    server._teardown_reasons.clear()
+    for i in range(server._TEARDOWN_MEMORY + 10):
+        rt = _runtime()
+        rt.rid = f"s{i}"
+        server._record_teardown(rt, "was closed")
+
+    assert len(server._teardown_reasons) == server._TEARDOWN_MEMORY
+
+
+def test_the_oldest_record_is_the_one_dropped():
+    server._teardown_reasons.clear()
+    for i in range(server._TEARDOWN_MEMORY + 1):
+        rt = _runtime()
+        rt.rid = f"s{i}"
+        server._record_teardown(rt, "was closed")
+
+    assert "s0" not in server._teardown_reasons
+    assert f"s{server._TEARDOWN_MEMORY}" in server._teardown_reasons
+
+
+def test_an_idle_reap_says_it_was_the_idle_rule():
+    """"Was closed" would be true and useless. The user's whole complaint was
+    not knowing *why* a session they never closed had gone, so the banner has
+    to name the rule and its timeout."""
+    captured: dict = {}
+
+    async def fake_teardown(r, **kw):
+        captured.update(kw)
+
+    orig = server._teardown_runtime
+    server._teardown_runtime = fake_teardown
+    try:
+        asyncio.run(server._idle_teardown_after(_runtime(), 0))
+    finally:
+        server._teardown_runtime = orig
+
+    reason = captured.get("reason", "")
+    assert "no tab connected" in reason, reason
+    assert "minute" in reason, reason
+
+
+def test_every_teardown_records_a_reason():
+    """The recorder is useless if a path forgets to call it, and the banner
+    silently falls back to the guess -- which is what it did before."""
+    import inspect
+    src = inspect.getsource(server._teardown_runtime)
+
+    assert "_record_teardown(rt, reason)" in src, (
+        "teardown no longer records why, so stale tabs get the old guess again"
+    )
+

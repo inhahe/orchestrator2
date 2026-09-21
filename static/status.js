@@ -274,6 +274,7 @@ const Status = (() => {
   // a countdown that freezes is worse than none.
   let _wakeupAt = null;         // epoch seconds, or null when nothing is armed
   let _wakeupDefers = 0;
+  let _wakeupBusy = false;
   let _loopTimer = null;
 
   // How many prompts are waiting, shown on the panels toggle.
@@ -300,6 +301,11 @@ const Status = (() => {
     if (!elLoop) return;
     const at = (typeof status.wakeup_at === 'number') ? status.wakeup_at : null;
     _wakeupDefers = status.wakeup_defers || 0;
+    // A wakeup cannot fire while a turn is running -- it defers instead.  The
+    // countdown is still the truth (the model armed it mid-turn, which is when
+    // ScheduleWakeup is called), but on its own it promises an injection at
+    // zero that will not happen yet.
+    _wakeupBusy = status.busy_class === 'working';
     if (at !== _wakeupAt) {
       _wakeupAt = at;
       const show = at !== null;
@@ -324,10 +330,16 @@ const Status = (() => {
     // mid-turn and is being pushed back, and at the cap it is dropped rather
     // than fired.  "armed" on its own would imply it will happen.
     if (_wakeupDefers) text += ' · deferred ' + _wakeupDefers;
+    else if (_wakeupBusy) text += ' · after this turn';
     _set(elLoop, 'textContent', text);
     _set(elLoop, 'title',
          'A wakeup is scheduled: a prompt will be injected into this session '
          + 'in ' + text.split(' · ')[0] + '.'
+         + (_wakeupBusy && !_wakeupDefers
+              ? '  This session is working, and a wakeup never fires mid-turn '
+                + '-- it waits, or is deferred if the turn is still running '
+                + 'when it comes due.'
+              : '')
          + (_wakeupDefers
               ? '  It has been deferred ' + _wakeupDefers + ' time(s) because a '
                 + 'turn was still running; after the cap it is dropped.'

@@ -67,6 +67,120 @@ their outputs stay on disk under `%TEMP%\claude\<project>\<session-uuid>\tasks\`
 This is why `_maybe_recycle_cli()` refuses while `state.background_tasks` is
 non-empty — including for a forced `/recycle now`.
 
+## Autonomous loops were reaped between iterations — FIXED (2026-09-20)
+
+> "for two sessions i had going, OSc and OSa, they now say 'This tab's session
+> is no longer running — the server was restarted (or the session was closed)
+> since the tab was opened.', even though i never closed them."
+
+Both halves of that banner were wrong, and the real cause was worse than
+either.
+
+**The hub had not restarted.** It was pid 21996, up since 2026-09-16. The two
+"log file opened" entries from today are a second `server.py` launch detecting
+the running hub and bowing out 360 ms later:
+
+```
+17:54:12,570 [pid 15336] --- log file opened ---
+17:54:12,930 [pid 15336] --- server shut down (pid 15336) ---
+```
+
+**And the user had closed nothing.** Both sessions were reaped by the idle
+timer, days earlier — and reaped *between loop iterations*:
+
+```
+22:25:10  wakeup armed: delay=1800s  'Autonomous-loop wakeup (scheduled by you)...'
+22:26:45  runtime s5 idle for 300s — tearing down            <- 95 seconds later
+
+01:30:15  wakeup armed: delay=1500s  'Autonomous-loop wakeup (scheduled by you)...'
+01:31:50  runtime s6 idle for 300s but still running 1 background task(s) — deferring
+01:36:48  bg task buj4ncnuw completed
+01:36:50  runtime s6 idle for 300s — tearing down            <- 19 minutes still to run
+```
+
+For s6 the background task was the *only* thing holding it open; the moment it
+finished, the runtime went.
+
+### A session with work scheduled is waiting, not idle
+
+`_idle_teardown_after` was taught in September that "a session that is working
+is not idle" — it defers on `state.busy` and on running background tasks. **A
+pending wakeup was never part of that**, and an autonomous loop between
+iterations is idle by definition: waiting is the whole activity. Worse,
+`state.wakeup_at` lives only in memory, so reaping cancels the loop outright
+and leaves nothing to restore it from. The loops stopped days ago, silently.
+
+The guard now also defers on a wakeup — but only one still in the *future*. A
+stale past timestamp means the wakeup should already have fired, and deferring
+on it would pin the runtime forever on a schedule nothing will honour.
+
+*This is the third time this teardown has been found reaping something it
+should not, and the second time my own fix for it was incomplete: the entry
+above it cites an autonomous-loop session as the worst case and still only
+covered the mid-turn half.*
+
+### The banner was guessing
+
+"The server was restarted (or the session was closed)" was a guess offered as
+an explanation, and it sent the user looking for a restart that never happened.
+Teardowns now record why, and the banner reads them:
+
+> This tab's session (E OSc) was closed after 5 minutes with no tab connected
+> at 2026-09-19 01:36. Its conversation is safe — reopen it from the list
+> below to carry on.
+
+The old wording survives only for a rid we genuinely cannot explain — one from
+a previous hub, or a reboot that restored old tabs. The record is bounded at 32
+entries: it is a courtesy for reconnecting tabs, not a log.
+
+**Verified:** `tests/test_idle_teardown.py` (+10) and the `wakeupidle` mutation
+target (`server.py` × 8), 8/8 after repair; `idle` re-swept 12/12; full suite
+1,074 passed. Two survivors on the first sweep: one was a real gap (nothing
+checked that the *idle* path passes its own reason, so "was closed" would have
+read as an ordinary close and hidden the five-minute rule), and one was
+equivalent — moving the record below `runtimes.pop` changes nothing, since
+popping the registry entry does not touch `rt.state`. A comment claiming that
+position was load-bearing has been corrected.
+
+### The restart half — also fixed
+
+A wakeup lived only in memory, so a hub restart cancelled every schedule just
+as quietly as the reaper did. Asked which behaviour a user would expect, the
+answer settled it: *"i guess my loops are mostly unattended."* Restoring a
+schedule only when someone next **opens** the session would have been the safe,
+queue-shaped design — and decoration, for a loop whose entire purpose is
+running while nobody watches. So `wakeup_store.py` persists them and the hub
+resurrects the sessions itself at startup.
+
+**That is the most dangerous thing the hub does, and every restraint on it is
+deliberate.** A wakeup carries a prompt that is *sent as a real turn*,
+unattended, in a session the user did not open — the same shape as the harm the
+persisted prompt queue once caused. So a record is session-scoped and must
+match its own slot; it expires; only `MAX_RESURRECT` sessions come back per
+boot (each is a CLI and a transcript load, on a machine that has exhausted its
+commit limit before); a session already running is never revived on top of
+itself; an overdue one waits `WAKEUP_RESTORE_SETTLE_S` so tabs can reconnect
+before a turn starts; and the session announces why it woke up.
+
+The interesting rule is the **lateness budget**: a wakeup may fire late by at
+most its own cadence (`due_at - armed_at`, floored at 1 min and capped at 1 h).
+A loop that ticks every twenty minutes has no business firing eight hours late
+on a plan that has gone stale, so past that budget it is left *paused* — the
+record stays on disk, and opening the session is what surfaces it. Derived
+rather than configured, so a fast loop tolerates little lateness and a slow one
+more, with no knob to get wrong.
+
+**Verified:** `tests/test_wakeup_store.py` (34) and the `wakestore`
+(`wakeup_store.py` × 12) and `wakerevive` (`server.py` × 5) mutation targets,
+17/17 after repair. **Four of the five `wakerevive` mutants survived the first
+sweep**, and all four for the same reason: the tests were source-greps. One
+asserted the source contained `live_sids` — which it still did after the guard
+became `if False:` — and another looked for `system_msg` in a function whose
+broadcast had been redirected to nowhere. They are behavioural now: fake
+runtimes, real resurrection, assertions on what was created, armed and sent.
+The fifth survivor was equivalent (a negative-interval guard the `max()` floor
+already covers) and was removed with a note.
+
 ## `/btw` waited behind the queue it exists to jump — FIXED (2026-09-18)
 
 > "I did a /btw and it didn't send it and show me the result until after the

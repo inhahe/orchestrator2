@@ -271,8 +271,58 @@ nothing else, so a turn started and then left to run — close the tab, lock the
 phone — was killed mid-edit five minutes later, taking its background tasks
 with it. That is the opposite of what a server-side agent is for: you close the
 tab *because* it keeps working. `_idle_teardown_after` now re-arms instead of
-tearing down when `state.busy` or `background_tasks` is non-empty, and reaps on
-the first pass after the session goes quiet. Deliberately unbounded, unlike the
+tearing down when `state.busy` or `background_tasks` is non-empty, **or when a
+wakeup is scheduled in the future**, and reaps on the first pass after the
+session goes quiet.
+
+*A session with work scheduled is waiting, not idle.* The wakeup half was
+missing until 2026-09-20 and cost two autonomous loops, reaped 95 s and 6 min
+after arming 1800 s and 1500 s wakeups. A loop between iterations is idle by
+definition — waiting is the entire activity — and `state.wakeup_at` lives only
+in memory, so reaping cancelled the loop outright with nothing left to restore
+it from. Only a *future* wakeup defers: a stale past timestamp means the wakeup
+should already have fired, and deferring on it would pin the runtime forever on
+a schedule nothing will honour.
+
+*The countdown is armed mid-turn, on purpose.* `ScheduleWakeup` is a **tool**
+the model calls during its turn, so a session can legitimately show `working`
+and a loop countdown at once: it has already committed to the next iteration
+while finishing this one. Asked whether that was a contradiction — it is not,
+but the bare number over-promises, because a wakeup never fires mid-turn. It
+defers by `WAKEUP_MIN_DELAY`, and the status bar now says `· after this turn`
+while busy rather than implying an injection at zero.
+
+*A dropped loop says so.* After `WAKEUP_MAX_DEFERS` deferrals the wakeup is
+discarded — the turn has outlasted the loop's whole cadence, so the schedule
+has stopped describing anything real. That used to be a log line only: the
+countdown simply vanished from the status bar. It is now announced in the
+session, with how to start it again. A loop that stops without saying it
+stopped is the failure this project spent a week removing from the idle
+teardown, and reproducing it inside the loop's own code would be indefensible.
+
+*A schedule outlives the hub.* `wakeup_store.py` mirrors each armed wakeup to
+`<config-dir>/orchestrator2/wakeups/`, keyed by cwd and session id, and erases
+it at every exit from the armed state — a record that outlives its wakeup is a
+turn waiting to run twice. At startup `_resurrect_scheduled_wakeups()` reopens
+those sessions and re-arms them, because the loops that need this are
+unattended by definition; restoring only on open would be decoration.
+
+It is the riskiest path in the hub — it starts CLIs and then runs turns in
+them, unwatched — so the restraints are the design: session-scoped records that
+must match their own slot, a freshness cap, a cap on how many sessions one boot
+may revive, never reviving one that is already running, a settling delay before
+an overdue wakeup fires, and an announcement in the session saying nobody typed
+anything. The **lateness budget** is the load-bearing rule: a wakeup may fire
+late by at most its own cadence (bounded 1 min–1 h), and past that it is left
+*paused* on disk rather than run, because an eight-hour-late loop is acting on
+a plan that has gone stale.
+
+*A stale tab is told what actually happened.* Teardowns record their reason
+(bounded at 32 entries) and the lobby banner reads it, because the old wording
+— "the server was restarted (or the session was closed)" — was a guess, and in
+the reported case both halves were false. The guess survives only for a rid we
+genuinely cannot explain: one from a previous hub, or a reboot that restored
+old tabs. Deliberately unbounded, unlike the
 wakeup deferral (§6): a wakeup that keeps landing mid-turn has already failed
 at its job, whereas a session that keeps working is succeeding at its, and a
 genuinely wedged one is still closable from the lobby.

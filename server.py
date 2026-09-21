@@ -40,10 +40,12 @@ import re
 import socket as _socket
 import sys
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import bg_stall
+import wakeup_store
 from urllib.parse import unquote
 
 import dataclasses
@@ -1181,6 +1183,10 @@ async def lifespan(app: FastAPI):
 
     _ticker_task = asyncio.create_task(_status_ticker(), name="status-ticker")
 
+    # Bring back any loop that was scheduled when the hub last stopped.  In the
+    # background: it opens CLIs, and the hub must be serving before it does.
+    asyncio.create_task(_resurrect_scheduled_wakeups(), name="wakeup-restore")
+
     # Keep the live model-list cache warm off the event loop so /model (which
     # runs on the loop) can read it without blocking on a network call.
     _model_task = asyncio.create_task(_model_cache_loop(), name="model-cache")
@@ -1484,7 +1490,156 @@ async def _load_runtime_title(
         log.debug("title publish failed for %s", sid, exc_info=True)
 
 
-async def _teardown_runtime(rt: SessionRuntime, *, force: bool = False) -> None:
+#: Why each recently torn-down runtime went away, newest last.  A stale tab
+#: reconnecting used to be told "the server was restarted (or the session was
+#: closed)" -- a guess, and in the reported case both halves were wrong: the hub
+#: had been up for days and the user had closed nothing.  The session had been
+#: reaped for being idle.  Bounded because this is a courtesy for reconnecting
+#: tabs, not a log; the log is the log.
+_teardown_reasons: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_TEARDOWN_MEMORY = 32
+
+
+def _record_teardown(rt: SessionRuntime, reason: str) -> None:
+    """Remember why *rt* went away, so its tabs can be told."""
+    st = getattr(rt, "state", None)
+    _teardown_reasons[rt.rid] = {
+        "reason": reason,
+        "at": time.time(),
+        "title": (getattr(st, "session_title", None)
+                  or getattr(st, "session_id", None) or rt.rid),
+    }
+    while len(_teardown_reasons) > _TEARDOWN_MEMORY:
+        _teardown_reasons.popitem(last=False)
+
+
+def _describe_missing_rid(rid: str) -> str:
+    """The banner for a tab whose runtime is gone.
+
+    Says what actually happened when we know, and only falls back to the old
+    guess when we genuinely do not -- a hub restart, a reboot that restored old
+    tabs, a rid from a different hub.
+    """
+    rec = _teardown_reasons.get(rid)
+    if rec is None:
+        return ("This tab's session is no longer running — the server was "
+                "restarted (or the session was closed) since the tab was "
+                "opened. Pick a session below to continue.")
+    when = datetime.datetime.fromtimestamp(rec["at"]).strftime("%Y-%m-%d %H:%M")
+    return (f"This tab's session ({rec['title']}) {rec['reason']} at {when}. "
+            f"Its conversation is safe — reopen it from the list below to "
+            f"carry on.")
+
+
+#: How long a restored-but-overdue wakeup waits before firing, so the hub
+#: finishes coming up (and its tabs connect) before a turn starts by itself.
+WAKEUP_RESTORE_SETTLE_S = 20.0
+
+
+async def _resurrect_scheduled_wakeups() -> None:
+    """Bring back sessions that had a loop scheduled when the hub last died.
+
+    **The riskiest thing the hub does, deliberately.**  It starts CLI processes
+    and, shortly after, runs turns in them, with nobody necessarily watching.
+    That is the point -- asked whether loops are attended, the answer was "i
+    guess my loops are mostly unattended", and a schedule that only resumes
+    when you next open the session would be decoration for a loop whose whole
+    purpose is running while you sleep.
+
+    Every restraint lives in :mod:`wakeup_store`: a record is session-scoped
+    and must match its own slot, expires, and may only fire late by its own
+    cadence.  This function adds the two that need the hub's view: it never
+    resurrects a session that is *already* running, and it stops after
+    ``MAX_RESURRECT`` so a boot cannot spawn an unbounded number of CLIs on a
+    machine that has exhausted its commit limit before.
+
+    A ``PAUSED`` record -- one that went stale while the hub was down -- is
+    deliberately left on disk and *not* run.  Opening that session is what
+    surfaces it; charging ahead on a plan from eight hours ago is the outcome
+    this whole path is written to avoid.
+    """
+    try:
+        records = list(wakeup_store.iter_pending_wakeups())
+    except Exception:
+        log.exception("wakeup restore: could not read the records")
+        return
+    if not records:
+        return
+
+    live_sids = {
+        getattr(getattr(rt, "state", None), "session_id", None)
+        for rt in runtimes.values()
+    }
+    revived = 0
+    for rec in records:
+        sid = rec.get("session_id")
+        plan = wakeup_store.plan_restore(rec)
+        if plan.action == wakeup_store.DISCARD:
+            log.info("wakeup restore: dropping %s — %s",
+                     (sid or "?")[:8], plan.reason)
+            wakeup_store.clear_wakeup(rec.get("cwd", ""), sid)
+            continue
+        if plan.action == wakeup_store.PAUSED:
+            # Left on disk on purpose: the session should say so when opened.
+            log.warning("wakeup restore: %s is %s", (sid or "?")[:8], plan.reason)
+            continue
+        if sid in live_sids:
+            log.info("wakeup restore: %s is already running — leaving it alone",
+                     (sid or "?")[:8])
+            continue
+        if revived >= wakeup_store.MAX_RESURRECT:
+            log.warning(
+                "wakeup restore: %s and any after it are left paused — already "
+                "resurrected %d sessions this start, which is the cap",
+                (sid or "?")[:8], revived)
+            break
+        try:
+            rt = await _create_runtime(
+                cwd=rec["cwd"], resume=sid,
+                config_dir=rec.get("config_dir") or None,
+            )
+        except Exception:
+            log.exception("wakeup restore: could not reopen %s", (sid or "?")[:8])
+            continue
+        revived += 1
+        delay = max(0.0, plan.delay) if plan.action == wakeup_store.ARM \
+            else WAKEUP_RESTORE_SETTLE_S
+        log.warning(
+            "wakeup restore: reopened %s as %s and re-armed for %.0fs (%s)",
+            (sid or "?")[:8], rt.rid, delay, plan.reason)
+        _rearm_restored_wakeup(rt, rec, delay, plan)
+
+
+def _rearm_restored_wakeup(rt: SessionRuntime, rec: dict, delay: float,
+                           plan: "wakeup_store.Plan") -> None:
+    """Re-arm a restored wakeup once its bridge is ready, and say so.
+
+    Announced in the session rather than only logged: a turn that starts by
+    itself, in a session the user did not open, with no explanation, is the
+    shape of every "why is it doing that?" report this project has collected.
+    """
+    br = getattr(rt, "bridge", None)
+    if br is None:
+        log.warning("wakeup restore: %s has no bridge — cannot re-arm", rt.rid)
+        return
+    try:
+        br._arm_wakeup(delay, rec["prompt"])
+    except Exception:
+        log.exception("wakeup restore: re-arming %s failed", rt.rid)
+        return
+    asyncio.create_task(rt.broadcast({
+        "type": "system_msg",
+        "subtype": "info",
+        "data": {"message": (
+            f"This session's scheduled loop survived a hub restart and was "
+            f"restored ({plan.reason}). It was reopened automatically because "
+            f"it had work scheduled — nobody typed anything here."
+        )},
+    }), name=f"wakeup-restore-notice-{rt.rid}")
+
+
+async def _teardown_runtime(rt: SessionRuntime, *, force: bool = False,
+                            reason: str = "was closed") -> None:
     """Stop a runtime's bridge and drop it from the registry.
 
     The default runtime is the process's primary session and is never torn
@@ -1510,6 +1665,10 @@ async def _teardown_runtime(rt: SessionRuntime, *, force: bool = False) -> None:
         return
     if runtimes.get(rt.rid) is not rt:
         return  # already gone
+    # A tab that reconnects later is owed the reason.  Placed here rather than
+    # at the end only for readability: the state it reads survives the whole
+    # function, so the position is not load-bearing.
+    _record_teardown(rt, reason)
     runtimes.pop(rt.rid, None)
     _cancel_idle_timer(rt)
     if rt is _default_runtime:
@@ -1581,7 +1740,8 @@ async def close_runtime(rid: str | None) -> dict[str, Any]:
     title = (getattr(rt.state, "session_title", None)
              or getattr(rt.state, "session_id", None) or rt.rid)
     log.info("runtime %s (%s) closed on request", rt.rid, title)
-    await _teardown_runtime(rt, force=True)
+    await _teardown_runtime(rt, force=True,
+                            reason="was closed from the session list")
     return {"ok": True, "rid": rt.rid, "title": title}
 
 
@@ -1735,15 +1895,35 @@ async def _idle_teardown_after(rt: SessionRuntime, timeout: int) -> None:
     # died.  See bg_stall.
     bg = len(bg_stall.active_tasks(getattr(st, "background_tasks", None) or {},
                                    now=time.monotonic())) if st is not None else 0
-    if busy or bg:
+    # **A session with work scheduled is waiting, not idle.**  An autonomous
+    # loop between iterations is doing exactly what it was asked to: nothing,
+    # until its wakeup fires.  Reaping it there cancels the wakeup outright --
+    # ``state.wakeup_at`` lives only in memory -- so the loop stops for good,
+    # silently, and the tab reports it days later as "the server was
+    # restarted".  Measured 2026-09-18/19: two autonomous-loop sessions killed
+    # 95 s and 6 min after arming 1800 s and 1500 s wakeups.
+    #
+    # Only a wakeup still in the *future* counts.  A stale past timestamp means
+    # the wakeup should already have fired, and deferring on it would pin the
+    # runtime forever on a schedule nothing will honour.
+    wake = getattr(st, "wakeup_at", None) if st is not None else None
+    waiting = isinstance(wake, (int, float)) and wake > time.time()
+    if busy or bg or waiting:
+        if busy:
+            why = "working"
+        elif bg:
+            why = f"running {bg} background task(s)"
+        else:
+            why = f"waiting on a wakeup in {int(wake - time.time())}s"
         log.info("runtime %s idle for %ds but still %s — deferring teardown",
-                 rt.rid, timeout,
-                 "working" if busy else f"running {bg} background task(s)")
+                 rt.rid, timeout, why)
         rt.idle_timer = None
         _maybe_start_idle_timer(rt, departing=None)
         return
     log.info("runtime %s idle for %ds — tearing down", rt.rid, timeout)
-    await _teardown_runtime(rt)
+    await _teardown_runtime(
+        rt, reason=f"was closed after {timeout // 60} minutes with no tab "
+                   f"connected")
 
 
 # ---------------------------------------------------------------------------
@@ -3376,10 +3556,8 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 # the computer rebooted and restored old tabs, etc.).  Land in
                 # the lobby with a *visible* banner so the user understands why
                 # this tab didn't reopen its old session.
-                await _enter_lobby(ws, notice=(
-                    "This tab's session is no longer running — the server was "
-                    "restarted (or the session was closed) since the tab was "
-                    "opened. Pick a session below to continue."))
+                await _enter_lobby(ws, notice=_describe_missing_rid(
+                    requested_rid))
         elif force_lobby:
             await _enter_lobby(ws)
         else:

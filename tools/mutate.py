@@ -1087,23 +1087,27 @@ LOOP_MUTATIONS = [
      "        self._wakeup_fire_at = None\n"
      "        self.state.wakeup_at = None\n"
      "        self.state.wakeup_defers = 0\n"
+     "        clear_wakeup(self.config.cwd, self.state.session_id)\n"
      "        if t is None or t.done():",
      "        self._wakeup_fire_at = None\n"
+     "        clear_wakeup(self.config.cwd, self.state.session_id)\n"
      "        if t is None or t.done():"),
 
     ("a fired wakeup leaves its countdown running",
      '        self.state.wakeup_at = None\n'
      '        self.state.wakeup_defers = 0\n'
+     '        clear_wakeup(self.config.cwd, self.state.session_id)\n'
      '        log.info("wakeup fired: injecting scheduled prompt %r", prompt[:80])',
+     '        clear_wakeup(self.config.cwd, self.state.session_id)\n'
      '        log.info("wakeup fired: injecting scheduled prompt %r", prompt[:80])'),
 
     ("a dropped wakeup leaves a countdown to a prompt that is never coming",
      "                self._wakeup_defers = 0\n"
      "                self.state.wakeup_at = None\n"
      "                self.state.wakeup_defers = 0\n"
-     "                return",
+     "                clear_wakeup(self.config.cwd, self.state.session_id)\n",
      "                self._wakeup_defers = 0\n"
-     "                return"),
+     "                clear_wakeup(self.config.cwd, self.state.session_id)\n"),
 
     ("the deferral count is not published, so 'armed' implies it will fire",
      "        self.state.wakeup_defers = self._wakeup_defers",
@@ -1250,15 +1254,15 @@ IDLE_MUTATIONS = [
      ""),
 
     ("a working session is torn down mid-turn again",
-     "    if busy or bg:",
+     "    if busy or bg or waiting:",
      "    if False:"),
 
     ("background tasks do not count as work in progress",
-     "    if busy or bg:",
+     "    if busy or bg or waiting:",
      "    if busy:"),
 
     ("nothing is ever torn down, because everything counts as busy",
-     "    if busy or bg:",
+     "    if busy or bg or waiting:",
      "    if True:"),
 
     ("a deferred teardown does not re-arm, so the session is never reaped",
@@ -2257,6 +2261,179 @@ FORKSKIP_MUTATIONS = [
 ]
 
 
+WAKEUPIDLE_MUTATIONS = [
+    ("a session waiting on a wakeup is reaped between loop iterations, "
+     "cancelling the loop outright -- the reported bug, restored",
+     "    if busy or bg or waiting:",
+     "    if busy or bg:"),
+
+    ("a stale past wakeup pins the runtime forever on a schedule nothing will "
+     "honour",
+     "    waiting = isinstance(wake, (int, float)) and wake > time.time()",
+     "    waiting = isinstance(wake, (int, float))"),
+
+    ("any session at all is treated as waiting, so nothing is ever reaped",
+     "    waiting = isinstance(wake, (int, float)) and wake > time.time()",
+     "    waiting = True"),
+
+    ("the teardown reason is never recorded, so every stale tab falls back to "
+     "blaming a restart that may not have happened",
+     "    _record_teardown(rt, reason)\n",
+     ""),
+
+    # One mutation deliberately absent here, equivalent -- kept as a note
+    # so nobody "fixes the coverage gap" by adding it back:
+    #
+    #  * moving `_record_teardown(rt, reason)` below `runtimes.pop(...)`
+    #    changes nothing observable.  Popping the registry entry does not
+    #    touch `rt.state`, so the title and session id the recorder reads
+    #    are still there either way.  The call sits early for readability;
+    #    an earlier comment claimed the position was load-bearing, which
+    #    the sweep disproved.
+
+    ("a stale tab is told a guess even when the real reason is known",
+     "    rec = _teardown_reasons.get(rid)\n    if rec is None:",
+     "    rec = None\n    if rec is None:"),
+
+    ("the record grows without bound",
+     "    while len(_teardown_reasons) > _TEARDOWN_MEMORY:\n"
+     "        _teardown_reasons.popitem(last=False)",
+     "    pass"),
+
+    ("the newest record is evicted instead of the oldest",
+     "        _teardown_reasons.popitem(last=False)",
+     "        _teardown_reasons.popitem(last=True)"),
+
+    ('an idle reap is reported as an ordinary close, hiding the five-minute rule the user did not know about',
+     '    await _teardown_runtime(\n        rt, reason=f"was closed after {timeout // 60} minutes with no tab "\n                   f"connected")',
+     '    await _teardown_runtime(rt)'),
+]
+
+
+WAKESTORE_MUTATIONS = [
+    ("a wakeup that went stale overnight fires anyway, running an unattended "
+     "turn on a plan from eight hours ago",
+     "    if late <= budget:\n        return Plan(FIRE",
+     "    if True:\n        return Plan(FIRE"),
+
+    ("nothing ever fires, so restoring a loop silently does nothing -- the "
+     "reported bug wearing a nicer hat",
+     "    if late <= budget:",
+     "    if False:"),
+
+    ("the freshness cap is gone, so an 18-day-old record can still run a turn",
+     '    if max_age_s > 0 and (now - float(rec["saved_at"])) > max_age_s:\n'
+     '        return Plan(DISCARD, 0.0, "older than the freshness cap")\n',
+     ""),
+
+    ("a record with no prompt or no session is treated as restorable",
+     "    if not _valid(rec):\n"
+     '        return Plan(DISCARD, 0.0, "not a usable record")\n',
+     ""),
+
+    ("a future wakeup is treated as overdue and fires immediately instead of "
+     "waiting out its remaining time",
+     "    if due > now:\n        return Plan(ARM, due - now",
+     "    if False:\n        return Plan(ARM, due - now"),
+
+    ("the lateness budget loses its floor, so a fast loop is declared stale by "
+     "a restart that took a few seconds",
+     "    return max(MIN_LATE_S, min(MAX_LATE_S, interval))",
+     "    return min(MAX_LATE_S, interval)"),
+
+    ("the lateness budget loses its ceiling, so a six-hour loop may fire six "
+     "hours late",
+     "    return max(MIN_LATE_S, min(MAX_LATE_S, interval))",
+     "    return max(MIN_LATE_S, interval)"),
+
+    # One mutation deliberately absent here, equivalent -- kept as a note so
+    # nobody "fixes the coverage gap" by adding it back:
+    #
+    #  * deleting `if interval <= 0: interval = MIN_LATE_S` changes nothing.
+    #    The `max(MIN_LATE_S, ...)` on the next line already floors a negative
+    #    interval to exactly MIN_LATE_S.  The guard stays because it names the
+    #    case (a corrupt or hand-edited record) at the point it arises, rather
+    #    than leaving a reader to work out that the floor covers it.
+
+    ("a record is restored into whatever session shares its slot, running a "
+     "turn in the wrong conversation",
+     '        if wakeup_file_for(rec["cwd"], rec["session_id"]).name != path.name:\n'
+     "            continue\n",
+     ""),
+
+    ("one corrupt file costs every other loop its schedule",
+     "        except (OSError, ValueError):\n            continue",
+     "        except OSError:\n            continue"),
+
+    ("records come back in arbitrary order, so the resurrection cap revives "
+     "whichever the filesystem listed first rather than the soonest due",
+     '    recs.sort(key=lambda r: r.get("due_at", 0.0))\n',
+     ""),
+
+    ("clearing a fired wakeup does nothing, leaving a record that runs the "
+     "same turn again on the next start",
+     "    try:\n        wakeup_file_for(cwd, session_id).unlink()\n"
+     "    except (OSError, FileNotFoundError):\n        pass",
+     "    pass"),
+
+    ("a session with no id, or a wakeup with no prompt, is written to disk "
+     "anyway",
+     '    if not session_id or not prompt or not isinstance(due_at, (int, float)):\n'
+     "        return\n",
+     ""),
+]
+
+WAKEREVIVE_MUTATIONS = [
+    ("a stale record is thrown away instead of being left for the session to "
+     "surface when opened",
+     "        if plan.action == wakeup_store.PAUSED:",
+     "        if False:"),
+
+    ("the resurrection cap is gone, so one boot can spawn a CLI per record on "
+     "a machine that has exhausted its commit limit before",
+     "        if revived >= wakeup_store.MAX_RESURRECT:",
+     "        if False:"),
+
+    ("a session that is already running is resurrected a second time, putting "
+     "two bridges on one conversation",
+     "        if sid in live_sids:",
+     "        if False:"),
+
+    ("an overdue wakeup fires the instant the process comes up, before any tab "
+     "has reconnected to see it",
+     "            else WAKEUP_RESTORE_SETTLE_S",
+     "            else 0.0"),
+
+    ("the session never says why it woke up, so a turn starts by itself with "
+     "no explanation",
+     "    asyncio.create_task(rt.broadcast({",
+     "    asyncio.create_task(_noop_broadcast({"),
+]
+
+
+LOOPDROP_MUTATIONS = [
+    ("a dropped loop goes back to being a log line nobody reads, and the "
+     "countdown just vanishes from the status bar",
+     "                await self._announce_wakeup_dropped()\n",
+     ""),
+
+    ("the notice stops saying how to start the loop again",
+     '                    f"is done."',
+     '                    f"is done.".replace("/loop", "the command")'),
+
+    ("every deferral is announced, turning one recoverable situation into ten "
+     "messages",
+     "            if self._wakeup_defers > WAKEUP_MAX_DEFERS:",
+     "            if True:"),
+
+    ("a failed notice escapes the timer task, where it becomes an asyncio "
+     "warning nobody reads rather than anything actionable",
+     "        except Exception as exc:\n"
+     '            log.warning("wakeup-dropped notice failed: %r", exc)',
+     "        except Exception:\n            raise"),
+]
+
+
 TARGETS = {
     "chat": ("static/chat.js", "tests/hidden_window.test.js",
              CHAT_MUTATIONS, "node"),
@@ -2294,6 +2471,14 @@ TARGETS = {
               BTWUI_MUTATIONS, "node"),
     "forkskip": ("proc_guard.py", "tests/test_proc_guard.py",
                  FORKSKIP_MUTATIONS, "pytest"),
+    "wakeupidle": ("server.py", "tests/test_idle_teardown.py",
+                   WAKEUPIDLE_MUTATIONS, "pytest"),
+    "wakestore": ("wakeup_store.py", "tests/test_wakeup_store.py",
+                  WAKESTORE_MUTATIONS, "pytest"),
+    "loopdrop": ("sdk_bridge.py", "tests/test_loop_control.py",
+                 LOOPDROP_MUTATIONS, "pytest"),
+    "wakerevive": ("server.py", "tests/test_wakeup_store.py",
+                   WAKEREVIVE_MUTATIONS, "pytest"),
     "bgstall-wire": ("state.py", "tests/test_bg_stall.py",
                      BGSTALLWIRE_MUTATIONS, "pytest"),
     "lostbg-session": ("session.py", "tests/test_lost_bg_tasks.py",

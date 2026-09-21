@@ -102,6 +102,7 @@ from state import (
     state_to_panels_dict,
     state_to_status_dict,
 )
+from wakeup_store import clear_wakeup, save_wakeup
 from btw import (
     build_btw_options,
     btw_prompt,
@@ -2860,10 +2861,45 @@ class SDKBridge:
         # monotonic one above stays authoritative for the timer itself.
         self.state.wakeup_at = time.time() + delay
         self.state.wakeup_defers = self._wakeup_defers
+        # Mirrored to disk so a hub restart does not silently cancel a loop.
+        # Every exit from the armed state erases it again -- a record that
+        # outlives its wakeup is a turn waiting to be run twice.
+        save_wakeup(
+            self.config.cwd, self.state.session_id,
+            due_at=self.state.wakeup_at, prompt=prompt,
+            armed_at=time.time(),
+            config_dir=getattr(self.config, "config_dir", None),
+        )
         self._wakeup_task = asyncio.create_task(
             self._wakeup_timer(delay, prompt), name="schedule-wakeup",
         )
         log.info("wakeup armed: delay=%.0fs prompt=%r", delay, prompt[:80])
+
+    async def _announce_wakeup_dropped(self) -> None:
+        """Tell the session its loop was dropped for outlasting a turn.
+
+        The deferral exists to survive a turn that happens to be in flight.
+        Ten of them means the turn is longer than the loop's whole cadence, so
+        the schedule has stopped describing anything real -- but the *user*
+        asked for that loop, and is owed the news rather than a gap where a
+        countdown used to be.
+        """
+        try:
+            await self.broadcast({
+                "type": "system_msg",
+                "subtype": "warning",
+                "data": {"message": (
+                    f"The scheduled loop was dropped: its wakeup came due "
+                    f"{WAKEUP_MAX_DEFERS} times while this session was still "
+                    f"working, so it has been pushed back for over "
+                    f"{int(WAKEUP_MAX_DEFERS * WAKEUP_MIN_DELAY // 60)} minutes "
+                    f"and is no longer describing anything real. Nothing is "
+                    f"scheduled now — start it again with /loop when this turn "
+                    f"is done."
+                )},
+            })
+        except Exception as exc:
+            log.warning("wakeup-dropped notice failed: %r", exc)
 
     def _cancel_wakeup(self) -> None:
         """Cancel any pending wakeup timer (idempotent).
@@ -2882,6 +2918,7 @@ class SDKBridge:
         self._wakeup_fire_at = None
         self.state.wakeup_at = None
         self.state.wakeup_defers = 0
+        clear_wakeup(self.config.cwd, self.state.session_id)
         if t is None or t.done():
             return
         try:
@@ -2925,6 +2962,14 @@ class SDKBridge:
                 self._wakeup_defers = 0
                 self.state.wakeup_at = None
                 self.state.wakeup_defers = 0
+                clear_wakeup(self.config.cwd, self.state.session_id)
+                # **Say so.**  Dropping it ends the loop, and until this the
+                # only trace was a log line -- the countdown simply vanished
+                # from the status bar.  A loop that stops without saying it
+                # stopped is the exact failure this session spent two days
+                # chasing in the idle teardown; it is not one to reproduce in
+                # the loop's own code.
+                await self._announce_wakeup_dropped()
                 return
             log.info(
                 "wakeup fired mid-turn — deferring %.0fs (turn still running, "
@@ -2939,6 +2984,7 @@ class SDKBridge:
         self._wakeup_fire_at = None
         self.state.wakeup_at = None
         self.state.wakeup_defers = 0
+        clear_wakeup(self.config.cwd, self.state.session_id)
         log.info("wakeup fired: injecting scheduled prompt %r", prompt[:80])
         # Surface the injected prompt so the user sees what triggered the turn,
         # then queue it as a normal message.  When the worker is parked in

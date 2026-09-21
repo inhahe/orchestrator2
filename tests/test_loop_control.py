@@ -212,6 +212,69 @@ def test_a_deferral_is_bounded(bridge):
         "the wakeup is still re-arming itself while the session is busy")
 
 
+def test_a_dropped_loop_says_it_was_dropped(bridge):
+    """Asked 2026-09-21 why a working session still showed a loop countdown.
+    It is correct -- the model arms the wakeup mid-turn, via ScheduleWakeup --
+    but it exposed the case next door: when the turn outlasts the loop's whole
+    cadence the wakeup is *dropped*, and until now the only trace was a log
+    line. The countdown simply vanished from the status bar.
+
+    A loop that stops without saying it stopped is precisely the failure this
+    week was spent removing from the idle teardown; reproducing it inside the
+    loop's own code would be indefensible."""
+    br, st, sent = bridge
+    st.busy = True
+
+    async def go():
+        for _ in range(WAKEUP_MAX_DEFERS + 1):
+            await br._wakeup_timer(0.0, "p")
+
+    asyncio.run(go())
+    notices = [m for m in sent if m.get("type") == "system_msg"]
+    text = " ".join((m.get("data") or {}).get("message", "") for m in notices)
+
+    assert "dropped" in text.lower(), (
+        "the loop ended and the session was told nothing"
+    )
+    assert "/loop" in text, "it does not say how to start it again"
+
+
+def test_a_failed_drop_notice_does_not_escape_the_timer():
+    """The announce is the last thing the drop path does, so the timer state is
+    already clean by then -- what a raising broadcaster would cost is an
+    unhandled exception escaping a fire-and-forget task, where it becomes an
+    asyncio warning nobody reads rather than anything actionable."""
+    cfg = parse_args([])
+    st = init_state_from_config(cfg)
+
+    async def bcast(m):
+        raise RuntimeError("socket went away")
+
+    br = SDKBridge(config=cfg, state=st, broadcaster=bcast)
+    st.busy = True
+
+    async def go():
+        for _ in range(WAKEUP_MAX_DEFERS + 1):
+            await br._wakeup_timer(0.0, "p")
+
+    asyncio.run(go())          # must not raise
+
+    assert br.loop_status()["armed"] is False
+
+
+def test_a_deferral_below_the_bound_says_nothing(bridge):
+    """A wakeup merely pushed back is not news -- the status bar already shows
+    the deferral count. Announcing each one would make ten messages out of a
+    situation that resolves itself."""
+    br, st, sent = bridge
+    st.busy = True
+
+    asyncio.run(_defer_once(br))
+    notices = [m for m in sent if m.get("type") == "system_msg"]
+
+    assert not notices, notices
+
+
 def test_a_deferral_below_the_bound_keeps_the_wakeup(bridge):
     """The bound must not throw away a wakeup that merely landed mid-turn --
     that is the case the deferral exists for."""
