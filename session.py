@@ -770,6 +770,26 @@ def _resolve_title(jsonl: Path) -> str | None:
     return _apply_rename_pin(str(jsonl), custom) or ai
 
 
+def read_human_title(session_id: str, config_dir: str | None = None) -> str | None:
+    """The session's title **only if a person chose it** -- never the AI summary.
+
+    This is what becomes the session's addressable name for other Claude
+    sessions (``CLAUDE_CODE_SESSION_NAME``), and the CLI itself withholds names
+    "not chosen by a human" from that role: a peer listed as *"Fixing the
+    parser bug in lexer.rs"* because a summariser said so would be both useless
+    and misleading. So this is the custom title with our rename pin applied,
+    and deliberately **not** ``_resolve_title``, which falls back to the AI one.
+    """
+    project = find_session_dir(session_id, config_dir)
+    if project is None:
+        return None
+    jsonl = project / f"{session_id}.jsonl"
+    if not jsonl.exists():
+        return None
+    custom, _ai = _resolve_title_raw(jsonl)
+    return _apply_rename_pin(str(jsonl), custom) or None
+
+
 def title_from_jsonl(jsonl: Path) -> str | None:
     """Extract a session's display title directly from a JSONL *path*.
 

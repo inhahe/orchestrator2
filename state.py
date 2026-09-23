@@ -510,6 +510,24 @@ class State:
     pending_rename: str | None = None   # title to apply once session_id arrives
     init_seen: bool = False
     expected_resume_sid: str | None = None
+    # The title a *person* gave session ``human_title_sid`` (``/rename``),
+    # never the AI summary -- it becomes the session's addressable name for
+    # other Claude sessions.  The sid says which session it belongs to, so a
+    # connect that lands on a different one (/clear, a hub restart) re-reads
+    # it instead of carrying one session's name over to another.  See
+    # SDKBridge._addressable_name and SDKBridge.connect.
+    human_title: str | None = None
+    human_title_sid: str | None = None
+    # The name this session was given explicitly: ``--agent-name`` on the
+    # launch that opened it, or remembered for it from an earlier one
+    # (agent_comms.session_name).  When set it is the session's name for both
+    # registries -- its agent-comms identity and what ListAgents shows -- and
+    # ``/rename`` changes only the title.  Per session: nothing the hub opens
+    # later inherits it.
+    agent_name: str | None = None
+    # Its ``--agent-label``s, the same way: this session's, remembered with it,
+    # never the hub's.  Published with its registry entry (_agent_labels).
+    agent_labels: dict[str, str] = field(default_factory=dict)
 
     # Metrics
     context_tokens: int = 0
@@ -700,6 +718,8 @@ def init_state_from_config(config: Config) -> State:
         panel_delay=config.panel_delay,
         panel_grace=config.panel_grace,
         bell_events=parse_bell_events(config.bell_on),
+        agent_name=getattr(config, "agent_name", None),
+        agent_labels=dict(getattr(config, "agent_labels", None) or {}),
     )
 
 

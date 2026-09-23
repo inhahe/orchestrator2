@@ -1409,6 +1409,8 @@ async def _create_runtime(
     bell_on: str | None = None,
     session_note: str | None = None,
     cli_path: str | None = None,
+    agent_name: str | None = None,
+    agent_labels: dict[str, str] | None = None,
 ) -> SessionRuntime:
     """Spin up a fresh live session runtime (config clone + state + bridge).
 
@@ -1419,6 +1421,9 @@ async def _create_runtime(
       silently inherits the *hub process's* bell set, which is wrong whenever
       the hub was started before (or with different flags than) this launch.
     * ``config_dir`` — ``CLAUDE_CONFIG_DIR`` override for cross-account sessions.
+    * ``agent_name`` / ``agent_labels`` — this session's explicit name and
+      labels (``--agent-name`` / ``--agent-label`` from the launch that asked
+      for it).  Never inherited from the hub.
     * ``session_note`` — one-shot note prepended to this session's next prompt
       (``SDKBridge._with_session_note``).  Used by ``/move`` to tell a copy
       that it moved.
@@ -1467,6 +1472,14 @@ async def _create_runtime(
     # `stable`.
     if cli_path:
         overrides["cli_path"] = cli_path
+    # Set every time, never inherited.  ``config`` is the *hub's*, so a name
+    # the hub was launched with belongs to the one session that launch opened;
+    # copying it into every session opened afterwards gave them all one
+    # identity -- one inbox, one halt state -- and one ListAgents name.
+    overrides["agent_name"] = (agent_name or "").strip() or None
+    # Labels the same way: the hub's --agent-label lane=b is not every
+    # session's lane.
+    overrides["agent_labels"] = dict(agent_labels or {})
     cfg = dataclasses.replace(config, **overrides)
     # Build the state *inside* the session's config-dir scope so account
     # detection (detect_account_info / detect_subscription*) reads the
@@ -2717,6 +2730,12 @@ async def api_restart() -> dict[str, Any]:
         if a.startswith("--resume="):
             i += 1
             continue
+        if a in ("--agent-name", "--agent-label"):
+            i += 2
+            continue
+        if a.startswith(("--agent-name=", "--agent-label=")):
+            i += 1
+            continue
         child.append(a)
         i += 1
     child.extend(["--port", str(port), "--skip-auto-login", "--wait-port"])
@@ -2724,6 +2743,17 @@ async def api_restart() -> dict[str, Any]:
     sid = state.session_id if state is not None else None
     if sid:
         child.extend(["--resume", sid])
+    # ...under the name it has *now*, rather than whatever the launch command
+    # said: one that came from ORCH2_AGENT_NAME is no longer in the
+    # environment (config.py consumes it), and the command line's is stale if
+    # the session was named since.
+    name = getattr(state, "agent_name", None) if state is not None else None
+    if name:
+        child.extend(["--agent-name", name])
+    # ...and labels, likewise: a launch that reached it since may have
+    # replaced the ones on the command line.
+    for key, value in (getattr(state, "agent_labels", None) or {}).items():
+        child.extend(["--agent-label", f"{key}={value}"])
 
     # Preserve the account so session discovery + the SDK subprocess use it.
     env = dict(os.environ)
@@ -2926,6 +2956,13 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     config_dir = (body.get("config_dir") or "").strip() or None
     bell_on = (body.get("bell_on") or "").strip() or None
     cli_path = (body.get("cli_path") or "").strip() or None
+    agent_name = (body.get("agent_name") or "").strip() or None
+    # A JSON object of label -> value; anything else is ignored rather than
+    # refusing the launch over the shape of an annotation (as _parse_labels).
+    raw_labels = body.get("agent_labels")
+    agent_labels = ({str(k).strip(): "" if v is None else str(v)
+                     for k, v in raw_labels.items() if str(k).strip()}
+                    if isinstance(raw_labels, dict) else {})
 
     # Resolve the on-disk session this launch would land on (an explicit
     # resume id, or — for a plain continue — the most recent session in cwd).
@@ -2969,6 +3006,27 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
                         sorted(new_bells),
                     )
                     existing.state.bell_events = new_bells
+            # And the CLI binary, which is fixed at connect time like the
+            # model.  Config is frozen and shared by the runtime and its
+            # bridge, so both get the replacement.
+            if cli_path and getattr(existing.config, "cli_path", None) != cli_path:
+                new_cfg = dataclasses.replace(existing.config, cli_path=cli_path)
+                existing.config = new_cfg
+                if existing.bridge is not None:
+                    existing.bridge.config = new_cfg
+                need_reconnect = True
+            # And its labels and name: the launch described this session,
+            # which happens to be open already.  Applied live, without the
+            # reconnect -- see SDKBridge.adopt_agent_labels / adopt_agent_name.
+            # Labels first, so a name change re-registers with them.
+            if (agent_labels and existing.state is not None
+                    and existing.state.agent_labels != agent_labels
+                    and existing.bridge is not None):
+                await existing.bridge.adopt_agent_labels(agent_labels)
+            if (agent_name and existing.state is not None
+                    and existing.state.agent_name != agent_name
+                    and existing.bridge is not None):
+                await existing.bridge.adopt_agent_name(agent_name)
             if need_reconnect and existing.bridge is not None:
                 # Route the reconnect through the worker's event queue rather
                 # than ``asyncio.create_task(bridge.reconnect())``.  A reconnect
@@ -2992,7 +3050,8 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
         rt = await _create_runtime(cwd=cwd, resume=resume, no_continue=no_continue,
                                    model=model, effort=effort,
                                    config_dir=config_dir, bell_on=bell_on,
-                                   cli_path=cli_path)
+                                   cli_path=cli_path, agent_name=agent_name,
+                                   agent_labels=agent_labels)
     except Exception as exc:
         log.exception("hub session launch failed")
         return {"ok": False, "error": str(exc)}
@@ -3227,6 +3286,33 @@ async def _enqueue_prompt(
                        exclude=echoed_by)
     rt.bridge.event_queue.put_nowait(("message", prompt))
     return True
+
+
+async def _forward_cli_command(rt: SessionRuntime, text: str) -> None:
+    """Hand a CLI-native slash command to this session's own CLI.
+
+    Not echoed as something the user said to the model: the user typed our
+    `/rename`, which already answered; this is its side effect on the CLI.
+
+    **Not through the prompt queue**, busy or not.  The bridge runs it as a
+    short exchange when the CLI is next idle (``request_cli_command``): never
+    into a running turn, where the CLI can absorb and drop it
+    (``absorbed_mid_turn``, measured 2026-09-16), and not as a queued prompt,
+    which is echoed as "You: ..." when sent and which "merge all" would glue
+    onto the user's next prompt -- the CLI would take that prompt as part of
+    the title.
+
+    Skipped when there is no connected CLI to tell: the name is passed on
+    every connect anyway (``CLAUDE_CODE_SESSION_NAME``), so the next CLI starts
+    with it.
+    """
+    st = getattr(rt, "state", None)
+    br = getattr(rt, "bridge", None)
+    if st is None or br is None or getattr(br, "client", None) is None:
+        return
+    if getattr(st, "connect_blocked_msg", None):
+        return
+    br.request_cli_command(text)
 
 
 @_route("post", "/api/queue/delete")
@@ -4421,9 +4507,12 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
                     "panels": panels,
                 })
             if result.forward_to_sdk and result.forward_payload:
-                # e.g. /queue send, which pops a pending prompt and runs it —
-                # a prompt nobody has echoed yet.
-                await _enqueue_prompt(rt, result.forward_payload)
+                if kind == "rename":
+                    await _forward_cli_command(rt, result.forward_payload)
+                else:
+                    # e.g. /queue send, which pops a pending prompt and runs it —
+                    # a prompt nobody has echoed yet.
+                    await _enqueue_prompt(rt, result.forward_payload)
             if result.login_launched:
                 # Browser OAuth completes asynchronously; watch for it, then
                 # refresh the account field / status bar for this runtime.
@@ -4840,10 +4929,106 @@ def _probe_hub(port: int) -> dict | None:
     return None
 
 
+def _hub_launch_kwargs(cfg: Config, config_dir: str | None) -> dict[str, Any]:
+    """Everything a launch that joins a running hub hands over.
+
+    One place, because the two call sites that join a hub each listed the
+    flags by hand -- and ``--cli-path`` was missing from both, silently: a
+    joining launch never builds a ``Config`` of its own, so a flag left out of
+    here is simply dropped.
+    """
+    return {
+        "cwd": cfg.cwd,
+        "resume": cfg.resume,
+        "no_continue": cfg.no_continue,
+        "model": cfg.model,
+        "effort": cfg.effort,
+        "config_dir": config_dir,
+        "bell_on": cfg.bell_on,
+        "cli_path": cfg.cli_path,
+        "agent_name": cfg.agent_name,
+        "agent_labels": dict(cfg.agent_labels or {}),
+    }
+
+
+def _detach_child_argv(argv: list[str], cfg: Config, actual_port: int) -> list[str]:
+    """The command line for the headless child a ``--detach`` launch hands off to.
+
+    The same launch, finished in another process -- so it gets what *this*
+    one resolved (port, cwd, the picked session, the agent name) rather than
+    what was typed.
+    """
+    # Rebuild argv: drop --detach, --open, override --port with actual.
+    # --open is stripped because the PARENT opens the browser (the child
+    # runs with CREATE_NO_WINDOW and webbrowser.open() doesn't reliably
+    # work from a hidden-console process on Windows).
+    child_argv = [sys.executable, argv[0]]
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--detach", "--open", "--auto-shutdown"):
+            i += 1
+            continue
+        if a == "--port":
+            i += 2  # skip --port and its value
+            continue
+        if a.startswith("--port="):
+            i += 1
+            continue
+        # --copy / --resume were consumed by the launch picker above; the
+        # resolved session id is re-added from cfg.resume below so the
+        # headless child doesn't try to open a picker it has no terminal
+        # for.
+        if a == "--copy":
+            i += 1
+            continue
+        if a == "--resume":
+            i += 1
+            if i < len(argv) and not argv[i].startswith("-"):
+                i += 1  # also skip its optional value
+            continue
+        if a.startswith("--resume="):
+            i += 1
+            continue
+        # --cwd may have been overridden by the picker (adopting the picked
+        # session's project dir); strip any inherited --cwd and re-add the
+        # resolved cfg.cwd below.
+        if a == "--cwd":
+            i += 2
+            continue
+        if a.startswith("--cwd="):
+            i += 1
+            continue
+        # Re-added below from what this launch resolved.
+        if a == "--agent-name":
+            i += 2
+            continue
+        if a.startswith("--agent-name="):
+            i += 1
+            continue
+        child_argv.append(a)
+        i += 1
+    child_argv.extend(["--port", str(actual_port), "--auto-shutdown",
+                       "--skip-auto-login", "--cwd", cfg.cwd])
+    # Re-add the (possibly picker-resolved) resume target for the child.
+    if cfg.resume == _PICKER_SENTINEL:
+        child_argv.append("--resume")  # bare → child shows browser picker
+    elif cfg.resume:
+        child_argv.extend(["--resume", cfg.resume])
+    # The name this launch resolved, which is not always on the command line:
+    # one taken from ORCH2_AGENT_NAME was consumed by parse_args, and the
+    # child inherits the environment as it is now.
+    if cfg.agent_name:
+        child_argv.extend(["--agent-name", cfg.agent_name])
+    return child_argv
+
+
 def _launch_into_hub(
     port: int, *, cwd: str, resume: str | None, no_continue: bool,
     model: str | None = None, effort: str | None = None,
     config_dir: str | None = None, bell_on: str | None = None,
+    cli_path: str | None = None, agent_name: str | None = None,
+    agent_labels: dict[str, str] | None = None,
 ) -> str | None:
     """Ask a running hub to open a session; return its ``rid`` (or None).
 
@@ -4852,6 +5037,12 @@ def _launch_into_hub(
     so any flag *not* in this payload is silently dropped and the session
     inherits whatever the hub process was started with.  That makes
     ``--bell`` a lie whenever the hub predates it.
+
+    ``cli_path`` likewise: the hub's endpoint accepted it from the day
+    ``--cli-path`` existed, but nothing sent it, so ``--cli-path`` on a launch
+    that joined a running hub was dropped and the session ran the hub's CLI --
+    the one that refuses the model the flag was passed to reach.  And
+    ``agent_name`` / ``agent_labels``, which were dropped the same way.
     """
     import urllib.request
 
@@ -4863,6 +5054,9 @@ def _launch_into_hub(
         "effort": effort,
         "config_dir": config_dir,
         "bell_on": bell_on,
+        "cli_path": cli_path,
+        "agent_name": agent_name,
+        "agent_labels": agent_labels or {},
     }).encode("utf-8")
     try:
         req = urllib.request.Request(
@@ -5403,13 +5597,10 @@ def main() -> None:
             and _probe_hub(config.port) is not None):
         rid = _launch_into_hub(
             config.port,
-            cwd=config.cwd,
-            resume=config.resume,
-            no_continue=config.no_continue,
-            model=config.model,
-            effort=config.effort,
-            config_dir=config.config_dir or os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude"),
-            bell_on=config.bell_on,
+            **_hub_launch_kwargs(
+                config,
+                config.config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
+                or str(Path.home() / ".claude")),
         )
         if rid:
             url = f"http://localhost:{config.port}/?rid={rid}"
@@ -5435,56 +5626,7 @@ def main() -> None:
             print(f"Port {config.port} in use — using {actual_port} instead.")
         sock.close()  # release for the child to rebind
 
-        # Rebuild argv: drop --detach, --open, override --port with actual.
-        # --open is stripped because the PARENT opens the browser (the child
-        # runs with CREATE_NO_WINDOW and webbrowser.open() doesn't reliably
-        # work from a hidden-console process on Windows).
-        child_argv = [sys.executable, sys.argv[0]]
-        i = 1
-        while i < len(sys.argv):
-            a = sys.argv[i]
-            if a in ("--detach", "--open", "--auto-shutdown"):
-                i += 1
-                continue
-            if a == "--port":
-                i += 2  # skip --port and its value
-                continue
-            if a.startswith("--port="):
-                i += 1
-                continue
-            # --copy / --resume were consumed by the launch picker above; the
-            # resolved session id is re-added from config.resume below so the
-            # headless child doesn't try to open a picker it has no terminal
-            # for.
-            if a == "--copy":
-                i += 1
-                continue
-            if a == "--resume":
-                i += 1
-                if i < len(sys.argv) and not sys.argv[i].startswith("-"):
-                    i += 1  # also skip its optional value
-                continue
-            if a.startswith("--resume="):
-                i += 1
-                continue
-            # --cwd may have been overridden by the picker (adopting the picked
-            # session's project dir); strip any inherited --cwd and re-add the
-            # resolved config.cwd below.
-            if a == "--cwd":
-                i += 2
-                continue
-            if a.startswith("--cwd="):
-                i += 1
-                continue
-            child_argv.append(a)
-            i += 1
-        child_argv.extend(["--port", str(actual_port), "--auto-shutdown",
-                           "--skip-auto-login", "--cwd", config.cwd])
-        # Re-add the (possibly picker-resolved) resume target for the child.
-        if config.resume == _PICKER_SENTINEL:
-            child_argv.append("--resume")  # bare → child shows browser picker
-        elif config.resume:
-            child_argv.extend(["--resume", config.resume])
+        child_argv = _detach_child_argv(sys.argv, config, actual_port)
 
         import subprocess
         import tempfile
@@ -5606,11 +5748,7 @@ def main() -> None:
             while _time.monotonic() < deadline:
                 if _probe_hub(config.port) is not None:
                     rid = _launch_into_hub(
-                        config.port, cwd=config.cwd, resume=config.resume,
-                        no_continue=config.no_continue, model=config.model,
-                        effort=config.effort, config_dir=join_cfg_dir,
-                        bell_on=config.bell_on,
-                    )
+                        config.port, **_hub_launch_kwargs(config, join_cfg_dir))
                     if rid:
                         break
                 _time.sleep(0.5)

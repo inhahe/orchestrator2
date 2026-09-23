@@ -1,5 +1,95 @@
 # Known issues / tech debt — orchestrator2
 
+## `/rename` set the title but not the name other sessions address — FIXED (2026-09-22)
+
+> "i did `/rename Lane A` and then sent `test` and it said: ... I checked again
+> and the session is still named os-f5, so I still don't know which lane this
+> is."
+
+The model was right. SlateOS's `which-lane.py` reads the lane from the first
+line of `ListAgents` — the session's **addressable name**, what `SendMessage`
+targets — and that is held by the running CLI. Our `/rename` wrote a
+`custom-title` record, which the running CLI never reads, and nothing on disk
+restores the name on resume either: measured, neither our record nor the
+`agent-name` record the CLI's own `/rename` writes survives a resume. The name
+comes only from `CLAUDE_CODE_SESSION_NAME` at startup or the CLI's own
+`/rename`, live.
+
+So now both: every connect passes the person-chosen title as
+`CLAUDE_CODE_SESSION_NAME`, and `/rename` is also handed to the live CLI. The
+second half is sent as a short exchange at the CLI's next idle moment, **not**
+as a turn (which would have cancelled a scheduled loop wakeup and rung the
+turn-done bell) and not as a queued prompt (echoed on send, and mergeable into
+the next prompt, which the CLI would take as part of the title). design.md §6,
+*CLI-native commands*, and §8a.
+
+### What the first version of the fix got wrong
+
+It let `--agent-name` / `ORCH2_AGENT_NAME` win over the title, to make
+SlateOS's documented `--agent-name "Lane A"` work. At the time both belonged
+to the *hub*, and every session the hub opened inherited them — so a hub
+started with `--agent-name orchestrator2`, which was advice given the same
+day, would have named all six lanes "orchestrator2". It was taken out before
+it shipped, and came back once the flag was made per session (next entry).
+
+### Not handled: the rolling-window context trim
+
+`--max-context-tokens` (off by default) trims into a **new** session id whose
+file carries no `custom-title`, so after a trim the next connect finds no title
+and the CLI comes up with an auto name. Rename again after a trim if it
+matters.
+
+## `--agent-name` belonged to the hub, not to a session — FIXED (2026-09-22)
+
+Found while fixing the entry above. `Config.agent_name` was parsed once, for
+the hub process, and `_create_runtime` builds every session from
+`dataclasses.replace(config, …)` — so every session the hub later opened
+inherited it, as they all read `ORCH2_AGENT_NAME` from the hub's environment.
+`resolve_identity()` takes an explicit name at face value, so all of them
+registered as that one identity: one inbox, one halt state, whichever session
+polled first got the message. The other direction was dropped silently: a
+launch that *joined* a running hub never handed `--agent-name` over, so it
+registered nothing by that name.
+
+> "yes, make --agent-name apply per session"
+
+Now it names the session its launch opens and nothing else, including through
+a running hub; it is that session's `ListAgents` name as well as its registry
+identity; and it is remembered by session id, so the session keeps it when it
+comes back from the lobby or a hub restart without the flag. That last part
+needed its own table: the registry row an identity lives in is deleted on a
+clean exit, so until now a named session closed normally and reopened without
+the flag came back re-identified by its directory instead. design.md §9a.
+
+`--agent-label` had the same fault — a hub started with `--agent-label
+lane=b` put lane=b on every session it opened, which is worse than no label
+in exactly the case labels exist for (telling lanes apart) — and got the same
+fix: per session, handed over, remembered.
+
+### Tests were writing to the real registry
+
+Found while doing this: a test that only meant to exercise a connect reached
+the machine's `agents.db`, which is how it came to have a `session_names`
+table before this code ever ran in a hub. Nothing was written into it, but
+the same path very probably explains the two identities `orchestrator2` and
+`orchestrator2-2`: registered by one process seven seconds apart on
+2026-09-06, no session id, never a heartbeat, nothing ever sent to them — and
+the reason every session opened in this directory since has *refused* an
+identity ("several agent identities are registered"). `tests/conftest.py` now
+gives every test a private registry. The two rows are still in the real one.
+
+### Two things it could not keep
+
+* **`ORCH2_AGENT_NAME` no longer reaches a session's own processes.** The
+  launch that reads it removes it, because left in place it reached *every*
+  session's processes: `tools/agents.py` defaulting to one session's inbox in
+  all of them, and a test hub an agent starts claiming that identity. It was
+  never visible to a session opened in a running hub anyway.
+* **Naming a session that is already open also retitles it.** The only live
+  way to change the running CLI's name is its own `/rename`, which sets its
+  title too. A reconnect would avoid that, at the cost of the session's
+  background tasks.
+
 ## Upstream: Anthropic's bundled `claude.exe` leaks committed memory per turn — WORKED AROUND (2026-09-01)
 
 **Not our bug, and not fixable here** — the leak is inside the `claude.exe` the

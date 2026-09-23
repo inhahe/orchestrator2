@@ -124,14 +124,91 @@ def test_a_session_can_be_launched_on_its_own_cli(tmp_path):
     assert "cli_path" in sig.parameters
 
 
-def test_the_launch_api_forwards_it():
+def test_a_launch_that_joins_a_running_hub_hands_it_over(tmp_path):
+    """The usual case: the hub is already up, so ``python server.py
+    --cli-path ...`` never builds a Config of its own and forwards what it was
+    given.  Until 2026-09-22 ``--cli-path`` was not in that list, so the
+    session silently ran the hub's CLI -- the one that refuses the model."""
+    import server
+    exe = tmp_path / "claude.exe"
+    exe.write_bytes(b"x")
+    cfg = parse_args(["--cli-path", str(exe)])
+
+    kwargs = server._hub_launch_kwargs(cfg, None)
+
+    assert kwargs["cli_path"] == str(exe)
+
+
+def test_every_flag_the_hub_accepts_is_handed_over(tmp_path):
+    """The helper's keys must be exactly what _launch_into_hub takes -- a key
+    the hub endpoint reads but the launcher never sends is how this broke."""
     import inspect
     import server
+    params = set(inspect.signature(server._launch_into_hub).parameters) - {"port"}
 
-    src = inspect.getsource(server)
-    assert 'cli_path = (body.get("cli_path")' in src, (
-        "the lobby can't launch a session on a different CLI"
-    )
+    assert set(server._hub_launch_kwargs(parse_args([]), None)) == params
+
+
+def test_the_hand_over_puts_it_on_the_wire(monkeypatch):
+    import json
+    import urllib.request
+    import server
+    seen = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"ok": true, "rid": "R9"}'
+
+    def fake_urlopen(req, timeout=None):
+        seen.update(json.loads(req.data.decode("utf-8")))
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    rid = server._launch_into_hub(8787, cwd="C:\\w", resume=None,
+                                  no_continue=False, cli_path="C:\\x\\claude.exe")
+
+    assert rid == "R9"
+    assert seen["cli_path"] == "C:\\x\\claude.exe"
+
+
+def test_the_hub_opens_the_session_on_that_cli(monkeypatch, tmp_path):
+    """And the receiving end passes it to the runtime it creates."""
+    import asyncio
+    import server
+    got = {}
+
+    class _RT:
+        rid = "R7"
+
+    async def fake_create_runtime(**kw):
+        got.update(kw)
+        return _RT()
+
+    monkeypatch.setattr(server, "_create_runtime", fake_create_runtime)
+    monkeypatch.setattr(server, "config", parse_args([]))
+
+    res = asyncio.run(server.api_session_launch({
+        "cwd": str(tmp_path), "no_continue": True,
+        "cli_path": "C:\\x\\claude.exe"}))
+
+    assert res == {"ok": True, "rid": "R7"}
+    assert got["cli_path"] == "C:\\x\\claude.exe"
+
+
+def test_a_relative_path_means_relative_to_where_it_was_typed(tmp_path, monkeypatch):
+    """The hub reading it would resolve it against its own directory."""
+    monkeypatch.chdir(tmp_path)
+
+    cfg = parse_args(["--cli-path", os.path.join("bin", "claude.exe")])
+
+    assert cfg.cli_path == str(tmp_path / "bin" / "claude.exe")
 
 
 def test_a_session_override_beats_the_hub_default(tmp_path):

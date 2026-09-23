@@ -278,7 +278,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         ("/logout",                      "sign out of your Claude account"),
         ("/connect",                     "reconnect (revives a dropped browser socket, or the SDK)"),
         ("/resume [id|title]",           "resume a session (or open picker)"),
-        ("/rename <name>",               "set a custom session title"),
+        ("/rename <name>",               "set the session title -- also the name other sessions address it by"),
         ("/move [path]",                 "copy this session to another account and/or directory, and continue it here"),
         ("/export [path]",               "save conversation as markdown"),
         ("/btw <question>",              "side question, answered in a fork"),
@@ -491,6 +491,13 @@ def _cmd_history(payload: str, state: State, config: Config) -> CommandResult:
     return CommandResult(messages=msgs)
 
 
+def _title_only(title: str, agent_name: str, what: str) -> str:
+    """The /rename reply for a session that has an explicit name."""
+    return (f"'{title}' {what}.  Other sessions still address it as "
+            f"'{agent_name}', the name it was given with --agent-name; "
+            f"/rename changes only the title.")
+
+
 def _cmd_rename(payload: str, state: State, config: Config) -> CommandResult:
     sid = state.session_id
     cfg_dir = getattr(config, "config_dir", None)
@@ -508,18 +515,56 @@ def _cmd_rename(payload: str, state: State, config: Config) -> CommandResult:
         # session_id arrives (handled in sdk_bridge init).
         state.pending_rename = new_title
         state.session_title = new_title
+        if state.agent_name:
+            return CommandResult(
+                messages=[_msg(_title_only(new_title, state.agent_name,
+                                           "will be applied when the session starts"))],
+                state_updates={"session_title": new_title},
+            )
+        # Forwarded all the same: the CLI is usually already running, and its
+        # own /rename as the first thing it is sent names it and starts the
+        # session (measured: ListAgents then reports the new name).  With no
+        # CLI yet, pending_rename is the name it starts with -- see
+        # SDKBridge._addressable_name.
         return CommandResult(
-            messages=[_msg(f"Title '{new_title}' will be applied when the session starts.")],
+            messages=[_msg(f"Title '{new_title}' will be applied when the session "
+                           f"starts; other sessions will address it by this name.")],
             state_updates={"session_title": new_title},
+            forward_to_sdk=True,
+            forward_payload=f"/rename {new_title}",
         )
     try:
         write_session_title(sid, new_title, cfg_dir)
     except (OSError, ValueError) as e:
         return CommandResult(messages=[_msg(f"Rename failed: {e}", level="error")])
     state.session_title = new_title
+    state.human_title = new_title
+    state.human_title_sid = sid
+    if state.agent_name:
+        # A session with an explicit name keeps it: that name is its identity
+        # in both registries, and handing the CLI this /rename would put the
+        # two out of step until the next reconnect put it back.
+        return CommandResult(
+            messages=[_msg(_title_only(new_title, state.agent_name,
+                                       f"is now the title of session {sid[:8]}"))],
+            state_updates={"session_title": new_title},
+        )
+    # **And tell the CLI.**  A title written to the transcript is only a title:
+    # the name other Claude sessions address this one by (``ListAgents``,
+    # ``SendMessage``) is held by the running CLI, and the CLI never learns
+    # about a record we append.  Reported 2026-09-22: `/rename Lane A` set the
+    # title while the session went on calling itself `os-f5`.  Forwarding the
+    # command lets the CLI rename itself live -- measured: "Session renamed to:
+    # Lane Live", then ListAgents reports Lane Live -- without a reconnect,
+    # which would reload the whole transcript.  It runs when the CLI is next
+    # idle (SDKBridge._run_pending_cli_command).
+    when = " once the current turn ends" if state.busy else ""
     return CommandResult(
-        messages=[_msg(f"Renamed session {sid[:8]} → '{new_title}'")],
+        messages=[_msg(f"Renamed session {sid[:8]} → '{new_title}' "
+                       f"(other sessions will address it by this name{when})")],
         state_updates={"session_title": new_title},
+        forward_to_sdk=True,
+        forward_payload=f"/rename {new_title}",
     )
 
 

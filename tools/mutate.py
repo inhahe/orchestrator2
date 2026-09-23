@@ -357,8 +357,9 @@ RECONNECT_MUTATIONS = [
      "            else:\n                await self.reconnect()"),
 
     ("the turn boundary does not flush, so the switch waits for the one after",
-     "            await self._flush_deferred_reconnect()\n\n        # --- Interrupted ---",
-     "\n        # --- Interrupted ---"),
+     "            await self._flush_deferred_reconnect()\n\n"
+     "        # A /rename typed during the turn",
+     "            pass\n\n        # A /rename typed during the turn"),
 
     ("the bg-all-done wakeup does not flush, so a parked session never applies it",
      "                await self._flush_deferred_reconnect()\n"
@@ -379,8 +380,8 @@ RECONNECT_MUTATIONS = [
 
     ("/clear leaves a deferred switch armed, so it reconnects a second time",
      "        self._deferred_reconnect = None\n"
-     "        # Wiping the session discards",
-     "        # Wiping the session discards"),
+     "        # ...and a /rename still waiting for the CLI",
+     "        # ...and a /rename still waiting for the CLI"),
 
     ("giving up on a dead CLI leaves the registry pointing at a dead process",
      '            await self._orphan_bg_tasks("the CLI exiting for good")\n',
@@ -2530,8 +2531,13 @@ CLIPATH_MUTATIONS = [
 
 CLIPATHCFG_MUTATIONS = [
     ("the hub's --cli-path never reaches a session",
-     "        config_dir=args.config_dir,\n        cli_path=args.cli_path,",
-     "        config_dir=args.config_dir,"),
+     "        cli_path=os.path.abspath(args.cli_path) if args.cli_path else None,\n",
+     ""),
+
+    ("a relative --cli-path handed to a running hub is read against the hub's "
+     "directory, not the one it was typed in",
+     "        cli_path=os.path.abspath(args.cli_path) if args.cli_path else None,\n",
+     "        cli_path=args.cli_path,\n"),
 
     ("the option help stops naming the error it solves, so nobody hitting "
      "that error can find it",
@@ -2609,6 +2615,546 @@ RESUMELIST_MUTATIONS = [
      "    found.sort(key=lambda x: x[1])"),
 ]
 
+# The name other Claude sessions address this one by (ListAgents /
+# SendMessage), and /rename reaching the live CLI.  tests/test_session_name.py.
+#
+# Not mutated, because equivalent: the explicit ``kind == "cli-command"``
+# branches in _await_next_prompt and _between_turns' drain.  An unknown kind is
+# already dropped by both loops, which then reach the same flush; the branches
+# exist to say so, not to change what happens.
+SESSIONNAME_MUTATIONS = [
+    ("the name is never passed to the CLI, so every session keeps its auto "
+     "name -- the reported 'still named os-f5'",
+     '            kwargs["env"]["CLAUDE_CODE_SESSION_NAME"] = name\n',
+     "            pass\n"),
+
+    ("a name the hub inherited from whatever launched it reaches every "
+     "unnamed session",
+     '        os.environ.pop("CLAUDE_CODE_SESSION_NAME", None)\n',
+     ""),
+
+    ("a blank title is passed as the name",
+     "        return (st.agent_name or st.pending_rename or st.human_title\n"
+     '                or "").strip() or None',
+     "        return (st.agent_name or st.pending_rename or st.human_title\n"
+     "                or None)"),
+
+    ("a /rename made before the session existed never names the CLI",
+     "        return (st.agent_name or st.pending_rename or st.human_title\n",
+     "        return (st.agent_name or st.human_title\n"),
+
+    ("a session's own --agent-name is not its address, so the two registries "
+     "disagree about who it is",
+     "        return (st.agent_name or st.pending_rename or st.human_title\n",
+     "        return (st.pending_rename or st.human_title\n"),
+
+    ("a hub restart, which resumes through the initial resume id, brings the "
+     "CLI up without its name",
+     "        rid = resume_id or self._initial_resume_id\n        if rid:\n"
+     "            return rid\n",
+     "        rid = resume_id\n        if rid:\n            return rid\n"),
+
+    ("connect never reads the title, so a restarted CLI is nameless",
+     "        if target != self.state.human_title_sid:",
+     "        if False:"),
+
+    ("connect reads the title only when none is known, so a second session in "
+     "the tab inherits the first one's name",
+     "        if target != self.state.human_title_sid:",
+     "        if self.state.human_title is None:"),
+
+    ("every /model reconnect re-reads the transcript, and a rename made in "
+     "this runtime is overwritten by what is on disk",
+     "        if target != self.state.human_title_sid:",
+     "        if True:"),
+
+    ("a failed read of the title is never retried",
+     "                # Left unmatched, so the next connect tries again.\n"
+     "                self.state.human_title = None\n",
+     "                self.state.human_title = None\n"
+     "                self.state.human_title_sid = target\n"),
+
+    ("the worker is not woken for a rename, so it waits for the next prompt",
+     '            self.event_queue.put_nowait(("cli-command", ""))\n'
+     "        except Exception:\n"
+     '            log.debug("could not poke the worker for a CLI command",',
+     "            pass\n"
+     "        except Exception:\n"
+     '            log.debug("could not poke the worker for a CLI command",'),
+
+    ("the first of two renames wins",
+     "        self._pending_cli_command = text\n        try:\n",
+     "        self._pending_cli_command = self._pending_cli_command or text\n"
+     "        try:\n"),
+
+    ("a rename is dropped, not kept, when the CLI is not free for it",
+     "        text = self._pending_cli_command\n        if not text:\n"
+     "            return\n",
+     "        text = self._pending_cli_command\n"
+     "        self._pending_cli_command = None\n"
+     "        if not text:\n            return\n"),
+
+    ("a rename is sent into a running turn, where the CLI can absorb it",
+     "        if (self.client is None or state.busy or state.connecting\n",
+     "        if (self.client is None or state.connecting\n"),
+
+    ("a rename is sent into a connect in progress",
+     "        if (self.client is None or state.busy or state.connecting\n",
+     "        if (self.client is None or state.busy\n"),
+
+    ("a rename is sent while the stream is already claimed",
+     "                or self.turn_active.is_set() or self._transport_dead\n",
+     "                or self._transport_dead\n"),
+
+    ("a rename is written to a CLI already known to be dead",
+     "                or self.turn_active.is_set() or self._transport_dead\n",
+     "                or self.turn_active.is_set()\n"),
+
+    ("a rename is sent into a turn the CLI has announced but not yet shown "
+     "output for -- a background task's notification waking the model",
+     "                or self.turn_active.is_set() or self._transport_dead\n"
+     '                or self._cli_state == "running"):\n',
+     "                or self.turn_active.is_set() or self._transport_dead):\n"),
+
+    ("a turn's result does not end its 'running', so every rename made after "
+     "a real turn waits indefinitely -- the CLI's 'idle' lands in the turn's "
+     "queue and is thrown away (found end-to-end against CLI 2.1.280)",
+     '                    # the end of the turn it announced as "running".\n'
+     '                    self._cli_state = "idle"\n',
+     '                    # the end of the turn it announced as "running".\n'),
+
+    ("the exchange's own result does not end its 'running', so a second "
+     "rename waits indefinitely",
+     "                    # queue we are about to stop reading.\n"
+     '                    self._cli_state = "idle"\n',
+     "                    # queue we are about to stop reading.\n"),
+
+    ("the CLI's own report that it started a turn is ignored",
+     "            if session_state:\n"
+     "                self._cli_state = session_state\n",
+     ""),
+
+    ("the CLI going idle does not wake a worker that deferred a rename, which "
+     "then waits for the next prompt",
+     '            if session_state == "idle" and self._pending_cli_command:\n',
+     "            if False:\n"),
+
+    ("the stream is not claimed, so the CLI's reply renders as a ghost turn",
+     "        self.turn_active.set()\n        reply = \"\"\n",
+     "        reply = \"\"\n"),
+
+    ("the stream is never released, so the next ghost turn's output goes to a "
+     "queue nobody reads",
+     "        finally:\n            self.turn_active.clear()\n"
+     "        for m in handoff:\n",
+     "        finally:\n            pass\n        for m in handoff:\n"),
+
+    ("the CLI's own reply is taken for the model and rendered as a turn",
+     '                        and getattr(msg, "model", None) == self._CLI_SYNTHETIC_MODEL):',
+     '                        and getattr(msg, "model", None) == "never"):'),
+
+    ("a model turn that got to the CLI first is swallowed as the reply",
+     "                if (isinstance(msg, AssistantMessage)\n"
+     '                        and getattr(msg, "model", None) == self._CLI_SYNTHETIC_MODEL):',
+     "                if isinstance(msg, AssistantMessage):"),
+
+    ("only the first message of a colliding turn is rendered; what was queued "
+     "behind it is lost",
+     "                handoff.append(msg)\n"
+     "                while not self.turn_msg_queue.empty():\n",
+     "                handoff.append(msg)\n"
+     "                while False:\n"),
+
+    ("a CLI that dies during the exchange is never reconnected",
+     '            self.event_queue.put_nowait(("connect", _CONNECT_TRANSPORT_DEAD))\n'
+     "            return\n        if not handoff:\n",
+     "            return\n        if not handoff:\n"),
+
+    ("an idle, parked worker never runs the rename",
+     "            await self._run_pending_cli_command()\n"
+     "            kind, payload = await self.event_queue.get()\n",
+     "            kind, payload = await self.event_queue.get()\n"),
+
+    ("a rename typed during a turn waits behind the next queued prompt",
+     "        # is not a turn, so it goes before anything that starts one.\n"
+     "        await self._run_pending_cli_command()\n",
+     "        # is not a turn, so it goes before anything that starts one.\n"),
+
+    ("the end of a ghost turn does not wake the worker for a waiting rename",
+     "        if self._pending_cli_command:\n            try:\n"
+     '                self.event_queue.put_nowait(("cli-command", ""))\n'
+     "            except Exception as exc:\n"
+     '                log.warning("ghost-turn CLI-command poke failed',
+     "        if False:\n            try:\n"
+     '                self.event_queue.put_nowait(("cli-command", ""))\n'
+     "            except Exception as exc:\n"
+     '                log.warning("ghost-turn CLI-command poke failed'),
+
+    ("/clear keeps a waiting rename, which then names the new session",
+     "        # being wiped, and would otherwise be run against the new one.\n"
+     "        self._pending_cli_command = None\n",
+     "        # being wiped, and would otherwise be run against the new one.\n"),
+]
+
+SESSIONNAME_CMD_MUTATIONS = [
+    ("/rename sets only the title; the live CLI is never told",
+     "        forward_to_sdk=True,\n"
+     '        forward_payload=f"/rename {new_title}",\n'
+     "    )\n\n\ndef _cmd_export",
+     "    )\n\n\ndef _cmd_export"),
+
+    ("/rename before the first turn is not handed to the CLI already running",
+     "            forward_to_sdk=True,\n"
+     '            forward_payload=f"/rename {new_title}",\n'
+     "        )\n    try:\n",
+     "        )\n    try:\n"),
+
+    ("the new title is not recorded as the name, so the next reconnect drops it",
+     "    state.human_title = new_title\n    state.human_title_sid = sid\n",
+     "    state.human_title_sid = sid\n"),
+
+    ("the new title is not tied to its session, so the next reconnect re-reads "
+     "the transcript over it",
+     "    state.human_title = new_title\n    state.human_title_sid = sid\n",
+     "    state.human_title = new_title\n"),
+
+    ("a rename during a turn claims to have taken effect already",
+     '    when = " once the current turn ends" if state.busy else ""',
+     '    when = ""'),
+
+    ("the reply does not say the name is now an address",
+     'f"(other sessions will address it by this name{when})"',
+     'f"({when})"'),
+]
+
+SESSIONNAME_SERVER_MUTATIONS = [
+    ("/rename goes through the prompt path: echoed, queued, mergeable into "
+     "the next prompt, and run as a turn",
+     '                if kind == "rename":\n'
+     "                    await _forward_cli_command(rt, result.forward_payload)",
+     "                if False:\n"
+     "                    await _forward_cli_command(rt, result.forward_payload)"),
+
+    ("a session with no CLI is poked anyway",
+     '    if st is None or br is None or getattr(br, "client", None) is None:\n'
+     "        return\n"
+     '    if getattr(st, "connect_blocked_msg", None):\n',
+     "    if st is None or br is None:\n"
+     "        return\n"
+     '    if getattr(st, "connect_blocked_msg", None):\n'),
+
+    ("a session blocked on a duplicate is poked anyway",
+     '    if getattr(st, "connect_blocked_msg", None):\n'
+     "        return\n"
+     "    br.request_cli_command(text)",
+     "    br.request_cli_command(text)"),
+
+    ("a launch that joins a running hub drops --cli-path",
+     '        "cli_path": cfg.cli_path,\n',
+     ""),
+
+    ("the hand-over leaves --cli-path off the wire",
+     '        "cli_path": cli_path,\n        "agent_name": agent_name,\n',
+     '        "agent_name": agent_name,\n'),
+
+    ("the hub opens the session on its own CLI, not the one asked for",
+     "                                   config_dir=config_dir, bell_on=bell_on,\n"
+     "                                   cli_path=cli_path, agent_name=agent_name,\n",
+     "                                   config_dir=config_dir, bell_on=bell_on,\n"
+     "                                   agent_name=agent_name,\n"),
+]
+
+# --agent-name names one session, not the hub.  tests/test_agent_name_per_session.py.
+AGENTNAME_MUTATIONS = [
+    ("the identity comes from the environment again, which every session in "
+     "the hub shares",
+     '        explicit = (self.state.agent_name or "").strip() or None\n',
+     '        explicit = (self.state.agent_name or os.environ.get("ORCH2_AGENT_NAME")'
+     ' or "").strip() or None\n'),
+
+    ("a name the registry refuses vanishes into the log again",
+     "        except agent_comms.AgentCommsError as exc:\n",
+     "        except ValueError as exc:\n"),
+
+    ("the refusal names no spelling that would work",
+     "                    f\"{re.sub(r'[^A-Za-z0-9._-]+', '-', explicit or '')!r} \"\n",
+     "                    f\"{explicit!r} \"\n"),
+
+    ("a session reopened without the flag is never looked up, so it loses its "
+     "name on the first reopen",
+     "                and target and target != self._agent_name_checked\n",
+     "                and False\n"),
+
+    ("a named session takes the record's name, and an old name beats the one "
+     "it was launched with",
+     "            if remembered and not self.state.agent_name:\n",
+     "            if remembered:\n"),
+
+    ("the name is looked up again on every reconnect",
+     "                and target and target != self._agent_name_checked\n",
+     "                and target\n"),
+
+    ("a remembered name is found but not used",
+     "            if remembered and not self.state.agent_name:\n"
+     "                self.state.agent_name = remembered\n",
+     "            if remembered and not self.state.agent_name:\n"
+     "                pass\n"),
+
+    ("the name is never recorded, so nothing is remembered",
+     "            await asyncio.to_thread(\n"
+     "                lambda: agent_comms.name_session(sid, name, labels=labels))\n",
+     "            pass\n"),
+
+    ("the record is rewritten on every tick",
+     "        if self._agent_name_recorded == key:\n            return\n",
+     ""),
+
+    ("what was recorded is not noted, so the record is rewritten on every tick",
+     "            self._agent_name_recorded = key\n",
+     ""),
+
+    ("a name the registry refused is not remembered either",
+     "        await self._remember_agent_name()\n"
+     "        if not self._agent_enabled() or not self.agent_identity:\n",
+     "        if not self._agent_enabled() or not self.agent_identity:\n"),
+
+    ("naming a running session leaves it on its old identity, which keeps "
+     "the inbox",
+     "        if self.agent_identity and self.agent_identity != name:\n"
+     "            await self.deregister_agent()\n",
+     ""),
+
+    ("naming a running session is not remembered until the next tick",
+     "        self.state.agent_name = name\n        await self._remember_agent_name()\n",
+     "        self.state.agent_name = name\n"),
+
+    ("the running CLI is not told, so ListAgents changes only at the next "
+     "reconnect",
+     '        self.request_cli_command(f"/rename {name}")\n',
+     ""),
+
+    # --agent-label
+    ("the registry entry carries the hub's labels, not the session's",
+     '        out.update(getattr(self.state, "agent_labels", None) or {})\n',
+     '        out.update(getattr(self.config, "agent_labels", None) or {})\n'),
+
+    ("a session reopened without flags loses its labels",
+     "            if remembered_labels and not self.state.agent_labels:\n",
+     "            if False:\n"),
+
+    ("remembered labels overwrite the ones this launch gave",
+     "            if remembered_labels and not self.state.agent_labels:\n",
+     "            if remembered_labels:\n"),
+
+    ("a session launched with only a name never gets its labels back",
+     "        if ((not self.state.agent_name or not self.state.agent_labels)\n",
+     "        if ((not self.state.agent_name)\n"),
+
+    ("a label change is not remembered",
+     "        key = (sid, name, tuple(sorted(labels.items())))\n",
+     "        key = (sid, name)\n"),
+
+    ("labels are never recorded",
+     "                lambda: agent_comms.name_session(sid, name, labels=labels))\n",
+     "                lambda: agent_comms.name_session(sid, name))\n"),
+
+    ("a session given only labels is not remembered",
+     "        if not (name or labels) or not sid or not self._agent_enabled():\n",
+     "        if not name or not sid or not self._agent_enabled():\n"),
+
+    ("new labels for a running session are not published",
+     "        if not self.agent_identity or not self._agent_enabled():\n"
+     "            return\n        ident = self.agent_identity\n",
+     "        return\n        ident = self.agent_identity\n"),
+
+    ("new labels for a running session are not remembered",
+     "        self.state.agent_labels = labels\n        await self._remember_agent_name()\n",
+     "        self.state.agent_labels = labels\n"),
+]
+
+AGENTNAME_SERVER_MUTATIONS = [
+    ("every session the hub opens inherits the hub's name -- the bug",
+     '    overrides["agent_name"] = (agent_name or "").strip() or None\n',
+     ""),
+
+    ("a launch that joins a running hub drops --agent-name",
+     '        "agent_name": cfg.agent_name,\n',
+     ""),
+
+    ("the hand-over leaves the name off the wire",
+     '        "agent_name": agent_name,\n        "agent_labels": agent_labels or {},\n',
+     '        "agent_labels": agent_labels or {},\n'),
+
+    ("the hub opens the handed-over session unnamed",
+     "                                   cli_path=cli_path, agent_name=agent_name,\n",
+     "                                   cli_path=cli_path,\n"),
+
+    ("naming a session that is already open does nothing",
+     "                await existing.bridge.adopt_agent_name(agent_name)\n",
+     "                pass\n"),
+
+    ("the same name again re-registers a running session",
+     "                    and existing.state.agent_name != agent_name\n",
+     ""),
+
+    ("--cli-path for a session that is already open is recorded but never "
+     "applied",
+     "                    existing.bridge.config = new_cfg\n"
+     "                need_reconnect = True\n",
+     "                    existing.bridge.config = new_cfg\n"),
+
+    ("the runtime and its bridge disagree about which CLI it runs",
+     "                if existing.bridge is not None:\n"
+     "                    existing.bridge.config = new_cfg\n",
+     ""),
+
+    ("a detached child loses a name that came from the environment",
+     "    if cfg.agent_name:\n"
+     '        child_argv.extend(["--agent-name", cfg.agent_name])\n',
+     ""),
+
+    ("a detached child is named twice",
+     '        if a == "--agent-name":\n            i += 2\n            continue\n'
+     '        if a.startswith("--agent-name="):\n            i += 1\n            continue\n'
+     "        child_argv.append(a)\n",
+     "        child_argv.append(a)\n"),
+
+    ("a restart re-applies the name the launch command once said",
+     '        if a in ("--agent-name", "--agent-label"):\n',
+     '        if a in ("--agent-label",):\n'),
+
+    ("a restart re-applies the labels the launch command once gave",
+     '        if a in ("--agent-name", "--agent-label"):\n',
+     '        if a in ("--agent-name",):\n'),
+
+    ("a restart re-applies labels given in --agent-label=K=V form",
+     '        if a.startswith(("--agent-name=", "--agent-label=")):\n',
+     '        if a.startswith(("--agent-name=",)):\n'),
+
+    ("a restart brings the primary session back unlabelled",
+     '    for key, value in (getattr(state, "agent_labels", None) or {}).items():\n'
+     '        child.extend(["--agent-label", f"{key}={value}"])\n',
+     ""),
+
+    ("every session the hub opens inherits the hub's labels",
+     '    overrides["agent_labels"] = dict(agent_labels or {})\n',
+     ""),
+
+    ("a launch that joins a running hub drops --agent-label",
+     '        "agent_labels": dict(cfg.agent_labels or {}),\n',
+     ""),
+
+    ("the hand-over leaves the labels off the wire",
+     '        "agent_labels": agent_labels or {},\n',
+     ""),
+
+    ("the hub opens the handed-over session unlabelled",
+     "                                   agent_labels=agent_labels)",
+     "                                   )"),
+
+    ("labels that are not a JSON object are passed on as they are",
+     "                    if isinstance(raw_labels, dict) else {})\n",
+     "                    if isinstance(raw_labels, dict) else raw_labels)\n"),
+
+    ("labels for a session that is already open are ignored",
+     "                await existing.bridge.adopt_agent_labels(agent_labels)\n",
+     "                pass\n"),
+
+    ("the same labels again re-publish a running session",
+     "                    and existing.state.agent_labels != agent_labels\n",
+     ""),
+
+    ("a restart brings the primary session back unnamed",
+     "    if name:\n"
+     '        child.extend(["--agent-name", name])\n',
+     ""),
+]
+
+AGENTNAME_CFG_MUTATIONS = [
+    ("ORCH2_AGENT_NAME stays in the environment, so every session the hub "
+     "starts inherits it",
+     '    env = os.environ.pop("ORCH2_AGENT_NAME", None)\n',
+     '    env = os.environ.get("ORCH2_AGENT_NAME")\n'),
+
+    ("ORCH2_AGENT_NAME is ignored",
+     '    return (flag or "").strip() or (env or "").strip() or None\n',
+     '    return (flag or "").strip() or None\n'),
+
+    ("the variable beats the flag",
+     '    return (flag or "").strip() or (env or "").strip() or None\n',
+     '    return (env or "").strip() or (flag or "").strip() or None\n'),
+
+    ("a blank flag hides the variable",
+     '    return (flag or "").strip() or (env or "").strip() or None\n',
+     '    return (flag or env or "").strip() or None\n'),
+]
+
+AGENTNAME_COMMS_MUTATIONS = [
+    ("a second name for a session does not replace the first",
+     '"name=excluded.name, named_at=excluded.named_at, "',
+     '"named_at=excluded.named_at, "'),
+
+    ("a session given only labels is not remembered",
+     "    if not sid or not (nm or lab):\n",
+     "    if not sid or not nm:\n"),
+
+    ("a blank name and no labels are recorded anyway",
+     "    if not sid or not (nm or lab):\n",
+     "    if not sid:\n"),
+
+    ("a second set of labels does not replace the first",
+     '"labels=excluded.labels",',
+     '"named_at=excluded.named_at",'),
+
+    ("remembered labels are never read back",
+     '    return (row["name"] or None), {str(k): str(v) for k, v in labels.items()}\n',
+     '    return (row["name"] or None), {}\n'),
+
+    ("a labels-only record reads as a session named ''",
+     '    return (row["name"] or None), {str(k): str(v) for k, v in labels.items()}\n',
+     '    return row["name"], {str(k): str(v) for k, v in labels.items()}\n'),
+
+    ("a registry from before labels were remembered cannot record them",
+     '        if "labels" not in cols:\n',
+     "        if False:\n"),
+]
+
+AGENTNAME_STATE_MUTATIONS = [
+    ("the session a launch opens does not start with the launch's name",
+     '        agent_name=getattr(config, "agent_name", None),\n',
+     ""),
+
+    ("the session a launch opens does not start with the launch's labels",
+     '        agent_labels=dict(getattr(config, "agent_labels", None) or {}),\n',
+     ""),
+]
+
+AGENTNAME_CMD_MUTATIONS = [
+    ("/rename in a named session renames the CLI away from its agent name",
+     "    if state.agent_name:\n"
+     "        # A session with an explicit name keeps it:",
+     "    if False:\n"
+     "        # A session with an explicit name keeps it:"),
+
+    ("the same before the session exists",
+     "        if state.agent_name:\n            return CommandResult(\n",
+     "        if False:\n            return CommandResult(\n"),
+]
+
+SESSIONNAME_DISK_MUTATIONS = [
+    ("an AI summary becomes the name other sessions address this one by",
+     "    return _apply_rename_pin(str(jsonl), custom) or None\n\n\n"
+     "def title_from_jsonl",
+     "    return _apply_rename_pin(str(jsonl), custom) or _ai\n\n\n"
+     "def title_from_jsonl"),
+
+    ("the name ignores the rename pin, so it differs from the title the tab "
+     "shows",
+     "    return _apply_rename_pin(str(jsonl), custom) or None\n\n\n"
+     "def title_from_jsonl",
+     "    return custom or None\n\n\ndef title_from_jsonl"),
+]
+
 
 TARGETS = {
     "chat": ("static/chat.js", "tests/hidden_window.test.js",
@@ -2665,6 +3211,27 @@ TARGETS = {
                    RESUMEFAIL_MUTATIONS, "pytest"),
     "resumelist": ("session.py", "tests/test_resume_unknown_session.py",
                    RESUMELIST_MUTATIONS, "pytest"),
+    "sessionname": ("sdk_bridge.py", "tests/test_session_name.py",
+                    SESSIONNAME_MUTATIONS, "pytest"),
+    "sessionname-cmd": ("commands.py", "tests/test_session_name.py",
+                        SESSIONNAME_CMD_MUTATIONS, "pytest"),
+    "sessionname-server": ("server.py",
+                           "tests/test_session_name.py tests/test_cli_path.py",
+                           SESSIONNAME_SERVER_MUTATIONS, "pytest"),
+    "sessionname-disk": ("session.py", "tests/test_session_name.py",
+                         SESSIONNAME_DISK_MUTATIONS, "pytest"),
+    "agentname": ("sdk_bridge.py", "tests/test_agent_name_per_session.py",
+                  AGENTNAME_MUTATIONS, "pytest"),
+    "agentname-server": ("server.py", "tests/test_agent_name_per_session.py",
+                         AGENTNAME_SERVER_MUTATIONS, "pytest"),
+    "agentname-cfg": ("config.py", "tests/test_agent_name_per_session.py",
+                      AGENTNAME_CFG_MUTATIONS, "pytest"),
+    "agentname-comms": ("agent_comms.py", "tests/test_agent_name_per_session.py",
+                        AGENTNAME_COMMS_MUTATIONS, "pytest"),
+    "agentname-state": ("state.py", "tests/test_agent_name_per_session.py",
+                        AGENTNAME_STATE_MUTATIONS, "pytest"),
+    "agentname-cmd": ("commands.py", "tests/test_agent_name_per_session.py",
+                      AGENTNAME_CMD_MUTATIONS, "pytest"),
     "wakerevive": ("server.py", "tests/test_wakeup_store.py",
                    WAKEREVIVE_MUTATIONS, "pytest"),
     "bgstall-wire": ("state.py", "tests/test_bg_stall.py",

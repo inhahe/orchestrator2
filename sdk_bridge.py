@@ -126,6 +126,7 @@ from session import (
     _bg_task_label,
     bg_task_items,
     describe_resumable_sessions,
+    read_human_title,
     check_session_integrity,
     describe_lost_bg_tasks,
     load_persisted_bg_tasks,
@@ -841,6 +842,15 @@ class SDKBridge:
         # _with_session_note.  Set from --session-note by /move.
         self._session_note: str | None = (
             getattr(config, "session_note", None) or None)
+        # One of the CLI's own slash commands -- today only ``/rename`` --
+        # waiting for the CLI to be idle.  Not a prompt and not a turn; see
+        # _run_pending_cli_command.  One slot: the newest request wins.
+        self._pending_cli_command: str | None = None
+        # The session id whose remembered name connect() last looked up, and
+        # the (session id, name) last written -- so neither costs a database
+        # round trip per reconnect or per tick.  See _remember_agent_name.
+        self._agent_name_checked: str | None = None
+        self._agent_name_recorded: tuple | None = None
         self._pending_permission: asyncio.Future | None = None
 
         # ScheduleWakeup heartbeat.  When the model calls the ScheduleWakeup
@@ -860,6 +870,13 @@ class SDKBridge:
         # or a write to a terminated process).  Cleared by a successful
         # connect().  See _note_transport_death().
         self._transport_dead = False
+        # The CLI's own word on whether it is working: the last
+        # ``session_state_changed`` it sent ("running" / "idle" /
+        # "requires_action"), None until it has said anything on this
+        # connection.  It says "running" the moment it starts a turn -- one a
+        # background task's notification started included -- which is seconds
+        # before that turn's first output flips ``state.busy``.
+        self._cli_state: str | None = None
         # Monotonic timestamps of the auto-reconnects we started because of a
         # dead transport, newest last.  Bounds the recovery so a CLI that dies
         # on every connect can't spin.  See _may_auto_reconnect().
@@ -954,6 +971,56 @@ class SDKBridge:
             if _AUTH_FAIL_RE.search(line):
                 self.state.auth_error = True
 
+    def _addressable_name(self) -> str | None:
+        """The name other Claude sessions should address this one by.
+
+        That name belongs to the **CLI**, not to us: it is what ``ListAgents``
+        prints on its first line and what ``SendMessage`` addresses.  Reported
+        2026-09-22 -- ``/rename Lane A`` set the title, but the session went on
+        calling itself ``os-f5``, so SlateOS's lane script (which reads exactly
+        that line) could not tell which lane it was.
+
+        Measured against CLI 2.1.280 rather than inferred:
+
+            nothing set                          -> nameprobe-qqmoa2tw-ab
+            CLAUDE_CODE_SESSION_NAME=Lane Test   -> Lane Test
+            our custom-title record, then resume -> nameprobe-qqmoa2tw-0d
+            an agent-name record, then resume    -> nameprobe-qqmoa2tw-1b
+
+        So the name is set only at runtime -- the CLI's own ``/rename``, or the
+        environment variable at startup -- and nothing on disk restores it. It
+        therefore has to be passed on *every* connect, or a hub restart quietly
+        takes every session back to an auto name.
+
+        In order:
+
+        * **The session's explicit name** (``state.agent_name``):
+          ``--agent-name`` on the launch that opened it, or remembered for it
+          from one.  It is also the session's agent-comms identity, so the two
+          registries agree, and it outranks the title: ``/rename`` in a named
+          session changes only the title (see ``commands._cmd_rename``).  This
+          is per session -- ``_create_runtime`` never copies the hub's own name
+          into the sessions it opens, which is what once made every session
+          in a hub share one address.
+        * Otherwise the title **a person chose**: a ``/rename`` made before the
+          session existed (``pending_rename``, the newer choice), else the one
+          on record.  Never the AI summary.
+        """
+        st = self.state
+        return (st.agent_name or st.pending_rename or st.human_title
+                or "").strip() or None
+
+    def _resume_target(self, resume_id: str | None) -> str | None:
+        """The session a connect with *resume_id* will land on, or None for a
+        new one.  The one rule both ``_make_options`` (which resumes it) and
+        ``connect`` (which loads its name) must agree on."""
+        rid = resume_id or self._initial_resume_id
+        if rid:
+            return rid
+        if not self.config.no_continue and self.state.session_id:
+            return self.state.session_id
+        return None
+
     def _make_options(self, resume_id: str | None = None) -> ClaudeAgentOptions:
         """Build ``ClaudeAgentOptions`` from config + state."""
         kwargs: dict[str, Any] = {
@@ -973,6 +1040,20 @@ class SDKBridge:
             # are suppressed in _handle_system_message.
             "env": {"CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS": "1"},
         }
+
+        # The session's addressable name.  See _addressable_name.
+        name = self._addressable_name()
+        if name:
+            kwargs["env"]["CLAUDE_CODE_SESSION_NAME"] = name
+        # ...and never one this process merely inherited.  The SDK starts the
+        # CLI with our whole environment *underneath* options.env, and
+        # options.env can add a variable but not remove one, so a hub started
+        # from inside a named session (an agent launching it from its Bash
+        # tool) would hand that session's name to every unnamed session it
+        # runs -- the /btw fork included, which builds its own env.  Nothing in
+        # the hub reads the variable; dropping it here, before any CLI starts,
+        # is the only way to keep it out of the children.
+        os.environ.pop("CLAUDE_CODE_SESSION_NAME", None)
 
         # Cross-account hub support: if the session's config specifies a
         # non-default CLAUDE_CONFIG_DIR, inject it into the subprocess env
@@ -1017,13 +1098,10 @@ class SDKBridge:
         # IMPORTANT: if no session is found for this cwd, we must NOT let the
         # SDK fall through to its default continue_conversation=True behavior,
         # which resumes the globally most recent session regardless of cwd.
-        rid = resume_id or self._initial_resume_id
+        rid = self._resume_target(resume_id)
         if rid:
             kwargs["resume"] = rid
             self.state.expected_resume_sid = rid
-        elif not self.config.no_continue and self.state.session_id:
-            kwargs["resume"] = self.state.session_id
-            self.state.expected_resume_sid = self.state.session_id
         else:
             # No session to resume — start fresh.  Explicitly disable the
             # SDK's global continue so it doesn't pick a random session.
@@ -1157,6 +1235,45 @@ class SDKBridge:
         is holding it.  See :meth:`_warn_if_foreign_task`.
         """
         self._warn_if_foreign_task("connect")
+        # The name the new CLI starts with is the person-chosen title of the
+        # session it lands on (see _addressable_name).  Re-read only when that
+        # session changes -- a hub restart, /clear -- not on every /model
+        # reconnect: it lives in the transcript, which on a large session is a
+        # real read (off the loop either way).  A /rename in this runtime keeps
+        # it current in between.
+        target = self._resume_target(resume_id)
+        if target != self.state.human_title_sid:
+            try:
+                self.state.human_title = (
+                    await asyncio.to_thread(
+                        read_human_title, target,
+                        getattr(self.config, "config_dir", None))
+                    if target else None)
+                self.state.human_title_sid = target
+            except Exception:
+                # Left unmatched, so the next connect tries again.
+                self.state.human_title = None
+                log.debug("could not read the session title", exc_info=True)
+        # A session given a name or labels (--agent-name, --agent-label) keeps
+        # them when it comes back without the flags -- reopened from the
+        # lobby, restored after a hub restart.  Looked up once per session,
+        # and only for what this launch did not give: once found they are
+        # this runtime's, as if they had been passed.
+        if ((not self.state.agent_name or not self.state.agent_labels)
+                and target and target != self._agent_name_checked
+                and self._agent_enabled()):
+            try:
+                remembered, remembered_labels = await asyncio.to_thread(
+                    agent_comms.session_naming, target)
+                self._agent_name_checked = target
+            except Exception:
+                remembered, remembered_labels = None, {}
+                log.debug("could not look up the session's name", exc_info=True)
+            if remembered and not self.state.agent_name:
+                self.state.agent_name = remembered
+                log.info("session %s keeps its name %r", target[:8], remembered)
+            if remembered_labels and not self.state.agent_labels:
+                self.state.agent_labels = dict(remembered_labels)
         options = self._make_options(resume_id)
         resume_sid = getattr(options, "resume", None)
         log.info(
@@ -1320,6 +1437,8 @@ class SDKBridge:
         # a *failed* reconnect leaves the flag set and the next detection is
         # still recognised as a death rather than a first one.
         self._transport_dead = False
+        # A new process has said nothing about its state yet.
+        self._cli_state = None
 
         # Join the cross-account agent registry now that the session id is
         # known: a resumed session inherits its prior identity by that id,
@@ -3259,6 +3378,14 @@ class SDKBridge:
                 self.event_queue.put_nowait(("wakeup", "queue-edit-done"))
             except Exception as exc:
                 log.warning("ghost-turn queue poke failed: %r", exc)
+        # Likewise a CLI command that arrived while this ghost turn held the
+        # CLI: the parked worker declined it then, and nothing else would wake
+        # it for this.
+        if self._pending_cli_command:
+            try:
+                self.event_queue.put_nowait(("cli-command", ""))
+            except Exception as exc:
+                log.warning("ghost-turn CLI-command poke failed: %r", exc)
 
     # ------------------------------------------------------------------
     # Deferred compact turn_end helpers
@@ -3719,6 +3846,13 @@ class SDKBridge:
             # we do in _make_options.
             d = msg.data if isinstance(msg.data, dict) else {}
             session_state = d.get("state")
+            if session_state:
+                self._cli_state = session_state
+            if session_state == "idle" and self._pending_cli_command:
+                # "idle" lands just *after* a turn's result, so the end-of-turn
+                # attempt at a waiting /rename can still have seen "running"
+                # and declined.  Nothing else would wake the worker for it.
+                self.event_queue.put_nowait(("cli-command", ""))
             if session_state == "requires_action":
                 ring_bell(state, "requires-action")
                 await self._flush_bell()
@@ -4322,6 +4456,12 @@ class SDKBridge:
                     if msg.session_id:
                         state.session_id = msg.session_id
 
+                    # The CLI's own "idle" follows in the same instant --
+                    # measured -- and so is routed here too, into a queue that
+                    # the next turn start throws away unread.  The result *is*
+                    # the end of the turn it announced as "running".
+                    self._cli_state = "idle"
+
                     # Terminating result after a user interrupt: emit the
                     # deferred interrupted turn_end marker now (after the
                     # wind-down output), and don't book the aborted turn.
@@ -4808,6 +4948,151 @@ class SDKBridge:
         return prompt
 
     # ------------------------------------------------------------------
+    # CLI-native commands (/rename) — an exchange, not a turn
+    # ------------------------------------------------------------------
+
+    #: How long the CLI gets to answer one of its own commands.  ``/rename``
+    #: answers in under 0.1 s (measured); this only bounds a CLI that never
+    #: answers at all.
+    CLI_COMMAND_TIMEOUT_S = 30.0
+
+    #: The ``model`` the CLI stamps on output it produced itself rather than
+    #: got from the API -- its reply to ``/rename`` among them (measured
+    #: against 2.1.280: ``AssistantMessage(model='<synthetic>', "Session
+    #: renamed to: X")``).
+    _CLI_SYNTHETIC_MODEL = "<synthetic>"
+
+    def request_cli_command(self, text: str) -> None:
+        """Have the CLI run one of its own slash commands once it is idle.
+
+        For commands the CLI answers by itself, no model involved -- today
+        only ``/rename``.  Called from the WebSocket handler; the exchange runs
+        on the worker, which owns the client.  One slot, newest wins: two
+        renames before the CLI is free mean the second one.
+        """
+        self._pending_cli_command = text
+        try:
+            self.event_queue.put_nowait(("cli-command", ""))
+        except Exception:
+            log.debug("could not poke the worker for a CLI command",
+                      exc_info=True)
+
+    async def _run_pending_cli_command(self) -> None:
+        """Run the waiting CLI command, if the CLI is free for it.
+
+        **Not a turn**, although it is sent the way a prompt is.  Put through
+        ``run_turn`` a ``/rename`` would cancel a scheduled loop wakeup (a turn
+        starting means the model's plan was superseded; a rename supersedes
+        nothing, and loops here run unattended), ring the turn-done bell and
+        book a turn.  **Nor a queued prompt**: the queue echoes each item as
+        "You: ..." when it sends it, and "merge all" would glue the next real
+        prompt onto the rename -- which the CLI would then take as the title.
+
+        So it claims the stream exactly as ``run_turn`` does (``turn_active``,
+        so the dispatcher routes the reply here instead of starting a ghost
+        turn), sends the command, and reads to its result.  Only ever when the
+        CLI is idle: never into a running turn, where a prompt can be absorbed
+        and dropped (``absorbed_mid_turn``, measured 2026-09-16), nor a ghost
+        turn, nor a connect.  Otherwise it stays pending for the next idle
+        point -- the end of the turn, the end of the ghost turn -- and a
+        reconnect in between is harmless: the new CLI already starts with the
+        name (``CLAUDE_CODE_SESSION_NAME``), so running it then is a no-op.
+        """
+        text = self._pending_cli_command
+        if not text:
+            return
+        state = self.state
+        if (self.client is None or state.busy or state.connecting
+                or self.turn_active.is_set() or self._transport_dead
+                or self._cli_state == "running"):
+            return
+        self._pending_cli_command = None
+        while not self.turn_msg_queue.empty():
+            try:
+                self.turn_msg_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self.turn_active.set()
+        reply = ""
+        dispatcher_died = False
+        handoff: list[Any] = []
+        try:
+            try:
+                await self.client.query(text)
+            except Exception as exc:
+                if _is_transport_death(exc):
+                    # Released first: with a "turn" live, the death handler
+                    # leaves recovery to it -- and this is not one.
+                    self.turn_active.clear()
+                    self._note_transport_death(_exc_reason(exc))
+                raise
+            deadline = time.monotonic() + self.CLI_COMMAND_TIMEOUT_S
+            while True:
+                msg = await asyncio.wait_for(
+                    self.turn_msg_queue.get(),
+                    timeout=max(deadline - time.monotonic(), 0.0))
+                if msg is DISPATCHER_DEAD:
+                    dispatcher_died = True
+                    break
+                if msg is INTERRUPT_SENTINEL:
+                    continue
+                if isinstance(msg, ResultMessage):
+                    # As in run_turn: the "idle" that follows lands in the
+                    # queue we are about to stop reading.
+                    self._cli_state = "idle"
+                    break
+                if isinstance(msg, SystemMessage):
+                    # init (which carries the session id of a session this
+                    # command just created), a background task's news: handled
+                    # exactly as during a turn.
+                    await self._handle_system_message(msg, during_turn=True)
+                    continue
+                if (isinstance(msg, AssistantMessage)
+                        and getattr(msg, "model", None) == self._CLI_SYNTHETIC_MODEL):
+                    reply += "".join(getattr(b, "text", "") or ""
+                                     for b in msg.content)
+                    continue
+                # Anything else is the model, not the CLI: a turn that reached
+                # the CLI first -- a background task's notification waking it
+                # in the instant we looked idle.  It goes to the ghost-turn
+                # path, which renders it, rather than being swallowed here --
+                # along with whatever of it is already queued behind it.
+                # Collected synchronously, straight after releasing the
+                # stream: from that moment the dispatcher routes the rest of
+                # the turn to the ghost path itself.
+                log.warning(
+                    "CLI command %r met a model turn (%s); handing the stream "
+                    "to the ghost-turn path", text, type(msg).__name__)
+                self.turn_active.clear()
+                handoff.append(msg)
+                while not self.turn_msg_queue.empty():
+                    try:
+                        handoff.append(self.turn_msg_queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                break
+        except asyncio.TimeoutError:
+            log.warning("CLI command %r: no result within %.0fs",
+                        text, self.CLI_COMMAND_TIMEOUT_S)
+        except Exception:
+            log.warning("CLI command %r failed", text, exc_info=True)
+        finally:
+            self.turn_active.clear()
+        for m in handoff:
+            if m is DISPATCHER_DEAD:
+                dispatcher_died = True
+                break
+            if m is not INTERRUPT_SENTINEL:
+                await self._handle_async_message(m)
+        if dispatcher_died:
+            # The dispatcher saw ``turn_active`` set and left recovery to the
+            # turn in progress -- which was us.
+            self.event_queue.put_nowait(("connect", _CONNECT_TRANSPORT_DEAD))
+            return
+        if not handoff:
+            log.info("CLI command %r -> %r", text, reply[:200])
+
+    # ------------------------------------------------------------------
     # worker_loop() — main turn driver
     # ------------------------------------------------------------------
 
@@ -5240,6 +5525,8 @@ class SDKBridge:
                 # pushing each one as it arrives would reverse two asides typed
                 # in one turn.
                 btw_prompts.append(payload)
+            elif kind == "cli-command":
+                pass  # the command itself is in _pending_cli_command; run below
         # /btw goes to the front of the queue, not the back.  A turn owns the
         # CLI, so a /btw typed during one cannot be answered until that turn
         # ends -- but "the moment the turn ends" and "after everything you
@@ -5275,6 +5562,10 @@ class SDKBridge:
             # it *here*, above the queued-prompt branch, so the next prompt runs
             # under the settings the user asked for rather than one turn late.
             await self._flush_deferred_reconnect()
+
+        # A /rename typed during the turn: the CLI is free now, and the command
+        # is not a turn, so it goes before anything that starts one.
+        await self._run_pending_cli_command()
 
         # --- Interrupted ---
         if interrupted:
@@ -5467,11 +5758,16 @@ class SDKBridge:
         # reach the frontend while we wait here.
         await self._flush_bell()
         while not self.stop_event.is_set():
+            # Parked means idle -- unless a ghost turn is streaming, which
+            # _run_pending_cli_command checks for itself.
+            await self._run_pending_cli_command()
             kind, payload = await self.event_queue.get()
 
             if kind == "message":
                 self.state.needs_user_attention = None
                 return payload
+            if kind == "cli-command":
+                continue  # run at the top of the loop
             if kind in ("quit", "force-quit"):
                 return None
             if kind == "compact":
@@ -5604,6 +5900,9 @@ class SDKBridge:
         # ...as does a reconnect we were holding for the background tasks: the
         # settings it carried are applied by the connect() at the bottom.
         self._deferred_reconnect = None
+        # ...and a /rename still waiting for the CLI: it named the session
+        # being wiped, and would otherwise be run against the new one.
+        self._pending_cli_command = None
         # Wiping the session discards the running tasks along with everything
         # else.  That is what /clear means, but the user should still be told
         # which tasks went with it — the bulk clear below is silent.
@@ -5833,7 +6132,9 @@ class SDKBridge:
         title = getattr(self.state, "session_title", None)
         if title:
             out["title"] = str(title)[:64]
-        out.update(getattr(self.config, "agent_labels", None) or {})
+        # This session's own labels -- state, not the hub's config, which every
+        # session a hub opens used to inherit.
+        out.update(getattr(self.state, "agent_labels", None) or {})
         return out
 
     async def register_agent(self) -> None:
@@ -5853,8 +6154,11 @@ class SDKBridge:
         if not self._agent_enabled() or self.agent_identity:
             return
         cwd = getattr(self.config, "cwd", "") or os.getcwd()
-        explicit = (getattr(self.config, "agent_name", None)
-                    or os.environ.get("ORCH2_AGENT_NAME") or "").strip() or None
+        # This session's own name -- never the environment's.  The hub's
+        # environment is every session's, which is how one ORCH2_AGENT_NAME
+        # once named them all; config.py consumes the variable for the one
+        # launch it was set for (_launch_agent_name).
+        explicit = (self.state.agent_name or "").strip() or None
         try:
             ident, how = await asyncio.to_thread(
                 lambda: agent_comms.resolve_identity(
@@ -5867,6 +6171,23 @@ class SDKBridge:
                     f"{exc}\n\nThis session is running normally, but it is not "
                     f"in the cross-account agent registry, so other sessions "
                     f"cannot address it and it will not receive halts."
+                )},
+            })
+            return
+        except agent_comms.AgentCommsError as exc:
+            # A name the registry refuses -- "Lane A", with its space.  It used
+            # to vanish into the log.  Other sessions still see the name in
+            # ListAgents, which allows it; only the registry is missing.
+            log.warning("agent name refused: %s", exc)
+            await self.broadcast({
+                "type": "system_msg", "subtype": "warning",
+                "data": {"message": (
+                    f"{exc}.\n\nOther Claude sessions still see this session "
+                    f"as {explicit!r} in ListAgents, but it is not in the "
+                    f"orchestrator2 agent registry, so tools/agents.py cannot "
+                    f"message or halt it.  A name like "
+                    f"{re.sub(r'[^A-Za-z0-9._-]+', '-', explicit or '')!r} "
+                    f"works in both."
                 )},
             })
             return
@@ -5913,6 +6234,9 @@ class SDKBridge:
         re-announcing it every turn would be exactly the noise §6 says agents
         learn to skip.
         """
+        # Before the identity check: a name the registry refused is still this
+        # session's name.
+        await self._remember_agent_name()
         if not self._agent_enabled() or not self.agent_identity:
             return
         now = time.monotonic()
@@ -5980,6 +6304,84 @@ class SDKBridge:
         finally:
             conn.close()
         return out
+
+    async def _remember_agent_name(self) -> None:
+        """Record this session's explicit name and labels against its id.
+
+        What lets a session named with ``--agent-name`` / ``--agent-label``
+        still be that agent when it comes back without the flags (``connect``
+        looks them up).  Called every tick, so it has to be cheap when nothing
+        changed -- which is every tick but the first after a session id
+        appears or changes (a new session's first turn, ``/clear``) or the
+        name or labels do.  Independent of the registry identity on purpose: a
+        name the registry refuses is still this session's ``ListAgents``
+        name, and still worth keeping.
+        """
+        name = (self.state.agent_name or "").strip()
+        labels = dict(self.state.agent_labels or {})
+        sid = self.state.session_id
+        if not (name or labels) or not sid or not self._agent_enabled():
+            return
+        key = (sid, name, tuple(sorted(labels.items())))
+        if self._agent_name_recorded == key:
+            return
+        try:
+            await asyncio.to_thread(
+                lambda: agent_comms.name_session(sid, name, labels=labels))
+            self._agent_name_recorded = key
+        except Exception:
+            log.debug("could not record the session's name", exc_info=True)
+
+    async def adopt_agent_labels(self, labels: dict[str, str]) -> None:
+        """Give this *running* session new ``--agent-label``s.
+
+        For a launch that lands on a session the hub already has open.  They
+        replace the old ones -- a launch's labels describe the session -- are
+        remembered with it, and are published at once if it is registered:
+        the entry is written again under the same identity.
+        """
+        labels = {str(k).strip(): str(v) for k, v in (labels or {}).items()
+                  if str(k).strip()}
+        if not labels or labels == (self.state.agent_labels or {}):
+            return
+        self.state.agent_labels = labels
+        await self._remember_agent_name()
+        if not self.agent_identity or not self._agent_enabled():
+            return
+        ident = self.agent_identity
+        cwd = getattr(self.config, "cwd", "") or os.getcwd()
+        try:
+            await asyncio.to_thread(lambda: agent_comms.register(
+                ident, cwd=cwd, session_id=self.state.session_id,
+                account=getattr(self.config, "config_dir", None),
+                repo=self._agent_repo or None,
+                labels=self._agent_labels()))
+        except Exception:
+            log.warning("could not publish the new labels", exc_info=True)
+
+    async def adopt_agent_name(self, name: str) -> None:
+        """Give this *running* session an explicit name.
+
+        For a launch with ``--agent-name`` that lands on a session the hub
+        already has open.  All three places the name lives are updated now,
+        without the reconnect that would otherwise carry it to the CLI -- a
+        reconnect ends the session's background tasks:
+
+        * the registry: re-registered under the new identity;
+        * the record that outlives this runtime (``_remember_agent_name``);
+        * the CLI: handed its own ``/rename``, run when it is next idle.  That
+          command also sets the session's *title*, so the tab takes the name
+          too; the CLI has no way to change one without the other.
+        """
+        name = (name or "").strip()
+        if not name or name == self.state.agent_name:
+            return
+        self.state.agent_name = name
+        await self._remember_agent_name()
+        if self.agent_identity and self.agent_identity != name:
+            await self.deregister_agent()
+        await self.register_agent()
+        self.request_cli_command(f"/rename {name}")
 
     async def deregister_agent(self) -> None:
         """Drop this session's registration on clean exit (§4.2)."""

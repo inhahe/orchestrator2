@@ -191,6 +191,18 @@ CREATE TABLE IF NOT EXISTS halt_deliveries (
     delivered_at REAL NOT NULL,
     PRIMARY KEY (halt_id, identity)
 );
+
+-- The name and labels a session was given explicitly (--agent-name,
+-- --agent-label), by session id; '' / '{}' for whichever it was not given.
+-- Not columns of ``agents``: that row is deleted on clean exit (§4.2), and an
+-- operator's choice has to outlive it -- a session reopened from the lobby,
+-- or after a hub restart, is the same agent.  See name_session().
+CREATE TABLE IF NOT EXISTS session_names (
+    session_id TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    named_at   REAL NOT NULL,
+    labels     TEXT NOT NULL DEFAULT '{}'
+);
 """
 
 
@@ -223,6 +235,14 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
                          "INTEGER NOT NULL DEFAULT 0")
     except sqlite3.DatabaseError:
         log.warning("could not migrate the messages table", exc_info=True)
+    # Likewise a session_names table from before labels were remembered.
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(session_names)")}
+        if "labels" not in cols:
+            conn.execute("ALTER TABLE session_names ADD COLUMN labels "
+                         "TEXT NOT NULL DEFAULT '{}'")
+    except sqlite3.DatabaseError:
+        log.warning("could not migrate the session_names table", exc_info=True)
     conn.commit()
     return conn
 
@@ -528,6 +548,74 @@ def deregister(identity: str, *, conn: sqlite3.Connection | None = None) -> bool
     finally:
         if own:
             conn.close()
+
+
+def name_session(session_id: str, name: str | None, *,
+                 labels: dict[str, str] | None = None,
+                 conn: sqlite3.Connection | None = None,
+                 now: float | None = None) -> None:
+    """Remember the name and labels *session_id* was explicitly given.
+
+    ``--agent-name`` / ``--agent-label`` describe the session their launch
+    opens, not the hub; a session reopened later -- from the lobby, after a
+    hub restart -- comes back without the flags, and this is how it is still
+    the same agent.  Any non-blank name is kept, including one the registry
+    itself would refuse (``"Lane A"``): it is also the name ``ListAgents``
+    shows, which allows it.  A session given only labels is remembered with
+    an empty name.
+    """
+    sid = (session_id or "").strip()
+    nm = (name or "").strip()
+    lab = {str(k): str(v) for k, v in (labels or {}).items() if str(k).strip()}
+    if not sid or not (nm or lab):
+        return
+    own = conn is None
+    conn = conn or connect()
+    now = now if now is not None else time.time()
+    try:
+        conn.execute(
+            "INSERT INTO session_names (session_id, name, named_at, labels) "
+            "VALUES (?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET "
+            "name=excluded.name, named_at=excluded.named_at, "
+            "labels=excluded.labels",
+            (sid, nm, now, json.dumps(lab, sort_keys=True)))
+        conn.commit()
+    finally:
+        if own:
+            conn.close()
+
+
+def session_naming(session_id: str, *, conn: sqlite3.Connection | None = None
+                   ) -> tuple[str | None, dict[str, str]]:
+    """``(name, labels)`` *session_id* was explicitly given -- ``(None, {})``
+    for a session that never was."""
+    sid = (session_id or "").strip()
+    if not sid:
+        return None, {}
+    own = conn is None
+    conn = conn or connect()
+    try:
+        row = conn.execute(
+            "SELECT name, labels FROM session_names WHERE session_id = ?",
+            (sid,)).fetchone()
+    finally:
+        if own:
+            conn.close()
+    if not row:
+        return None, {}
+    try:
+        labels = json.loads(row["labels"] or "{}")
+    except (TypeError, ValueError):
+        labels = {}
+    if not isinstance(labels, dict):
+        labels = {}
+    return (row["name"] or None), {str(k): str(v) for k, v in labels.items()}
+
+
+def session_name(session_id: str, *,
+                 conn: sqlite3.Connection | None = None) -> str | None:
+    """The name *session_id* was explicitly given, if it ever was."""
+    return session_naming(session_id, conn=conn)[0]
 
 
 def find_agent(identity: str, *, conn: sqlite3.Connection | None = None

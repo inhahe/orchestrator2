@@ -307,7 +307,7 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 - **Permission dialogs** -- allow/deny tool execution from the browser
 - **AskUserQuestion fallback** -- Claude's interactive multiple-choice tool (`AskUserQuestion`) has no picker widget in the web UI, so instead of silently failing, its questions and options are surfaced as a chat message and Claude is told to continue the exchange in plain text — you just type your answer
 - **Session resume** -- automatically continues the most recent session for the working directory
-- **Bring your own Claude Code binary** (`--cli-path`) -- the Agent SDK pins a CLI version and bundles that binary, and the CLI refuses models newer than itself (*"Claude Code 2.1.259 does not support this model; version 2.1.280 or newer is required"*). Upgrading the SDK does not always help: when Opus 5.5 shipped, the newest SDK still pinned 2.1.277. Point `--cli-path` at a newer binary and the model works; it can be set per session, so one session runs the newer CLI while the rest stay on the bundled one. A path that does not exist falls back to the bundled CLI with a warning rather than failing the session
+- **Bring your own Claude Code binary** (`--cli-path`) -- the Agent SDK pins a CLI version and bundles that binary, and the CLI refuses models newer than itself (*"Claude Code 2.1.259 does not support this model; version 2.1.280 or newer is required"*). Upgrading the SDK does not always help: when Opus 5.5 shipped, the newest SDK still pinned 2.1.277. Point `--cli-path` at a newer binary and the model works; it can be set per session, so one session runs the newer CLI while the rest stay on the bundled one — including when the launch joins a hub that is already running. A path that does not exist falls back to the bundled CLI with a warning rather than failing the session
 - **Interrupted turns are picked back up, and announced** -- if a session's last turn was cut off (the tab closed on a working session, the CLI died, the machine rebooted), resuming it makes the CLI finish that turn rather than abandon the work. Because that means output can start appearing with nobody having typed anything, the session says so once in the transcript and points at the interrupt button -- the recovered work may be days old and no longer wanted
 - **Lost background work is reported** -- background tasks die with the CLI process, so a session cut off while they were running used to come back believing they were still out there, waiting for completion notices nobody could send. The live task set is now kept on disk, and a resumed session is handed a queued prompt (at the front of its queue, visible in the queue pane) naming what was running and how long it had been going. It says the results are gone and the outcome is *unknown* rather than claiming the tasks failed -- a task can finish in the seconds while a session is being torn down -- and tells the model to check for effects before re-running
 - **Stalled background tasks are called out** -- a background task whose completion the CLI never reports would otherwise sit in the panel forever, and (worse) keep deferring idle teardown, `/model` switches and the context trim. Tasks are probed for output-file movement, CPU time and disk-I/O operations across their whole process tree; one that has done none of the three for five minutes is annotated in the panel ("no output or CPU for 20m") and stops holding those gates open. It is never removed or reported as finished -- usually it is a real process hung on I/O, and the panel is the only thing that can see it. Rows we can identify a process for get a kill button; nothing is killed automatically
@@ -467,7 +467,7 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/cls` | Clear the chat output area |
 | `/history [N]` | Clear output and replay session history (last N records; default 2000) |
 | `/cwd [path]` | Show current working directory, or switch to a new one and reconnect |
-| `/rename [name]` | Set a custom session title |
+| `/rename [name]` | Set a custom session title — which is also the name other Claude sessions address it by (`ListAgents` / `SendMessage`), live and across reconnects, unless the session was given one with `--agent-name`. During a turn the new name takes effect when the turn ends |
 | `/move` | Copy this session to another Claude account **and/or another project directory**, and continue it in the same window. Opens a picker: choose the account (the current one included, if you only want to change directory), then the destination directory and a name for the copy. Leave either as-is to change only the other. Directories Claude already knows about are offered as one-click fills, but any existing directory works |
 | `/move <path>` | Same, with the destination directory prefilled |
 | `/export [path]` | Save conversation as markdown |
@@ -549,14 +549,22 @@ where its safe abort points are. It is cooperative by design: a job that does
 not check cannot be stopped.
 
 A session's identity is a **name**, not something derived from its account or
-directory: set it with `--agent-name` (or `ORCH2_AGENT_NAME`). It is inherited
-on resume. If a session starts in a directory where several identities are
-registered and none was given, it **refuses and lists them** rather than
-guessing — adopting the wrong one would silently inherit another agent's
-messages and halt state, and neither session could tell.
+directory: set it with `--agent-name` (or `ORCH2_AGENT_NAME`). The name belongs
+to the one session that launch opens — also when the launch joins a hub that is
+already running, and never to the other sessions a hub opens — and the session
+keeps it when reopened from the lobby or after a hub restart. It is also the
+name other Claude sessions see in `ListAgents`; a session without one is listed
+by its title (`/rename`). Use letters, digits, `.`, `-` and `_` (`Lane-D`, not
+`Lane D`): the registry refuses anything else and says so. If a session starts
+in a directory where several identities are registered and none was given, it
+**refuses and lists them** rather than guessing — adopting the wrong one would
+silently inherit another agent's messages and halt state, and neither session
+could tell.
 
 Sessions can carry free-form **labels** (`--agent-label lane=b
---agent-label role=reviewer`, repeatable), shown by `agents.py list`. They exist
+--agent-label role=reviewer`, repeatable), shown by `agents.py list`. Like the
+name, they belong to the one session the launch opens and stay with it when it
+is reopened. They exist
 because a listing of names and start times meant one agent had to be identified
 by elimination on a timestamp, and two sessions once claimed the same lane and
 made the same one-line fix on different trees with nothing able to notice. The

@@ -164,6 +164,18 @@ distributions are separated for the same reason: they share `/mnt/d` but not
 own server; a hub that reports no `namespace` predates the check and is still
 joined, so an upgrade doesn't split same-OS relaunches onto a second port.
 
+**What a joining launch hands over is one list**, `_hub_launch_kwargs(cfg,
+config_dir)`, used by both call sites that join a hub. A launch that joins
+never builds a `Config` of its own, so any flag left out of that list is simply
+dropped — which is how `--cli-path` went missing from both hand-written lists
+while the hub's endpoint had accepted it all along, and `--agent-name` with it.
+A test pins the list's keys to `_launch_into_hub`'s parameters. A launch that
+lands on a session the hub already has open applies `--model`, `--effort`,
+`--bell`, `--cli-path` (reconnecting, as the model does) and `--agent-name`
+(live, §9a) to it. `--cli-path` is made absolute at parse
+time for the same hand-over: the hub would read a relative path against its own
+directory.
+
 **`_create_runtime` refuses a working directory it cannot see**, raising
 `NotADirectoryError` naming both the requested and resolved forms. It is the
 single funnel for every way a session is born — the launch API and the lobby's
@@ -1323,6 +1335,61 @@ logs loudly.
 
 Tests: `tests/test_prompt_during_ghost_turn.py`; mutation target `ghostqueue`.
 
+### CLI-native commands are an exchange, not a turn
+
+`/rename` has to reach the running CLI (§8a, *A title is not the name…*), and
+the CLI answers it by itself — measured, in under 0.1 s: `session_state_changed
+running`, `init`, `AssistantMessage(model='<synthetic>', "Session renamed to:
+X")`, a zero-cost `ResultMessage`, then `session_state_changed idle` *after*
+the result. Neither of the two existing ways to send the CLI text fits:
+
+* **As a turn** (`run_turn`), it would cancel a scheduled loop wakeup — a turn
+  starting means the model's plan was superseded, and a rename supersedes
+  nothing, in loops that run unattended — ring the turn-done bell and book a
+  turn.
+* **As a queued prompt**, it would be echoed as `You: /rename …` when sent, and
+  *merge all* would glue the user's next prompt onto it, which the CLI would
+  then take as part of the title.
+
+So `server._forward_cli_command` calls `SDKBridge.request_cli_command(text)`:
+one slot (`_pending_cli_command`, newest wins) plus a `cli-command` poke. The
+worker runs it in `_run_pending_cli_command()` at its idle points — the top of
+every `_await_next_prompt` iteration, and in `_between_turns` right after the
+reconnect handling, ahead of anything that starts a turn. It claims the stream
+exactly as `run_turn` does (`turn_active`, so the dispatcher routes the reply
+to it rather than starting a ghost turn), sends the command, handles
+SystemMessages as a turn would (the `init` of a session the command itself
+created lands here), keeps the `<synthetic>` reply for the log, and stops at
+the result.
+
+**Only when the CLI is free**: never with `state.busy` (a turn, or a ghost
+turn), `state.connecting`, `turn_active`, a dead transport — or
+`_cli_state == "running"`. That last one is the CLI's own
+`session_state_changed`, which it sends the moment it starts *any* turn,
+including one a background task's notification started — seconds before that
+turn's first output flips `state.busy`. Its "idle", though, cannot be relied
+on to arrive: the CLI sends it in the **same instant** as the result (measured),
+so for a turn we are reading, the dispatcher routes it into `turn_msg_queue` —
+which the next turn start drains unread. Waiting for it left every rename made
+after a real turn pending forever; the unit tests delivered it a step later
+and passed, and only the end-to-end run against the real CLI caught it. So the
+result itself ends "running", in `run_turn` and in the exchange. An "idle"
+that does arrive through the async path (after a ghost turn) pokes the worker
+when a command is waiting, as `_end_ghost_turn` does. A connect in between is
+harmless: the new CLI already starts with the name.
+
+**A turn that got there first is handed over, not swallowed.** Anything that
+is not a SystemMessage, the `<synthetic>` reply or the result is the model: the
+exchange releases the stream and passes that message — and whatever is already
+queued behind it, collected synchronously before the dispatcher starts routing
+the rest to the ghost path itself — to `_handle_async_message`. A dead
+dispatcher during the exchange queues the transport-death reconnect itself,
+because with `turn_active` set the dispatcher left recovery to "the turn in
+progress". `/clear` drops a waiting command: it named the session being wiped.
+
+Tests: `tests/test_session_name.py`; mutation targets `sessionname`,
+`sessionname-cmd`, `sessionname-server`, `sessionname-disk`.
+
 ### Background work that died with the session
 
 Recovering the turn is only half of it. If the session was running background
@@ -1425,7 +1492,8 @@ override — which matters because the CLI that unblocks a new model is
 typically `latest` rather than `stable`, and this project has been bitten by
 CLI-side behaviour repeatedly (the cache-TTL 400s, the committed-memory leak,
 `absorbed_mid_turn`). One session can run the new binary while everything else
-stays on the bundled one.
+stays on the bundled one. (Until 2026-09-22 `--cli-path` on a launch that
+*joined* a running hub was dropped — see §4, *Central-hub reuse*.)
 
 **A missing binary falls back to bundled rather than failing.** A typo in a
 path must not leave a session unable to connect at all; running the model an
@@ -2404,6 +2472,54 @@ Two smaller rules fall out of the same interop:
   process's in-memory title, so its next compaction stamp agrees with us. We pin
   anyway: that process gets replaced on resume and loses the memory.
 
+### A title is not the name other sessions address it by
+
+Reported 2026-09-22 from a SlateOS lane: `/rename Lane A`, then the model
+checked and "the session is still named os-f5". SlateOS's `which-lane.py`
+reads the lane from the first line of `ListAgents`, which is the session's
+**addressable name** — what `SendMessage` targets — and that belongs to the
+running **CLI**, not to the transcript. Measured against CLI 2.1.280:
+
+| What was done | `ListAgents` said |
+|---|---|
+| nothing | an auto name (`nameprobe-qqmoa2tw-ab`) |
+| `CLAUDE_CODE_SESSION_NAME=Lane Test` at startup | `Lane Test` |
+| our `custom-title` record, then resume | an auto name |
+| an `agent-name` record (what the CLI's own `/rename` writes), then resume | an auto name |
+| the CLI's own `/rename Lane Live`, sent live | `Lane Live`, immediately — also as a brand-new CLI's first input |
+
+So the name exists only at runtime and nothing on disk restores it. Two halves
+follow:
+
+* **Every connect passes it** (`_make_options` → `CLAUDE_CODE_SESSION_NAME`),
+  from `SDKBridge._addressable_name`: the session's explicit name
+  (`state.agent_name`, from `--agent-name` — §9a) if it has one, else a
+  `/rename` made before the session existed (`pending_rename`), else
+  `state.human_title`. `connect()` loads
+  `human_title` from disk with `session.read_human_title` — the custom title
+  with the rename pin applied, **never the AI title** (the CLI itself withholds
+  names not chosen by a human from this role). It re-reads only when the
+  session the connect lands on (`_resume_target`, the same rule `_make_options`
+  resumes by) differs from `state.human_title_sid`, so `/model` reconnects
+  don't rescan the transcript, `/clear` comes up unnamed, and one session's
+  name never carries over to another.
+* **`/rename` is handed to the live CLI** (`request_cli_command`), as a short
+  exchange rather than a turn — see §6, *CLI-native commands*.
+
+**An explicit name outranks the title**, so a session launched with
+`--agent-name Lane-D` answers to `Lane-D` in both registries whatever its tab
+is called, and `/rename` there changes only the title: handing the CLI that
+`/rename` would take it off its agent name until the next reconnect put it
+back. This was briefly the other way round, while `--agent-name` still
+belonged to the hub and every session would have shared one address; it is
+per session now (§9a).
+
+`_make_options` also pops an **inherited** `CLAUDE_CODE_SESSION_NAME` from
+`os.environ`: the SDK starts the CLI with the hub's whole environment
+underneath `options.env`, which can add a variable but not remove one, and a
+hub launched from a named session's Bash tool would otherwise name every
+unnamed session after it.
+
 ---
 
 ## 8b. Session-file integrity (`session.py`)
@@ -2630,6 +2746,59 @@ writers from different accounts are a hard requirement.
 topology — by account when two agents share one, by cwd when two share a
 directory, by pid when a session restarts — so it is a name, like a hostname,
 set with `--agent-name` / `ORCH2_AGENT_NAME` and stable across restarts.
+
+**A name belongs to one session, not to the hub.** It used to be the hub's:
+`Config.agent_name` was parsed once, for the hub process, `_create_runtime`
+built every session from `dataclasses.replace(config, …)`, and
+`register_agent` also read `ORCH2_AGENT_NAME` from the hub's environment — so
+every session a named hub opened registered as that one identity (one inbox,
+one halt state), while a launch that *joined* a running hub never handed its
+name over at all. Now:
+
+* `parse_args` resolves `--agent-name`, else `ORCH2_AGENT_NAME`, for the
+  launch that was given it, and **consumes** the variable
+  (`_launch_agent_name`): left in the environment, every CLI the hub starts
+  would inherit it — `tools/agents.py` in every session defaulting to that
+  inbox, and a test hub an agent starts claiming the identity.
+* `_create_runtime` sets `agent_name` on every runtime it builds, from its own
+  argument — never the hub's. `_hub_launch_kwargs` hands it over, and
+  `/api/session/launch` passes it on; a launch that lands on a session already
+  open calls `SDKBridge.adopt_agent_name`, which re-registers the identity,
+  records the name and hands the running CLI its own `/rename` — live, with no
+  reconnect to end its background tasks, though that command also sets the
+  session's title. The in-place restart passes the primary session's current
+  name, and `--detach` the resolved one, since neither child sees the consumed
+  variable.
+* It lives in `state.agent_name`, and it is the session's name in **both**
+  registries: `register_agent`'s explicit identity and the name `ListAgents`
+  shows (§8a). A name the registry refuses — `"Lane A"`, with its space — is
+  said so in the transcript rather than only logged, and still names the
+  session in `ListAgents`, which allows it.
+* **It is remembered by session id** in a `session_names` table, separate
+  from `agents` because that row is deleted on clean exit (§4.2).
+  `_remember_agent_name` records it from the ticker once the session id is
+  known (and again after `/clear` changes it); `connect()` looks it up for an
+  unnamed session it is about to resume, once per session. So a session opened
+  with `--agent-name` is still that agent when it comes back from the lobby or
+  after a hub restart, with no flag. A session `/move`d elsewhere is a new
+  session and is not named: the original is still running under the name.
+* **`--agent-label` works the same way** — it had the same fault: a hub
+  started with `--agent-label lane=b` put `lane=b` on every session it opened.
+  Labels live in `state.agent_labels` (published by `_agent_labels`), are set
+  per runtime by `_create_runtime`, handed over by `_hub_launch_kwargs`,
+  replaced live on a session that is already open (`adopt_agent_labels`, which
+  re-writes the registry entry under the same identity), re-applied by the
+  restart, and remembered in the same `session_names` row (a `labels` column,
+  added to older stores by `connect()`'s migration). What a launch does give
+  beats the record; what it does not is restored — name and labels
+  independently.
+
+Tests never touch the machine's registry: `tests/conftest.py` points
+`ORCH2_AGENT_DB` at a temp file for every test. Before it, a test that only
+meant to exercise a connect reached the real store — which is how that store
+got a `session_names` table on the day the table was written, and very
+probably how it got the two `orchestrator2` identities that one process
+registered seven seconds apart on 2026-09-06 and never heartbeated.
 `resolve_identity()` implements the spec's table, and the row that matters is
 the refusal: a fresh session in a directory with several registered identities
 **refuses and lists them** rather than guessing. Adopting the wrong one

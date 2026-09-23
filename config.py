@@ -571,6 +571,21 @@ def config_to_dict(config: Config) -> dict:
 # Argument parser
 # ---------------------------------------------------------------------------
 
+def _launch_agent_name(flag: str | None) -> str | None:
+    """``--agent-name``, else ``ORCH2_AGENT_NAME`` -- read once, by this launch.
+
+    The variable is **consumed**, not just read.  Left in the environment it
+    would be inherited by every CLI this process starts, and so by every
+    session's own processes: ``tools/agents.py`` there defaults to it as the
+    caller's identity (another session's inbox), and a hub an agent starts for
+    a test would parse it as *its* name and take over the registration.  That
+    is the hub-wide naming ``--agent-name`` used to have, through the back
+    door.  A blank value means "not given", as it does for the flag.
+    """
+    env = os.environ.pop("ORCH2_AGENT_NAME", None)
+    return (flag or "").strip() or (env or "").strip() or None
+
+
 def _parse_labels(pairs: list[str] | None) -> dict[str, str]:
     """``["lane=b", "role=x"]`` -> ``{"lane": "b", "role": "x"}``.
 
@@ -1007,11 +1022,13 @@ def parse_args(argv: list[str] | None = None) -> Config:
         default=None,
         metavar="KEY=VALUE",
         help=(
-            "Attach a label to this session's entry in the cross-account "
-            "agent registry; repeatable. Shown by `tools/agents.py list`, so "
-            "a peer can tell which session is which without messaging it to "
-            "find out. The registry never interprets these -- e.g. "
-            "--agent-label lane=b --agent-label role=reviewer."
+            "Attach a label to the registry entry of the session this launch "
+            "opens; repeatable. Shown by `tools/agents.py list`, so a peer can "
+            "tell which session is which without messaging it to find out. The "
+            "registry never interprets these -- e.g. --agent-label lane=b "
+            "--agent-label role=reviewer.  Per session, like --agent-name: "
+            "never passed on to the other sessions a hub opens, handed to a hub "
+            "that is already running, and remembered with the session."
         ),
     )
     ap.add_argument(
@@ -1029,15 +1046,20 @@ def parse_args(argv: list[str] | None = None) -> Config:
         default=None,
         metavar="NAME",
         help=(
-            "This session's identity in the cross-account agent registry, so "
-            "other Claude sessions on this machine can address it (see "
-            "specs/agent-comms-spec.md).  Assigned, not derived: stable across "
-            "restarts.  When omitted it is inherited on resume, adopted if "
-            "exactly one non-live identity is registered for this directory, "
-            "or created; if several are registered the session REFUSES to "
-            "guess and lists them, because adopting the wrong one silently "
-            "inherits another agent's messages and halt state.  Falls back to "
-            "the ORCH2_AGENT_NAME environment variable."
+            "The name of the session this launch opens: its identity in the "
+            "cross-account agent registry (see specs/agent-comms-spec.md) and "
+            "the name other Claude sessions see in ListAgents / SendMessage.  "
+            "Per session -- it names only the session this launch opens, "
+            "including one opened in a hub that is already running, never the "
+            "other sessions a hub opens -- and remembered with that session, "
+            "so it keeps the name when reopened.  Without it the registry "
+            "identity is inherited on resume, adopted if exactly one non-live "
+            "identity is registered for this directory, or created; if several "
+            "are registered the session REFUSES to guess and lists them, "
+            "because adopting the wrong one silently inherits another agent's "
+            "messages and halt state.  Falls back to the ORCH2_AGENT_NAME "
+            "environment variable, which this launch then removes so the "
+            "sessions it starts do not inherit it."
         ),
     )
     ap.add_argument(
@@ -1168,11 +1190,14 @@ def parse_args(argv: list[str] | None = None) -> Config:
         external_password=args.external_password,
         external_access=args.external_access,
         resume_interrupted_turn=args.resume_interrupted_turn,
-        agent_name=args.agent_name,
+        agent_name=_launch_agent_name(args.agent_name),
         session_note=args.session_note,
         agent_labels=_parse_labels(args.agent_label),
         config_dir=args.config_dir,
-        cli_path=args.cli_path,
+        # Absolute now, against the directory it was typed in: a launch that
+        # joins a running hub hands it over, and the hub would otherwise read
+        # a relative path against its own directory.
+        cli_path=os.path.abspath(args.cli_path) if args.cli_path else None,
         skip_auto_login=args.skip_auto_login,
         wait_port=args.wait_port,
     )
