@@ -6,7 +6,7 @@ A web-based orchestrator for the Claude Agent SDK. Wraps Claude Code's agentic c
 
 **1. Prerequisites**
 
-- **Python 3.11+**
+- **Python 3.11+, installed on an SSD.** orchestrator2 launches much more quickly when Python is on an SSD, and is intolerably slow when Python is on a spinning hard disk: startup imports thousands of small library files, and from an HDD every one of them pays a seek. Measured with the same Python 3.14 on both drives, `import server` took about 12 s cold (3 s warm) from a 7200 rpm HDD and 0.8 s from an NVMe SSD. What counts is where the interpreter *and its site-packages* live, not where orchestrator2 or your project is. The Agent SDK's bundled ~220 MB `claude.exe` sits in site-packages too, and is read every time a session starts. If you have Python on both kinds of drive, launch orchestrator2 with the one on the SSD. (Details: `known-issues.md`, "Launching was slow because the interpreter lived on a hard disk".)
 - **Claude Code CLI** — install it from <https://claude.com/claude-code> (the `claude` command must be on your `PATH`). orchestrator2 drives the same CLI the Claude Code app uses, and shares its session store and login.
 
 **2. Install dependencies**
