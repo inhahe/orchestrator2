@@ -125,6 +125,7 @@ from session import (
     _classify_user_text,
     _bg_task_label,
     bg_task_items,
+    describe_resumable_sessions,
     check_session_integrity,
     describe_lost_bg_tasks,
     load_persisted_bg_tasks,
@@ -678,6 +679,24 @@ def _build_graphify_prompt(args: str) -> str:
     )
 
 
+#: The CLI's own words when ``--resume`` names nothing it can find.  Matched
+#: rather than pre-validated: the CLI is the authority on what resolves -- it
+#: accepts titles as well as ids -- and reimplementing its rules here would
+#: eventually disagree with them.  If the wording ever changes this simply stops
+#: matching and the failure is retried like any other; since a retry now keeps
+#: the requested id, that costs time but can never open the wrong session.
+_UNKNOWN_SESSION_MARKERS = (
+    "does not match any session title",
+    "requires a valid session id or session title",
+)
+
+
+def _is_unknown_session_error(text: str) -> bool:
+    """True when a connect failed because the resume target does not exist."""
+    t = (text or "").lower()
+    return any(m in t for m in _UNKNOWN_SESSION_MARKERS)
+
+
 # A fork has to load the whole transcript before it can say anything, so it
 # gets the same generous budget a main connect does rather than a snappy one.
 BTW_CONNECT_TIMEOUT = 180.0
@@ -1009,10 +1028,40 @@ class SDKBridge:
             # No session to resume — start fresh.  Explicitly disable the
             # SDK's global continue so it doesn't pick a random session.
             kwargs["continue_conversation"] = False
+            # And forget any resume a *previous* connect expected.  Left set,
+            # the first init of this deliberately-new session is compared
+            # against it and reported as "Expected to resume X but SDK started
+            # Y — prior context may not be loaded": a false alarm after every
+            # /clear, which is exactly the one time a new session is the point.
+            self.state.expected_resume_sid = None
 
         # A resumed session can start streaming with no prompt from us; arm
         # the notice that explains that to whoever opens it.
         self._unprompted_resume_pending = bool(kwargs.get("resume"))
+
+        # A Claude Code binary other than the one the SDK bundles.
+        #
+        # The SDK pins a CLI version, and the CLI refuses models newer than
+        # itself: "Claude Code 2.1.259 does not support this model; version
+        # 2.1.280 or newer is required" (reported 2026-09-22, the day Opus 5.5
+        # shipped).  Upgrading the SDK is not always the answer -- the newest
+        # SDK at the time bundled 2.1.277, still short -- so the way out is to
+        # point at a CLI we installed ourselves.
+        #
+        # **A missing binary falls back to the bundled one rather than
+        # failing.**  The alternative is a session that cannot connect at all
+        # because of a typo in a path, which is a far worse outcome than
+        # running the model a slightly older CLI supports.
+        cli_path = getattr(self.config, "cli_path", None)
+        if cli_path:
+            if os.path.exists(cli_path):
+                kwargs["cli_path"] = cli_path
+                log.info("using CLI %s (not the SDK's bundled one)", cli_path)
+            else:
+                log.warning(
+                    "--cli-path %s does not exist — falling back to the "
+                    "bundled CLI; models newer than it will be refused",
+                    cli_path)
 
         # Effort override.
         if self.state.effort:
@@ -1115,7 +1164,14 @@ class SDKBridge:
             getattr(options, 'resume', None),
             getattr(options, 'cwd', None),
         )
-        self._initial_resume_id = None  # one-time use
+        # NOT consumed here.  It used to be cleared right after building the
+        # options ("one-time use"), which meant a first connect that *failed*
+        # had already spent the resume -- and the retry loop, which calls a
+        # bare ``connect()``, then built options with no resume at all and,
+        # because an explicit resume implies ``no_continue``, started a
+        # brand-new empty session.  Every lobby-opened session was one failed
+        # first attempt away from being silently swapped for a blank one.
+        # Consumed at the bottom of this method, once the connect succeeds.
 
         # A working directory that doesn't exist is not something a retry can
         # cure, and the SDK reports it uselessly: ``anyio.open_process`` raises
@@ -1337,6 +1393,11 @@ class SDKBridge:
         # no idea that the work is gone -- the process that knew died with it.
         # Read that off disk and put it in front of the model before it acts.
         await self._report_lost_bg_tasks(resume_sid)
+
+        # The connect worked, so the requested resume has been honoured and is
+        # spent.  Later reconnects resume ``state.session_id`` explicitly (see
+        # reconnect()), so nothing needs it after this.
+        self._initial_resume_id = None
 
     async def _report_session_integrity(self) -> None:
         """Warn if the session we just resumed can't reach its own history."""
@@ -4851,6 +4912,14 @@ class SDKBridge:
                 # while prompts are queued" case below, which would otherwise
                 # spin forever on a directory that is never going to appear.
                 _fatal = isinstance(exc, UnusableCwd)
+                # A session that does not exist will not start existing on the
+                # tenth attempt.  Reported 2026-09-22 after `--resume "OS A"`:
+                # the retries used to drop the resume and quietly open a blank
+                # session instead, whose id stayed "OS A" until its first turn,
+                # so `/rename` reported "session OS A not found on disk".
+                _unknown_session = _is_unknown_session_error(_why)
+                if _unknown_session:
+                    _fatal = True
 
                 if _fatal or _connect_attempt >= _MAX_CONNECT_ATTEMPTS:
                     # If the user queued prompt(s) while we were retrying,
@@ -4885,7 +4954,33 @@ class SDKBridge:
                     state.connecting = False
                     state.connect_started_at = None
                     await self._broadcast_status()
-                    if _fatal:
+                    if _unknown_session:
+                        # Name what *can* be resumed.  "Not found" on its own
+                        # leaves the user guessing at titles they cannot see --
+                        # the reported sessions were 'E OSb' and 'E OSc', and
+                        # nothing said so.
+                        requested = (self._initial_resume_id
+                                     or state.expected_resume_sid or "?")
+                        try:
+                            listing = await asyncio.to_thread(
+                                describe_resumable_sessions, config.cwd,
+                                getattr(config, "config_dir", None))
+                        except Exception:
+                            listing = ""
+                        _msg = (
+                            f"There is no session called '{requested}' here — "
+                            f"it is neither a session id nor any session's "
+                            f"title. {listing} Open one of those from the "
+                            f"session list, or start a new session."
+                        )
+                        # Nothing was resumed, so nothing may go on claiming it
+                        # was: history, /rename and the persisted queue all key
+                        # on this id, and "OS A" is not a session.
+                        if state.session_id == requested:
+                            state.session_id = None
+                        state.expected_resume_sid = None
+                        self._initial_resume_id = None
+                    elif _fatal:
                         # No attempt count — it wasn't tried repeatedly — and no
                         # "send a message to retry", which would be a lie.
                         _msg = (

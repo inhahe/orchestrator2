@@ -1382,13 +1382,87 @@ remembers the work, so all of them tell it.
 Tests: `tests/test_lost_bg_tasks.py`; mutation targets `lostbg`,
 `lostbg-session`.
 
+## 6y. A resume that cannot happen
+
+A requested resume id (`SDKBridge._initial_resume_id`, seeded by
+`_create_runtime`) is consumed **only when a connect succeeds**. It used to be
+cleared as soon as the options were built, which meant the first-connect retry
+loop — a bare `connect()` — rebuilt options with no resume and, because an
+explicit resume implies `no_continue`, opened a brand-new empty session. Every
+lobby-opened session was one failed first attempt away from being silently
+swapped for a blank one. `reconnect()` was never affected: it passes
+`resume_id=sid` explicitly.
+
+A resume target that does not exist is a **settled** failure, classified from
+the CLI's own wording (`_is_unknown_session_error`) and handled like
+`UnusableCwd`: one attempt, no retry loop, and a message listing what *can* be
+resumed here (`session.describe_resumable_sessions` — newest first, capped,
+scoped to the session's own account). The bogus id is cleared from
+`state.session_id` so nothing keys on a session that does not exist.
+
+`_make_options`' fresh-session branch also clears `state.expected_resume_sid`,
+so a deliberately new session (`/clear`) is not reported as a failed resume.
+
+## 6z. Which Claude Code binary runs
+
+The Agent SDK **pins a CLI version and ships that binary in the wheel**, and
+the CLI refuses models newer than itself:
+
+```
+Claude Code 2.1.259 does not support this model;
+version 2.1.280 or newer is required.
+```
+
+Upgrading the SDK is the obvious response and is not reliably the answer. On
+2026-09-22, when Opus 5.5 shipped, the newest SDK (0.2.157) pinned
+`__cli_version__ = "2.1.277"` — still short. The `latest` release channel had
+2.1.280 the same day; `stable` was on 2.1.267.
+
+`ClaudeAgentOptions.cli_path` overrides the bundled binary and always has;
+orchestrator2 simply never set it. `--cli-path PATH` now does, and
+`_create_runtime(cli_path=...)` / the launch API accept a **per-session**
+override — which matters because the CLI that unblocks a new model is
+typically `latest` rather than `stable`, and this project has been bitten by
+CLI-side behaviour repeatedly (the cache-TTL 400s, the committed-memory leak,
+`absorbed_mid_turn`). One session can run the new binary while everything else
+stays on the bundled one.
+
+**A missing binary falls back to bundled rather than failing.** A typo in a
+path must not leave a session unable to connect at all; running the model an
+older CLI supports is a much better outcome. It logs a warning, because
+silently ignoring it presents as "my new model is *still* refused" with
+nothing to explain why.
+
+Installing a CLI by hand: the release channel is
+`https://downloads.claude.ai/claude-code-releases`, with `/latest` and
+`/stable` returning a bare version, `/<version>/manifest.json` carrying a
+SHA-256 per platform, and `/<version>/win32-x64/claude.exe` the binary.
+**Check the manifest checksum** — `claude.exe` is ~226 MiB and a truncated
+download runs far enough to be confusing.
+
 ## 6a. The model list
 
-`/model` runs on the event loop, so it can only ever read a cache — it must
-never block on a network call. `config.py` holds that cache
-(`_model_cache`, `_model_cache_at`), filled from Anthropic `/v1/models` using
-`ANTHROPIC_API_KEY` when set, otherwise the Claude Code OAuth token from
-`<config-dir>/.credentials.json`.
+`/model` must never **block** the event loop — which is not the same as never
+fetching, though it was implemented as though it were until 2026-09-22.
+`config.py` holds the cache (`_model_cache`, `_model_cache_at`), filled from
+Anthropic `/v1/models` using `ANTHROPIC_API_KEY` when set, otherwise the Claude
+Code OAuth token from `<config-dir>/.credentials.json`.
+
+**`/model` with no argument refreshes before it answers.** The question it
+asks is "what can I switch to?", so answering from an hour-old cache is
+answering the wrong question: reported when Opus 5.5 had been out for forty
+minutes and the picker still listed eleven models with no hint it was behind.
+`server._refresh_models_for_show()` runs the fetch in a thread — the same way
+`_model_cache_loop` already does — and is **awaited**, so the list rendered a
+line later is the refreshed one. It costs at most `MODEL_SHOW_FETCH_BUDGET`
+(4 s); past that, or on any error, the previous list is shown and labelled as
+such.
+
+Concurrent shows **coalesce** rather than merely serialise: the lock is held
+across a freshness check (`MODEL_SHOW_COALESCE_S`, 2 s), so three tabs running
+`/model` at once make one request. A lock alone would have made three
+sequential requests, which is barely an improvement — caught by a test that
+counted fetches rather than trusting the lock.
 
 `server.py::_model_cache_loop()` keeps it warm: retry with exponential backoff
 (30 s → 10 min) while fetching fails, then re-fetch every `MODEL_CACHE_TTL`
@@ -1397,11 +1471,21 @@ pinned the process to the stale hardcoded `KNOWN_MODELS` for its whole
 lifetime; without the TTL, a hub left up for days never saw a newly released
 model.
 
-`KNOWN_MODELS` is the offline fallback. When it's what's being served,
-`/model` sets `live: false` and the UI says so — a *silent* fallback is
-indistinguishable from "that model doesn't exist". Note that `/model <id>`
-never validates the id against the list, so any model can be selected by name
-regardless.
+**Three provenances, not two** (`config.model_list_source()`): `live` (fetched
+within `MODEL_LIST_FRESH_S`, 60 s), `cache` (a real list from the API, old
+enough that a release since would be missing), `builtin` (`KNOWN_MODELS`; the
+API has never answered this process). `live` used to mean merely "the cache has
+not aged out" — a much weaker claim, and **True in exactly the case that
+misled**, which is why the picker stayed silent while showing a 41-minute-old
+list.
+
+The two failures get different warnings, because "showing the built-in list" is
+alarming and correct for one and simply wrong for the other — saying it anyway
+teaches the reader to ignore the banner. A silent fallback is worse than
+either: it is indistinguishable from "that model doesn't exist".
+
+Note that `/model <id>` never validates the id against the list, so any model
+can be selected by name regardless of what the picker shows.
 
 Caveat: the cache is process-global, but credentials are per config dir.
 `main()` pins `CLAUDE_CONFIG_DIR` for the process, so the list reflects the

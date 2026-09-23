@@ -97,7 +97,9 @@ SLASH_COMMANDS = [
 # cache is refreshed periodically (see _model_cache / MODEL_CACHE_TTL) so a
 # transient fetch failure no longer pins the process to this list.
 KNOWN_MODELS = [
-    ("claude-opus-5", "Opus 5 — 1M context, max capability"),
+    ("claude-opus-5-5", "Opus 5.5 — 1M context, max capability"),
+    ("claude-fable-5-1", "Fable 5.1 — 200k context"),
+    ("claude-opus-5", "Opus 5 — 1M context"),
     ("claude-sonnet-5", "Sonnet 5 — 200k context"),
     ("claude-fable-5", "Fable 5 — 200k context"),
     ("claude-opus-4-8", "Opus 4.8 — 1M context"),
@@ -331,6 +333,37 @@ def model_cache_is_stale() -> bool:
     return (time.monotonic() - _model_cache_at) > MODEL_CACHE_TTL
 
 
+#: How recently the list must have been fetched to count as *live*.
+#: Deliberately much shorter than MODEL_CACHE_TTL: "the cache has not aged
+#: out" and "this is what the API says right now" are different claims, and
+#: conflating them is how a 41-minute-old list hid a model released in the
+#: meantime while the picker cheerfully reported itself live.
+MODEL_LIST_FRESH_S = 60.0
+
+
+def model_cache_age() -> float | None:
+    """Seconds since the live list was last fetched, or None if never."""
+    if _model_cache is None:
+        return None
+    return max(0.0, time.monotonic() - _model_cache_at)
+
+
+def model_list_source() -> str:
+    """Where the list `get_known_models` would return actually comes from.
+
+    ``"live"``    - fetched within MODEL_LIST_FRESH_S, so it is what the API
+                    says now;
+    ``"cache"``   - a real list from the API, but old enough that something
+                    released since would be missing;
+    ``"builtin"`` - the hardcoded KNOWN_MODELS fallback; the API has never
+                    answered this process.
+    """
+    age = model_cache_age()
+    if age is None:
+        return "builtin"
+    return "live" if age <= MODEL_LIST_FRESH_S else "cache"
+
+
 def get_known_models() -> list[tuple[str, str]]:
     """Best available model list for display — non-blocking, event-loop safe.
 
@@ -519,6 +552,7 @@ class Config:
     # Free-form labels for the agent registry (see --agent-label).
     agent_labels: dict[str, str] = field(default_factory=dict)
     config_dir: str | None = None      # CLAUDE_CONFIG_DIR override
+    cli_path: str | None = None        # claude.exe to run instead of the bundled one
     skip_auto_login: bool = False      # internal: child skips the login check
     wait_port: bool = False            # internal: retry binding --port while an old instance releases it (restart)
 
@@ -863,6 +897,20 @@ def parse_args(argv: list[str] | None = None) -> Config:
         ),
     )
 
+    # -- Claude Code CLI --
+    ap.add_argument(
+        "--cli-path",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Run this Claude Code binary instead of the one bundled with the "
+            "Agent SDK. The SDK pins a CLI version, so a model released after "
+            "that pin is rejected with 'does not support this model; version "
+            "X or newer is required' until the SDK catches up -- this is the "
+            "way out. Unset (the default) uses the bundled CLI."
+        ),
+    )
+
     # -- Config directory --
     ap.add_argument(
         "--config-dir",
@@ -1124,6 +1172,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         session_note=args.session_note,
         agent_labels=_parse_labels(args.agent_label),
         config_dir=args.config_dir,
+        cli_path=args.cli_path,
         skip_auto_login=args.skip_auto_login,
         wait_port=args.wait_port,
     )

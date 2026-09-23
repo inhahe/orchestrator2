@@ -783,6 +783,57 @@ def title_from_jsonl(jsonl: Path) -> str | None:
     return _resolve_title(jsonl)
 
 
+def resumable_sessions(cwd: str, config_dir: str | None = None, *,
+                       limit: int = 6) -> list[tuple[str, str | None]]:
+    """``(session_id, title)`` for the sessions in *cwd*, newest first.
+
+    What a failed ``--resume`` should offer instead of a bare "not found": the
+    reported case was ``--resume "OS A"`` in a directory whose sessions were
+    titled ``E OSb`` and ``E OSc``, and nothing told the user what the names
+    actually were.
+
+    Scoped to *config_dir*'s account, because a cross-account session lives
+    under that account's projects tree rather than the hub's.  Capped at
+    *limit*: this runs on a failure path, and a directory can hold hundreds of
+    sessions whose titles nobody needs to see all of.
+    """
+    try:
+        resolved = str(Path(cwd).resolve(strict=False))
+    except OSError:
+        resolved = cwd
+    project = claude_projects_dir(config_dir) / _sanitize_cwd(resolved)
+    if not project.exists():
+        return []
+    found: list[tuple[Path, float]] = []
+    for jsonl in project.glob("*.jsonl"):
+        try:
+            found.append((jsonl, jsonl.stat().st_mtime))
+        except OSError:
+            continue
+    found.sort(key=lambda x: x[1], reverse=True)
+    out: list[tuple[str, str | None]] = []
+    for jsonl, _mtime in found[:limit]:
+        try:
+            title = title_from_jsonl(jsonl)
+        except Exception:
+            title = None
+        out.append((jsonl.stem, title))
+    return out
+
+
+def describe_resumable_sessions(cwd: str, config_dir: str | None = None) -> str:
+    """One line naming what *can* be resumed here, for an error message."""
+    sessions = resumable_sessions(cwd, config_dir)
+    if not sessions:
+        return "There are no sessions in this directory to resume."
+    named = [f"'{t}' ({sid[:8]})" for sid, t in sessions if t]
+    untitled = sum(1 for _sid, t in sessions if not t)
+    parts = named[:]
+    if untitled:
+        parts.append(f"{untitled} untitled")
+    return "Sessions here: " + ", ".join(parts) + "."
+
+
 def read_session_title(session_id: str, config_dir: str | None = None) -> str | None:
     """Look up a session's display title from JSONL (custom-title or ai-title).
 

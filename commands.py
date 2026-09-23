@@ -19,7 +19,8 @@ from config import (
     SLASH_COMMANDS,
     Config,
     get_known_models,
-    model_cache_is_stale,
+    model_cache_age,
+    model_list_source,
     parse_bell_events,
 )
 from state import (
@@ -1060,9 +1061,20 @@ def _cmd_model_show(_payload: str, state: State, _config: Config) -> CommandResu
     else:
         current = "(auto — no AssistantMessage received yet)"
     models = [{"id": m, "description": d} for m, d in get_known_models()]
-    # Flag a fallback list explicitly.  Silently showing the hardcoded list as
-    # if it were live is how "a model I know exists is missing from /model"
-    # goes unnoticed — any model id still works when typed directly.
+    # **Say where this list came from.**  Showing a stale list as if it were
+    # live is how "a model I know exists is missing from /model" goes
+    # unnoticed — reported 2026-09-22, when Opus 5.5 had been out for forty
+    # minutes and the picker showed an hour-old list with no hint of it.
+    #
+    # ``live`` used to mean "the cache has not aged out", which is a much
+    # weaker claim than "this is what the API says now" and was True in
+    # exactly the case that misled.  It now means the latter; ``source``
+    # distinguishes a real-but-old list from the hardcoded fallback, because
+    # those two deserve different warnings.  Any model id still works when
+    # typed directly, whatever this list says.
+    source = model_list_source()
+    age = model_cache_age()
     data = {"current": current, "models": models,
-            "live": not model_cache_is_stale()}
+            "live": source == "live", "source": source,
+            "age_s": None if age is None else int(age)}
     return CommandResult(messages=[_data_msg(data, label="model")])

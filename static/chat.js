@@ -1193,11 +1193,25 @@ const Chat = (() => {
     // fallback list and may be missing recently-released models.  Say so —
     // otherwise a missing model just looks like it doesn't exist.  Any id
     // still works when typed directly (`/model <id>`).
-    if (data.live === false) {
+    // Two different failures deserve two different warnings. "Showing the
+    // built-in list" is alarming and correct when the API has never answered;
+    // it is simply wrong when we have a real list from four minutes ago, and
+    // saying it anyway would train the reader to ignore the banner.
+    if (data.source === 'builtin') {
       html += `<div class="model-picker-stale">`
             + `couldn\u2019t reach the model API \u2014 showing the built-in list, `
             + `which may be out of date. Any model id still works if you type it: `
             + `<code>/model &lt;id&gt;</code>`
+            + `</div>`;
+    } else if (data.source === 'cache') {
+      const mins = Math.round((data.age_s || 0) / 60);
+      const ago = mins < 1 ? 'less than a minute ago'
+                : mins === 1 ? 'a minute ago'
+                : mins + ' minutes ago';
+      html += `<div class="model-picker-stale">`
+            + `couldn\u2019t refresh just now \u2014 this list was fetched ${_esc(ago)}, `
+            + `so anything released since is missing. Any model id still works `
+            + `if you type it: <code>/model &lt;id&gt;</code>`
             + `</div>`;
     }
     html += `</div>`;

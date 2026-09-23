@@ -67,6 +67,219 @@ their outputs stay on disk under `%TEMP%\claude\<project>\<session-uuid>\tasks\`
 This is why `_maybe_recycle_cli()` refuses while `state.background_tasks` is
 non-empty — including for a forced `/recycle now`.
 
+## A failed resume silently became a blank session — FIXED (2026-09-22)
+
+> "i did --resume with a nonexistent session name, and now it won't let me
+> /rename the session"
+
+```
+SDK connection failed (attempt 1/10: ... Provided value "OS A" is not a UUID
+and does not match any session title. (exit code: 1)), retrying in 2s…
+Rename failed: session OS A not found on disk
+SDK connected.
+Rename failed: session OS A not found on disk
+```
+
+"SDK connected" is the misleading line. What it connected *to*:
+
+```
+20:54:56  SDK connect failed (attempt 1): ... "OS A" ...
+20:54:58  connect: resume=None            <- the retry dropped the resume
+20:55:00  agent identity: os-2 (created)  <- and minted a new identity
+20:55:00  SDK connected after 1 retries
+```
+
+### The typo was the harmless trigger for a general hazard
+
+The requested resume id was "one-time use" — cleared the moment
+`_make_options` had built the options, so a first attempt that **failed** had
+already spent it. The retry loop calls a bare `connect()`; `_create_runtime`
+sets `no_continue = no_continue or bool(resume)`; so the retry took the
+fresh-session branch. `reconnect()` never had the problem because it passes
+`resume_id=sid` explicitly — only the first-connect retry relied on the
+one-time id.
+
+That applied to **every lobby-opened session**, not just typos: any whose
+first connect attempt failed for a transient reason was silently swapped for a
+blank one. Proven offline before writing a fix:
+
+```
+attempt 1 resume : 43ee6a50-real
+retry     resume : None | continue_conversation = False
+```
+
+The resume id is now consumed only once a connect succeeds.
+
+### A missing session is settled, not transient
+
+With the resume kept across retries, a typo would have been retried ten times
+over minutes of backoff — safe, but useless. The CLI's own wording for a
+nonexistent target (`does not match any session title` / `requires a valid
+session ID or session title`) is now classified like `UnusableCwd`: one
+attempt, then a message that names what was asked for **and what exists**:
+
+> There is no session called 'OS A' here — it is neither a session id nor any
+> session's title. Sessions here: 'E OSc' (1aa74fb0). Open one of those from
+> the session list, or start a new session.
+
+Matched on the CLI's words rather than pre-validated: the CLI accepts titles as
+well as ids, and reimplementing its resolution would eventually disagree with
+it. If the wording changes, the match fails safe — back to retrying, which now
+keeps the right id.
+
+The bogus id is also cleared from `state.session_id`. That was the reported
+symptom: nothing was resumed, but history, `/rename` and the persisted queue
+all went on keying on "OS A" until the blank session's first turn.
+
+### And a false alarm on `/clear`
+
+`/clear` starts a new session on purpose, but `_make_options`' fresh branch
+never reset `state.expected_resume_sid`. Its first turn therefore reported
+*"Expected to resume X but SDK started Y — prior context may not be loaded"* —
+the only other occurrence of that warning in the whole log was exactly this, on
+the Lithic session on 2026-09-20.
+
+**Verified:** `tests/test_resume_unknown_session.py` (18), driven through the
+real `worker_loop` with a fake client rather than asserted against source, and
+the `resumefail` (`sdk_bridge.py` × 8) and `resumelist` (`session.py` × 4)
+mutation targets, 12/12; neighbouring targets re-swept 21/21; full suite 1,157
+passed. One assertion in my first draft was wrong — `continue_conversation`
+is False on *every* resume (dataclass default; `resume` takes precedence), so
+it cannot distinguish a resume from a fresh session. `resume` is the whole
+question.
+
+## A new model was refused by the SDK's bundled CLI — FIXED (2026-09-22)
+
+> "Claude Code 2.1.259 does not support this model; version 2.1.280 or newer
+> is required." — "maybe we need to update the sdk?"
+
+Reasonable guess, and **not sufficient**. The Agent SDK pins a CLI version and
+ships that binary inside the wheel:
+
+| | version |
+|---|---|
+| Installed SDK 0.2.152 bundles | 2.1.259 |
+| **Newest SDK 0.2.157 bundles** | **2.1.277** ← still short |
+| Opus 5.5 requires | 2.1.280 |
+| Standalone `claude` on PATH | 2.1.232 (older still) |
+
+Read out of the 0.2.157 *sdist* (`__cli_version__ = "2.1.277"`) rather than by
+installing it — upgrading in place under a running hub is what left the
+`~laude_agent_sdk` directories the last time, and the answer turned out to be
+"upgrading would not have fixed it" anyway.
+
+2.1.280 did exist: the release channel serves `/latest` (2.1.280 that day) and
+`/stable` (2.1.267) as bare version strings, with a per-platform SHA-256 in
+`/<version>/manifest.json`.
+
+### The override was always there
+
+`ClaudeAgentOptions.cli_path` takes priority over the bundled binary.
+orchestrator2 had simply never set it — `grep cli_path sdk_bridge.py config.py`
+returned nothing. So the fix is `--cli-path`, plus the same override on
+`_create_runtime` and the launch API so a **single session** can run the newer
+CLI while the rest stay on the bundled one. That split matters: the binary that
+unblocks a new model is `latest`, not `stable`, and CLI-side behaviour has
+burned this project repeatedly.
+
+A path that does not exist falls back to the bundled CLI with a warning.
+Failing the session over a typo would be much worse than running the model an
+older CLI supports, and a *silent* fallback would present as "my new model is
+still refused" with nothing to explain it.
+
+### Verified both directions
+
+```
+cli 2.1.280 + opus-5-5 : ('ok', 'OK')
+bundled     + opus-5-5 : ('ok', 'API Error: 400 Claude Code 2.1.259 ...')
+```
+
+The second line is the control. Without it the first proves only that a session
+can start, not that the override is what made the model work. Note also that
+the refusal arrives as *response text*, not an exception — the SDK does not
+raise, which is why this presented as a chat message rather than a connect
+failure.
+
+Installed to `~/.claude-cli/2.1.280/claude.exe` (checksum-verified against the
+manifest), deliberately **not** over the existing `~/.local/bin/claude`, so the
+change is reversible by deleting one directory and unsetting one flag.
+
+**Verified:** `tests/test_cli_path.py` (10) and the `clipath` (`sdk_bridge.py`
+× 4) and `clipath-cfg` (`config.py` × 2) mutation targets, 6/6; full suite
+1,139 passed.
+
+**Still open:** the SDK itself is 0.2.152 and 0.2.157 is out. Worth taking, but
+it buys nothing for this problem and wants a quiet moment — it rewrites
+site-packages under a hub that has live sessions holding the old CLI open.
+
+## `/model` answered from an hour-old cache — FIXED (2026-09-22)
+
+> "/model currently doesn't show opus 5.5, so it must be using an old cached
+> /model. i want /model to always read the current list when possible."
+
+Correct diagnosis. `/model` never fetched — it rendered whatever
+`_model_cache_loop` had last cached, and that loop runs hourly. Opus 5.5 went
+live between 11:59 and 12:40; the hub's 11:59 refresh had cached eleven models,
+and a fetch at 12:40 returned twelve:
+
+```
+claude-opus-5-5   Claude Opus 5.5 — 1M context    ← listed first
+claude-fable-5-1  Claude Fable 5.1 — 200k context
+claude-opus-5     Claude Opus 5 — 1M context
+...
+```
+
+### "Must not block the loop" is not "must not fetch"
+
+The design note said *"`/model` runs on the event loop, so it can only ever
+read a cache — it must never block on a network call"*, and the second clause
+was treated as implying the first. It does not. `_model_cache_loop` had been
+doing `await asyncio.to_thread(fetch_available_models)` all along — the
+off-loop pattern was already there, just not wired to the command.
+
+`/model` with no argument now awaits a threaded refresh before rendering
+(`MODEL_SHOW_FETCH_BUDGET`, 4 s). On timeout or error the previous list is
+shown, labelled. The WS router already had precedent for this: `/mcp` sits a
+few lines above, handled in the async context "because it can't be a
+synchronous immediate command".
+
+### The picker's own staleness signal was the thing that hid it
+
+The UI has had a "couldn't reach the model API" banner for a while, shown when
+`live === false`. But `live` meant `not model_cache_is_stale()` — *the cache
+has not aged out in an hour* — which is a far weaker claim than *this is what
+the API says now*, and was **True in precisely the case that misled**. A
+41-minute-old list missing a released model reported itself live.
+
+There are now three provenances — `live` (fetched within 60 s), `cache` (real
+but old), `builtin` (the hardcoded fallback) — and the two failure states get
+different warnings. "Showing the built-in list" is alarming and true for one of
+them and simply wrong for the other; saying it anyway trains the reader to
+ignore the banner.
+
+`KNOWN_MODELS` itself was missing both `claude-opus-5-5` and
+`claude-fable-5-1`, so a hub that lost API auth would have silently dropped
+them from the picker. (That hub had 1,676 `HTTP 401 from /v1/models` lines
+across the preceding days, so this was not hypothetical.) Both added, newest
+first, and pinned by a test.
+
+**Verified:** `tests/test_model_list.py` (24, up from 6) and the `modellive`
+(`server.py` × 6) and `modelfresh` (`config.py` × 5) mutation targets, 11/11;
+full suite 1,129 passed. The router tests drive the real `_handle_ws_message`
+rather than grepping for the call — a source-level assertion survives the
+mutation that deletes it, which is how four wakeup-restore tests passed while
+the guard they checked had been replaced by `if False`.
+
+Two defects the tests caught in the first implementation: the lock **serialised
+but did not coalesce**, so three tabs running `/model` made three sequential
+requests rather than one (fixed with a freshness check *inside* the lock); and
+the hang test's own `asyncio.run` teardown joins executor threads, so a fixed
+`sleep` in the fake was paid at teardown and hid what was being measured — the
+fake now blocks on an event released once the measurement is taken. The second
+is worth remembering beyond the test: a hung fetch thread will delay loop
+shutdown, which matters little for a server that runs for days but would matter
+for anything short-lived.
+
 ## Autonomous loops were reaped between iterations — FIXED (2026-09-20)
 
 > "for two sessions i had going, OSc and OSa, they now say 'This tab's session

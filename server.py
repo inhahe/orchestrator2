@@ -80,6 +80,7 @@ from config import (
     MODEL_CACHE_TTL,
     _PICKER_SENTINEL,
     fetch_available_models,
+    model_cache_age,
     parse_args,
     parse_bell_events,
 )
@@ -819,6 +820,64 @@ async def _model_cache_loop() -> None:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 600.0)
 
+#: How long `/model` waits for a live list before giving up and showing what
+#: it already has.  Short enough that the picker still feels instant; long
+#: enough that a normal round-trip to /v1/models finishes.
+MODEL_SHOW_FETCH_BUDGET = 4.0
+
+#: A fetch this recent counts as "now", so a burst of `/model` from several
+#: tabs collapses into one request.  Deliberately seconds, not minutes: the
+#: request was "always read the current list when possible", and anything
+#: longer starts hiding releases again -- which is the bug being fixed.
+MODEL_SHOW_COALESCE_S = 2.0
+
+#: Serialises on-demand refreshes.  Created lazily: a module-level asyncio
+#: primitive would bind to whichever loop imported the module.
+_model_refresh_lock: asyncio.Lock | None = None
+
+
+async def _refresh_models_for_show() -> None:
+    """Re-read the live model list, so `/model` answers from *now*.
+
+    The old behaviour was to render whatever the hourly background refresh had
+    last cached.  That is fine until a model ships mid-hour: reported
+    2026-09-22, when Opus 5.5 had been available for forty minutes and `/model`
+    still listed eleven models with no indication it was out of date.
+
+    "`/model` must never block the event loop" and "`/model` must never fetch"
+    are different rules, and only the first one was ever true.  The fetch runs
+    in a thread -- the same way the background refresher already does it -- so
+    the loop keeps serving while it waits.
+
+    Failure is not an error: `fetch_available_models` leaves the previous list
+    intact and returns None, and the picker reports that it is showing a cached
+    list rather than pretending otherwise.
+    """
+    global _model_refresh_lock
+    if _model_refresh_lock is None:
+        _model_refresh_lock = asyncio.Lock()
+    async with _model_refresh_lock:
+        # Checked *inside* the lock: the whole point is that whoever waited
+        # behind the fetch gets its result instead of repeating it.  A lock
+        # alone would serialise three tabs into three sequential requests,
+        # which is not much better than three parallel ones.
+        age = model_cache_age()
+        if age is not None and age <= MODEL_SHOW_COALESCE_S:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(fetch_available_models,
+                                  MODEL_SHOW_FETCH_BUDGET),
+                MODEL_SHOW_FETCH_BUDGET + 1.0,
+            )
+        except asyncio.TimeoutError:
+            log.info("model list: live refresh for /model timed out after "
+                     "%.0fs — showing what we have", MODEL_SHOW_FETCH_BUDGET)
+        except Exception:
+            log.warning("model list: live refresh for /model failed",
+                        exc_info=True)
+
+
 # Auto-shutdown: when all tabs close, shut down after a grace period.
 _shutdown_timer: asyncio.Task | None = None
 _has_had_clients: bool = False          # True once the first tab connects
@@ -1349,6 +1408,7 @@ async def _create_runtime(
     config_dir: str | None = None,
     bell_on: str | None = None,
     session_note: str | None = None,
+    cli_path: str | None = None,
 ) -> SessionRuntime:
     """Spin up a fresh live session runtime (config clone + state + bridge).
 
@@ -1401,6 +1461,12 @@ async def _create_runtime(
         overrides["bell_on"] = bell_on
     if session_note:
         overrides["session_note"] = session_note
+    # Per-session CLI. Lets one session run a newer Claude Code (for a model
+    # the bundled one refuses) while everything else stays on the bundled
+    # binary -- which matters when the newer CLI is `latest` rather than
+    # `stable`.
+    if cli_path:
+        overrides["cli_path"] = cli_path
     cfg = dataclasses.replace(config, **overrides)
     # Build the state *inside* the session's config-dir scope so account
     # detection (detect_account_info / detect_subscription*) reads the
@@ -2859,6 +2925,7 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     effort = (body.get("effort") or "").strip() or None
     config_dir = (body.get("config_dir") or "").strip() or None
     bell_on = (body.get("bell_on") or "").strip() or None
+    cli_path = (body.get("cli_path") or "").strip() or None
 
     # Resolve the on-disk session this launch would land on (an explicit
     # resume id, or — for a plain continue — the most recent session in cwd).
@@ -2924,7 +2991,8 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     try:
         rt = await _create_runtime(cwd=cwd, resume=resume, no_continue=no_continue,
                                    model=model, effort=effort,
-                                   config_dir=config_dir, bell_on=bell_on)
+                                   config_dir=config_dir, bell_on=bell_on,
+                                   cli_path=cli_path)
     except Exception as exc:
         log.exception("hub session launch failed")
         return {"ok": False, "error": str(exc)}
@@ -4332,6 +4400,13 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
         if kind == "mcp":
             await _handle_mcp(ws, rt, payload)
             return
+
+        # `/model` with no argument is "what can I switch to?", so it must
+        # answer from the API rather than from an hour-old cache.  Awaited, not
+        # fired-and-forgotten: the whole point is that the list rendered a line
+        # below is the refreshed one.
+        if kind == "model-show":
+            await _refresh_models_for_show()
 
         # Try immediate command.
         result = try_immediate_command(kind, payload, state, config)

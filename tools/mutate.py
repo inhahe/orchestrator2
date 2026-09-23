@@ -2434,6 +2434,182 @@ LOOPDROP_MUTATIONS = [
 ]
 
 
+MODELLIVE_MUTATIONS = [
+    ("/model answers from the cache again, so a model released mid-hour stays "
+     "invisible -- the reported bug, restored",
+     "        if kind == \"model-show\":\n"
+     "            await _refresh_models_for_show()\n",
+     ""),
+
+    ("the refresh is fired and forgotten, so the list rendered a line later is "
+     "still the old one",
+     "            await _refresh_models_for_show()",
+     "            asyncio.create_task(_refresh_models_for_show())"),
+
+    ("a hung API hangs the command instead of costing it the budget",
+     "            await asyncio.wait_for(\n"
+     "                asyncio.to_thread(fetch_available_models,\n"
+     "                                  MODEL_SHOW_FETCH_BUDGET),\n"
+     "                MODEL_SHOW_FETCH_BUDGET + 1.0,\n"
+     "            )",
+     "            await asyncio.to_thread(fetch_available_models,\n"
+     "                                    MODEL_SHOW_FETCH_BUDGET)"),
+
+    ("a failed refresh propagates instead of falling back to the list we "
+     "already have",
+     "        except asyncio.TimeoutError:",
+     "        except _NeverRaised:"),
+
+    ("concurrent /model from several tabs each fetch, so the lock only makes "
+     "three requests sequential instead of parallel",
+     "        age = model_cache_age()\n"
+     "        if age is not None and age <= MODEL_SHOW_COALESCE_S:\n"
+     "            return\n",
+     ""),
+
+    ("the coalescing window grows to cache-TTL scale and starts hiding "
+     "releases again",
+     "MODEL_SHOW_COALESCE_S = 2.0",
+     "MODEL_SHOW_COALESCE_S = 1800.0"),
+]
+
+MODELFRESH_MUTATIONS = [
+    ("\"live\" goes back to meaning \"the cache has not aged out\", which was "
+     "True in exactly the case that misled",
+     "    return \"live\" if age <= MODEL_LIST_FRESH_S else \"cache\"",
+     "    return \"live\""),
+
+    ("a stale cached list is reported as the built-in fallback, so the picker "
+     "cries wolf about a perfectly real list",
+     "    if age is None:\n        return \"builtin\"",
+     "    if age is not None:\n        return \"builtin\""),
+
+    ("the freshness window widens to the cache TTL and the distinction "
+     "collapses",
+     "MODEL_LIST_FRESH_S = 60.0",
+     "MODEL_LIST_FRESH_S = 3600.0"),
+
+    ("a clock that moved backwards renders as \"fetched -3 minutes ago\"",
+     "    return max(0.0, time.monotonic() - _model_cache_at)",
+     "    return time.monotonic() - _model_cache_at"),
+
+    ("a never-fetched list reports an age, so the picker shows the built-in "
+     "list as though it had come from somewhere",
+     "    if _model_cache is None:\n        return None\n"
+     "    return max(0.0, time.monotonic() - _model_cache_at)",
+     "    return max(0.0, time.monotonic() - _model_cache_at)"),
+]
+
+
+CLIPATH_MUTATIONS = [
+    ("the override is ignored, so a model newer than the SDK's pinned CLI is "
+     "refused again -- the reported bug, restored",
+     '                kwargs["cli_path"] = cli_path\n',
+     ""),
+
+    ("a typo in the path makes the session unable to connect at all, instead "
+     "of falling back to a CLI that at least works",
+     "            if os.path.exists(cli_path):",
+     "            if True:"),
+
+    ("the bundled CLI is overridden with nothing when the option is unset, so "
+     "the SDK's own resolution never runs",
+     '        cli_path = getattr(self.config, "cli_path", None)\n'
+     "        if cli_path:",
+     '        cli_path = getattr(self.config, "cli_path", None)\n'
+     "        if True:"),
+
+    ("a missing binary is swallowed, so \"my new model is still refused\" "
+     "comes with nothing to explain it",
+     "                log.warning(\n"
+     '                    "--cli-path %s does not exist — falling back to the "\n'
+     '                    "bundled CLI; models newer than it will be refused",\n'
+     "                    cli_path)",
+     "                pass"),
+]
+
+CLIPATHCFG_MUTATIONS = [
+    ("the hub's --cli-path never reaches a session",
+     "        config_dir=args.config_dir,\n        cli_path=args.cli_path,",
+     "        config_dir=args.config_dir,"),
+
+    ("the option help stops naming the error it solves, so nobody hitting "
+     "that error can find it",
+     '            "Agent SDK. The SDK pins a CLI version, so a model released after "\n'
+     '            "that pin is rejected with \'does not support this model; version "',
+     '            "Agent SDK. "\n'
+     '            "\'"'),
+]
+
+
+RESUMEFAIL_MUTATIONS = [
+    ("the requested resume is spent before the connect is known to have worked "
+     "again, so a failed first attempt silently becomes a blank session -- the "
+     "general hazard the report exposed",
+     "        # Consumed at the bottom of this method, once the connect succeeds.\n",
+     "        # Consumed at the bottom of this method, once the connect succeeds.\n"
+     "        self._initial_resume_id = None\n"),
+
+    ("a missing session is retried like a transient failure, ten times over "
+     "several minutes of backoff",
+     "                _unknown_session = _is_unknown_session_error(_why)",
+     "                _unknown_session = False"),
+
+    ("a missing session is recognised but still retried",
+     "                if _unknown_session:\n                    _fatal = True\n",
+     ""),
+
+    ("the bogus id survives as the session id, so /rename looks for \"OS A\" "
+     "on disk -- the reported symptom",
+     "                        if state.session_id == requested:\n"
+     "                            state.session_id = None\n",
+     ""),
+
+    ("the user is told nothing about which sessions do exist",
+     '                            f"title. {listing} Open one of those from the "',
+     '                            f"title. Open one of those from the "'),
+
+    ("nothing is recognised as a missing session",
+     '    "does not match any session title",\n'
+     '    "requires a valid session id or session title",\n',
+     ""),
+
+    ("every connect failure is taken for a missing session, so a timeout gives "
+     "up on a session the next attempt would have opened",
+     "    return any(m in t for m in _UNKNOWN_SESSION_MARKERS)",
+     "    return True"),
+
+    ("after /clear the new session's first turn warns that prior context may "
+     "not be loaded -- a false alarm on the one occasion a new session is the "
+     "point",
+     "            self.state.expected_resume_sid = None\n"
+     "\n"
+     "        # A resumed session can start streaming with no prompt from us; arm",
+     "\n"
+     "        # A resumed session can start streaming with no prompt from us; arm"),
+]
+
+RESUMELIST_MUTATIONS = [
+    ("untitled sessions vanish from the listing",
+     "    if untitled:\n        parts.append(f\"{untitled} untitled\")\n",
+     ""),
+
+    ("an empty directory is described as though it held sessions",
+     "    if not sessions:\n"
+     "        return \"There are no sessions in this directory to resume.\"\n",
+     ""),
+
+    ("the listing reads the hub's account instead of the session's, so a "
+     "cross-account session's siblings are never shown",
+     "    project = claude_projects_dir(config_dir) / _sanitize_cwd(resolved)",
+     "    project = claude_projects_dir() / _sanitize_cwd(resolved)"),
+
+    ("the newest sessions are no longer the ones shown",
+     "    found.sort(key=lambda x: x[1], reverse=True)",
+     "    found.sort(key=lambda x: x[1])"),
+]
+
+
 TARGETS = {
     "chat": ("static/chat.js", "tests/hidden_window.test.js",
              CHAT_MUTATIONS, "node"),
@@ -2477,6 +2653,18 @@ TARGETS = {
                   WAKESTORE_MUTATIONS, "pytest"),
     "loopdrop": ("sdk_bridge.py", "tests/test_loop_control.py",
                  LOOPDROP_MUTATIONS, "pytest"),
+    "modellive": ("server.py", "tests/test_model_list.py",
+                  MODELLIVE_MUTATIONS, "pytest"),
+    "modelfresh": ("config.py", "tests/test_model_list.py",
+                   MODELFRESH_MUTATIONS, "pytest"),
+    "clipath": ("sdk_bridge.py", "tests/test_cli_path.py",
+                CLIPATH_MUTATIONS, "pytest"),
+    "clipath-cfg": ("config.py", "tests/test_cli_path.py",
+                    CLIPATHCFG_MUTATIONS, "pytest"),
+    "resumefail": ("sdk_bridge.py", "tests/test_resume_unknown_session.py",
+                   RESUMEFAIL_MUTATIONS, "pytest"),
+    "resumelist": ("session.py", "tests/test_resume_unknown_session.py",
+                   RESUMELIST_MUTATIONS, "pytest"),
     "wakerevive": ("server.py", "tests/test_wakeup_store.py",
                    WAKEREVIVE_MUTATIONS, "pytest"),
     "bgstall-wire": ("state.py", "tests/test_bg_stall.py",
