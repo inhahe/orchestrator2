@@ -803,8 +803,48 @@ def title_from_jsonl(jsonl: Path) -> str | None:
     return _resolve_title(jsonl)
 
 
+def sessions_titled(title: str, cwd: str, config_dir: str | None = None
+                    ) -> list[tuple[str, str]]:
+    """``(session_id, title)`` for the sessions in *cwd* whose title *is*
+    *title* -- the whole title, ignoring case -- newest first.
+
+    Exact, as the CLI's own ``--resume <title>`` is (2.1.280 resolves with
+    ``{exact: true}``): a substring match would let ``--resume "Lane A"`` open
+    a session called "OS Lane A".  Scoped to *cwd*'s project in *config_dir*'s
+    account, because that is where the CLI looks for the session it resumes.
+    """
+    want = (title or "").strip().casefold()
+    if not want:
+        return []
+    return [(sid, t) for sid, t in resumable_sessions(cwd, config_dir, limit=None)
+            if t and t.strip().casefold() == want]
+
+
+def resolve_session_ref(ref: str, cwd: str, config_dir: str | None = None) -> str:
+    """The session id ``--resume <ref>`` means.
+
+    *ref* itself when it already names a session; otherwise the id of the one
+    session in *cwd* titled *ref*.  Anything else -- no session by that title,
+    or several -- comes back unchanged, for the CLI to refuse in its own words,
+    which the connect loop reports (``_is_unknown_session_error``).
+
+    Titles are resolved *here*, not left to the CLI, because everything
+    orchestrator2 keys on a session id -- history, ``/rename``, the queue, the
+    reuse check that stops a second runtime opening the same session -- would
+    otherwise be keyed on the title until the session's first turn.  Reported
+    2026-09-24: ``--resume "OS Lane A"`` into a running hub resumed the right
+    session, then showed no transcript, a status bar reading "OS Lane", and
+    "Rename failed: session OS Lane A not found on disk".
+    """
+    ref = (ref or "").strip()
+    if not ref or find_session_dir(ref, config_dir) is not None:
+        return ref
+    matches = sessions_titled(ref, cwd, config_dir)
+    return matches[0][0] if len(matches) == 1 else ref
+
+
 def resumable_sessions(cwd: str, config_dir: str | None = None, *,
-                       limit: int = 6) -> list[tuple[str, str | None]]:
+                       limit: int | None = 6) -> list[tuple[str, str | None]]:
     """``(session_id, title)`` for the sessions in *cwd*, newest first.
 
     What a failed ``--resume`` should offer instead of a bare "not found": the

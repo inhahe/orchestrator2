@@ -2572,8 +2572,8 @@ RESUMEFAIL_MUTATIONS = [
      ""),
 
     ("the user is told nothing about which sessions do exist",
-     '                            f"title. {listing} Open one of those from the "',
-     '                            f"title. Open one of those from the "'),
+     '                                f"session\'s title. {listing} Open one of those "',
+     '                                f"session\'s title. Open one of those "'),
 
     ("nothing is recognised as a missing session",
      '    "does not match any session title",\n'
@@ -2862,6 +2862,106 @@ SESSIONNAME_SERVER_MUTATIONS = [
      "                                   cli_path=cli_path, agent_name=agent_name,\n",
      "                                   config_dir=config_dir, bell_on=bell_on,\n"
      "                                   agent_name=agent_name,\n"),
+]
+
+# --resume <title> into a running hub, and two sessions sharing a name.
+# tests/test_resume_by_title.py.
+#
+# Not mutated: the resolver call in the hub's own startup (lifespan).  Driving
+# lifespan installs the process reaper and connects a real CLI; the call is one
+# line, and what it calls is covered here directly.
+RESUMETITLE_MUTATIONS = [
+    ("part of a title counts as the title, so --resume 'Lane A' opens 'OS "
+     "Lane A'",
+     "            if t and t.strip().casefold() == want]\n",
+     "            if t and want in t.strip().casefold()]\n"),
+
+    ("the title has to be typed in the same case",
+     '    want = (title or "").strip().casefold()\n',
+     '    want = (title or "").strip()\n'),
+
+    ("a title two sessions carry is resolved to one of them, silently",
+     "    return matches[0][0] if len(matches) == 1 else ref\n",
+     "    return matches[0][0] if matches else ref\n"),
+
+    ("only the six newest sessions are searched",
+     "    return [(sid, t) for sid, t in resumable_sessions(cwd, config_dir, limit=None)\n",
+     "    return [(sid, t) for sid, t in resumable_sessions(cwd, config_dir)\n"),
+
+    ("titles are never resolved -- the reported bug",
+     "    matches = sessions_titled(ref, cwd, config_dir)\n"
+     "    return matches[0][0] if len(matches) == 1 else ref\n",
+     "    return ref\n"),
+]
+
+RESUMETITLE_SERVER_MUTATIONS = [
+    ("a launch into a running hub keeps the title as the session id -- the "
+     "reported bug",
+     "    if resume:\n        resume = await asyncio.to_thread(\n"
+     "            resolve_session_ref, resume, cwd or config.cwd, config_dir)\n",
+     ""),
+
+    ("the title is looked up in the hub's directory, not the launch's",
+     "            resolve_session_ref, resume, cwd or config.cwd, config_dir)\n",
+     "            resolve_session_ref, resume, config.cwd, config_dir)\n"),
+
+    ("the title is looked up in the hub's account, not the launch's",
+     "            resolve_session_ref, resume, cwd or config.cwd, config_dir)\n",
+     "            resolve_session_ref, resume, cwd or config.cwd, None)\n"),
+]
+
+RESUMETITLE_BRIDGE_MUTATIONS = [
+    ("a title several sessions carry is retried ten times as if transient",
+     '    "requires a valid session id or session title",\n'
+     "    _AMBIGUOUS_SESSION_MARKER,\n)",
+     '    "requires a valid session id or session title",\n)'),
+
+    ("a title several sessions carry is reported as no session at all",
+     "                        if _AMBIGUOUS_SESSION_MARKER in (_why or \"\").lower():\n",
+     "                        if False:\n"),
+
+    ("a closing session deletes the registration another session now holds",
+     "                lambda: agent_comms.deregister(ident, session_id=sid))\n",
+     "                lambda: agent_comms.deregister(ident))\n"),
+
+    ("a vanished registration is never restored, and the session goes on "
+     "believing it is registered",
+     "            if not alive:\n",
+     "            if False:\n"),
+
+    ("a vanished registration is re-resolved, and can come back under a "
+     "different name",
+     "                            self.agent_identity)\n"
+     "                await self._republish_agent()\n",
+     "                            self.agent_identity)\n"
+     "                self.agent_identity = None\n"
+     "                await self.register_agent()\n"),
+
+    ("a second live session takes the name in silence",
+     "        if how == \"explicit\":\n"
+     "            await self._warn_if_name_in_use(ident)\n",
+     ""),
+
+    ("a session reconnecting is warned about itself",
+     "        if held is None or held.session_id in (\"\", self.state.session_id or \"\"):\n",
+     "        if held is None:\n"),
+
+    ("a holder that stopped heartbeating long ago counts as live",
+     "        if time.time() - held.heartbeat_at > agent_comms.AGENT_TTL:\n"
+     "            return\n",
+     ""),
+]
+
+RESUMETITLE_COMMS_MUTATIONS = [
+    ("deregistering deletes the entry whoever holds it now",
+     "                \"DELETE FROM agents WHERE identity = ? AND session_id IN (?, '')\",\n"
+     "                (identity, session_id))",
+     "                \"DELETE FROM agents WHERE identity = ?\",\n"
+     "                (identity,))"),
+
+    ("an entry registered before its session had an id can never be removed",
+     "session_id IN (?, '')",
+     "session_id = ?"),
 ]
 
 # --agent-name names one session, not the hub.  tests/test_agent_name_per_session.py.
@@ -3220,6 +3320,14 @@ TARGETS = {
                            SESSIONNAME_SERVER_MUTATIONS, "pytest"),
     "sessionname-disk": ("session.py", "tests/test_session_name.py",
                          SESSIONNAME_DISK_MUTATIONS, "pytest"),
+    "resumetitle": ("session.py", "tests/test_resume_by_title.py",
+                    RESUMETITLE_MUTATIONS, "pytest"),
+    "resumetitle-server": ("server.py", "tests/test_resume_by_title.py",
+                           RESUMETITLE_SERVER_MUTATIONS, "pytest"),
+    "resumetitle-bridge": ("sdk_bridge.py", "tests/test_resume_by_title.py",
+                           RESUMETITLE_BRIDGE_MUTATIONS, "pytest"),
+    "resumetitle-comms": ("agent_comms.py", "tests/test_resume_by_title.py",
+                          RESUMETITLE_COMMS_MUTATIONS, "pytest"),
     "agentname": ("sdk_bridge.py", "tests/test_agent_name_per_session.py",
                   AGENTNAME_MUTATIONS, "pytest"),
     "agentname-server": ("server.py", "tests/test_agent_name_per_session.py",

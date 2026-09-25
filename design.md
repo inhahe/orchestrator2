@@ -176,6 +176,22 @@ lands on a session the hub already has open applies `--model`, `--effort`,
 time for the same hand-over: the hub would read a relative path against its own
 directory.
 
+**`--resume <title>` is resolved to a session id before anything keys on
+it**, by `session.resolve_session_ref`: the whole title, ignoring case, of
+exactly one session in the launch directory's project, in the launch's
+account — the CLI's own rule (2.1.280 resolves `--resume` titles with
+`{exact: true}` and refuses one several sessions carry). The hub's startup
+path and `/api/session/launch` both call it; before 2026-09-24 only the
+startup path resolved titles, and through a helper that fell back to a
+*substring* match across every project. A launch that joined a running hub
+passed the title through: the CLI resumed the right session, but the runtime
+was seeded with the title as its session id until the first turn — no
+transcript, "OS Lane" in the status bar, `/rename` looking for a session
+called "OS Lane A" on disk — and the reuse check could never match the
+runtime already open on it. An unknown or ambiguous title is handed through
+unchanged for the CLI to refuse; the connect loop reports either, each in its
+own words.
+
 **`_create_runtime` refuses a working directory it cannot see**, raising
 `NotADirectoryError` naming both the requested and resolved forms. It is the
 single funnel for every way a session is born — the launch API and the lobby's
@@ -2793,12 +2809,31 @@ name over at all. Now:
   beats the record; what it does not is restored — name and labels
   independently.
 
+**Two live sessions under one name** are possible — an explicit name is taken
+at face value (§3.3) — and used to fail silently and badly. Found 2026-09-24:
+one launch opened an empty session as `Lane-A`, the next opened the real lane
+session as `Lane-A`, and when the empty one was torn down for idleness its
+`deregister` deleted the shared row, leaving the lane session out of the
+registry while it went on believing it was in. Three things now:
+
+* `agent_comms.deregister(identity, session_id=…)` deletes the row only while
+  it is still that session's (or has no session id yet); the bridge always
+  passes its own.
+* A heartbeat that finds no row (`heartbeat()` returns False) restores it
+  under the **same** identity (`_republish_agent`) — not by re-resolving,
+  which could hand the session a different address.
+* Registering an explicit name that another live session holds (heartbeat
+  within `AGENT_TTL`, a different session id) says so in the transcript
+  (`_warn_if_name_in_use`). It is not refused — replacing a session on
+  purpose is legitimate — but it is no longer silent.
+
 Tests never touch the machine's registry: `tests/conftest.py` points
 `ORCH2_AGENT_DB` at a temp file for every test. Before it, a test that only
 meant to exercise a connect reached the real store — which is how that store
 got a `session_names` table on the day the table was written, and very
 probably how it got the two `orchestrator2` identities that one process
 registered seven seconds apart on 2026-09-06 and never heartbeated.
+
 `resolve_identity()` implements the spec's table, and the row that matters is
 the refusal: a fresh session in a directory with several registered identities
 **refuses and lists them** rather than guessing. Adopting the wrong one

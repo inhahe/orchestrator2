@@ -103,6 +103,7 @@ from session import (
     normalize_path_for_compare,
     read_session_title,
     render_session_history,
+    resolve_session_ref,
     save_persisted_queue,
     write_session_title,
 )
@@ -1267,13 +1268,15 @@ async def lifespan(app: FastAPI):
     _pending_resume_id = None
     if config.resume and config.resume != _PICKER_SENTINEL:
         # Resolve the resume value to a real session UUID — it might be a
-        # title/name rather than an ID (e.g. ``--resume fastpyb``).
-        _resolved_resume = config.resume
-        if not find_session_dir(config.resume, config.config_dir):
-            _match = _find_session_by_name(config.resume)
-            if _match:
-                _resolved_resume = _match
-                config = dataclasses.replace(config, resume=_match)
+        # title rather than an ID (e.g. ``--resume fastpyb``).  The same rule
+        # as a launch into a running hub (session.resolve_session_ref): the
+        # exact title of one session in this directory.  This used to fall
+        # back to a *substring* match across every project, which could open
+        # "OS Lane A" for ``--resume "Lane A"``.
+        _resolved_resume = resolve_session_ref(
+            config.resume, config.cwd, config.config_dir)
+        if _resolved_resume != config.resume:
+            config = dataclasses.replace(config, resume=_resolved_resume)
         state.session_id = _resolved_resume
         state.session_title = read_session_title(_resolved_resume, config.config_dir)
         _pending_resume_id = _resolved_resume
@@ -2534,17 +2537,11 @@ async def _reconfigure(
     # --- Resolve resume ---
     new_resume: str | None = None
     if resume:
-        # Check if it's a UUID (or UUID prefix).
-        session_dir = find_session_dir(resume, config.config_dir)
-        if session_dir:
-            new_resume = resume
-        else:
-            # Try matching as a title / name substring.
-            match = _find_session_by_name(resume)
-            if match:
-                new_resume = match
-            else:
-                return False, f"session not found: {resume}"
+        # A session id, or the exact title of one session in the new cwd --
+        # see session.resolve_session_ref.
+        new_resume = resolve_session_ref(resume, new_cwd, config.config_dir)
+        if find_session_dir(new_resume, config.config_dir) is None:
+            return False, f"session not found: {resume}"
 
     # --- Stop existing bridge ---
     if bridge is not None:
@@ -2603,23 +2600,6 @@ async def _reconfigure(
     await bridge.start()
     log.info("reconfigured: resume=%s cwd=%s", new_resume, new_cwd)
     return True, None
-
-
-def _find_session_by_name(name: str) -> str | None:
-    """Search all sessions for one whose title matches *name* (case-insensitive)."""
-    name_lower = name.lower()
-    for proj in list_projects():
-        for sess in list_sessions_for_project(Path(proj["project_dir"])):
-            title = sess.get("title") or ""
-            if title.lower() == name_lower:
-                return sess["session_id"]
-    # Partial match fallback.
-    for proj in list_projects():
-        for sess in list_sessions_for_project(Path(proj["project_dir"])):
-            title = sess.get("title") or ""
-            if name_lower in title.lower():
-                return sess["session_id"]
-    return None
 
 
 # Serve static files with explicit no-cache headers.  Using a regular
@@ -2963,6 +2943,14 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     agent_labels = ({str(k).strip(): "" if v is None else str(v)
                      for k, v in raw_labels.items() if str(k).strip()}
                     if isinstance(raw_labels, dict) else {})
+
+    # A title is resolved to its session's id first, as the hub's own startup
+    # does -- left as the title, it became this runtime's session id until the
+    # first turn (no transcript, "/rename: session <title> not found on disk")
+    # and the reuse check below could never match the runtime already open.
+    if resume:
+        resume = await asyncio.to_thread(
+            resolve_session_ref, resume, cwd or config.cwd, config_dir)
 
     # Resolve the on-disk session this launch would land on (an explicit
     # resume id, or — for a plain continue — the most recent session in cwd).

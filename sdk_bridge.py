@@ -686,9 +686,17 @@ def _build_graphify_prompt(args: str) -> str:
 #: eventually disagree with them.  If the wording ever changes this simply stops
 #: matching and the failure is retried like any other; since a retry now keeps
 #: the requested id, that costs time but can never open the wrong session.
+#: The CLI's refusal of a ``--resume`` title that several sessions carry
+#: (2.1.280: ``--resume "X" matches 2 sessions. Pass one of these session IDs
+#: to disambiguate``).  orchestrator2 resolves titles itself
+#: (session.resolve_session_ref) and hands an ambiguous one through for the
+#: CLI to refuse -- settled like a missing session, but not the same news.
+_AMBIGUOUS_SESSION_MARKER = "pass one of these session ids to disambiguate"
+
 _UNKNOWN_SESSION_MARKERS = (
     "does not match any session title",
     "requires a valid session id or session title",
+    _AMBIGUOUS_SESSION_MARKER,
 )
 
 
@@ -5252,12 +5260,21 @@ class SDKBridge:
                                 getattr(config, "config_dir", None))
                         except Exception:
                             listing = ""
-                        _msg = (
-                            f"There is no session called '{requested}' here — "
-                            f"it is neither a session id nor any session's "
-                            f"title. {listing} Open one of those from the "
-                            f"session list, or start a new session."
-                        )
+                        if _AMBIGUOUS_SESSION_MARKER in (_why or "").lower():
+                            _msg = (
+                                f"More than one session here is called "
+                                f"'{requested}', so none was resumed. "
+                                f"{listing} Open the one you meant from the "
+                                f"session list, where each is listed with its "
+                                f"last activity."
+                            )
+                        else:
+                            _msg = (
+                                f"There is no session called '{requested}' "
+                                f"here — it is neither a session id nor any "
+                                f"session's title. {listing} Open one of those "
+                                f"from the session list, or start a new session."
+                            )
                         # Nothing was resumed, so nothing may go on claiming it
                         # was: history, /rename and the persisted queue all key
                         # on this id, and "OS A" is not a session.
@@ -6194,6 +6211,8 @@ class SDKBridge:
         except Exception:
             log.warning("agent registry unavailable", exc_info=True)
             return
+        if how == "explicit":
+            await self._warn_if_name_in_use(ident)
         try:
             repo = await asyncio.to_thread(agent_comms.repo_key, cwd)
             await asyncio.to_thread(lambda: agent_comms.register(
@@ -6243,10 +6262,20 @@ class SDKBridge:
         if now - self._agent_hb_at >= agent_comms.HEARTBEAT_INTERVAL:
             self._agent_hb_at = now
             try:
-                await asyncio.to_thread(lambda: agent_comms.heartbeat(
+                alive = await asyncio.to_thread(lambda: agent_comms.heartbeat(
                     self.agent_identity, session_id=self.state.session_id))
             except Exception:
+                alive = True    # unknown -- no reason to rewrite anything
                 log.debug("agent heartbeat failed", exc_info=True)
+            if not alive:
+                # The registration is gone: deleted by a session that shared
+                # the name, or by hand.  Without this the session went on
+                # believing it was registered while nothing could reach it.
+                # Put it back under the *same* identity -- re-resolving could
+                # hand this session a different address.
+                log.warning("agent registration %r had vanished; restoring it",
+                            self.agent_identity)
+                await self._republish_agent()
         if now - self._agent_poll_at < AGENT_POLL_INTERVAL:
             return
         self._agent_poll_at = now
@@ -6305,6 +6334,41 @@ class SDKBridge:
             conn.close()
         return out
 
+    async def _warn_if_name_in_use(self, ident: str) -> None:
+        """Say so when another live session already answers to *ident*.
+
+        An explicit name is taken at face value (spec §3.3), so two launches
+        given the same one both register as it -- one inbox, one halt state,
+        and two CLIs listed under it by ``ListAgents``.  Found 2026-09-24: an
+        empty session opened by one launch and the real lane session opened by
+        the next were both ``Lane-A``, and nothing said so until the empty
+        one's teardown took the registration with it.  Not a refusal -- the
+        operator may be replacing a session on purpose -- but it must not be
+        silent.  The same session reconnecting (same session id, or an entry
+        with none yet) is not "another".
+        """
+        try:
+            held = await asyncio.to_thread(agent_comms.find_agent, ident)
+        except Exception:
+            log.debug("could not check who holds %r", ident, exc_info=True)
+            return
+        if held is None or held.session_id in ("", self.state.session_id or ""):
+            return
+        if time.time() - held.heartbeat_at > agent_comms.AGENT_TTL:
+            return
+        log.warning("agent name %r is also held by live session %s",
+                    ident, held.session_id[:8])
+        await self.broadcast({
+            "type": "system_msg", "subtype": "warning",
+            "data": {"message": (
+                f"Another live session already answers to '{ident}' "
+                f"(session {held.session_id[:8]}, in {held.cwd}). Both do now "
+                f"-- in ListAgents and in the agent registry -- so a message or "
+                f"halt for '{ident}' may reach either one. Close one of them, "
+                f"or launch one under another name."
+            )},
+        })
+
     async def _remember_agent_name(self) -> None:
         """Record this session's explicit name and labels against its id.
 
@@ -6346,6 +6410,11 @@ class SDKBridge:
             return
         self.state.agent_labels = labels
         await self._remember_agent_name()
+        await self._republish_agent()
+
+    async def _republish_agent(self) -> None:
+        """Write this session's registry entry again, under the identity it
+        already has -- for new labels, or to restore an entry that vanished."""
         if not self.agent_identity or not self._agent_enabled():
             return
         ident = self.agent_identity
@@ -6357,7 +6426,7 @@ class SDKBridge:
                 repo=self._agent_repo or None,
                 labels=self._agent_labels()))
         except Exception:
-            log.warning("could not publish the new labels", exc_info=True)
+            log.warning("could not publish the registry entry", exc_info=True)
 
     async def adopt_agent_name(self, name: str) -> None:
         """Give this *running* session an explicit name.
@@ -6388,8 +6457,11 @@ class SDKBridge:
         if not self._agent_enabled() or not self.agent_identity:
             return
         ident, self.agent_identity = self.agent_identity, None
+        # Only our own registration: a session sharing the name may hold it now.
+        sid = self.state.session_id or ""
         try:
-            await asyncio.to_thread(lambda: agent_comms.deregister(ident))
+            await asyncio.to_thread(
+                lambda: agent_comms.deregister(ident, session_id=sid))
         except Exception:
             log.debug("agent deregistration failed", exc_info=True)
 

@@ -537,12 +537,26 @@ def heartbeat(identity: str, *, conn: sqlite3.Connection | None = None,
             conn.close()
 
 
-def deregister(identity: str, *, conn: sqlite3.Connection | None = None) -> bool:
-    """Remove a registration on clean exit (§4.2)."""
+def deregister(identity: str, *, session_id: str | None = None,
+               conn: sqlite3.Connection | None = None) -> bool:
+    """Remove a registration on clean exit (§4.2).
+
+    Given *session_id*, only while the registration is still that session's
+    (or has none yet).  Two sessions given the same explicit name share one
+    row, and the first to close used to delete it out from under the other --
+    found 2026-09-24, when an idle teardown left the live ``Lane-A`` session out
+    of the registry: unaddressable, deaf to halts, and with nothing to say so.
+    """
     own = conn is None
     conn = conn or connect()
     try:
-        cur = conn.execute("DELETE FROM agents WHERE identity = ?", (identity,))
+        if session_id is None:
+            cur = conn.execute("DELETE FROM agents WHERE identity = ?",
+                               (identity,))
+        else:
+            cur = conn.execute(
+                "DELETE FROM agents WHERE identity = ? AND session_id IN (?, '')",
+                (identity, session_id))
         conn.commit()
         return cur.rowcount > 0
     finally:

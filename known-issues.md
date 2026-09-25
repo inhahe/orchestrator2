@@ -1,5 +1,45 @@
 # Known issues / tech debt — orchestrator2
 
+## `--resume <title>` into a running hub kept the title as the session id — FIXED (2026-09-24)
+
+> "i tried '/rename OS A' and I got "Rename failed: session OS Lane A not found
+> on disk". also, 'session' in the status bar shows 'OS Lane' even though the
+> session should be OS Lane A"
+
+```
+19:22:19  runtime s3 started (cwd=E:\visual studio projects\os, resume=OS Lane A)
+19:22:20  connect: resume=OS Lane A
+19:22:20  [history] session_dir not found for OS Lane A
+19:22:23  SDK connected in 3.0s
+```
+
+`orch2 --resume "OS Lane A"` joined the running hub, and the hub opened a
+runtime with the *title* as its resume target. The CLI accepts a title for
+`--resume` and resumed the right session — but orchestrator2 had seeded the
+runtime's session id with the title, where it stayed until the first turn's
+init: no transcript, the status bar showing the id's first eight characters
+("OS Lane"), and `/rename` looking on disk for a session called "OS Lane A".
+The reuse check could never match either, so launching it twice would have
+opened it twice.
+
+Only the hub's *own* startup resolved titles, and through a helper that fell
+back to a substring match across every project — `--resume "Lane A"` could
+have opened "OS Lane A". Both now use `session.resolve_session_ref`: the exact
+title (any case) of one session in the launch directory, as the CLI itself
+does. A title two sessions share opens neither, and says so rather than
+reporting that no such session exists.
+
+### And two sessions under one name
+
+The same log showed the launch before it opening an empty session as
+`Lane-A`, and this one taking `Lane-A` too. Nothing said so. When the empty
+one was torn down for idleness, its `deregister` deleted the shared registry
+entry, and the real lane session dropped out of the registry — no halts, not
+addressable — while believing itself registered. Now a session only removes
+its own entry, a heartbeat that finds its entry gone restores it under the
+same name, and taking a name another live session holds is said in the
+transcript. design.md §9a.
+
 ## `/rename` set the title but not the name other sessions address — FIXED (2026-09-22)
 
 > "i did `/rename Lane A` and then sent `test` and it said: ... I checked again
