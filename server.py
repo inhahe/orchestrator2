@@ -1072,6 +1072,14 @@ async def _tick_runtime(rt: SessionRuntime) -> bool:
     for k in expired_bg:
         st.completed_panel_bg.pop(k, None)
 
+    # The status bar's agent name, read from the CLI before the snapshot so a
+    # change shows on this tick (the bridge throttles the read itself).
+    if rt.bridge is not None:
+        try:
+            await rt.bridge.refresh_cli_name()
+        except Exception:
+            log.debug("CLI name refresh failed", exc_info=True)
+
     msg = {
         "type": "status_update",
         "status": state_to_status_dict(st, cfg),

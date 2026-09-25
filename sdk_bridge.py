@@ -10,6 +10,7 @@ messages through a ``broadcaster`` callback.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -92,6 +93,7 @@ from config import (
 from state import (
     State,
     apply_rate_limit_info,
+    config_dir_path,
     detect_account_info,
     extract_context_tokens,
     fmt_duration,
@@ -925,7 +927,9 @@ class SDKBridge:
         # once, on the first connect, and then stable for the life of the
         # session; None means the registry is unavailable and every comms
         # operation degrades to a no-op rather than blocking the session.
-        self.agent_identity: str | None = None
+        self.agent_identity = None      # a property: mirrored into state
+        # When refresh_cli_name last read the CLI's registry file.
+        self._cli_name_read_at: float = 0.0
         self._agent_repo: str = ""
         self._agent_hb_at: float = 0.0
         self._agent_poll_at: float = 0.0
@@ -1559,6 +1563,59 @@ class SDKBridge:
             "subtype": "error",
             "data": {"message": describe_integrity_problem(report)},
         })
+
+    @property
+    def agent_identity(self) -> str | None:
+        """This session's identity in orchestrator2's agent registry."""
+        return self._agent_identity
+
+    @agent_identity.setter
+    def agent_identity(self, value: str | None) -> None:
+        # Mirrored into state so the status bar can show it: the status dict is
+        # built from state and config alone.
+        self._agent_identity = value
+        self.state.agent_registry_name = value
+
+    #: How often the status bar's agent name is re-read from the CLI.  A
+    #: rename lands this long after the CLI takes it, at most.
+    CLI_NAME_REFRESH_S = 5.0
+
+    async def refresh_cli_name(self) -> None:
+        """Read the name this session's CLI advertises to other sessions.
+
+        The CLI writes a registry file per process -- ``<config
+        dir>/sessions/<pid>.json`` -- and its ``name`` is exactly what
+        ``ListAgents`` shows and ``SendMessage`` addresses: an ``--agent-name``,
+        a title, or the one the CLI made up ("os-71").  orchestrator2 can
+        predict the first two but not the third, so it reads the file rather
+        than guessing.  Throttled (``CLI_NAME_REFRESH_S``); a CLI that is not
+        running has no name.
+        """
+        now = time.monotonic()
+        if now - self._cli_name_read_at < self.CLI_NAME_REFRESH_S:
+            return
+        self._cli_name_read_at = now
+        pid = self._cli_pid()
+        if pid is None:
+            self.state.cli_name = None
+            return
+        path = (config_dir_path(getattr(self.config, "config_dir", None))
+                / "sessions" / f"{pid}.json")
+
+        def read() -> str | None:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return None
+            name = data.get("name") if isinstance(data, dict) else None
+            if not isinstance(name, str):
+                return None
+            return name.strip() or None
+
+        try:
+            self.state.cli_name = await asyncio.to_thread(read)
+        except Exception:
+            log.debug("could not read the CLI's session name", exc_info=True)
 
     def _cli_pid(self) -> int | None:
         """PID of our ``claude.exe``, or None if the SDK doesn't expose it.

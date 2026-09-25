@@ -528,6 +528,17 @@ class State:
     # Its ``--agent-label``s, the same way: this session's, remembered with it,
     # never the hub's.  Published with its registry entry (_agent_labels).
     agent_labels: dict[str, str] = field(default_factory=dict)
+    # The name this session's CLI advertises to other Claude sessions -- what
+    # ``ListAgents`` shows and ``SendMessage`` addresses -- read from the CLI's
+    # own registry file (SDKBridge.refresh_cli_name).  Read rather than
+    # predicted: without --agent-name or a title the CLI makes one up
+    # ("os-71"), and only it knows what.
+    cli_name: str | None = None
+    # This session's identity in orchestrator2's agent registry, mirrored from
+    # SDKBridge.agent_identity; None while it is not registered.  Usually the
+    # same as cli_name when the session was given --agent-name, and not
+    # otherwise -- the two registries name sessions independently.
+    agent_registry_name: str | None = None
 
     # Metrics
     context_tokens: int = 0
@@ -888,6 +899,12 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
     return {
         "session_id": state.session_id,
         "session_title": session_title,
+        # The name other sessions address this one by, as its CLI advertises
+        # it; None until it has been read.  The registry identity and whether
+        # the name was given explicitly go to the field's tooltip.
+        "agent_name": state.cli_name,
+        "agent_registry": state.agent_registry_name,
+        "agent_name_given": state.agent_name,
         "cwd": config.cwd,
         "busy_label": busy_label,
         "busy_class": busy_class,

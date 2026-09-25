@@ -2536,6 +2536,21 @@ underneath `options.env`, which can add a variable but not remove one, and a
 hub launched from a named session's Bash tool would otherwise name every
 unnamed session after it.
 
+**The status bar shows the name as the CLI advertises it** (the `agent`
+field, 2026-09-24). Every running CLI keeps a registry file,
+`<config dir>/sessions/<pid>.json`, whose `name` is exactly what `ListAgents`
+prints and `SendMessage` addresses; `SDKBridge.refresh_cli_name` reads it into
+`state.cli_name` from the ticker, at most every `CLI_NAME_REFRESH_S`, just
+before the status snapshot is built. It is read rather than predicted because
+orchestrator2 knows the name only when it set it — an `--agent-name`, a title
+— and not the one the CLI makes up for a session nobody named ("os-71"), which
+is the case the field is most needed for. Until the file has been read the
+field is hidden, not guessed. Its tooltip adds `state.agent_registry_name`,
+mirrored from `SDKBridge.agent_identity` (a property, so every assignment
+reaches the status bar): the session's name in orchestrator2's own registry,
+the same one only when `--agent-name` set both, or a note that the session is
+not in that registry and so receives no halts.
+
 ---
 
 ## 8b. Session-file integrity (`session.py`)

@@ -726,5 +726,85 @@ test('a meta-click (macOS) is left to the browser too', (h) => {
   assert(!ev.defaultPrevented, 'swallowed a cmd-click');
 });
 
+/* ---- the agent name ------------------------------------------------------ *
+ *
+ * Asked for 2026-09-24 ("update the status bar to include the agent name"),
+ * after a session that should have been Lane A turned out to be going by
+ * os-71 and only the model, asked, could tell.  The field shows the name other
+ * sessions address this one by -- what ListAgents shows -- as the CLI itself
+ * advertises it.
+ */
+
+function agentOf(h, extra) {
+  h.live.accept();
+  h.live.deliver({ type: 'status_update',
+                   status: Object.assign({ busy_class: 'idle',
+                                           busy_label: 'idle' }, extra || {}) });
+  const doc = h.win.document;
+  return {
+    field: doc.getElementById('status-agent'),
+    sep: doc.getElementById('status-agent-sep'),
+    label: doc.getElementById('status-agent-label'),
+  };
+}
+
+test('the agent name is shown, labelled', (h) => {
+  const els = agentOf(h, { agent_name: 'Lane-A', agent_registry: 'Lane-A' });
+  assert(!els.field.hidden && !els.label.hidden && !els.sep.hidden,
+         'the field, its label or its separator stayed hidden');
+  assert(els.field.textContent === 'Lane-A', els.field.textContent);
+});
+
+test('the name the CLI made up is shown as it is', (h) => {
+  // The case the field exists for: nothing named the session, so it goes by
+  // whatever the CLI chose, and that is what other sessions will call it.
+  const els = agentOf(h, { agent_name: 'os-71', agent_registry: 'os-2' });
+  assert(els.field.textContent === 'os-71', els.field.textContent);
+});
+
+test('an unknown name is not shown at all', (h) => {
+  // Not "--": the name is read from the CLI a moment after it starts, and a
+  // placeholder would read as "this session has no name".
+  const els = agentOf(h, { agent_name: null });
+  assert(els.field.hidden && els.label.hidden && els.sep.hidden,
+         'showed an agent field with no name in it');
+});
+
+test('the field goes away when the name does', (h) => {
+  const els = agentOf(h, { agent_name: 'Lane-A' });
+  assert(!els.field.hidden, 'setup failed');
+  agentOf(h, { agent_name: null });
+  assert(els.field.hidden, 'the old name outlived the CLI that had it');
+});
+
+test('a renamed session shows its new name', (h) => {
+  const els = agentOf(h, { agent_name: 'os-71' });
+  agentOf(h, { agent_name: 'OS Lane A' });
+  assert(els.field.textContent === 'OS Lane A', els.field.textContent);
+});
+
+test('the tooltip gives the registry name when it differs', (h) => {
+  // Two registries, two names, unless --agent-name set both.
+  const els = agentOf(h, { agent_name: 'os-71', agent_registry: 'os-2' });
+  assert(/registry it is "os-2"/.test(els.field.title), els.field.title);
+});
+
+test('the tooltip does not repeat a registry name that is the same', (h) => {
+  const els = agentOf(h, { agent_name: 'Lane-A', agent_registry: 'Lane-A',
+                           agent_name_given: 'Lane-A' });
+  assert(!/registry it is/.test(els.field.title), els.field.title);
+  assert(/--agent-name/.test(els.field.title),
+         `a name given with --agent-name is not said to be: ${els.field.title}`);
+});
+
+test('the tooltip says when the session is not in the registry', (h) => {
+  // "Lane A" with its space: ListAgents allows it, the registry does not, and
+  // a session outside the registry receives no halts.
+  const els = agentOf(h, { agent_name: 'Lane A', agent_registry: null });
+  assert(/Not in the orchestrator2 agent registry/.test(els.field.title),
+         els.field.title);
+  assert(/halts/.test(els.field.title), els.field.title);
+});
+
 console.log(`\n${passes}/${passes + failures} passed`);
 process.exit(failures ? 1 : 0);

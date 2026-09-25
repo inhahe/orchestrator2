@@ -107,8 +107,8 @@ MOVECMD_MUTATIONS = [
 PANELSTOGGLE_MUTATIONS = [
     ("the queue count never reaches the toggle, so nothing says the panels "
      "hold anything (the original report)",
-     "    _updateLoop(status);\n    _updateToggleCount(status);",
-     "    _updateLoop(status);"),
+     "    _updateAgent(status);\n    _updateToggleCount(status);",
+     "    _updateAgent(status);"),
 
     ("the badge is shown even when the queue is empty, so it stops being a "
      "signal",
@@ -2864,6 +2864,98 @@ SESSIONNAME_SERVER_MUTATIONS = [
      "                                   agent_name=agent_name,\n"),
 ]
 
+# The status bar's agent name.  tests/test_status_agent_name.py and, for the
+# field itself, tests/reconnect_on_show.test.js.
+STATUSAGENT_JS_MUTATIONS = [
+    ("the agent field is never shown",
+     "    const show = name !== '';\n",
+     "    const show = false;\n"),
+
+    ("a field is shown for a session whose name is not known yet",
+     "    const show = name !== '';\n",
+     "    const show = true;\n"),
+
+    ("the field is shown without its label and separator",
+     "      for (const el of [elAgent, elAgentSep, elAgentLabel]) {\n",
+     "      for (const el of [elAgent]) {\n"),
+
+    ("the name itself is never written into the field",
+     "    _set(elAgent, 'textContent', name);\n",
+     ""),
+
+    ("the field is never updated at all",
+     "    _updateAgent(status);\n",
+     ""),
+
+    ("the tooltip never gives the registry name",
+     "      parts.push('In the orchestrator2 agent registry it is \"' + reg + '\".');\n",
+     ""),
+
+    ("the tooltip repeats a registry name that is the same",
+     "    } else if (reg !== name) {\n",
+     "    } else {\n"),
+
+    ("a session outside the registry is not said to be",
+     "    if (!reg) {\n",
+     "    if (false) {\n"),
+
+    ("a name given with --agent-name is not said to be",
+     "    if (status.agent_name_given && status.agent_name_given === name) {\n",
+     "    if (false) {\n"),
+]
+
+STATUSAGENT_MUTATIONS = [
+    ("the CLI's registry file is never read",
+     "            self.state.cli_name = await asyncio.to_thread(read)\n",
+     "            pass\n"),
+
+    ("the hub's account is read for a session in another account",
+     '        path = (config_dir_path(getattr(self.config, "config_dir", None))\n',
+     "        path = (config_dir_path(None)\n"),
+
+    ("the file is re-read on every tick",
+     "        if now - self._cli_name_read_at < self.CLI_NAME_REFRESH_S:\n"
+     "            return\n",
+     ""),
+
+    ("a CLI that stopped keeps showing its old name",
+     "        if pid is None:\n            self.state.cli_name = None\n"
+     "            return\n",
+     "        if pid is None:\n            return\n"),
+
+    ("a blank name is shown as the name",
+     "            return name.strip() or None\n",
+     "            return name\n"),
+
+    ("a name that is not text keeps the last one on screen",
+     "            if not isinstance(name, str):\n                return None\n",
+     ""),
+
+    ("the registry identity never reaches the status bar",
+     "        self.state.agent_registry_name = value\n",
+     ""),
+]
+
+STATUSAGENT_STATE_MUTATIONS = [
+    ("an unknown name is guessed from the title",
+     '        "agent_name": state.cli_name,\n',
+     '        "agent_name": state.cli_name or state.human_title,\n'),
+
+    ("the registry identity is left out of the status",
+     '        "agent_registry": state.agent_registry_name,\n',
+     '        "agent_registry": None,\n'),
+
+    ("whether the name was given with --agent-name is left out",
+     '        "agent_name_given": state.agent_name,\n',
+     '        "agent_name_given": None,\n'),
+]
+
+STATUSAGENT_SERVER_MUTATIONS = [
+    ("the ticker never reads the name, so the field never appears",
+     "            await rt.bridge.refresh_cli_name()\n",
+     "            pass\n"),
+]
+
 # --resume <title> into a running hub, and two sessions sharing a name.
 # tests/test_resume_by_title.py.
 #
@@ -3320,6 +3412,14 @@ TARGETS = {
                            SESSIONNAME_SERVER_MUTATIONS, "pytest"),
     "sessionname-disk": ("session.py", "tests/test_session_name.py",
                          SESSIONNAME_DISK_MUTATIONS, "pytest"),
+    "statusagent-js": ("static/status.js", "tests/reconnect_on_show.test.js",
+                       STATUSAGENT_JS_MUTATIONS, "node"),
+    "statusagent": ("sdk_bridge.py", "tests/test_status_agent_name.py",
+                    STATUSAGENT_MUTATIONS, "pytest"),
+    "statusagent-state": ("state.py", "tests/test_status_agent_name.py",
+                          STATUSAGENT_STATE_MUTATIONS, "pytest"),
+    "statusagent-server": ("server.py", "tests/test_status_agent_name.py",
+                           STATUSAGENT_SERVER_MUTATIONS, "pytest"),
     "resumetitle": ("session.py", "tests/test_resume_by_title.py",
                     RESUMETITLE_MUTATIONS, "pytest"),
     "resumetitle-server": ("server.py", "tests/test_resume_by_title.py",

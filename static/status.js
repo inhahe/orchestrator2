@@ -11,6 +11,7 @@ const Status = (() => {
   let elContext, elRateLimit;
   let elCliMem, elCliMemSep, elCliMemLabel;
   let elLoop, elLoopSep, elLoopLabel;
+  let elAgent, elAgentSep, elAgentLabel;
   let elToggleCount;
   let elCollapseCheck;
 
@@ -47,6 +48,9 @@ const Status = (() => {
     elLoop        = document.getElementById('status-loop');
     elLoopSep     = document.getElementById('status-loop-sep');
     elLoopLabel   = document.getElementById('status-loop-label');
+    elAgent       = document.getElementById('status-agent');
+    elAgentSep    = document.getElementById('status-agent-sep');
+    elAgentLabel  = document.getElementById('status-agent-label');
     elToggleCount = document.getElementById('sidebar-toggle-count');
     elCollapseCheck = document.getElementById('collapse-tools-check');
     if (elCollapseCheck) {
@@ -222,6 +226,7 @@ const Status = (() => {
     // CLI subprocess memory.
     _updateCliMem(status);
     _updateLoop(status);
+    _updateAgent(status);
     _updateToggleCount(status);
 
     // Rate limits.
@@ -345,6 +350,41 @@ const Status = (() => {
                 + 'turn was still running; after the cap it is dropped.'
               : '')
          + '  Stop it with /loop off.');
+  }
+
+  // The name other Claude sessions address this one by -- what ListAgents
+  // shows -- as the session's CLI advertises it.  Hidden until it is known:
+  // a guessed name would be wrong in exactly the case that needs the field,
+  // a session that was never given one and is going by a name the CLI made up.
+  // The tooltip adds the orchestrator2 agent-registry identity, which is a
+  // separate name (the same one only when --agent-name set both), or says the
+  // session is not in that registry -- and so receives no halts.
+  function _updateAgent(status) {
+    if (!elAgent) return;
+    const name = status.agent_name || '';
+    const show = name !== '';
+    if (_prev.agentShown !== show) {
+      for (const el of [elAgent, elAgentSep, elAgentLabel]) {
+        if (el) el.hidden = !show;
+      }
+      _prev.agentShown = show;
+    }
+    if (!show) return;
+    _set(elAgent, 'textContent', name);
+
+    const reg = status.agent_registry || '';
+    const parts = ['Other Claude sessions address this one as "' + name
+                   + '" (ListAgents / SendMessage).'];
+    if (status.agent_name_given && status.agent_name_given === name) {
+      parts.push('Given with --agent-name.');
+    }
+    if (!reg) {
+      parts.push('Not in the orchestrator2 agent registry, so it receives no '
+                 + 'halts and tools/agents.py cannot message it.');
+    } else if (reg !== name) {
+      parts.push('In the orchestrator2 agent registry it is "' + reg + '".');
+    }
+    _set(elAgent, 'title', parts.join(' '));
   }
 
   function _updateCliMem(status) {
