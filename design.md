@@ -394,10 +394,45 @@ about the same client and disagreeing would be worse than either being wrong.
 Shared blind spot: iPadOS Safari reports a desktop UA, so an iPad is treated as
 a desktop.
 
-Known limitation, stated rather than papered over: a **laptop** suspending has
-the same shape and is not covered. Generalising to "any abnormal close" would
-catch it, but 1006 is common enough (a crashed tab, flaky wifi) that almost
-everything would become exempt — so the narrower, stable signal was chosen.
+*Nor is a background tab the browser put to sleep.* Asked 2026-09-27: *"what
+i would like is for orchestrator2 not to automatically kill a process after n
+seconds when a tab disconnects due to chrome forcing it"*. Chrome's Memory
+Saver discards background tabs, which kills the page. The hub's log records
+the browser resetting their connections (WinError 10054), and the session was
+reaped five minutes later although its tab was still open.
+
+"Any abnormal close" was rejected earlier as too broad: a tab that crashes, or
+flaky wifi, would be exempt too. The signal used is narrower, and matches how
+Chrome behaves. It only discards or freezes **background** tabs, and a tab
+closed by hand sends a Close frame (1001) even from the background, while a
+killed page sends none. Measured against this uvicorn: a clean close reaches
+the endpoint as 1001, a reset as 1006.
+
+So the page tells the hub when it is hidden (`{type: "visibility"}`), which
+tracks `_hidden_ws`. `_note_how_it_ended` marks a socket asleep (`_asleep_ws`)
+when it was hidden and ended without a deliberate close. That covers both a
+`WebSocketDisconnect` other than 1000/1001, and the "websocket error" path,
+where the send side found the socket gone first. `_maybe_start_idle_timer`
+treats an asleep socket exactly like a phone's: `--mobile-idle-timeout`,
+never by default. A tab that crashes or loses its connection while you are
+looking at it still counts as leaving.
+
+The page sends `visibility` only after `attached.hears` lists it
+(`HUB_HEARS`), because an older hub answers an unknown message type in the
+chat.
+
+The cost is the same as for phones: a discarded tab that is then closed never
+says so. The page is already dead, so its session stays up until closed from
+the lobby or the hub restarts. That was judged the right side to err on here
+as well.
+
+Known limitation, stated rather than papered over: a **laptop** suspending
+while its tab is in the *foreground* is not covered. Its page never said it was
+hidden, and from the hub that is indistinguishable from a crash.
+
+Tests: `tests/test_asleep_tab.py` (each close kind hidden and visible, the
+timer, and the real endpoint) and four tests in `reconnect_on_show.test.js`;
+mutation targets `asleep-server` and `asleep-app`.
 
 The runtime remembers whether its countdown is the mobile one (`idle_mobile`),
 so a deferral re-arms with the grace it was armed with rather than quietly
@@ -2197,6 +2232,80 @@ boolean the logic actually used). **A mutation that survives is a fact about the
 code, not a gap in the tests to paper over:** twice now the right answer was to
 delete the unverifiable code rather than write a test that could not distinguish
 its presence from its absence.
+
+### A tab that loses its socket resumes; it does not reload
+
+Reported 2026-09-27: *"often, a tab randomly changes its name from the session
+name to 'orchestrator2', and when i click on it, it reloads the history …
+tabs from other things than orchestrator2 never change their names OR have to
+reload anything due to the tab falling asleep."*
+
+Neither end closes a sleeping tab's socket. The hub runs uvicorn with
+WebSocket pings off (`ws_ping_interval=None`), and its per-tab channel queues
+and coalesces for a slow reader but never gives up on one. The page closes its
+own socket only from the prompt watchdog. The hub's log shows the other side
+already gone ("WebSocket is not connected"), followed by a burst of
+full-history sends as the user clicks through tabs. **The browser drops the
+socket of a tab it has put to sleep.** Two faults followed from that, both
+ours:
+
+- **The rename.** `app.js` reports a dropped, reconnecting or abandoned socket
+  through `Status.update({busy_label, busy_class})`. `status.js` read the
+  session fields that update doesn't carry as "no session": the tab title
+  became `orchestrator2`, and the session and cwd fields became `--`. These
+  updates are now marked `connection: true`, and `Status.update` stops after
+  the state text for them. The session hasn't changed, only the connection to
+  it, and the favicon already shows the drop (all three LEDs yellow). The
+  title is also kept in `sessionStorage` per `rid`, so a tab the browser
+  discards and reloads, or one refreshed, shows its name before the socket is
+  back.
+- **The reload.** Every reconnect went through `_attach_ws` →
+  `_send_initial_state`, which is `clear_screen` plus the whole history
+  re-rendered from the transcript: a thousand-odd messages and seconds of work,
+  to show the tab what it already had plus the few it missed. Now each runtime
+  numbers what it broadcasts (`seq`, under a per-runtime `epoch`) and keeps
+  the recent part: up to 4 MB, or 20,000 messages. It keeps them even with no
+  tab attached, since a tab whose socket has dropped is exactly who needs
+  them. `attached` tells a tab where in the stream it joins, the tab tracks
+  every numbered message it shows, and a reconnect to the same `rid` sends
+  `?resume=<epoch>.<seq>`. If `replay_since` can still cover it,
+  `_resume_ws` sends fresh snapshots and then only the missed messages: no
+  clear, no history. Otherwise it is the full attach as before: a first visit,
+  a hub restart (a new epoch), a position the stream never had, or a gap that
+  was trimmed.
+
+The details that make the resume exact:
+
+- **Snapshots and bells are not numbered** (`NOT_REPLAYED`). A resumed tab gets
+  a fresh snapshot of each, and an old bell would ring late.
+- **The tab that sent a prompt is skipped by its echo's broadcast** (`exclude`),
+  so it is sent a bare `{type: "seq"}` instead. Otherwise its position would lag
+  one message, and a resume would hand it its own prompt again.
+- **`_resume_ws` is synchronous** from the first enqueue to adding the socket to
+  `rt.clients`, so no broadcast can fall between the replay and the live stream.
+- **A resumed `attached` does not move the tab's position.** The replay after it
+  does, message by message, so a socket that drops again mid-replay asks again
+  for what it has not yet shown. `attached`'s `seq` is also never read as a
+  message the tab has shown; a test caught exactly that bug.
+
+**Why it dropped, from now on.** A reconnecting tab adds the close code, how
+long it had been hidden, whether the page was frozen (the `freeze` event), or
+that the browser discarded and reloaded it (`document.wasDiscarded`). The hub
+logs this as "tab for sN reconnecting: socket closed with 1006 after 312s
+hidden; page frozen meanwhile: yes". The next occurrence will say which of
+Chrome's mechanisms did it.
+
+**Not covered: a discarded tab.** Chrome's Memory Saver throws away a
+background tab's page entirely and reloads it on click. Nothing of the page
+survives to resume from, so it gets the full history; only its title is
+restored at once. Chrome's Settings → Performance → "Always keep these sites
+active" exempts the hub's address.
+
+Tests: `tests/test_resume_stream.py` (the stream, `_resume_ws`, and the real
+`websocket_endpoint` choosing resume or full history), and 15 tests in
+`reconnect_on_show.test.js` (the position and resume in the reconnect URL, the
+close report, and the name kept through a drop and a reload). Mutation
+targets: `resume-runtime`, `resume-server`, `resume-app`, `resume-status`.
 
 ### Display options are backend state, not frontend state
 

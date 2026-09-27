@@ -22,6 +22,19 @@ const App = (() => {
   let _promptSeq = 0;              // per-tab counter behind each prompt_id
   let _watchedPrompt = null;       // { id, disposition } for the in-flight prompt
   let _pendingSends = [];          // user messages typed while disconnected
+  // Where this tab is in its session's numbered stream: { rid, epoch, seq }.
+  // Sent back on reconnect, so the hub sends only what was missed instead of
+  // clearing the tab and re-sending the whole history (server._resume_ws).
+  let _stream = null;
+  // Why the last socket went away, for the hub's log: { code, hiddenAt }.
+  let _lastClose = null;
+  let _frozen = false;             // the browser froze this page since then
+  let _hiddenAt = null;            // when the page was last hidden
+  let _discardReported = false;    // told the hub this page was reloaded from a discard
+  // Messages the hub on this socket said it understands (`attached.hears`).
+  // An older hub answers an unknown type in the chat, so nothing optional is
+  // sent until it says so.
+  let _hubHears = [];
   const MAX_RECONNECT_DELAY = 30000;
   const MAX_RECONNECT_ATTEMPTS = 20;
   const PROMPT_WATCHDOG_MS = 8000; // ~how long a turn should take to start
@@ -55,6 +68,9 @@ const App = (() => {
     // Recover a socket that died while nobody was looking. See
     // _onVisibilityChange.
     document.addEventListener('visibilitychange', _onVisibilityChange);
+    // Chrome freezes a background tab to save power; whether it did so before
+    // a socket dropped is the first thing to know about the drop.
+    document.addEventListener('freeze', () => { _frozen = true; });
 
     // Focus input.
     Commands.focus();
@@ -149,8 +165,26 @@ const App = (() => {
     const account = params.get('account');
     const lobbyFlag = params.get('lobby');
     wsUrl = `${protocol}//${location.host}/ws`;
-    if (rid) wsUrl += `?rid=${encodeURIComponent(rid)}`;
-    else if (lobbyFlag) wsUrl += `?lobby=1`;
+    const q = [];
+    if (rid) q.push(`rid=${encodeURIComponent(rid)}`);
+    else if (lobbyFlag) q.push('lobby=1');
+    // Back to the session this tab was already showing: resume, not reload.
+    if (rid && _stream && _stream.rid === rid) {
+      q.push(`resume=${encodeURIComponent(_stream.epoch + '.' + _stream.seq)}`);
+    }
+    // Why the last socket went away -- the browser drops a sleeping tab's
+    // socket, and the hub logs which way.
+    if (_lastClose) {
+      q.push(`why=${_lastClose.code}`, `frozen=${_frozen ? 1 : 0}`);
+      if (_lastClose.hiddenAt) {
+        q.push(`hidden=${Math.round((Date.now() - _lastClose.hiddenAt) / 1000)}`);
+      }
+    } else if (document.wasDiscarded && !_discardReported) {
+      _discardReported = true;
+      q.push('discarded=1');
+    }
+    if (q.length) wsUrl += '?' + q.join('&');
+    _hubHears = [];                // until this socket's hub says otherwise
 
     // Don't flash the landing lobby while we wait for the open/new to attach.
     if (!rid && (openSid || newFlag)) Lobby.expectSession();
@@ -161,6 +195,8 @@ const App = (() => {
       console.log('WebSocket connected');
       reconnectDelay = 1000;
       reconnectAttempt = 0;
+      _lastClose = null;
+      _frozen = false;
       // The server drops this ws from its lobby-watcher set on disconnect, so
       // forget any prior subscription — the next render()/show() must re-send
       // lobby_watch to resume live updates on this fresh socket.
@@ -184,6 +220,11 @@ const App = (() => {
 
     ws.onclose = (e) => {
       console.log('WebSocket closed:', e.code, e.reason);
+      // Kept from the first close of a run of retries, so the report says
+      // how the connection was lost, not how the last retry failed.
+      if (!_lastClose) {
+        _lastClose = { code: e.code, hiddenAt: document.hidden ? (_hiddenAt || Date.now()) : null };
+      }
       // The drop *is* the answer the watchdog was waiting for, and the
       // reconnect banner says it better than "no response from the server".
       // Leaving it armed would also have it close an already-closed socket.
@@ -216,7 +257,7 @@ const App = (() => {
     if (reconnectAttempt > MAX_RECONNECT_ATTEMPTS) {
       _serverShutdown = true;
       _retriesExhausted = true;
-      Status.update({ busy_label: 'disconnected', busy_class: 'shutdown' });
+      Status.update({ busy_label: 'disconnected', busy_class: 'shutdown', connection: true });
       Chat.handleMessage({
         type: 'system_msg',
         subtype: 'error',
@@ -241,7 +282,7 @@ const App = (() => {
       const label = reconnectAttempt > 1
         ? `disconnected — reconnecting (${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS})`
         : 'disconnected';
-      Status.update({ busy_label: label, busy_class: 'reconnecting' });
+      Status.update({ busy_label: label, busy_class: 'reconnecting', connection: true });
     }
   }
 
@@ -329,7 +370,7 @@ const App = (() => {
     // A socket already handshaking will flush the queue on its own onopen;
     // don't open a second one that would orphan the first.
     if (ws && ws.readyState === WebSocket.CONNECTING) return;
-    Status.update({ busy_label: 'reconnecting', busy_class: 'reconnecting' });
+    Status.update({ busy_label: 'reconnecting', busy_class: 'reconnecting', connection: true });
     _connect();
   }
 
@@ -362,8 +403,22 @@ const App = (() => {
    * tab focus would be a command the user never typed.  A CONNECTING socket
    * needs no check here -- reconnect() already refuses to open a second one.
    */
+  /* Tell the hub whether this tab is in the background.  A background tab is
+   * the only kind Chrome discards or freezes, so if its socket then dies
+   * without a close the hub knows the browser put it to sleep -- and does not
+   * idle out its session as if its viewer had left (server._note_how_it_ended).
+   */
+  function _sendVisibility() {
+    if (!_hubHears.includes('visibility')) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      ws.send(JSON.stringify({ type: 'visibility', hidden: !!document.hidden }));
+    } catch (e) { /* the socket is going; the next one will say */ }
+  }
+
   function _onVisibilityChange() {
-    if (document.hidden) return;
+    _sendVisibility();
+    if (document.hidden) { _hiddenAt = Date.now(); return; }
     if (ws && ws.readyState === WebSocket.OPEN) return;
     if (_serverShutdown && !_retriesExhausted) return;
     reconnect();
@@ -453,6 +508,17 @@ const App = (() => {
   function _dispatch(msg) {
     const type = msg.type;
 
+    // How far into its session's stream this tab has got (see _stream).  Not
+    // from `attached`: its seq is where the stream stands, not a message this
+    // tab has shown -- the attached handler below decides what it means.
+    if (type !== 'attached' && typeof msg.seq === 'number' && _stream
+        && msg.seq > _stream.seq) {
+      _stream.seq = msg.seq;
+    }
+    // A broadcast this tab drew itself (its own prompt's echo): only the
+    // position moves.
+    if (type === 'seq') return;
+
     // The server telling us where the prompt we're watching landed.  This does
     // *not* disarm the watchdog — it decides what the watchdog will check for.
     // Only the id we're actually waiting on counts, so a late ack for a prompt
@@ -508,6 +574,23 @@ const App = (() => {
       // Update the URL to ?rid=<rid> so a refresh re-attaches directly
       // (instead of re-opening, which would fork the session).
       const s = msg.session || {};
+      // Where in this session's stream the tab now stands.  A hub that does
+      // not number its stream sends no epoch, and the tab then reloads on
+      // reconnect as it always did.
+      // A resumed attach keeps the position the tab resumed *from*: the
+      // replay that follows moves it on message by message, so a socket that
+      // drops again mid-replay resumes from what was actually shown.
+      const resumedHere = msg.resumed && _stream && _stream.rid === s.rid
+                          && _stream.epoch === msg.epoch;
+      if (!resumedHere) {
+        _stream = (s.rid && msg.epoch)
+          ? { rid: s.rid, epoch: msg.epoch, seq: msg.seq || 0 }
+          : null;
+      }
+      // What this hub understands; then where this tab stands now -- it may
+      // be attaching in the background.
+      _hubHears = Array.isArray(msg.hears) ? msg.hears : [];
+      _sendVisibility();
       if (s.rid) {
         try {
           const u = new URL(location.href);
@@ -617,6 +700,7 @@ const App = (() => {
       Status.update({
         busy_label: 'server stopped',
         busy_class: 'shutdown',
+        connection: true,
       });
       Chat.handleMessage({
         type: 'system_msg',

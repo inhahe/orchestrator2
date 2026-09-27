@@ -132,12 +132,19 @@ the same port. Notes:
   - **Tear down a session that is working.** A turn still running (or a
     background task still going) defers the teardown until it finishes — you
     close the tab *because* it keeps working.
-  - **Start the clock when the last viewer was a phone or tablet.** Phones
-    suspend their browser a minute or two after the screen locks, well inside
-    the 5-minute default, so the ordinary clock reaps a session its only viewer
-    is still using. Mobile-only sessions use `--mobile-idle-timeout`, which
-    defaults to **0 (never)**; set a positive value to reap them too. (An iPad
-    is treated as a desktop — iPadOS Safari reports a desktop User-Agent.)
+  - **Start the clock when the last viewer was a phone or tablet, or a
+    background tab the browser put to sleep.** Phones suspend their browser a
+    minute or two after the screen locks, well inside the 5-minute default,
+    and Chrome discards background tabs to save memory. Either way the
+    ordinary clock would reap a session its viewer is still using. So these
+    use `--mobile-idle-timeout`, which defaults to **0 (never)**; set a
+    positive value to reap them too.
+    
+    A background tab counts when it had told the hub it was hidden and its
+    connection then ended without a goodbye. A tab you close yourself says
+    goodbye even from the background, and still starts the ordinary clock, as
+    does a tab that crashes while you're looking at it. (An iPad is treated as
+    a desktop — iPadOS Safari reports a desktop User-Agent.)
 
 ### A second hub, with several sessions in it
 
@@ -301,6 +308,7 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 - **Auto-compact** -- automatic context compaction when token usage gets high
 - **Readable post-compact summary** -- after a compact, the harness-injected summary that becomes the new conversation's starting context is shown as a collapsed box you can click to expand and read in full (Claude Code hides this prompt from the user)
 - **Messages from other sessions are shown** -- a message another Claude session sends this one appears in the chat as "✉ From *name*", live and in history, so a reply such as "Reply sent." has its context.
+- **A tab that loses its connection keeps its place** -- when the browser puts a background tab to sleep and drops its connection, the tab keeps its name (the icon's three yellow LEDs say it's disconnected), and when it reconnects it is sent only what it missed rather than reloading the whole history. A hub restart, or a very long sleep, still reloads it. A tab Chrome *discards* outright reloads the page itself; to stop that, add the hub's address under Chrome's Settings → Performance → "Always keep these sites active".
 - **Your message waits for the session's own turn** -- a message you send just as the session starts a turn of its own (for another session's message, or a finished background task) is held until that turn ends, then runs as a turn of its own. If it does get folded into the other turn anyway, you're told, and the history shows it marked "sent while it was working".
 - **Background tasks** -- track and inspect agent-spawned background work
 - **Autonomous-loop heartbeat** -- honours the model's `ScheduleWakeup` tool calls: when the agent schedules a self-paced wake-up (e.g. a 60s autonomous-loop tick), the orchestrator re-injects the scheduled prompt as a fresh turn after the requested delay, even while a background task is still running. `ScheduleWakeup(stop=true)` ends the loop, and a wakeup that keeps landing mid-turn is deferred at most 10 times before being dropped rather than re-arming forever. Inspect and control it from either side with **`/loop`**; disable it for the whole session with `--no-wakeup`. **A scheduled loop survives restarting the hub.** That covers the lobby's Shut down and ⟳ Restart, the no-tabs auto-shutdown, and Ctrl+C. When the hub comes back, it re-arms each loop due when it was: in the session it resumed itself, and in sessions it reopens because they had a loop (at most 4 per start). A session it reopens says so, and says that nobody typed anything. A loop that would now fire later than its own interval (1 min–1 h) is not run, because a plan that late is stale; restart it with `/loop`. Closing a session yourself (the lobby's ×, `/quit`, `/move`) ends its loop for good
@@ -454,7 +462,7 @@ The status bar grows a `cli` field once memory approaches the threshold.
 | `--no-auto-shutdown` | off | Never auto-shut-down when tabs close, even under `--open`/`--detach`; the server runs until stopped explicitly |
 | `--standalone` | off | Start a separate server instead of joining a running hub on the same port/account |
 | `--session-idle-timeout SECS` | 300 | Seconds a session with zero viewers lingers before teardown (`0` disables) |
-| `--mobile-idle-timeout SECONDS` | `0` | Idle teardown when the last viewer was a phone or tablet. `0` = never — phones sleep, and a sleeping phone is not a viewer who left |
+| `--mobile-idle-timeout SECONDS` | `0` | Idle teardown when the last viewer was put to sleep by its browser: a phone or tablet, or a background tab whose connection the browser dropped (Chrome discarding it). `0` = never — a sleeping viewer is not one who left |
 | `--config-dir PATH` | -- | Override `CLAUDE_CONFIG_DIR` (session/credential storage). Use to run under a different Claude account |
 | `--debug` | off | Print extra diagnostic messages |
 

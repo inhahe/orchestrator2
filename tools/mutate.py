@@ -273,8 +273,8 @@ APP_MUTATIONS = [
      "    if (_serverShutdown && !_retriesExhausted) return;\n  }"),
 
     ("hiding reconnects too, so the retry storm runs unattended",
-     "    if (document.hidden) return;\n",
-     ""),
+     "    if (document.hidden) { _hiddenAt = Date.now(); return; }\n",
+     "    if (document.hidden) { _hiddenAt = Date.now(); }\n"),
 
     ("an exhausted retry budget is not recorded, so it can never be undone",
      "      _retriesExhausted = true;\n",
@@ -1239,18 +1239,19 @@ IDLE_MUTATIONS = [
     ("a sleeping phone starts the ordinary 5-minute clock again "
      "(the original report)",
      "    mobile = (rt.idle_mobile if departing is None\n"
-     "              else departing in _mobile_ws)",
+     "              else departing in _mobile_ws or departing in _asleep_ws)",
      "    mobile = False"),
 
     ("every session gets the mobile grace, so nothing is ever reaped",
      "    mobile = (rt.idle_mobile if departing is None\n"
-     "              else departing in _mobile_ws)",
+     "              else departing in _mobile_ws or departing in _asleep_ws)",
      "    mobile = True"),
 
     ("a deferral drops a mobile session onto the short desktop clock",
      "    mobile = (rt.idle_mobile if departing is None\n"
-     "              else departing in _mobile_ws)",
-     "    mobile = departing is not None and departing in _mobile_ws"),
+     "              else departing in _mobile_ws or departing in _asleep_ws)",
+     "    mobile = departing is not None and (departing in _mobile_ws\n"
+     "                                        or departing in _asleep_ws)"),
 
     ("the mobile grace is not remembered, so a deferral cannot preserve it",
      "    rt.idle_mobile = mobile\n",
@@ -1587,8 +1588,8 @@ TABECHO_MUTATIONS = [
 # another file silently register as "anchor appears 0x" rather than as passes.
 TABECHO_RT_MUTATIONS = [
     ("exclude is ignored, so the sender sees its prompt twice",
-     "            if exclude is not None and ws is exclude:\n                continue\n",
-     ""),
+     "            if exclude is not None and ws is exclude:",
+     "            if False:"),
 
     # Deliberately NOT mutating ``is`` to ``==``: neither Starlette's WebSocket
     # nor the test double defines ``__eq__``, so the two are the same operation
@@ -1596,8 +1597,8 @@ TABECHO_RT_MUTATIONS = [
     # the intent, but pretending a sweep verifies it would be theatre.
 
     ("exclude swallows the whole broadcast",
-     "            if exclude is not None and ws is exclude:\n                continue\n",
-     "            if exclude is not None:\n                continue\n"),
+     "            if exclude is not None and ws is exclude:",
+     "            if exclude is not None:"),
 ]
 
 FOREIGN_MUTATIONS = [
@@ -2963,6 +2964,247 @@ MOVESTOP_WAKEUP_MUTATIONS = [
      "    return None\n"),
 ]
 
+# A background tab Chrome kills is asleep, not gone: its session is kept.
+# tests/test_asleep_tab.py and tests/reconnect_on_show.test.js.
+ASLEEP_SERVER_MUTATIONS = [
+    ("a tab the browser put to sleep is never marked asleep -- the request",
+     "    _asleep_ws.add(ws)\n    rt = _ws_runtime.get(ws)",
+     "    rt = _ws_runtime.get(ws)"),
+
+    ("any abnormal close counts: a tab killed as you look at it is kept too",
+     "    if code in _DELIBERATE_CLOSES or ws not in _hidden_ws:",
+     "    if code in _DELIBERATE_CLOSES:"),
+
+    ("a background tab closed by hand is kept as if asleep",
+     "    if code in _DELIBERATE_CLOSES or ws not in _hidden_ws:",
+     "    if ws not in _hidden_ws:"),
+
+    ("the page's own ws.close() counts as being killed",
+     "_DELIBERATE_CLOSES = frozenset({1000, 1001})",
+     "_DELIBERATE_CLOSES = frozenset({1001})"),
+
+    ("the idle timer ignores an asleep tab",
+     "              else departing in _mobile_ws or departing in _asleep_ws)",
+     "              else departing in _mobile_ws)"),
+
+    ("a disconnect is never classified",
+     "        _note_how_it_ended(ws, getattr(exc, \"code\", None))",
+     "        pass"),
+
+    ("a socket the hub found gone first is never classified",
+     "        _note_how_it_ended(ws, None)\n    finally:",
+     "    finally:"),
+
+    ("the hub never hears a tab go to the background",
+     "        if msg.get(\"hidden\"):\n            _hidden_ws.add(ws)",
+     "        if False:\n            _hidden_ws.add(ws)"),
+
+    ("the hub never hears it come back",
+     "        else:\n            _hidden_ws.discard(ws)\n        return True",
+     "        else:\n            pass\n        return True"),
+
+    ("a gone socket is left in the sets",
+     "    _hidden_ws.discard(ws)\n    _asleep_ws.discard(ws)\n",
+     ""),
+
+    ("the hub never says it hears visibility, so no page sends it",
+     "HUB_HEARS = [\"visibility\"]",
+     "HUB_HEARS = []"),
+]
+
+ASLEEP_APP_MUTATIONS = [
+    ("an older hub is sent it, and answers in the chat",
+     "    if (!_hubHears.includes('visibility')) return;\n",
+     ""),
+
+    ("the hub is not told when the tab goes to the background",
+     "    _sendVisibility();\n    if (document.hidden) { _hiddenAt",
+     "    if (document.hidden) { _hiddenAt"),
+
+    ("a tab attaching in the background never says so",
+     "      _hubHears = Array.isArray(msg.hears) ? msg.hears : [];\n      _sendVisibility();",
+     "      _hubHears = Array.isArray(msg.hears) ? msg.hears : [];"),
+
+    ("a new socket keeps what the last hub heard",
+     "    _hubHears = [];                // until this socket's hub says otherwise\n",
+     ""),
+
+    ("the tab always says it is visible",
+     "hidden: !!document.hidden }",
+     "hidden: false }"),
+]
+
+# A tab whose socket drops resumes; it does not reload, and keeps its name.
+# tests/test_resume_stream.py and tests/reconnect_on_show.test.js.
+#
+# Not mutated: replay_since's `seq < 0` guard and its caught-up `return []`
+# (each is also covered by the check after it, so removing either changes
+# nothing); document.wasDiscarded, which jsdom does not implement.
+RESUME_RUNTIME_MUTATIONS = [
+    ("nothing is numbered or kept, so every reconnect reloads",
+     "        if msg.get(\"type\") not in NOT_REPLAYED:\n            msg = self._record(msg)",
+     "        if False:\n            msg = self._record(msg)"),
+
+    ("a bell is replayed, ringing late",
+     "                          \"session_list\", \"bell\"})",
+     "                          \"session_list\"})"),
+
+    ("what is said with nobody watching is not kept -- the tab that dropped",
+     "        seq: int | None = None\n        if msg.get(\"type\") not in NOT_REPLAYED:",
+     "        if not self.clients:\n            return\n"
+     "        seq: int | None = None\n        if msg.get(\"type\") not in NOT_REPLAYED:"),
+
+    ("the tab that sent a prompt loses its place, and is sent it again",
+     "                if seq is not None:\n"
+     "                    ws_channel.send(ws, {\"type\": \"seq\", \"seq\": seq})\n",
+     ""),
+
+    ("every message gets the same number",
+     "        self.seq += 1\n",
+     ""),
+
+    ("what is kept is unbounded in size",
+     "        while self._replay and (self._replay_bytes > REPLAY_MAX_BYTES\n",
+     "        while self._replay and (False\n"),
+
+    ("what is kept is unbounded in count",
+     "                                or len(self._replay) > REPLAY_MAX_MESSAGES):",
+     "                                or False):"),
+
+    ("a dropped message's size is still counted, so everything goes",
+     "            self._replay_bytes -= dropped\n",
+     ""),
+
+    ("another runtime's stream is resumed -- a hub restart",
+     "        if epoch != self.epoch or not isinstance(seq, int) or isinstance(seq, bool):",
+     "        if not isinstance(seq, int) or isinstance(seq, bool):"),
+
+    ("True is taken for position 1",
+     "        if epoch != self.epoch or not isinstance(seq, int) or isinstance(seq, bool):",
+     "        if epoch != self.epoch or not isinstance(seq, int):"),
+
+    ("a position the stream never reached is resumed",
+     "        if seq < 0 or seq > self.seq:\n            return None",
+     "        if seq < 0:\n            return None"),
+
+    ("a tab is resumed past messages that were dropped, skipping them",
+     "        if seq + 1 < oldest:\n            return None\n",
+     ""),
+]
+
+RESUME_SERVER_MUTATIONS = [
+    ("a reconnect's position is never read",
+     "    return rt.replay_since(epoch, position)",
+     "    return None"),
+
+    ("the hub never resumes",
+     "            if missed is not None:\n                await _resume_ws(ws, target, missed)",
+     "            if False:\n                await _resume_ws(ws, target, missed)"),
+
+    ("a resumed tab is cleared anyway",
+     "    ws_channel.send(ws, {\"type\": \"attached\", \"session\": rt.meta(),\n"
+     "                         \"epoch\": rt.epoch, \"seq\": rt.seq, \"resumed\": True,",
+     "    ws_channel.send(ws, {\"type\": \"clear_screen\"})\n"
+     "    ws_channel.send(ws, {\"type\": \"attached\", \"session\": rt.meta(),\n"
+     "                         \"epoch\": rt.epoch, \"seq\": rt.seq, \"resumed\": True,"),
+
+    ("a resumed tab is not told what changed meanwhile",
+     "    if state is not None and config is not None:\n        ws_channel.send(ws, {\n"
+     "            \"type\": \"status_update\",",
+     "    if False:\n        ws_channel.send(ws, {\n"
+     "            \"type\": \"status_update\","),
+
+    ("a resumed tab is not sent what it missed",
+     "    for msg in missed:\n        ws_channel.send(ws, msg)\n",
+     ""),
+
+    ("a resumed tab is not mapped to its session",
+     "    _ws_runtime[ws] = rt\n    log.info(\"tab resumed",
+     "    log.info(\"tab resumed"),
+
+    ("a full attach does not say where in the stream the tab joins",
+     "    await send_to(ws, {\"type\": \"attached\", \"session\": rt.meta(),\n"
+     "                       \"epoch\": rt.epoch, \"seq\": rt.seq, \"hears\": HUB_HEARS})",
+     "    await send_to(ws, {\"type\": \"attached\", \"session\": rt.meta(),\n"
+     "                       \"hears\": HUB_HEARS})"),
+
+    ("why a tab reconnected is never logged",
+     "        _log_reconnect_reason(ws, requested_rid)\n",
+     ""),
+
+    ("a frozen page is logged as not frozen",
+     "\"yes\" if q.get(\"frozen\") == \"1\" else \"no\")",
+     "\"no\")"),
+]
+
+RESUME_APP_MUTATIONS = [
+    ("a reconnect never asks to resume",
+     "    if (rid && _stream && _stream.rid === rid) {\n      q.push(`resume=",
+     "    if (false) {\n      q.push(`resume="),
+
+    ("the tab never learns how far it got",
+     "    if (type !== 'attached' && typeof msg.seq === 'number' && _stream",
+     "    if (false && typeof msg.seq === 'number' && _stream"),
+
+    ("the stream's position in attached is taken for a message shown",
+     "    if (type !== 'attached' && typeof msg.seq === 'number' && _stream",
+     "    if (typeof msg.seq === 'number' && _stream"),
+
+    ("a seq marker reaches the chat",
+     "    if (type === 'seq') return;\n",
+     ""),
+
+    ("a resumed attach jumps to the latest position, losing a replay cut short",
+     "      if (!resumedHere) {",
+     "      if (true) {"),
+
+    ("a hub that numbers nothing is asked to resume anyway",
+     "      _stream = (s.rid && msg.epoch)",
+     "      _stream = (s.rid)"),
+
+    ("why the socket dropped is never reported",
+     "    if (_lastClose) {\n      q.push(`why=",
+     "    if (false) {\n      q.push(`why="),
+
+    ("a freeze goes unnoticed",
+     "    document.addEventListener('freeze', () => { _frozen = true; });",
+     "    document.addEventListener('freeze', () => {});"),
+
+    ("a failed retry is reported instead of the loss",
+     "      if (!_lastClose) {\n        _lastClose = {",
+     "      if (true) {\n        _lastClose = {"),
+
+    ("an old loss is reported after a good connection",
+     "      _lastClose = null;\n      _frozen = false;\n",
+     ""),
+
+    ("how long it was hidden is not measured from when it hid",
+     "    if (document.hidden) { _hiddenAt = Date.now(); return; }",
+     "    if (document.hidden) { return; }"),
+
+    ("a dropped socket's update is not marked as connection-only",
+     "      Status.update({ busy_label: label, busy_class: 'reconnecting', connection: true });",
+     "      Status.update({ busy_label: label, busy_class: 'reconnecting' });"),
+]
+
+RESUME_STATUS_MUTATIONS = [
+    ("a dropped connection renames the tab -- the report",
+     "    if (status.connection) return;\n",
+     ""),
+
+    ("the name is not kept for a reload",
+     "        try {\n          sessionStorage.setItem(TITLE_KEY, JSON.stringify(",
+     "        try {\n          if (false) sessionStorage.setItem(TITLE_KEY, JSON.stringify("),
+
+    ("a reloaded tab still shows the page's own title",
+     "        document.title = saved.title;\n",
+     ""),
+
+    ("a reloaded tab shows another session's name",
+     "      if (saved && saved.title && rid && saved.rid === rid) {",
+     "      if (saved && saved.title) {"),
+]
+
 # A prompt sent as the CLI starts a turn of its own.  tests/test_cli_queue_race.py
 # and tests/peer_message.test.js.
 CLIQUEUE_BRIDGE_MUTATIONS = [
@@ -3956,6 +4198,18 @@ TARGETS = {
                  MOVESTOP_MUTATIONS, "pytest"),
     "movestop-wakeup": ("wakeup_store.py", "tests/test_move_stops_original.py",
                         MOVESTOP_WAKEUP_MUTATIONS, "pytest"),
+    "asleep-server": ("server.py", "tests/test_asleep_tab.py",
+                      ASLEEP_SERVER_MUTATIONS, "pytest"),
+    "asleep-app": ("static/app.js", "tests/reconnect_on_show.test.js",
+                   ASLEEP_APP_MUTATIONS, "node"),
+    "resume-runtime": ("session_runtime.py", "tests/test_resume_stream.py",
+                       RESUME_RUNTIME_MUTATIONS, "pytest"),
+    "resume-server": ("server.py", "tests/test_resume_stream.py",
+                      RESUME_SERVER_MUTATIONS, "pytest"),
+    "resume-app": ("static/app.js", "tests/reconnect_on_show.test.js",
+                   RESUME_APP_MUTATIONS, "node"),
+    "resume-status": ("static/status.js", "tests/reconnect_on_show.test.js",
+                      RESUME_STATUS_MUTATIONS, "node"),
     "cliqueue-bridge": ("sdk_bridge.py", "tests/test_cli_queue_race.py",
                         CLIQUEUE_BRIDGE_MUTATIONS, "pytest"),
     "cliqueue-history": ("session.py", "tests/test_cli_queue_race.py",

@@ -1894,6 +1894,19 @@ async def close_runtime(rid: str | None) -> dict[str, Any]:
 #: when the page is no longer running to be asked.
 _mobile_ws: set[Any] = set()
 
+#: Messages this hub understands that an older one would answer with
+#: "unknown message type" in the chat; the page sends them only if listed in
+#: ``attached``.
+HUB_HEARS = ["visibility"]
+
+#: Sockets whose page last said it was hidden -- a background tab.
+_hidden_ws: set[Any] = set()
+
+#: Sockets that ended the way a tab the browser put to sleep ends: hidden, and
+#: gone without a close (``_note_how_it_ended``).  The idle timer treats them
+#: like a phone.
+_asleep_ws: set[Any] = set()
+
 #: Mirrors `lobby.js`'s `_isMobile()` regex, deliberately.  The two decide the
 #: same thing about the same client and disagreeing would be worse than either
 #: being wrong.  Known blind spot, shared with the frontend: iPadOS Safari
@@ -1986,8 +1999,10 @@ def _maybe_start_idle_timer(rt: SessionRuntime,
         return
     # `departing is None` is the re-arm after a deferral, which must keep the
     # grace it was armed with rather than quietly dropping to the short one.
+    # A background tab the browser killed is the same case as a phone: a
+    # viewer asleep, not gone (_note_how_it_ended).
     mobile = (rt.idle_mobile if departing is None
-              else departing in _mobile_ws)
+              else departing in _mobile_ws or departing in _asleep_ws)
     if mobile:
         timeout = int(getattr(config, "mobile_idle_timeout", 0) or 0
                       if config else 0)
@@ -1995,7 +2010,8 @@ def _maybe_start_idle_timer(rt: SessionRuntime,
         timeout = getattr(config, "session_idle_timeout", 300) if config else 300
     if timeout <= 0:
         if mobile:
-            log.info("runtime %s: last viewer was mobile — no idle teardown",
+            log.info("runtime %s: last viewer was put to sleep by its browser "
+                     "(a phone, or a background tab) — no idle teardown",
                      rt.rid)
         return
     _cancel_idle_timer(rt)
@@ -3668,6 +3684,78 @@ async def _attach_ws(ws: WebSocket, rt: SessionRuntime) -> None:
     await _push_session_list()   # viewer counts changed
 
 
+def _missed_since(ws: WebSocket, rt: SessionRuntime) -> list[dict[str, Any]] | None:
+    """What a reconnecting tab missed of *rt*'s stream, from its ``?resume=``
+    (``<epoch>.<seq>``) -- or None when it has to be sent the full history."""
+    try:
+        epoch, _dot, seq = (ws.query_params.get("resume") or "").partition(".")
+        position = int(seq)
+    except (ValueError, AttributeError):
+        return None
+    if not epoch:
+        return None
+    return rt.replay_since(epoch, position)
+
+
+async def _resume_ws(ws: WebSocket, rt: SessionRuntime,
+                     missed: list[dict[str, Any]]) -> None:
+    """Reattach a tab whose socket dropped, sending only what it missed.
+
+    No ``clear_screen`` and no history: it still shows everything up to the
+    drop.  Fresh snapshots, because state moved on meanwhile, then the missed
+    messages in order.  Everything from here to the last enqueue is
+    synchronous -- ``ws_channel.send`` does not await -- so no broadcast can
+    land between the replay and the live stream after it, and none is lost or
+    doubled: the tab joins ``rt.clients`` at the same instant as the replay's
+    last message is queued.
+    """
+    old = _ws_runtime.get(ws)
+    if old is not None and old is not rt:
+        old.discard_client(ws)
+    lobby_clients.discard(ws)
+    _cancel_idle_timer(rt)
+    state, config = rt.state, rt.config
+    ws_channel.send(ws, {"type": "attached", "session": rt.meta(),
+                         "epoch": rt.epoch, "seq": rt.seq, "resumed": True,
+                         "hears": HUB_HEARS})
+    if state is not None and config is not None:
+        ws_channel.send(ws, {
+            "type": "status_update",
+            "status": state_to_status_dict(state, config),
+            "panels": _enrich_panels(state_to_panels_dict(state)),
+        })
+    for msg in missed:
+        ws_channel.send(ws, msg)
+    rt.add_client(ws)
+    _ws_runtime[ws] = rt
+    log.info("tab resumed %s at #%d: %d missed message(s), no history reload",
+             rt.rid, rt.seq, len(missed))
+    await _push_session_list()   # viewer counts changed
+
+
+def _log_reconnect_reason(ws: WebSocket, rid: str | None) -> None:
+    """Record why a tab is connecting again, when it says.
+
+    A socket can be dropped by the browser for a tab it has put to sleep;
+    the tab reports the close code, how long it had been hidden, whether the
+    page was frozen, and whether it was discarded and reloaded -- which
+    together say which of those it was.
+    """
+    try:
+        q = ws.query_params
+        why, discarded = q.get("why"), q.get("discarded")
+        if not why and not discarded:
+            return
+        if discarded:
+            log.info("tab for %s was discarded by the browser and reloaded", rid or "lobby")
+            return
+        log.info("tab for %s reconnecting: socket closed with %s after %ss "
+                 "hidden; page frozen meanwhile: %s", rid or "lobby", why,
+                 q.get("hidden") or "0", "yes" if q.get("frozen") == "1" else "no")
+    except Exception:
+        pass
+
+
 async def _enter_lobby(ws: WebSocket, notice: str | None = None) -> None:
     """Detach *ws* from its runtime (if any) and send it the session list.
 
@@ -3702,6 +3790,37 @@ def _cleanup_ws(ws: WebSocket) -> None:
         old.discard_client(ws)
         _maybe_start_idle_timer(old, departing=ws)
     _mobile_ws.discard(ws)
+    _hidden_ws.discard(ws)
+    _asleep_ws.discard(ws)
+
+
+#: Close codes a page sends when it goes away on purpose: 1000 its own
+#: ``ws.close()``, 1001 the page unloading (the tab closed, reloaded or
+#: navigated).  A page the browser kills sends nothing, and the disconnect
+#: reports 1006.
+_DELIBERATE_CLOSES = frozenset({1000, 1001})
+
+
+def _note_how_it_ended(ws: WebSocket, code: int | None) -> None:
+    """Mark *ws* asleep when it ended the way a sleeping tab's socket ends.
+
+    Asked 2026-09-27: "what i would like is for orchestrator2 not to
+    automatically kill a process after n seconds when a tab disconnects due
+    to chrome forcing it".  Chrome only discards or freezes *background* tabs,
+    and a tab closed by hand says goodbye (1001) even from the background.  So
+    a socket whose page last said it was hidden, gone without a close, is a
+    tab the browser put to sleep: its viewer has not left, and the idle timer
+    treats it like a sleeping phone.  (Any abnormal close was rejected as too
+    broad -- a crashed or cut-off tab you are looking at still counts as
+    leaving; this is only the background ones.)
+    """
+    if code in _DELIBERATE_CLOSES or ws not in _hidden_ws:
+        return
+    _asleep_ws.add(ws)
+    rt = _ws_runtime.get(ws)
+    log.info("tab for %s was dropped in the background (close code %s): the "
+             "browser put it to sleep, so its session is not idled out",
+             getattr(rt, "rid", "lobby"), code if code is not None else "none")
 
 
 # ---------------------------------------------------------------------------
@@ -3749,6 +3868,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         except Exception:
             pass
 
+        _log_reconnect_reason(ws, requested_rid)
         if requested_rid:
             # The sentinel ``default`` resolves to the hub's primary session
             # (used by launches that join a running hub without a specific rid).
@@ -3756,7 +3876,13 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 target = _default_runtime
             else:
                 target = _runtime_by_rid(requested_rid)
-            if target is not None:
+            # A tab reconnecting to the session it was showing picks up where
+            # it left off; only a first visit, or one that cannot resume, is
+            # sent the full history.
+            missed = _missed_since(ws, target) if target is not None else None
+            if missed is not None:
+                await _resume_ws(ws, target, missed)
+            elif target is not None:
                 await _attach_ws(ws, target)
             else:
                 # The rid is stale (session was torn down, hub was restarted,
@@ -3790,10 +3916,13 @@ async def websocket_endpoint(ws: WebSocket) -> None:
 
             await _handle_ws_message(ws, msg)
 
-    except WebSocketDisconnect:
-        pass
+    except WebSocketDisconnect as exc:
+        _note_how_it_ended(ws, getattr(exc, "code", None))
     except Exception:
         log.exception("websocket error")
+        # Usually the send side finding the socket already gone -- an ending
+        # without a close, like the one a disconnect with 1006 reports.
+        _note_how_it_ended(ws, None)
     finally:
         async with _ws_lock:
             _ws_clients.discard(ws)
@@ -3894,8 +4023,11 @@ async def _send_initial_state(ws: WebSocket) -> None:
         })
         return
 
-    # Tell the tab which session it's now viewing (rid + meta).
-    await send_to(ws, {"type": "attached", "session": rt.meta()})
+    # Tell the tab which session it's now viewing (rid + meta), and where in
+    # that session's numbered stream it joins -- what it resumes from if its
+    # socket later drops (_resume_ws).
+    await send_to(ws, {"type": "attached", "session": rt.meta(),
+                       "epoch": rt.epoch, "seq": rt.seq, "hears": HUB_HEARS})
 
     # Status + panels.
     panels = _enrich_panels(state_to_panels_dict(state))
@@ -4363,6 +4495,16 @@ async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
     across the whole function once ``_handle_ws_message`` rebinds them).
     """
     msg_type = msg.get("type", "")
+
+    # The page saying it went to the background or came back.  Sent only to a
+    # hub whose ``attached`` said it hears it -- an older one answers an
+    # unknown type in the chat.  See _note_how_it_ended.
+    if msg_type == "visibility":
+        if msg.get("hidden"):
+            _hidden_ws.add(ws)
+        else:
+            _hidden_ws.discard(ws)
+        return True
 
     if msg_type == "list":
         await _push_session_list(ws)

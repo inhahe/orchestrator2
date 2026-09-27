@@ -1,5 +1,56 @@
 # Known issues / tech debt — orchestrator2
 
+## A session was idled out when Chrome discarded its tab — FIXED (2026-09-27)
+
+> "what i would like is for orchestrator2 not to automatically kill a process
+> after n seconds when a tab disconnects due to chrome forcing it"
+
+When Chrome's Memory Saver discarded a background tab, the hub saw its last
+viewer leave and started the 5-minute idle teardown. The session's CLI was
+stopped although the tab was still open, only asleep.
+
+Now the page tells the hub when it is in the background. A socket that was
+hidden and then ended without a close is a tab the browser put to sleep, and
+it is treated like a sleeping phone: `--mobile-idle-timeout`, never by
+default. A tab closed by hand says goodbye (1001) even from the background,
+and still starts the ordinary countdown, as does a tab that crashes while
+visible. Measured: a clean close reaches the hub as 1001, a killed page as
+1006. design.md §4, *Nor is a background tab the browser put to sleep*.
+
+Cost, as for phones: a discarded tab that is then closed never tells the hub,
+so its session stays up until closed from the lobby or the hub restarts.
+
+## A sleeping tab renamed itself "orchestrator2" and reloaded its history — FIXED (2026-09-27)
+
+> "often, a tab randomly changes its name from the session name to
+> 'orchestrator2', and when i click on it, it reloads the history ... tabs
+> from other things than orchestrator2 never change their names OR have to
+> reload anything due to the tab falling asleep."
+
+The browser drops the socket of a tab it has put to sleep. Neither end closes
+it: the hub has WebSocket pings off and never gives up on a slow tab, and the
+page closes its own socket only from the prompt watchdog. After the drop, two
+things were ours:
+
+- **The rename.** The page's own "disconnected" status update carries no
+  session, and `status.js` read that as "no session": the title became
+  `orchestrator2`, and the session and cwd fields became `--`. Those updates
+  are now marked connection-only and leave everything but the state alone.
+  The title is also kept for a reload of the tab.
+- **The reload.** Every reconnect was a first visit: the tab was cleared and
+  the whole history re-rendered from disk. Now a session numbers what it
+  sends, and keeps the last 4 MB or so. A tab reconnecting to the same
+  session gets only what it missed, appended. A hub restart, a gap past what
+  was kept, or a first visit still gets the full history.
+
+The hub now also logs, for each reconnect, the close code, how long the tab
+was hidden, and whether the browser froze or discarded it. That should
+settle which of Chrome's mechanisms does this. Not fixed: a tab Chrome
+*discards* (Memory Saver) reloads the whole page, so there is nothing to
+resume from. Chrome's Settings → Performance → "Always keep these sites
+active" exempts the hub's address. design.md §7, *A tab that loses its socket
+resumes*.
+
 ## A message sent as the session started answering a peer went into that turn — FIXED (2026-09-27)
 
 > "in session 'OS D', i interrupted it, sent a message, it showed my message,

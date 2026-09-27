@@ -171,7 +171,9 @@ def test_broadcast_reaches_clients_and_prunes_stale():
     rt.add_client(good)
     rt.add_client(bad)
     asyncio.run(rt.broadcast({"type": "ping"}))
-    assert good.sent == [{"type": "ping"}]
+    # Delivered with its place in the session's stream, so a tab that drops
+    # can resume from it (design.md §7, "A tab that loses its socket resumes").
+    assert good.sent == [{"type": "ping", "seq": 1}]
     # The broken socket is dropped so it isn't retried forever.
     assert bad not in rt.clients
     assert good in rt.clients

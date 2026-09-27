@@ -13,12 +13,46 @@ phases add a lobby, on-demand runtime creation, and per-runtime routing.
 
 from __future__ import annotations
 
+import collections
 import itertools
 import json
 import time
+import uuid
 from typing import Any
 
 import ws_channel
+
+# --- A tab that loses its socket resumes; it does not reload ----------------
+#
+# Reported 2026-09-27: "often, a tab randomly changes its name from the session
+# name to 'orchestrator2', and when i click on it, it reloads the history ...
+# tabs from other things than orchestrator2 never change their names OR have
+# to reload anything due to the tab falling asleep."
+#
+# Chrome drops the socket of a tab it has put to sleep -- neither end closes it
+# (the hub runs with WebSocket pings off, and its per-tab channel never gives
+# up on a slow reader).  Every reconnect was then treated as a first visit:
+# ``clear_screen`` and the whole history re-rendered from the transcript, a
+# thousand-odd messages, to show a tab everything it already had plus the few
+# it missed.
+#
+# So a session numbers what it broadcasts (``seq``) and keeps the recent part.
+# A tab reconnecting to the same session says how far it got; if that is still
+# covered it gets only the rest, appended, and nothing is cleared.  ``epoch``
+# is per runtime, so a hub restart -- a new runtime, a different stream --
+# never resumes into the wrong one.  Past what is kept, it falls back to the
+# full history exactly as before.
+
+#: Broadcasts that are not replayed: full snapshots (a resumed tab is sent a
+#: fresh one of each) and a bell, which would ring late.
+NOT_REPLAYED = frozenset({"status_update", "panel_update", "queue_update",
+                          "session_list", "bell"})
+
+#: How much of a session's recent output is kept for a tab that reconnects.
+#: By size, not only count: one turn can stream thousands of small deltas, or
+#: one tool result of a few hundred KB.
+REPLAY_MAX_BYTES = 4 * 1024 * 1024
+REPLAY_MAX_MESSAGES = 20_000
 
 # Monotonic-ish counter for stable internal ids.  A brand-new session has no
 # Claude ``session_id`` until its first result arrives, so we key runtimes by
@@ -65,6 +99,12 @@ class SessionRuntime:
         # ticker compares against this and stays quiet.  See _status_ticker.
         self.last_status_sig: str | None = None
         self.last_status_sent: float = 0.0
+        # The numbered stream a reconnecting tab resumes from (see top).
+        self.epoch = uuid.uuid4().hex[:12]
+        self.seq = 0
+        self._replay: collections.deque[tuple[int, dict[str, Any], int]] = \
+            collections.deque()
+        self._replay_bytes = 0
 
     # -- clients ----------------------------------------------------------
 
@@ -94,11 +134,21 @@ class SessionRuntime:
         whole send left every *other* tab without the prompt while still
         showing them the reply to it.
         """
+        # Numbered and kept even with nobody watching: a tab whose socket has
+        # dropped is exactly who needs it.
+        seq: int | None = None
+        if msg.get("type") not in NOT_REPLAYED:
+            msg = self._record(msg)
+            seq = msg["seq"]
         if not self.clients:
             return
         data: str | None = None
         for ws in list(self.clients):
             if exclude is not None and ws is exclude:
+                # It drew this itself, but its place in the stream still moves
+                # -- or a resume would hand it its own prompt a second time.
+                if seq is not None:
+                    ws_channel.send(ws, {"type": "seq", "seq": seq})
                 continue
             if ws_channel.send(ws, msg):
                 continue
@@ -109,6 +159,37 @@ class SessionRuntime:
                 await ws.send_text(data)
             except Exception:
                 self.clients.discard(ws)
+
+    def _record(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Number *msg* and keep it for a reconnecting tab."""
+        self.seq += 1
+        msg = {**msg, "seq": self.seq}
+        size = len(json.dumps(msg, default=str))
+        self._replay.append((self.seq, msg, size))
+        self._replay_bytes += size
+        while self._replay and (self._replay_bytes > REPLAY_MAX_BYTES
+                                or len(self._replay) > REPLAY_MAX_MESSAGES):
+            _seq, _msg, dropped = self._replay.popleft()
+            self._replay_bytes -= dropped
+        return msg
+
+    def replay_since(self, epoch: Any, seq: Any) -> list[dict[str, Any]] | None:
+        """What a tab that last saw *seq* of this stream has missed.
+
+        None when it cannot resume and needs the full history: another
+        runtime's stream (a hub restart), a position this stream never reached,
+        or one so far back that part of what followed has been dropped.
+        """
+        if epoch != self.epoch or not isinstance(seq, int) or isinstance(seq, bool):
+            return None
+        if seq < 0 or seq > self.seq:
+            return None
+        if seq == self.seq:
+            return []
+        oldest = self._replay[0][0] if self._replay else self.seq + 1
+        if seq + 1 < oldest:
+            return None
+        return [m for s, m, _size in self._replay if s > seq]
 
     # -- lobby / listing --------------------------------------------------
 

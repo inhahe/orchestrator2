@@ -1000,11 +1000,14 @@ def parse_args(argv: list[str] | None = None) -> Config:
         default=0,
         metavar="SECONDS",
         help=(
-            "Idle teardown for a session whose last viewer was a phone or "
-            "tablet. Default: 0 (never). Phones suspend their browser within "
-            "a minute or two of the screen locking, so the ordinary "
-            "--session-idle-timeout reaps a session its only viewer is still "
-            "using. Set a positive value to reap mobile-only sessions too."
+            "Idle teardown for a session whose last viewer was put to sleep "
+            "by its browser: a phone or tablet, or a background tab whose "
+            "connection the browser dropped (Chrome discarding or freezing "
+            "it). Default: 0 (never). Phones suspend their browser within a "
+            "minute or two of the screen locking, and Chrome discards "
+            "background tabs to save memory, so the ordinary "
+            "--session-idle-timeout reaps a session its viewer is still "
+            "using. Set a positive value to reap those sessions too."
         ),
     )
     ap.add_argument(

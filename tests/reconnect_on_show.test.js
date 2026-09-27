@@ -29,10 +29,10 @@ function assert(cond, msg) {
   if (!cond) throw new Error(msg);
 }
 
-function test(name, fn) {
+function test(name, fn, opts) {
   let h;
   try {
-    h = build();
+    h = build(opts);
     fn(h);
     console.log('  ok    ' + name);
     passes++;
@@ -46,10 +46,16 @@ function test(name, fn) {
 
 /* ---- harness ---------------------------------------------------------- */
 
-function build() {
+// *opts*: `url` for the page (default the hub's root), `session` for
+// sessionStorage entries present before the page's scripts run -- a tab the
+// browser reloaded keeps its sessionStorage.
+function build(opts) {
+  const o = opts || {};
   const html = fs.readFileSync(path.join(STATIC, 'index.html'), 'utf8');
-  const dom = new JSDOM(html, { url: 'http://localhost:8240/', runScripts: 'outside-only' });
+  const dom = new JSDOM(html, { url: o.url || 'http://localhost:8240/',
+                                runScripts: 'outside-only' });
   const win = dom.window;
+  for (const [k, v] of Object.entries(o.session || {})) win.sessionStorage.setItem(k, v);
 
   // --- manual clock.  app.js's reconnect backoff is the thing under test, so
   // it must be steppable rather than real.
@@ -969,6 +975,202 @@ test('and keeps it when its socket drops: a lobby tab has no state to show', (h)
   h.live.deliver({ type: 'session_closed', rid: 's1', message: 'closed' });
   h.live.drop();
   assert(iconOf(h) === 'plain', iconOf(h));
+});
+
+/* ---- a dropped socket resumes, and the tab keeps its name --------------- */
+//
+// Reported 2026-09-27: "often, a tab randomly changes its name from the session
+// name to 'orchestrator2', and when i click on it, it reloads the history".
+// The server half is tests/test_resume_stream.py.
+
+function attachedAt(h, epoch, seq, extra) {
+  h.live.accept();
+  h.live.deliver(Object.assign(
+    { type: 'attached', session: { rid: 's1', cwd: 'D:\\x' }, epoch, seq }, extra || {}));
+}
+
+function says(h, seq) {
+  h.live.deliver({ type: 'assistant_text', content: 'x', delta: false, seq });
+}
+
+// The query of the socket the tab opened most recently.
+function asked(h, key) {
+  return new URL(h.live.url.replace(/^ws/, 'http')).searchParams.get(key);
+}
+
+function reconnects(h, code) {
+  h.live.drop(code);
+  h.advance(1500);
+}
+
+test('a dropped socket comes back asking to resume where the tab left off', (h) => {
+  attachedAt(h, 'e1', 5);
+  says(h, 6);
+  says(h, 7);
+  reconnects(h);
+  assert(asked(h, 'rid') === 's1', 'reconnected to another session');
+  assert(asked(h, 'resume') === 'e1.7', 'asked to resume from ' + asked(h, 'resume'));
+});
+
+test('the echo of its own prompt moves its place too', (h) => {
+  // The broadcast of a prompt skips the tab that drew it, sending only this.
+  attachedAt(h, 'e1', 5);
+  h.live.deliver({ type: 'seq', seq: 9 });
+  reconnects(h);
+  assert(asked(h, 'resume') === 'e1.9', asked(h, 'resume'));
+  assert(h.errors.length === 0, 'a seq marker reached the chat: ' + h.errors.join(' | '));
+});
+
+test('a tab that never attached does not ask to resume', (h) => {
+  h.live.accept();
+  reconnects(h);
+  assert(asked(h, 'resume') === null, 'asked to resume ' + asked(h, 'resume'));
+});
+
+test('a resumed attach keeps the position it resumed from', (h) => {
+  // The replay after it moves it on; a socket that drops again mid-replay
+  // must ask again for what it has not yet shown.
+  attachedAt(h, 'e1', 5);
+  says(h, 6);
+  reconnects(h);
+  attachedAt(h, 'e1', 20, { resumed: true });
+  reconnects(h);
+  assert(asked(h, 'resume') === 'e1.6', asked(h, 'resume'));
+});
+
+test('a restarted hub is a new stream', (h) => {
+  attachedAt(h, 'e1', 5);
+  reconnects(h);
+  attachedAt(h, 'e2', 3);                 // a full attach, not a resume
+  reconnects(h);
+  assert(asked(h, 'resume') === 'e2.3', asked(h, 'resume'));
+});
+
+test('a hub that does not number its stream is never asked to resume', (h) => {
+  h.live.accept();
+  h.live.deliver({ type: 'attached', session: { rid: 's1', cwd: 'D:\\x' } });
+  reconnects(h);
+  assert(asked(h, 'resume') === null, asked(h, 'resume'));
+});
+
+test('the reconnect says how the last socket was lost', (h) => {
+  attachedAt(h, 'e1', 1);
+  reconnects(h, 1006);
+  assert(asked(h, 'why') === '1006', 'why=' + asked(h, 'why'));
+  assert(asked(h, 'frozen') === '0', 'frozen=' + asked(h, 'frozen'));
+  assert(asked(h, 'hidden') === null, 'hidden reported for a visible tab');
+});
+
+test('and whether the browser froze it, and for how long it was hidden', (h) => {
+  attachedAt(h, 'e1', 1);
+  h.setHidden(true);
+  h.win.document.dispatchEvent(new h.win.Event('freeze'));
+  h.tickIntervals(1, 300000);             // five minutes pass on Date.now()
+  reconnects(h, 1006);
+  assert(asked(h, 'frozen') === '1', 'frozen=' + asked(h, 'frozen'));
+  assert(Number(asked(h, 'hidden')) >= 299, 'hidden=' + asked(h, 'hidden'));
+});
+
+test('it reports the loss, not how a retry then failed', (h) => {
+  attachedAt(h, 'e1', 1);
+  reconnects(h, 1006);                    // the loss
+  const retry = h.live;
+  h.live.drop(1011);                      // a retry that failed differently
+  h.advance(60000);                       // >= any backoff step
+  // Read from the attempt *after* the failed retry: the retry itself was
+  // opened before it failed, so its URL could not have been wrong.
+  assert(h.live !== retry, 'no further attempt after the failed retry');
+  assert(asked(h, 'why') === '1006', 'why=' + asked(h, 'why'));
+});
+
+test('and the latest loss, not an old one', (h) => {
+  attachedAt(h, 'e1', 1);
+  reconnects(h, 1006);
+  h.live.accept();                        // back: nothing left to report
+  reconnects(h, 1001);
+  assert(asked(h, 'why') === '1001', 'why=' + asked(h, 'why'));
+});
+
+test('a dropped connection keeps the tab\'s name', (h) => {
+  // The report.  The page's own "disconnected" update carries no session, and
+  // was read as "no session": the tab became "orchestrator2".
+  attachedAt(h, 'e1', 1);
+  statusOf(h, { session_id: 'sid-1', session_title: 'OS D', cwd: 'E:\\os' });
+  assert(h.win.document.title === 'OS D', 'setup: ' + h.win.document.title);
+  h.live.drop();
+  assert(h.win.document.title === 'OS D', 'renamed to ' + h.win.document.title);
+});
+
+test('and the rest of the status bar keeps its values', (h) => {
+  attachedAt(h, 'e1', 1);
+  statusOf(h, { session_id: 'sid-1', session_title: 'OS D', cwd: 'E:\\os' });
+  h.live.drop();
+  const doc = h.win.document;
+  assert(doc.getElementById('status-session').textContent === 'OS D',
+         'session field: ' + doc.getElementById('status-session').textContent);
+  assert(doc.getElementById('status-cwd').textContent === 'E:\\os',
+         'cwd field: ' + doc.getElementById('status-cwd').textContent);
+  assert(stateText(h).startsWith('disconnected'), 'state: ' + stateText(h));
+});
+
+test('the name is kept for a reload of the tab', (h) => {
+  attachedAt(h, 'e1', 1);
+  statusOf(h, { session_id: 'sid-1', session_title: 'OS D' });
+  const saved = JSON.parse(h.win.sessionStorage.getItem('orch2.title') || 'null');
+  assert(saved && saved.rid === 's1' && saved.title === 'OS D', JSON.stringify(saved));
+});
+
+test('a reloaded tab shows its session\'s name at once', (h) => {
+  // Before any socket: the browser discarded it and reloaded, or F5.
+  assert(h.win.document.title === 'OS D', 'showed ' + h.win.document.title);
+}, { url: 'http://localhost:8240/?rid=s1',
+     session: { 'orch2.title': JSON.stringify({ rid: 's1', title: 'OS D' }) } });
+
+test('but never another session\'s', (h) => {
+  assert(h.win.document.title === 'orchestrator2', 'showed ' + h.win.document.title);
+}, { url: 'http://localhost:8240/?rid=s1',
+     session: { 'orch2.title': JSON.stringify({ rid: 's2', title: 'OS E' }) } });
+
+/* ---- the hub is told when the tab is in the background ------------------ */
+//
+// Asked 2026-09-27: "what i would like is for orchestrator2 not to
+// automatically kill a process after n seconds when a tab disconnects due to
+// chrome forcing it".  Chrome only puts background tabs to sleep, so the hub
+// needs to know which tabs those are (server._note_how_it_ended; the server
+// half is tests/test_asleep_tab.py).
+
+function visibilitySent(h, sock) {
+  return (sock || h.live).sent.map((d) => JSON.parse(d))
+    .filter((m) => m.type === 'visibility').map((m) => m.hidden);
+}
+
+test('a tab tells the hub when it goes to the background, and back', (h) => {
+  attachedAt(h, 'e1', 1, { hears: ['visibility'] });
+  h.setHidden(true);
+  h.setHidden(false);
+  const said = visibilitySent(h);
+  assert(said.slice(-2).join() === 'true,false', 'sent ' + JSON.stringify(said));
+});
+
+test('and says where it stands as it attaches: it may be in the background', (h) => {
+  h.setHidden(true);
+  attachedAt(h, 'e1', 1, { hears: ['visibility'] });
+  assert(visibilitySent(h).join() === 'true', JSON.stringify(visibilitySent(h)));
+});
+
+test('an older hub is never sent it: it would answer in the chat', (h) => {
+  attachedAt(h, 'e1', 1);                 // no `hears`
+  h.setHidden(true);
+  h.setHidden(false);
+  assert(visibilitySent(h).length === 0, JSON.stringify(visibilitySent(h)));
+});
+
+test('a new socket forgets what the last hub understood', (h) => {
+  attachedAt(h, 'e1', 1, { hears: ['visibility'] });
+  reconnects(h);
+  h.live.accept();                        // open, but not yet attached
+  h.setHidden(true);
+  assert(visibilitySent(h).length === 0, JSON.stringify(visibilitySent(h)));
 });
 
 console.log(`\n${passes}/${passes + failures} passed`);

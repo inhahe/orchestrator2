@@ -28,7 +28,21 @@ const Status = (() => {
     done:         'var(--system-done)',
   };
 
+  // This tab's last session title, for a reload of it (see update()).
+  const TITLE_KEY = 'orch2.title';
+
   function init() {
+    // A tab the browser discarded and reloaded -- or one refreshed -- shows
+    // its session's name from the start, not the page's own <title> until
+    // the socket is back.  Only for the session this URL names.
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(TITLE_KEY) || 'null');
+      const rid = new URLSearchParams(location.search).get('rid');
+      if (saved && saved.title && rid && saved.rid === rid) {
+        document.title = saved.title;
+      }
+    } catch (e) { /* no storage, or not ours: keep the page's title */ }
+
     elIndicator = document.getElementById('status-indicator');
     elState     = document.getElementById('status-state');
     elConfigDir = document.getElementById('status-configdir');
@@ -178,6 +192,14 @@ const Status = (() => {
       _prev.stateColor = stateColor;
     }
 
+    // A connection-only update -- app.js saying the socket dropped, is
+    // reconnecting, or gave up (``connection: true``) -- carries just the
+    // state.  Reading its missing fields as "no session" is what renamed a
+    // sleeping tab to "orchestrator2" and blanked the rest of the bar; the
+    // session has not changed, only the connection to it, so everything else
+    // keeps its last known value.  Reported 2026-09-27.
+    if (status.connection) return;
+
     // Config dir (the CLAUDE_CONFIG_DIR / account store this session uses).
     // Show the folder name; full path in the tooltip.
     if (elConfigDir) _updateConfigDir(status.config_dir);
@@ -195,6 +217,12 @@ const Status = (() => {
         elSession.textContent = title;
         elSession.title = sid || '';
         document.title = title;
+        // Kept for a reload of this tab (the browser discarding it, or F5):
+        // the page's own <title> would otherwise show until it reconnects.
+        try {
+          sessionStorage.setItem(TITLE_KEY, JSON.stringify(
+            { rid: new URLSearchParams(location.search).get('rid'), title }));
+        } catch (e) { /* storage off or full: only the reload title is lost */ }
       } else if (sid) {
         elSession.textContent = sid.substring(0, 8);
         elSession.title = sid;
