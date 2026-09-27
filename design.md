@@ -173,7 +173,8 @@ while the hub's endpoint had accepted it all along, and `--agent-name` with it.
 A test pins the list's keys to `_launch_into_hub`'s parameters. A launch that
 lands on a session the hub already has open applies `--model`, `--effort`,
 `--bell`, `--cli-path` (reconnecting, as the model does) and `--agent-name`
-(live, §9a) to it. `--cli-path` is made absolute at parse
+(live, §9a) to it, and queues its `--initial-prompt` there (§6, *A launch's
+`--initial-prompt`*). `--cli-path` is made absolute at parse
 time for the same hand-over: the hub would read a relative path against its own
 directory.
 
@@ -788,6 +789,9 @@ payload — is a REST call or a server-side synthesis that echoes nowhere. So
 choke point: it echoes unless the client already did, then puts the message on
 the event queue. Prompts that go via `queued_prompts` instead are echoed by
 `_pop_queued_prompt` (above); between them every path is covered exactly once.
+The launch's `--initial-prompt` went to `run_turn` by neither route until
+2026-09-27, and was never shown. It is queued now (§6, *A launch's
+`--initial-prompt`*).
 
 Echoing at *enqueue* rather than where the bridge consumes the prompt is
 deliberate: the event queue carries plain `(kind, payload)` tuples with nowhere
@@ -1438,7 +1442,8 @@ gone.
 
 - **The race.** `_pop_queued_prompt`, the single exit for a queued prompt,
   waits until `TURN_END_SETTLE_S` (1.5 s) has passed since `_turn_ended_at`,
-  which `_end_ghost_turn` and `run_turn`'s `finally` both set. A turn the CLI
+  which `_end_ghost_turn` and `run_turn`'s `finally` both set, and so does
+  `connect()` (next section). A turn the CLI
   starts announces itself within milliseconds: its first message begins a
   ghost turn. The pop then returns None, which every caller treats as "wait for
   a poke", and `_end_ghost_turn` pokes when that turn is over, so the prompt gets
@@ -1474,6 +1479,52 @@ make for this signal.
 
 Tests: `tests/test_cli_queue_race.py`, `tests/peer_message.test.js`; mutation
 targets `cliqueue-bridge`, `cliqueue-history`, `cliqueue-chat`.
+
+### A launch's `--initial-prompt`
+
+Reported 2026-09-27, after the Slate OS lanes were started with
+`--initial-prompt "Continue. If any background processes were running they
+may be gone."`. Some lanes showed the prompt, some showed only the lost-work
+notice, and a session opened with no initial prompt at all started working
+on the lanes' "Continue..." (known-issues.md has the log).
+
+**It belongs to the launch that gave it.** The hub's Config carries the prompt
+of the launch that *started* the hub, and every other session is built from a
+copy of that Config, so `_create_runtime` sets `initial_prompt` (and
+`session_note`, the other one-shot input) every time, like `agent_name`. It
+is never inherited. A launch that joins a running hub hands its prompt over
+(`_hub_launch_kwargs`). If the session it lands on is already open, the
+prompt is queued there, like a prompt typed in it: sent when the session is
+next free, and not queued twice. `_reconfigure` (`/cwd`, `/resume`) clears
+both one-shot inputs, except in picker mode, where the session being picked is
+the launch's own. `api_restart` drops `--initial-prompt`/`-p`/`--session-note`
+from the command line it re-runs. The `--detach` child keeps them, because it
+is the same launch finishing in another process.
+
+**It goes through the pending queue.** `worker_loop` appends it to
+`state.queued_prompts` before connecting, rather than handing it to `run_turn`
+afterwards. So it is on the panel while the session connects, and
+`_pop_queued_prompt` sends it with the echo. Handed over directly, it
+bypassed both echo points, and a tab that attached before the CLI wrote it to
+the transcript never showed it. A lost-work notice goes ahead of it
+(`appendleft`), because the notice is context for what the session does next;
+prompts typed during the connect go after it. It is not queued by a
+restarted worker (`skip_connect`, already delivered), and not when the queue
+restored from disk already holds it (a launch that never finished connecting,
+run again).
+
+**A connect starts the settle.** A fresh CLI starts turns of its own at once:
+it reports the previous process's background tasks as stopped, and it re-runs
+a turn that was cut off (`CLAUDE_CODE_RESUME_INTERRUPTED_TURN`). The lanes'
+prompt went out 30-100 ms after connecting, into that turn. So `connect()`
+sets `_turn_ended_at` exactly as a turn end does. The first queued prompt after
+*any* connect waits `TURN_END_SETTLE_S`, and waits for a turn the CLI starts
+inside it. That includes a reconnect, which orphans running tasks too. This
+also fixes the lost-work notice when there is no initial prompt, since it had
+the same collision.
+
+Tests: `tests/test_initial_prompt.py`; mutation targets `initprompt-bridge`,
+`initprompt-server`.
 
 ### CLI-native commands are an exchange, not a turn
 
@@ -3512,7 +3563,9 @@ a session carries with it when
 `move_overlay.test.js`, section 8) and that the move stops the original
 (`test_move_stops_original.py`, section 8), what `/usage` asks for and
 how it draws the answer (`test_usage.py`, `test_usage_hub.py` +
-`usage.test.js`, section 6f), and that a
+`usage.test.js`, section 6f), which session a launch's `--initial-prompt`
+goes to, and that it is shown and kept out of the CLI's own turns
+(`test_initial_prompt.py`, section 6), and that a
 mistyped launch flag leaves a trace instead of
 evaporating (`test_launch_errors.py`, section 10a).
 

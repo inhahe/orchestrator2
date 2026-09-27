@@ -1426,6 +1426,7 @@ async def _create_runtime(
     cli_path: str | None = None,
     agent_name: str | None = None,
     agent_labels: dict[str, str] | None = None,
+    initial_prompt: str | None = None,
 ) -> SessionRuntime:
     """Spin up a fresh live session runtime (config clone + state + bridge).
 
@@ -1441,7 +1442,10 @@ async def _create_runtime(
       for it).  Never inherited from the hub.
     * ``session_note`` — one-shot note prepended to this session's next prompt
       (``SDKBridge._with_session_note``).  Used by ``/move`` to tell a copy
-      that it moved.
+      that it moved.  Never inherited from the hub.
+    * ``initial_prompt`` — the ``--initial-prompt`` of the launch that asked
+      for this session, queued for it once it connects.  Never inherited from
+      the hub either.
     * otherwise — continue the most recent session in *cwd*.
 
     Registers the runtime, starts its bridge, and refreshes the lobby.
@@ -1479,8 +1483,16 @@ async def _create_runtime(
         overrides["config_dir"] = config_dir
     if bell_on:
         overrides["bell_on"] = bell_on
-    if session_note:
-        overrides["session_note"] = session_note
+    # A launch's one-shot inputs are set every time, never inherited.
+    # ``config`` is the *hub's*, and the hub's --initial-prompt and
+    # --session-note were for the one session the hub's own launch opened.
+    # Inherited, every session opened afterwards -- from the lobby, by
+    # another launch, by /move -- was sent the hub's launch prompt as soon as
+    # it connected.  Reported 2026-09-27: a session opened with no
+    # --initial-prompt started working by itself, on another launch's prompt.
+    overrides["session_note"] = session_note or None
+    overrides["initial_prompt"] = (
+        initial_prompt if initial_prompt and initial_prompt.strip() else None)
     # Per-session CLI. Lets one session run a newer Claude Code (for a model
     # the bundled one refuses) while everything else stays on the bundled
     # binary -- which matters when the newer CLI is `latest` rather than
@@ -2632,6 +2644,13 @@ async def _reconfigure(
     overrides: dict[str, Any] = {"cwd": new_cwd}
     if new_resume:
         overrides["resume"] = new_resume
+    # The launch's --initial-prompt and --session-note were for the session
+    # that launch opened.  In picker mode, that is the session being picked
+    # now.  Afterwards this is /cwd or /resume moving the primary session
+    # somewhere else, which must not be sent the launch's prompt again.
+    if not _picker_mode:
+        overrides["initial_prompt"] = None
+        overrides["session_note"] = None
     config = dataclasses.replace(config, **overrides)
 
     # --- Reinitialise state + bridge ---
@@ -2794,6 +2813,16 @@ async def api_restart() -> dict[str, Any]:
             continue
         if a.startswith(("--agent-name=", "--agent-label=")):
             i += 1
+            continue
+        # The launch's one-shot inputs.  Its prompt went to the session it
+        # opened, once; a restart is not that launch again, and kept, it sent
+        # the prompt to the primary session after every restart.
+        if a in ("--initial-prompt", "-p", "--session-note"):
+            i += 2
+            continue
+        if (a.startswith(("--initial-prompt=", "--session-note="))
+                or (a.startswith("-p") and not a.startswith("--"))):
+            i += 1              # "-pTEXT", argparse's attached form
             continue
         child.append(a)
         i += 1
@@ -3024,6 +3053,10 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     agent_labels = ({str(k).strip(): "" if v is None else str(v)
                      for k, v in raw_labels.items() if str(k).strip()}
                     if isinstance(raw_labels, dict) else {})
+    # Not stripped: it is a prompt, sent as typed.  Whitespace alone is none.
+    initial_prompt = body.get("initial_prompt")
+    if not isinstance(initial_prompt, str) or not initial_prompt.strip():
+        initial_prompt = None
 
     # A title is resolved to its session's id first, as the hub's own startup
     # does -- left as the title, it became this runtime's session id until the
@@ -3114,13 +3147,24 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
                 # session shows "idle" while ignoring input.  See known-issues.md
                 # "worker killed by cross-task SDK disconnect".
                 existing.bridge.event_queue.put_nowait(("connect", ""))
+            # And its prompt.  The launch asked for this session to be sent
+            # it, and the session happens to be open already, so it is queued
+            # like a prompt typed there: sent when the session is next free,
+            # and echoed then.  Not twice, if the same launch runs again
+            # before it has gone out.
+            if (initial_prompt and existing.state is not None
+                    and initial_prompt not in existing.state.queued_prompts):
+                existing.state.queued_prompts.append(initial_prompt)
+                log.info("hub launch: initial prompt queued for rid=%s",
+                         existing.rid)
             return {"ok": True, "rid": existing.rid, "reused": True}
     try:
         rt = await _create_runtime(cwd=cwd, resume=resume, no_continue=no_continue,
                                    model=model, effort=effort,
                                    config_dir=config_dir, bell_on=bell_on,
                                    cli_path=cli_path, agent_name=agent_name,
-                                   agent_labels=agent_labels)
+                                   agent_labels=agent_labels,
+                                   initial_prompt=initial_prompt)
     except Exception as exc:
         log.exception("hub session launch failed")
         return {"ok": False, "error": str(exc)}
@@ -5320,6 +5364,7 @@ def _hub_launch_kwargs(cfg: Config, config_dir: str | None) -> dict[str, Any]:
         "cli_path": cfg.cli_path,
         "agent_name": cfg.agent_name,
         "agent_labels": dict(cfg.agent_labels or {}),
+        "initial_prompt": cfg.initial_prompt,
     }
 
 
@@ -5401,6 +5446,7 @@ def _launch_into_hub(
     config_dir: str | None = None, bell_on: str | None = None,
     cli_path: str | None = None, agent_name: str | None = None,
     agent_labels: dict[str, str] | None = None,
+    initial_prompt: str | None = None,
 ) -> str | None:
     """Ask a running hub to open a session; return its ``rid`` (or None).
 
@@ -5415,6 +5461,10 @@ def _launch_into_hub(
     that joined a running hub was dropped and the session ran the hub's CLI --
     the one that refuses the model the flag was passed to reach.  And
     ``agent_name`` / ``agent_labels``, which were dropped the same way.
+
+    ``initial_prompt`` too, until 2026-09-27.  A launch that joined a hub lost
+    its --initial-prompt, and its session was sent the prompt of whichever
+    launch had started the hub instead, because sessions inherited that.
     """
     import urllib.request
 
@@ -5429,6 +5479,7 @@ def _launch_into_hub(
         "cli_path": cli_path,
         "agent_name": agent_name,
         "agent_labels": agent_labels or {},
+        "initial_prompt": initial_prompt,
     }).encode("utf-8")
     try:
         req = urllib.request.Request(

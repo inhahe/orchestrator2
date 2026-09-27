@@ -4023,8 +4023,8 @@ AGENTNAME_SERVER_MUTATIONS = [
      ""),
 
     ("the hub opens the handed-over session unlabelled",
-     "                                   agent_labels=agent_labels)",
-     "                                   )"),
+     "                                   agent_labels=agent_labels,\n",
+     "\n"),
 
     ("labels that are not a JSON object are passed on as they are",
      "                    if isinstance(raw_labels, dict) else {})\n",
@@ -4635,6 +4635,119 @@ USAGE_INDEX_MUTATIONS = [
 ]
 
 
+# A launch's --initial-prompt goes to its own session, once, shown, and in a
+# turn of its own.  tests/test_initial_prompt.py.
+INITPROMPT_BRIDGE_MUTATIONS = [
+    ("a connect does not start the settle",
+     "        self._turn_ended_at = time.monotonic()\n\n"
+     "        # Anything the user typed during the connect went to",
+     "        pass\n\n"
+     "        # Anything the user typed during the connect went to"),
+
+    ("the launch's prompt is not queued",
+     "            state.queued_prompts.append(config.initial_prompt)\n",
+     "            pass\n"),
+
+    ("a restarted worker queues it again",
+     "        if (config.initial_prompt and not skip_connect\n",
+     "        if (config.initial_prompt\n"),
+
+    ("a restored queue gets it twice",
+     "\n                and config.initial_prompt not in state.queued_prompts):",
+     "):"),
+
+    ("it jumps ahead of what was queued before it",
+     "            state.queued_prompts.append(config.initial_prompt)\n",
+     "            state.queued_prompts.appendleft(config.initial_prompt)\n"),
+
+    ("the worker's first pop is not made",
+     "        if state.queued_prompts and state.queue_editing_index != 0:\n"
+     "            next_prompt = await self._pop_queued_prompt()\n"
+     "        if next_prompt is None:",
+     "        if False:\n"
+     "            next_prompt = await self._pop_queued_prompt()\n"
+     "        if next_prompt is None:"),
+
+    ("a popped prompt is dropped for the idle wait",
+     "            next_prompt = await self._pop_queued_prompt()\n"
+     "        if next_prompt is None:",
+     "            next_prompt = await self._pop_queued_prompt()\n"
+     "        if True:"),
+]
+
+INITPROMPT_SERVER_MUTATIONS = [
+    ("a new session inherits the hub's prompt",
+     '    overrides["initial_prompt"] = (\n'
+     '        initial_prompt if initial_prompt and initial_prompt.strip() else None)\n',
+     ''),
+
+    ("a blank prompt is kept",
+     'initial_prompt if initial_prompt and initial_prompt.strip() else None)',
+     'initial_prompt or None)'),
+
+    ("a new session inherits the hub's note",
+     '    overrides["session_note"] = session_note or None\n',
+     '    if session_note:\n        overrides["session_note"] = session_note\n'),
+
+    ("the hand-over leaves it out",
+     '        "initial_prompt": cfg.initial_prompt,\n',
+     ''),
+
+    ("the request leaves it out",
+     '        "initial_prompt": initial_prompt,\n    }).encode("utf-8")',
+     '    }).encode("utf-8")'),
+
+    ("the launch API ignores it",
+     '    initial_prompt = body.get("initial_prompt")\n',
+     '    initial_prompt = None\n'),
+
+    ("anything truthy is taken for a prompt",
+     '    if not isinstance(initial_prompt, str) or not initial_prompt.strip():\n',
+     '    if not initial_prompt:\n'),
+
+    ("a new session is not given it",
+     '                                   initial_prompt=initial_prompt)',
+     '                                   initial_prompt=None)'),
+
+    ("an open session is not sent it",
+     '                existing.state.queued_prompts.append(initial_prompt)\n',
+     '                pass\n'),
+
+    ("an open session gets it twice",
+     '\n                    and initial_prompt not in existing.state.queued_prompts):',
+     '):'),
+
+    ("/cwd and /resume send it again",
+     '    if not _picker_mode:\n'
+     '        overrides["initial_prompt"] = None\n'
+     '        overrides["session_note"] = None\n',
+     ''),
+
+    ("the session picked in the picker loses it",
+     '    if not _picker_mode:\n'
+     '        overrides["initial_prompt"] = None\n',
+     '    if True:\n'
+     '        overrides["initial_prompt"] = None\n'),
+
+    ("a restart sends it again",
+     '        if a in ("--initial-prompt", "-p", "--session-note"):\n'
+     '            i += 2\n'
+     '            continue\n',
+     ''),
+
+    ("a restart keeps the joined forms",
+     '        if (a.startswith(("--initial-prompt=", "--session-note="))\n'
+     '                or (a.startswith("-p") and not a.startswith("--"))):\n'
+     '            i += 1              # "-pTEXT", argparse\'s attached form\n'
+     '            continue\n',
+     ''),
+
+    ("a restart keeps -pTEXT",
+     '                or (a.startswith("-p") and not a.startswith("--"))):',
+     '                or False):'),
+]
+
+
 TARGETS = {
     "chat": ("static/chat.js", "tests/hidden_window.test.js",
              CHAT_MUTATIONS, "node"),
@@ -4836,6 +4949,10 @@ TARGETS = {
                    USAGE_CHAT_MUTATIONS, "node"),
     "usage-index": ("static/index.html", "tests/reconnect_on_show.test.js",
                     USAGE_INDEX_MUTATIONS, "node"),
+    "initprompt-bridge": ("sdk_bridge.py", "tests/test_initial_prompt.py",
+                          INITPROMPT_BRIDGE_MUTATIONS, "pytest"),
+    "initprompt-server": ("server.py", "tests/test_initial_prompt.py",
+                          INITPROMPT_SERVER_MUTATIONS, "pytest"),
     "extauth": ("server.py",
                 "tests/test_external_access_policy.py tests/test_external_auth.py",
                 EXTAUTH_MUTATIONS, "pytest"),

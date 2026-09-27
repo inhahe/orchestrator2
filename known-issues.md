@@ -1,5 +1,54 @@
 # Known issues / tech debt — orchestrator2
 
+## A launch's `--initial-prompt` went to sessions that never asked for it — FIXED (2026-09-27)
+
+> "i just started a bunch of Slate OS sessions with an --initial-prompt, and
+> in some of the sessions i saw only my initial prompt sent, in some i didn't
+> and saw only this sent: [the lost-background-work notice] ... and when i
+> restarted this session, it automatically started working again and i have
+> no idea why. i didn't start it with any --initial-prompt."
+
+The lanes were launched with `--initial-prompt "Continue. If any background
+processes were running they may be gone."`. The first launch started the hub,
+and the rest joined it. Five faults:
+
+- **Every session got the hub's prompt.** `_create_runtime` builds a session
+  from a copy of the hub's Config, and the hub's Config carried the prompt of
+  the launch that started it. So every session opened later was sent it as
+  soon as it connected. That includes this orchestrator2 session (opened
+  16:46, with no `--initial-prompt`, sent "Continue..." 7 s later). The same
+  was true of `--session-note`.
+- **A joining launch dropped its own.** `_hub_launch_kwargs` had no
+  `initial_prompt`. The lanes that joined got the hub's prompt by
+  inheritance, which happened to be the same text, so this one did not show.
+- **It was never shown.** It went straight to `run_turn`, bypassing both
+  places a prompt is echoed. A tab that attached before the CLI had written it
+  to the transcript never showed it.
+- **It went into the CLI's own turn.** A lane that came back with lost
+  background tasks has a CLI that starts a turn of its own the moment it is
+  up, to report them stopped. The prompt was sent 30-100 ms after
+  connecting, into that turn, and `run_turn` ended on the CLI's result ("not
+  ours"). In one lane the CLI later merged the prompt with the lost-work
+  notice into a single message. In the browser only the notice was echoed,
+  hence "saw only this sent".
+- **It came back.** `/cwd` and `/resume` rebuilt the primary session from the
+  hub's Config, and ⟳ Restart re-ran the launch command, so both re-sent it.
+
+Now the prompt belongs to the launch that gave it. A session gets one only
+from its own launch: it is handed over by a launch that joins the hub, and
+queued on the session if that one is already open. It is queued like any
+prompt typed during the connect, so it is on the panel while the session
+connects, and it is shown when it goes out. A connect starts the same
+1.5 s settle a turn end does, so the first prompt after any connect waits for
+a turn the CLI starts by itself. That covers the lost-work notice too, which
+had the same collision with no initial prompt at all. The notice still goes
+first. `/cwd`, `/resume` and restarts no longer re-send the prompt. design.md
+§6, *A launch's `--initial-prompt`*.
+
+Separately, the first round of launches (16:43:48) failed outright, "unrecognized
+arguments: If any background processes were running they may be gone.", which
+is what an unquoted prompt looks like. `launch-error.log` has them.
+
 ## A session was idled out when Chrome discarded its tab — FIXED (2026-09-27)
 
 > "what i would like is for orchestrator2 not to automatically kill a process

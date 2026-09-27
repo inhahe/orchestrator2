@@ -339,7 +339,7 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--initial-prompt`, `-p` | -- | First message to send on startup |
+| `--initial-prompt`, `-p` | -- | First message for the session this launch opens. It waits in the queue panel while the session connects, then is sent (and shown) in a turn of its own, after anything the session starts by itself on resuming. It goes only to this launch's session, including when the launch joins a hub that is already running (if that session is already open there, it is queued there). Other sessions the hub opens don't get it, and `/cwd`, `/resume` and restarts don't re-send it. Quote it: an unquoted prompt makes the launch fail with "unrecognized arguments" (see `launch-error.log`) |
 | `--no-continue` | off | Start a fresh session instead of resuming the most recent one |
 | `--no-replay` | off | When resuming, don't replay prior messages into backscroll |
 | `--allow-duplicate-session` | off | Connect even when another Claude process is already resuming the same session id. Off by default because two agents sharing one session file and working directory commit over each other — see [Session safety](#session-safety) |

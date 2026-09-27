@@ -1479,6 +1479,18 @@ class SDKBridge:
         # which is the one case the spec calls unambiguous by definition.
         await self.register_agent()
 
+        # A fresh CLI starts turns of its own the moment it is up.  It reports
+        # the previous process's background tasks as stopped, and it re-runs a
+        # turn that was cut off (CLAUDE_CODE_RESUME_INTERRUPTED_TURN).  A
+        # prompt sent in that instant is folded into the CLI's turn instead
+        # of getting one of its own.  Measured 2026-09-27: every lane that came
+        # back with lost background tasks was sent its --initial-prompt 30-100
+        # ms after connecting, and run_turn ended on the CLI's own result
+        # ("not ours").  So a connect starts the same settle as a turn end
+        # does.  The first queued prompt waits TURN_END_SETTLE_S, and waits for
+        # any turn the CLI starts inside that window (_pop_queued_prompt).
+        self._turn_ended_at = time.monotonic()
+
         # Anything the user typed during the connect went to
         # ``state.queued_prompts`` (that is what ``state.connecting`` routes),
         # and the poke it fired was declined because the client wasn't usable
@@ -5346,6 +5358,23 @@ class SDKBridge:
         state = self.state
         config = self.config
 
+        # --- The launch's --initial-prompt, into the pending queue ---
+        # Queued like any prompt typed during the connect, rather than handed
+        # to run_turn once connected.  Handed over directly, it bypassed both
+        # places a prompt is echoed.  So a tab that attached before the CLI
+        # wrote the prompt to the transcript never showed it.  It also skipped
+        # the settle that keeps a prompt out of a turn the CLI starts by itself
+        # (see connect()).  Queued first, it is on the panel while the session
+        # connects, and _pop_queued_prompt sends it with the echo.  A lost-work
+        # notice goes ahead of it (appendleft).
+        #
+        # A restarted worker has delivered it already.  And it is not queued
+        # twice: a queue restored from disk may still hold it from a launch
+        # that never finished connecting.
+        if (config.initial_prompt and not skip_connect
+                and config.initial_prompt not in state.queued_prompts):
+            state.queued_prompts.append(config.initial_prompt)
+
         # --- Connect (with auto-retry) ---
         _connect_delay = 2.0
         _MAX_CONNECT_DELAY = 30.0
@@ -5566,17 +5595,15 @@ class SDKBridge:
                 _connect_delay = min(_connect_delay * 2, _MAX_CONNECT_DELAY)
 
         # --- Initial prompt ---
-        # Messages sent during connect go to state.queued_prompts (so
-        # they appear in the queue panel).  Check those first.
+        # Everything pending is in state.queued_prompts by now: the launch's
+        # --initial-prompt (queued above), a lost-work notice, and messages
+        # sent during the connect.  The pop waits out the settle the connect
+        # started, and returns None if the CLI began a turn of its own inside
+        # it.  The idle wait below is poked when that turn ends.
         next_prompt: str | None = None
-        if config.initial_prompt and not skip_connect:
-            # ``not skip_connect``: a restarted worker (see _spawn_worker) has
-            # already run this session's initial prompt — re-sending it would
-            # replay the launch prompt in the middle of a live conversation.
-            next_prompt = config.initial_prompt
-        elif state.queued_prompts and state.queue_editing_index != 0:
+        if state.queued_prompts and state.queue_editing_index != 0:
             next_prompt = await self._pop_queued_prompt()
-        else:
+        if next_prompt is None:
             # Wait for first user input — through the *same* helper the
             # between-turns path parks in.  This used to be a second,
             # hand-rolled wait loop, and every divergence between the two was

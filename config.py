@@ -613,7 +613,13 @@ def parse_args(argv: list[str] | None = None) -> Config:
     ap.add_argument(
         "--initial-prompt", "-p",
         default=None,
-        help="First message to send.",
+        help=(
+            "First message for the session this launch opens, sent once it "
+            "has connected (and after anything it starts by itself on "
+            "resuming). Also when the launch joins a running hub; never to "
+            "the other sessions a hub opens, and not re-sent by /cwd, /resume "
+            "or a restart. Quote it."
+        ),
     )
     ap.add_argument(
         "--no-continue",
