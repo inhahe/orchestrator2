@@ -80,7 +80,7 @@ SHORT_OUTPUT_TOOLS = frozenset({
 
 # All recognised slash commands — used for frontend tab-completion.
 SLASH_COMMANDS = [
-    "/help", "/history", "/status", "/debug", "/cost", "/cwd", "/clear", "/cls",
+    "/help", "/history", "/status", "/debug", "/cost", "/usage", "/cwd", "/clear", "/cls",
     "/interrupt", "/i", "/compact", "/effort", "/thinking", "/model",
     "/login", "/logout",
     "/connect", "/reconnect", "/resume", "/rename", "/move", "/export",

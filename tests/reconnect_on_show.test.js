@@ -20,7 +20,7 @@ const { JSDOM } = require('jsdom');
 const ROOT = path.join(__dirname, '..');
 const STATIC = path.join(ROOT, 'static');
 const SCRIPTS = ['util.js', 'favicon.js', 'diff.js', 'status.js', 'panels.js',
-                 'commands.js', 'chat.js', 'lobby.js', 'move.js', 'app.js'];
+                 'commands.js', 'usage.js', 'chat.js', 'lobby.js', 'move.js', 'app.js'];
 
 let failures = 0;
 let passes = 0;
@@ -164,7 +164,7 @@ function build(opts) {
   // production's own lookups by accident.
   win.eval(SCRIPTS.map((s) => fs.readFileSync(path.join(STATIC, s), 'utf8'))
                   .join('\n;\n')
-           + '\n;window.__mods = { App, Lobby, Chat, Move, Commands, Status };');
+           + '\n;window.__mods = { App, Lobby, Chat, Move, Commands, Status, Usage };');
 
   // Keep the restart path from starting a real poll loop (it would fetch()).
   let reloadPolls = 0;
@@ -428,6 +428,164 @@ test('/help opens a real modal instead of falling back to inline text', (h) => {
   const msgs = h.win.document.getElementById('messages');
   assert(!(msgs && msgs.textContent.includes('Commands:')),
          'the content was rendered inline as well as in the modal');
+});
+
+test('the harness loads the page\'s scripts, in the page\'s order', () => {
+  // A script index.html loads but the harness does not (usage.js, say) would
+  // be missing from every test here while the real page has it.
+  const html = fs.readFileSync(path.join(STATIC, 'index.html'), 'utf8');
+  const page = [...html.matchAll(/<script src="\/static\/([^"]+)"/g)].map((m) => m[1]);
+  assert(JSON.stringify(page) === JSON.stringify(SCRIPTS),
+         'index.html loads ' + page.join(', '));
+});
+
+/* ---- /usage ------------------------------------------------------------ */
+
+// Asked 2026-09-27: "the claude code TUI has a /usage command that tells you
+// in ascii all about your usage ... can you implement /usage in
+// orchestrator2?"  The drawing is tests/usage.test.js; these check the page.
+
+const USAGE_REPORT = {
+  usage: { five_hour: { utilization: 18, resets_at: '2026-09-27T21:10:00Z' },
+           seven_day: { utilization: 53, resets_at: '2026-10-03T00:00:00Z' } },
+  subscription_type: 'max', account: { email: 'someone@example.com' },
+};
+
+function usageMsg(h, data) {
+  h.win.__mods.Chat.handleMessage({ type: 'command_data', label: 'usage', data });
+}
+
+function modal(h) {
+  const d = h.win.document;
+  return {
+    open: !d.getElementById('detail-modal').classList.contains('hidden'),
+    title: d.getElementById('modal-title').textContent,
+    body: d.getElementById('modal-body').textContent,
+  };
+}
+
+test('/usage opens the modal at once, loading', (h) => {
+  h.live.accept();
+  usageMsg(h, { loading: true });
+  const m = modal(h);
+  assert(m.open && m.title === 'Usage', JSON.stringify(m));
+  assert(m.body === 'Loading usage data…', m.body);
+});
+
+test('then shows the limits in it, and nothing in the chat', (h) => {
+  h.live.accept();
+  usageMsg(h, { loading: true });
+  usageMsg(h, USAGE_REPORT);
+  const m = modal(h);
+  assert(m.open && m.title === 'Usage', JSON.stringify(m));
+  assert(m.body.startsWith('someone@example.com · Claude Max'), m.body);
+  assert(m.body.includes('Current session\n'), m.body);
+  assert(m.body.includes(' 18% used') && m.body.includes(' 53% used'), m.body);
+  const msgs = h.win.document.getElementById('messages');
+  assert(!msgs.textContent.includes('five_hour') && !msgs.textContent.includes('18% used'),
+         'printed in the chat as well');
+});
+
+test('an error is shown in the modal', (h) => {
+  h.live.accept();
+  usageMsg(h, { loading: true });
+  usageMsg(h, { error: 'This account\'s sign-in token has expired.' });
+  const m = modal(h);
+  assert(m.open && m.body === 'Error: This account\'s sign-in token has expired.', m.body);
+});
+
+test('closed while it loaded, it stays closed', (h) => {
+  h.live.accept();
+  usageMsg(h, { loading: true });
+  h.win.__mods.App.closeModal();
+  usageMsg(h, USAGE_REPORT);
+  assert(!modal(h).open, 'reopened after being closed');
+});
+
+test('another modal opened while it loaded is left alone', (h) => {
+  h.live.accept();
+  usageMsg(h, { loading: true });
+  h.win.__mods.Chat.handleMessage({ type: 'modal', title: 'Help', content: 'Commands:' });
+  usageMsg(h, USAGE_REPORT);
+  const m = modal(h);
+  assert(m.title === 'Help' && m.body === 'Commands:', JSON.stringify(m));
+});
+
+test('and the next /usage opens again', (h) => {
+  h.live.accept();
+  usageMsg(h, { loading: true });
+  h.win.__mods.App.closeModal();
+  usageMsg(h, USAGE_REPORT);             // dropped: it was closed
+  usageMsg(h, { loading: true });
+  usageMsg(h, USAGE_REPORT);
+  const m = modal(h);
+  assert(m.open && m.body.includes(' 18% used'), JSON.stringify(m));
+});
+
+test('only the answer to the closed one is dropped', (h) => {
+  // The next report is not the answer to that loading, so it is shown.
+  h.live.accept();
+  usageMsg(h, { loading: true });
+  h.win.__mods.App.closeModal();
+  usageMsg(h, USAGE_REPORT);             // the answer: dropped
+  usageMsg(h, USAGE_REPORT);             // not an answer to it
+  assert(modal(h).open, 'a second report was dropped too');
+});
+
+test('a report with no loading before it is still shown', (h) => {
+  // Nothing sends one today, but a report must never be dropped for want of
+  // one: only a modal the user closed is left closed.
+  h.live.accept();
+  usageMsg(h, USAGE_REPORT);
+  assert(modal(h).open && modal(h).body.includes(' 18% used'), JSON.stringify(modal(h)));
+});
+
+/* A phone-sized modal: 400px across with 16px padding each side, 7.2px a
+ * cell -- 51 cells, too few for the wide layout.  jsdom does no layout, so
+ * the page's measurements are stood in for; a hidden modal measures 0, as it
+ * does in a browser. */
+function phoneModal(h) {
+  const win = h.win;
+  const box = win.document.getElementById('detail-modal');
+  const body = win.document.getElementById('modal-body');
+  Object.defineProperty(body, 'clientWidth', {
+    get: () => (box.classList.contains('hidden') ? 0 : 400) });
+  const realCS = win.getComputedStyle.bind(win);
+  win.getComputedStyle = (el) => (el === body
+    ? { paddingLeft: '16px', paddingRight: '16px' } : realCS(el));
+  win.HTMLElement.prototype.getBoundingClientRect = function () {
+    const shown = !box.classList.contains('hidden');
+    return { width: shown && this.textContent === '0000000000' ? 72 : 0 };
+  };
+}
+
+test('the report is laid out for the modal it is shown in', (h) => {
+  h.live.accept();
+  phoneModal(h);
+  usageMsg(h, { loading: true });
+  usageMsg(h, USAGE_REPORT);
+  const lines = modal(h).body.split('\n');
+  const i = lines.findIndex((l) => l.startsWith('Current session'));
+  assert(lines[i].startsWith('Current session · Resets '), 'not the narrow layout: ' + lines[i]);
+  assert(lines[i + 1].length === 49, 'bar of ' + lines[i + 1].length + ', not 51 - 2');
+});
+
+test('even when nothing opened it first', (h) => {
+  // Measured once shown: a hidden modal has no width to measure.
+  h.live.accept();
+  phoneModal(h);
+  usageMsg(h, USAGE_REPORT);
+  const body = modal(h).body;
+  assert(body.includes('Current session · Resets '), 'laid out for 80 columns:\n' + body);
+});
+
+test('with no modal on the page, the report is printed instead', (h) => {
+  h.live.accept();
+  const box = h.win.document.getElementById('detail-modal');
+  box.parentNode.removeChild(box);
+  usageMsg(h, USAGE_REPORT);
+  const msgs = h.win.document.getElementById('messages');
+  assert(msgs.textContent.includes('five_hour'), 'the report was lost');
 });
 
 /* ---- /move (formerly /switch) ------------------------------------------ */

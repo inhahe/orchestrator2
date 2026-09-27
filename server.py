@@ -125,6 +125,7 @@ from theme import (
     PRESET_THEMES,
 )
 import auth
+import plan_usage
 
 log = logging.getLogger("orchestrator2")
 
@@ -4831,6 +4832,12 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             await _handle_mcp(ws, rt, payload)
             return
 
+        # /usage -- the account's plan limits.  A network fetch, so it can't
+        # be a synchronous immediate command either.
+        if kind == "usage":
+            await _handle_usage(ws, rt)
+            return
+
         # `/model` with no argument is "what can I switch to?", so it must
         # answer from the API rather than from an hour-old cache.  Awaited, not
         # fired-and-forgotten: the whole point is that the list rendered a line
@@ -5040,6 +5047,27 @@ async def _handle_mcp(ws: WebSocket, rt: "SessionRuntime", payload: str) -> None
         servers, tools_mode=tools_mode, filter_name=filter_name,
     )
     await send_to(ws, {"type": "modal", "title": "MCP Servers", "content": content})
+
+
+async def _handle_usage(ws: WebSocket, rt: "SessionRuntime") -> None:
+    """Handle ``/usage``: show the session's account's plan limits in a modal.
+
+    Two ``command_data`` messages go to the asking tab only.  The first,
+    ``{"loading": true}``, goes at once, so the modal opens before the
+    network answers.  The second carries the limits or an ``error``
+    (``plan_usage.usage_report``).  The fetch blocks, so it runs in a thread.
+    It uses the *runtime's* account: a session on another account shows that
+    account's limits.  static/usage.js draws them.
+    """
+    config_dir = getattr(rt.config, "config_dir", None)
+    await send_to(ws, {"type": "command_data", "label": "usage",
+                       "data": {"loading": True}})
+    try:
+        data = await asyncio.to_thread(plan_usage.usage_report, config_dir)
+    except Exception:  # noqa: BLE001 -- a bug; say so rather than hang "Loading"
+        log.exception("/usage: building the report failed")
+        data = {"error": "Failed to load usage data (see the hub log)."}
+    await send_to(ws, {"type": "command_data", "label": "usage", "data": data})
 
 
 async def _run_graphify_cli(ws: WebSocket, payload: str) -> None:

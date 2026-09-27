@@ -1241,6 +1241,11 @@ const Chat = (() => {
   // --- Command data (from immediate commands) ---
 
   function _addCommandData(msg) {
+    // /usage is drawn in the modal, as Claude Code draws it (static/usage.js).
+    if (msg.label === 'usage' && typeof Usage !== 'undefined' && Usage.show(msg.data)) {
+      return;
+    }
+
     const el = document.createElement('div');
     el.className = 'msg msg-command';
 

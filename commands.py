@@ -190,6 +190,10 @@ def classify(line: str) -> tuple[str, str]:
         return "clear-screen", ""
     if cmd == "cost":
         return "status", ""
+    if cmd == "usage":
+        # Plan limits -- a network fetch, so handled in server.py (like /mcp)
+        # rather than by the synchronous immediate dispatch table below.
+        return "usage", ""
     if cmd == "cwd":
         if arg:
             return "switch-cwd", arg
@@ -265,6 +269,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
     rows: list[tuple[str, str]] = [
         ("/help",                        "this help"),
         ("/status, /cost",               "session info, cost, usage"),
+        ("/usage",                       "plan limits: how much of the 5-hour and weekly limits is used, and when they reset"),
         ("/cwd [path]",                  "show or switch working directory"),
         ("/clear",                       "start a fresh session (wipes context)"),
         ("/cls",                         "clear the output area"),

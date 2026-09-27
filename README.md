@@ -44,7 +44,7 @@ The server starts serving and the browser opens **immediately**; the status bar 
 - The **status bar** (above the input) shows state, **config dir**, account, session, **agent** (the name other Claude sessions address this one by — what their `ListAgents` shows — read from the session's CLI; hover it for the session's name in the orchestrator2 agent registry, or a note that it isn't in that registry and so gets no halts), **working directory (full path)**, turns, model, effort, context usage, and rate limits. A **`loop`** field appears with a live countdown whenever a self-paced wakeup is scheduled — and says so if it has been deferred because a turn was running — and is hidden the rest of the time. See `/loop`.
 - The **browser tab's icon** shows the session's state on the rack's three LEDs, each in the colour the status bar writes it in, so you can read a session from the tab strip. Each LED is one thing, and they light together when several are true at once — compacting during bg-wait lights two. The **top** LED is the turn: green while working, yellow while compacting, red on an error, grey when nothing at all is going on. The **middle** LED is purple while background tasks are running. The **bottom** LED is purple while a loop is scheduled. All three yellow means it isn't connected (connecting, or disconnected and reconnecting); all three red means it has given up or the server shut down. A tab showing the session list has all three off.
 - The **sidebar panels** show active tools, background tasks, the pending queue, and the current plan/todos. On a phone they live behind the **⚙ Panels** button in the status bar (tap outside to close); it shows a count when prompts are queued.
-- **Slash commands** start with `/` — type `/help` for the full list. Common ones: `/status`, `/cwd <path>` (switch project), `/model`, `/effort`, `/resume`, `/rename`, `/move` (move this session to another account and/or another project directory), `/login`, `/clear`, `/interrupt`.
+- **Slash commands** start with `/` — type `/help` for the full list. Common ones: `/status`, `/usage` (how much of your plan's 5-hour and weekly limits is used, and when they reset), `/cwd <path>` (switch project), `/model`, `/effort`, `/resume`, `/rename`, `/move` (move this session to another account and/or another project directory), `/login`, `/clear`, `/interrupt`.
 
 Sessions are stored the same way Claude Code stores them — under `<config-dir>/projects/<cwd>/` — so a conversation is interchangeable with `claude --continue` / `claude --resume` **as long as both use the same `CLAUDE_CONFIG_DIR`** (account). See [Choosing a Claude account](#choosing-a-claude-account).
 
@@ -297,6 +297,7 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 
 - **Live WebSocket UI** -- real-time streaming of assistant messages, tool calls, and results
 - **Config-dir display** -- a dedicated **config** field (just before **account**) shows the active `CLAUDE_CONFIG_DIR` this session uses, as its trailing folder name (e.g. `.claude-account-b`); hover for the full path. Makes it obvious which config dir / account store a session is on when running several side by side
+- **Plan usage (`/usage`)** -- the same report as Claude Code's `/usage`: how much of the 5-hour session limit and of the weekly limits (all models, Sonnet only on Max and Team, and any per-model weekly limit) the session's account has used, each as a bar with `N% used` and when it resets, in your browser's time zone. Also shown: usage credits, and which products this week's usage went to. It is for the account *that session* runs on, so sessions on different accounts each show their own. It needs a Claude subscription login (Pro, Max, Team or Enterprise). If the account's sign-in token has expired, it says so rather than renewing it; the token renews the next time a session on that account talks to the API
 - **Account display** -- the status bar shows the signed-in account (the email address from `<config-dir>/.claude.json`, falling back to the config-dir name when no email is stored). Hover it to see the display name, organization, plan type, role, and the active `CLAUDE_CONFIG_DIR` — handy when running multiple accounts/config dirs side by side
 - **Working-directory display** -- the status bar shows the full working-directory path Claude is operating in
 - **Auto-login** -- checks your Claude sign-in on startup and opens the standard Claude login window if you're not authenticated (the same flow Claude Code uses). Sign in / out at runtime with `/login` and `/logout`
@@ -496,6 +497,7 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 |---------|-------------|
 | `/help` | Show all commands |
 | `/status` | Session info, cost, and usage |
+| `/usage` | Plan limits: how much of the 5-hour and weekly limits the session's account has used, and when each resets (see *Plan usage* under Features) |
 | `/debug` | Internal state diagnostics |
 
 ### Model & Behavior
@@ -691,6 +693,7 @@ sdk_bridge.py      SDK connection, worker loop, message dispatcher, auto-continu
 state.py           Mutable session state, status/panel serializers
 config.py          Config dataclass, argparse, constants
 commands.py        Slash command parsing and dispatch
+plan_usage.py      /usage: fetches the account's plan limits
 session.py         Session discovery, JSONL parsing, history replay, export
 tool_manager.py    Tool-use/result rendering helpers
 theme.py           Color token system, theme file I/O, CSS generation
@@ -703,6 +706,7 @@ static/
   status.js        Status bar updates
   panels.js        Sidebar panel rendering
   diff.js          Side-by-side diff computation
+  usage.js         /usage: draws the plan limits in the modal
 ```
 
 ### Key flows

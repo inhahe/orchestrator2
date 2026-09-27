@@ -4130,6 +4130,511 @@ SESSIONNAME_DISK_MUTATIONS = [
 ]
 
 
+# /usage: the account's plan limits.  plan_usage.py, the command, the
+# server's handler, and static/usage.js.  tests/test_usage.py,
+# tests/usage.test.js and tests/reconnect_on_show.test.js.
+USAGE_PY_MUTATIONS = [
+    ("the request goes to another endpoint",
+     'USAGE_URL = "https://api.anthropic.com/api/oauth/usage"',
+     'USAGE_URL = "https://api.anthropic.com/api/oauth/profile"'),
+
+    ("the oauth beta header is not sent",
+     '        "anthropic-beta": OAUTH_BETA,\n',
+     ''),
+
+    ("the token is not sent as a bearer token",
+     '"Authorization": f"Bearer {token}",',
+     '"Authorization": token,'),
+
+    ("an account with no login is asked anyway",
+     '    if not isinstance(token, str) or not token:\n',
+     '    if False:\n'),
+
+    ("a token without the profile scope is sent",
+     '    if isinstance(scopes, list) and PROFILE_SCOPE not in scopes:\n',
+     '    if False:\n'),
+
+    ("a record that lists no scopes is refused",
+     '    if isinstance(scopes, list) and PROFILE_SCOPE not in scopes:\n',
+     '    if PROFILE_SCOPE not in (scopes or []):\n'),
+
+    ("an expired token is sent",
+     '    if isinstance(expires_ms, (int, float)) and expires_ms / 1000 <= now_s:\n',
+     '    if False:\n'),
+
+    ("a token is expired only after its moment",
+     'expires_ms / 1000 <= now_s:',
+     'expires_ms / 1000 < now_s:'),
+
+    ("the expiry is read as seconds",
+     'expires_ms / 1000 <= now_s:',
+     'expires_ms <= now_s:'),
+
+    ("a record with no expiry is refused",
+     '    if isinstance(expires_ms, (int, float)) and expires_ms / 1000 <= now_s:\n',
+     '    if expires_ms is None or expires_ms / 1000 <= now_s:\n'),
+
+    ("the request has no timeout",
+     '        with opener(req, timeout=timeout) as resp:',
+     '        with opener(req) as resp:'),
+
+    ("the credentials are read from the hub's account",
+     '    path = config_dir_path(config_dir) / ".credentials.json"',
+     '    path = config_dir_path(None) / ".credentials.json"'),
+
+    ("an unreadable credentials file escapes",
+     '    except (OSError, ValueError):\n        return None\n    oauth =',
+     '    except OSError:\n        return None\n    oauth ='),
+
+    ("a credentials file that is not an object escapes",
+     'oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None',
+     'oauth = data.get("claudeAiOauth")'),
+
+    ("a login record that is not an object is used",
+     '    return oauth if isinstance(oauth, dict) else None',
+     '    return oauth'),
+
+    ("rate limiting is not told apart",
+     '    if code == 429:\n',
+     '    if code == 4290:\n'),
+
+    ("a rejected token is not told apart",
+     '    if code == 401:\n',
+     '    if code == 4010:\n'),
+
+    ("the API's reason is dropped",
+     '        f": {detail}" if detail else ".")',
+     '        ".")'),
+
+    ("a long reason is not cut short",
+     '    return msg[:200] + ("..." if len(msg) > 200 else "")',
+     '    return msg'),
+
+    ("a reason's line breaks are kept",
+     '    msg = " ".join(msg.split())\n',
+     ''),
+
+    ("an error body that is not the API's is repeated",
+     '    msg = err.get("message") if isinstance(err, dict) else None',
+     '    msg = err.get("message") if isinstance(err, dict) else err'),
+
+    ("an error body that cannot be read escapes",
+     '    except (OSError, ValueError, http.client.HTTPException):\n        return ""',
+     '    except ValueError:\n        return ""'),
+
+    ("the token is not scrubbed from an HTTP error",
+     '        raise UsageError(_scrub(_http_error_text(exc), token)) from None',
+     '        raise UsageError(_http_error_text(exc)) from None'),
+
+    ("an HTTP error chains back to the request",
+     '        raise UsageError(_scrub(_http_error_text(exc), token)) from None',
+     '        raise UsageError(_scrub(_http_error_text(exc), token))'),
+
+    ("the token is not scrubbed from a network error",
+     '            _scrub(f"Failed to load usage data: {reason}", token)) from None',
+     '            f"Failed to load usage data: {reason}") from None'),
+
+    ("a network error chains back to the request",
+     '            _scrub(f"Failed to load usage data: {reason}", token)) from None',
+     '            _scrub(f"Failed to load usage data: {reason}", token))'),
+
+    ("a network failure's reason is wrapped",
+     '        reason = getattr(exc, "reason", None) or exc\n',
+     '        reason = exc\n'),
+
+    ("a reply cut short escapes",
+     '    except (OSError, ValueError, http.client.HTTPException) as exc:\n',
+     '    except (OSError, ValueError) as exc:\n'),
+
+    ("a reply that is not JSON escapes",
+     '    except ValueError:\n        raise UsageError(',
+     '    except KeyError:\n        raise UsageError('),
+
+    ("a reply that is not an object is passed on",
+     '    if not isinstance(body, dict):\n',
+     '    if False:\n'),
+
+    ("the plan is not reported",
+     '"subscription_type": _text(oauth.get("subscriptionType")),',
+     '"subscription_type": None,'),
+
+    ("the tier is not reported",
+     '"rate_limit_tier": _text(oauth.get("rateLimitTier")),',
+     '"rate_limit_tier": None,'),
+
+    ("an empty plan is passed on as a plan",
+     '    return value if isinstance(value, str) and value else None',
+     '    return value if isinstance(value, str) else None'),
+
+    ("the report does not say whose email",
+     'account = {"email": info.get("email"), "config_dir": info.get("config_dir")}',
+     'account = {"email": None, "config_dir": info.get("config_dir")}'),
+
+    ("a failed report does not say whose",
+     '        return {"error": str(exc), "account": account}',
+     '        return {"error": str(exc)}'),
+
+    ("a report does not say whose",
+     '    report["account"] = account\n',
+     ''),
+]
+
+USAGE_SERVER_MUTATIONS = [
+    ("/usage is not handled",
+     '        if kind == "usage":\n            await _handle_usage(ws, rt)\n            return\n',
+     ''),
+
+    ("no loading message",
+     '    await send_to(ws, {"type": "command_data", "label": "usage",\n'
+     '                       "data": {"loading": True}})\n',
+     ''),
+
+    ("the fetch blocks the hub",
+     '        data = await asyncio.to_thread(plan_usage.usage_report, config_dir)',
+     '        data = plan_usage.usage_report(config_dir)'),
+
+    ("every session gets the hub's account",
+     '    config_dir = getattr(rt.config, "config_dir", None)\n'
+     '    await send_to(ws, {"type": "command_data", "label": "usage",',
+     '    config_dir = None\n'
+     '    await send_to(ws, {"type": "command_data", "label": "usage",'),
+
+    ("a bug leaves it loading",
+     '        data = {"error": "Failed to load usage data (see the hub log)."}\n',
+     '        return\n'),
+
+    ("a bug is not logged",
+     '        log.exception("/usage: building the report failed")\n',
+     ''),
+
+    ("every tab gets the answer",
+     '    await send_to(ws, {"type": "command_data", "label": "usage", "data": data})',
+     '    await rt.broadcast({"type": "command_data", "label": "usage", "data": data})'),
+
+    ("the answer is not sent",
+     '    await send_to(ws, {"type": "command_data", "label": "usage", "data": data})\n',
+     ''),
+]
+
+USAGE_CMD_MUTATIONS = [
+    ("/usage is not a command",
+     '    if cmd == "usage":\n',
+     '    if cmd == "usages":\n'),
+
+    ("/usage is not in /help",
+     '        ("/usage",                       "plan limits: how much of the 5-hour'
+     ' and weekly limits is used, and when they reset"),\n',
+     ''),
+]
+
+USAGE_CONFIG_MUTATIONS = [
+    ("/usage is not offered for completion",
+     '"/cost", "/usage", "/cwd"',
+     '"/cost", "/cwd"'),
+]
+
+USAGE_JS_MUTATIONS = [
+    ("the wide bar is another width",
+     "  const WIDE_BAR = 50;", "  const WIDE_BAR = 40;"),
+
+    ("the wide layout starts later",
+     "  const WIDE_AT = 62;", "  const WIDE_AT = 63;"),
+
+    ("the default width is narrower",
+     "  const DEFAULT_COLS = 80;", "  const DEFAULT_COLS = 60;"),
+
+    ("a half cell needs more than half",
+     "(exact - whole >= 0.5 ? HALF : EMPTY)",
+     "(exact - whole > 0.5 ? HALF : EMPTY)"),
+
+    ("a full bar runs over",
+     "    if (whole >= width) return FULL.repeat(width);\n", ""),
+
+    ("a negative figure is not floored at zero",
+     "Math.max(0, Number(ratio) || 0) * width", "(Number(ratio) || 0) * width"),
+
+    ("a figure that is not a number is not zero",
+     "Math.max(0, Number(ratio) || 0) * width", "Math.max(0, Number(ratio)) * width"),
+
+    ("exactly a day away shows the date",
+     "    if (o.alwaysDate || hoursAway > 24) {",
+     "    if (o.alwaysDate || hoursAway >= 24) {"),
+
+    ("a weekly limit's reset today shows no date",
+     "    if (o.alwaysDate || hoursAway > 24) {",
+     "    if (hoursAway > 24) {"),
+
+    ("dated resets always show minutes",
+     "        if (minute !== 0) f.minute = '2-digit';\n      }",
+     "        f.minute = '2-digit';\n      }"),
+
+    ("time-only resets always show minutes",
+     "timeZone: tz };\n      if (minute !== 0) f.minute = '2-digit';",
+     "timeZone: tz };\n      f.minute = '2-digit';"),
+
+    ("minutes are read in UTC",
+     "    const minute = Number(_part(d, tz, { minute: 'numeric' }, 'minute'));",
+     "    const minute = Number(_part(d, 'UTC', { minute: 'numeric' }, 'minute'));"),
+
+    ("the year is never shown",
+     "      if (_part(d, tz, { year: 'numeric' }, 'year')\n"
+     "          !== _part(now, tz, { year: 'numeric' }, 'year')) {",
+     "      if (false) {"),
+
+    ("the year is read in UTC",
+     "      if (_part(d, tz, { year: 'numeric' }, 'year')",
+     "      if (_part(d, 'UTC', { year: 'numeric' }, 'year')"),
+
+    ("dated resets always show the time",
+     "      if (showTime) {\n", "      if (true) {\n"),
+
+    ("am/pm after a narrow no-break space is left",
+     "s.replace(/[ \\u202f]([AP]M)/i,", "s.replace(/ ([AP]M)/i,"),
+
+    ("am/pm stays upper case",
+     "(_m, ap) => ap.toLowerCase());", "(_m, ap) => ap);"),
+
+    ("the zone named is always this browser's",
+     "    return s + ' (' + (tz || localZone()) + ')';",
+     "    return s + ' (' + localZone() + ')';"),
+
+    ("an unreadable time is formatted",
+     "    if (isNaN(d.getTime())) return null;\n    const now",
+     "    const now"),
+
+    ("epoch seconds are read as milliseconds",
+     "typeof when === 'number' ? new Date(when * 1000) : new Date(when)",
+     "new Date(when)"),
+
+    ("a limit without a figure is drawn",
+     "    if (typeof util !== 'number' || !isFinite(util)) return null;",
+     "    if (util === null) return null;"),
+
+    ("the percentage is rounded, not rounded down",
+     "    const used = Math.floor(util) + '% used';",
+     "    const used = Math.round(util) + '% used';"),
+
+    ("a limit with no reset time is given one",
+     "    if (limit.resets_at) {\n", "    if (true) {\n"),
+
+    ("what is spent replaces when it resets",
+     "if (o.extra) sub = sub ? o.extra + DOT + sub : o.extra;",
+     "if (o.extra) sub = o.extra;"),
+
+    ("the credit's note is not used",
+     "    if (o.override !== undefined) sub = o.override;\n", ""),
+
+    ("a wide block with no reset gets an empty line",
+     "      if (sub) lines.push(sub);", "      lines.push(sub);"),
+
+    ("a narrow block with no reset says so anyway",
+     "title + (sub ? DOT + sub : '')", "title + DOT + sub"),
+
+    ("the narrow bar is the wide one",
+     "bar(util / 100, o.maxWidth), used]", "bar(util / 100, WIDE_BAR), used]"),
+
+    ("other kinds of model-scoped limit count as weekly",
+     "const model = l && l.kind === 'weekly_scoped' && l.scope && l.scope.model;",
+     "const model = l && l.scope && l.scope.model;"),
+
+    ("a Sonnet per-model limit is always skipped",
+     "      if (sonnetShown && name.toLowerCase() === 'sonnet') continue;",
+     "      if (name.toLowerCase() === 'sonnet') continue;"),
+
+    ("every per-model limit is skipped once Sonnet's is shown",
+     "      if (sonnetShown && name.toLowerCase() === 'sonnet') continue;",
+     "      if (sonnetShown) continue;"),
+
+    ("the Sonnet match is case-sensitive",
+     "name.toLowerCase() === 'sonnet'", "name === 'sonnet'"),
+
+    ("a per-model limit's figure is not its percent",
+     "limit: { utilization: l.percent, resets_at: l.resets_at },",
+     "limit: { utilization: l.utilization, resets_at: l.resets_at },"),
+
+    ("a currency without cents is divided by 100",
+     "    const whole = fmt && fmt.resolvedOptions().maximumFractionDigits === 0;",
+     "    const whole = false;"),
+
+    ("an unknown currency drops its cents",
+     "code + ' ' + amount.toFixed(2)", "code + ' ' + amount"),
+
+    ("an unknown currency code is shown as typed",
+     "    const code = String(currency || 'USD').toUpperCase();",
+     "    const code = String(currency || 'USD');"),
+
+    ("no currency is not dollars",
+     "String(currency || 'USD')", "String(currency)"),
+
+    ("credits reset on the 1st of this month",
+     "Date.UTC(y, m, 1, 12)", "Date.UTC(y, m - 1, 1, 12)"),
+
+    ("the credit's expiry is formatted when unreadable",
+     "    if (d && !isNaN(d.getTime())) {", "    if (d) {"),
+
+    ("Enterprise credits are not shown",
+     "if (!proOrMax && plan !== 'team' && plan !== 'enterprise') return null;",
+     "if (!proOrMax && plan !== 'team') return null;"),
+
+    ("Team's credits are shown when off",
+     "    if (!x.is_enabled) return proOrMax ? TITLE + '\\nUsage credits are off' : null;",
+     "    if (!x.is_enabled) return TITLE + '\\nUsage credits are off';"),
+
+    ("a missing monthly limit is a limit",
+     "    if (x.monthly_limit === null || x.monthly_limit === undefined) {",
+     "    if (x.monthly_limit === null) {"),
+
+    ("Pro and Max credits with no limit are not unlimited",
+     "      if (proOrMax) return TITLE + '\\nUnlimited';\n", ""),
+
+    ("nothing spent is spent",
+     "      if (typeof x.used_credits !== 'number') return null;\n      return TITLE",
+     "      return TITLE"),
+
+    ("credits with no spend figure are drawn",
+     "    }\n    if (typeof x.used_credits !== 'number') return null;\n    let util",
+     "    }\n    let util"),
+
+    ("spending over the limit is not capped",
+     "Math.max(0, Math.min(100, x.used_credits / x.monthly_limit * 100))",
+     "x.used_credits / x.monthly_limit * 100"),
+
+    ("a zero limit is empty, not full",
+     "        : 100;\n", "        : 0;\n"),
+
+    ("the endpoint's null figure is used",
+     "    if (typeof util !== 'number') {\n      util = x.monthly_limit > 0",
+     "    if (util === undefined) {\n      util = x.monthly_limit > 0"),
+
+    ("products with no share are listed",
+     "&& typeof r.percent === 'number' && r.percent > 0) : [];",
+     "&& typeof r.percent === 'number' && r.percent >= 0) : [];"),
+
+    ("a product's share is not rounded",
+     "Math.round(r.percent) + '%'", "r.percent + '%'"),
+
+    ("a nameless product is listed",
+     "&& typeof r.display_name === 'string' && r.display_name\n",
+     "&& typeof r.display_name === 'string'\n"),
+
+    ("the plan's size is left off",
+     "    if (m) name += ' ' + m[1];\n", ""),
+
+    ("a backslash path is not split",
+     "p.split(/[\\\\/]+/)", "p.split('/')"),
+
+    ("a trailing separator names nothing",
+     ".split(/[\\\\/]+/).filter(Boolean);", ".split(/[\\\\/]+/);"),
+
+    ("the email is not preferred",
+     "    const who = (typeof a.email === 'string' && a.email) || _folder(a.config_dir);",
+     "    const who = _folder(a.config_dir);"),
+
+    ("an unknown plan gets no Sonnet-only limit",
+     "    if (plan === null || plan === 'max' || plan === 'team') {",
+     "    if (plan === 'max' || plan === 'team') {"),
+
+    ("Team gets no Sonnet-only limit",
+     "    if (plan === null || plan === 'max' || plan === 'team') {",
+     "    if (plan === null || plan === 'max') {"),
+
+    ("a Sonnet-only limit shown does not stop the duplicate",
+     "scopedWeeklies(u.limits, sonnet !== null)", "scopedWeeklies(u.limits, false)"),
+
+    ("a per-model weekly limit shows no date today",
+     "      add(limitBlock(s.title, s.limit, weekly));",
+     "      add(limitBlock(s.title, s.limit, o));"),
+
+    ("the weekly limit shows no date today",
+     "    add(limitBlock('Current week (all models)', u.seven_day, weekly));",
+     "    add(limitBlock('Current week (all models)', u.seven_day, o));"),
+
+    ("an empty report says nothing",
+     "    if (!blocks.length) blocks.push('No plan limits reported for this account.');\n",
+     ""),
+
+    ("an error shows the limits anyway",
+     "    if (data.error) {\n", "    if (false) {\n"),
+
+    ("no reply at all breaks it",
+     "    if (!data || typeof data !== 'object') return 'Error: no usage data came back.';\n",
+     ""),
+
+    ("a very narrow modal gets a sliver of a bar",
+     "o.maxWidth = Math.max(10, (o.cols || DEFAULT_COLS) - 2);",
+     "o.maxWidth = (o.cols || DEFAULT_COLS) - 2;"),
+
+    ("the layout is for the whole width, not less 2",
+     "(o.cols || DEFAULT_COLS) - 2);", "(o.cols || DEFAULT_COLS));"),
+
+    ("the probe is left in the modal",
+     "    probe.remove();\n", ""),
+
+    ("the padding is counted as room",
+     "    const inner = el.clientWidth\n"
+     "      - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);",
+     "    const inner = el.clientWidth;"),
+
+    ("cells are counted rounding up",
+     "Math.floor(inner / cell) : DEFAULT_COLS", "Math.ceil(inner / cell) : DEFAULT_COLS"),
+
+    ("the credit block is not shown",
+     "    add(creditBlock(u.cinder_cove, o));\n", ""),
+
+    ("the product line is not shown",
+     "    add(byProduct(u.seven_day_breakdown));\n", ""),
+]
+
+USAGE_PAGE_MUTATIONS = [
+    ("loading does not open the modal",
+     "      App.openModal('Usage', 'Loading usage data\\u2026');\n", ""),
+
+    ("an answer to a closed modal is not recognised",
+     "      _awaiting = true;\n", ""),
+
+    ("an answer reopens a modal closed while it loaded",
+     "(modal.classList.contains('hidden') || title.textContent !== 'Usage')",
+     "(title.textContent !== 'Usage')"),
+
+    ("an answer replaces another modal",
+     "(modal.classList.contains('hidden') || title.textContent !== 'Usage')",
+     "(modal.classList.contains('hidden'))"),
+
+    ("a dropped answer is still awaited",
+     "    const awaited = _awaiting;\n    _awaiting = false;\n",
+     "    const awaited = _awaiting;\n"),
+
+    ("the report is measured while hidden",
+     "    App.openModal('Usage', '');            // shown, so its width can be measured\n",
+     ""),
+
+    ("the report is laid out for 80 columns",
+     "render(data, { cols: columnsFor(body) })", "render(data, {})"),
+
+    ("a page without the modal loses the report",
+     "        || typeof App === 'undefined' || typeof App.openModal !== 'function') {\n"
+     "      return false;",
+     "        || typeof App === 'undefined' || typeof App.openModal !== 'function') {\n"
+     "      return true;"),
+]
+
+USAGE_CHAT_MUTATIONS = [
+    ("the report is printed, not drawn",
+     "    if (msg.label === 'usage' && typeof Usage !== 'undefined' && Usage.show(msg.data)) {\n"
+     "      return;\n    }\n",
+     ""),
+
+    ("a report with no modal is lost",
+     "&& Usage.show(msg.data)) {\n      return;\n    }",
+     ") {\n      Usage.show(msg.data);\n      return;\n    }"),
+]
+
+USAGE_INDEX_MUTATIONS = [
+    ("the page does not load usage.js",
+     '  <script src="/static/usage.js"></script>\n', ""),
+]
+
+
 TARGETS = {
     "chat": ("static/chat.js", "tests/hidden_window.test.js",
              CHAT_MUTATIONS, "node"),
@@ -4315,6 +4820,22 @@ TARGETS = {
                    TABECHO_RT_MUTATIONS, "pytest"),
     "foreign": ("server.py", "tests/test_foreign_running_sessions.py",
                 FOREIGN_MUTATIONS, "pytest"),
+    "usage-py": ("plan_usage.py", "tests/test_usage.py",
+                 USAGE_PY_MUTATIONS, "pytest"),
+    "usage-server": ("server.py", "tests/test_usage_hub.py",
+                     USAGE_SERVER_MUTATIONS, "pytest"),
+    "usage-cmd": ("commands.py", "tests/test_usage.py",
+                  USAGE_CMD_MUTATIONS, "pytest"),
+    "usage-config": ("config.py", "tests/test_usage.py",
+                     USAGE_CONFIG_MUTATIONS, "pytest"),
+    "usage-js": ("static/usage.js", "tests/usage.test.js",
+                 USAGE_JS_MUTATIONS, "node"),
+    "usage-page": ("static/usage.js", "tests/reconnect_on_show.test.js",
+                   USAGE_PAGE_MUTATIONS, "node"),
+    "usage-chat": ("static/chat.js", "tests/reconnect_on_show.test.js",
+                   USAGE_CHAT_MUTATIONS, "node"),
+    "usage-index": ("static/index.html", "tests/reconnect_on_show.test.js",
+                    USAGE_INDEX_MUTATIONS, "node"),
     "extauth": ("server.py",
                 "tests/test_external_access_policy.py tests/test_external_auth.py",
                 EXTAUTH_MUTATIONS, "pytest"),

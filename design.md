@@ -101,6 +101,7 @@ Three layers, deliberately separated:
 | `state.py` | `State` dataclass + `state_to_status_dict()` / `state_to_panels_dict()` serialisers, rate-limit helpers |
 | `config.py` | `Config` dataclass, `parse_args()`, constants (`CONTINUE_PROMPT`, `MARKERS`, …) |
 | `commands.py` | `classify(line)` → `(kind, payload)`, immediate-command dispatch, completions |
+| `plan_usage.py` | `/usage`: fetches the account's plan limits from the usage endpoint (§6f) |
 | `session.py` | Session discovery, JSONL parsing, `render_session_history`, titles, trim, export |
 | `tool_manager.py` | Tool-use / tool-result / thinking rendering helpers, registries |
 | `theme.py` | CSS-variable theme system, `load_theme()` |
@@ -1698,6 +1699,97 @@ Caveat: the cache is process-global, but credentials are per config dir.
 `main()` pins `CLAUDE_CONFIG_DIR` for the process, so the list reflects the
 *hub's* account even for a runtime opened under a different one.
 
+## 6f. Plan limits: `/usage` (`plan_usage.py`, `static/usage.js`)
+
+Asked 2026-09-27: "the claude code TUI has a /usage command that tells you in
+ascii all about your usage, including what percentage of the 5-hr limit and
+7-day limit's been used and when they reset. can you implement /usage in
+orchestrator2?"
+
+**Where the numbers come from.** The data is the same as Claude Code's:
+`GET https://api.anthropic.com/api/oauth/usage`, with the account's OAuth
+token as a bearer token and `anthropic-beta: oauth-2025-04-20`. The reply has
+`five_hour` and `seven_day` (plus `seven_day_sonnet`), each with a
+`utilization` percentage and a `resets_at`. It also carries a generic `limits`
+list, whose `weekly_scoped` entries are the per-model weekly limits;
+`extra_usage` (usage credits); `cinder_cove` (a one-time credit); and
+`seven_day_breakdown` (which products the week's usage went to). The
+endpoint does not report the plan. `subscriptionType` and `rateLimitTier`
+come from the login record, which is also how the TUI decides whether there
+is a Sonnet-only limit.
+
+**Whose limits.** They are the *runtime's* account's:
+`plan_usage.usage_report(rt.config.config_dir)`, falling back to the process's
+`CLAUDE_CONFIG_DIR` like everything else (§6a's model list is the exception,
+because it is process-global). A session moved to another account shows that
+account's limits, and the report names the account (email, or the config
+dir's folder) because one hub runs several.
+
+**Why not ask the session's CLI.** The bundled CLI (2.1.258) has a
+`get_usage` control request, and it would renew an expired token itself.
+Tried on 2026-09-27, it never answered, twice: not in 30 s, not in 170 s. It
+builds its answer from the same endpoint *plus* a "what's contributing to your
+limits" breakdown made by scanning every local transcript, and the caller
+cannot switch that part off. The endpoint alone answers in well under a
+second.
+
+**The hub never renews the token.** Access tokens last about eight hours, and
+the CLI renews one when an API call finds it expired. Renewal rotates the
+refresh token, and Claude Code serialises renewals across its processes with
+a lock file in the config dir (`lockfile.lock(claudeDir)` in its
+`auth.ts`). A renewal from the hub would not take that lock, so it could race
+a session's and sign the account out. An expired token (`expiresAt`, in ms)
+is therefore reported without asking the endpoint, together with what renews
+it: the next API call from any session on that account, or `/login`. The same
+goes for a login without the `user:profile` scope, which Claude Code also
+skips.
+
+**The token goes nowhere but the request.** It is not logged and not put in
+an error. Errors are raised `from None`, because the chain would lead back to
+the `Request` that holds the token. Text that repeats something the server
+said has the token scrubbed out (`_scrub`). Only an API error body's
+`error.message` is repeated, trimmed to 200 characters, because a proxy's
+HTML page is not an explanation. A 429 and a 401 get their own wording.
+
+**Two messages, to the asking tab only.** `server._handle_usage` sends
+`command_data` `usage` `{loading: true}` at once, runs the blocking fetch in
+a thread, then sends the report or `{error}`. It is special-cased next to
+`/mcp` rather than put in the synchronous immediate table, which must not
+block. A bug in building the report is logged and still answered, so the
+modal is never left on "Loading".
+
+**Drawn in the browser, as the TUI draws it.** `static/usage.js` renders the
+report as the modal's text. Reset times belong in the *viewer's* time zone,
+and the hub's zone is not necessarily that when the tab is on a phone. It
+follows Claude Code 2.1.258's Usage screen, read out of the bundled binary:
+
+- The same sections, in the same order.
+- `Math.floor` percentages.
+- A 50-cell bar once the layout has 62 columns (the modal is measured in
+  cells, less 2 as the TUI subtracts); below that, the narrow layout, with the
+  bar across the width.
+- The same reset wording (`formatResetTime`): the time alone within 24 hours,
+  and the date past that. The weekly limits and the credits always show the
+  date. A lower-case am/pm, and the IANA zone in brackets.
+
+It differs in four places. The empty part of the bar is `░`, where the TUI uses
+a background colour that plain text cannot carry. Every per-model weekly limit
+is shown; the TUI shows only those named in a server-side feature flag. The
+account and plan head the report. The product breakdown is an addition.
+
+A report that arrives after the user closed the loading modal, or replaced it
+with another, is dropped. Only the answer to that one loading is dropped,
+though: a later report is shown. Without a modal on the page, `show()`
+returns false and chat.js prints the report instead of losing it.
+
+Tests: `tests/test_usage.py` (the fetch, what it says instead, the token),
+`tests/test_usage_hub.py` (the handler: kept apart because importing
+`server.py` is slow and the fetch tests do not need it), `tests/usage.test.js`
+(the drawing), and `tests/reconnect_on_show.test.js` (the modal, and that the
+harness loads the same scripts as `index.html`). Mutation targets:
+`usage-py`, `usage-server`, `usage-cmd`, `usage-config`, `usage-js`,
+`usage-page`, `usage-chat`, `usage-index`.
+
 ## 6b. Subprocess ownership (`proc_guard.py`)
 
 The SDK spawns `claude.exe` as a child process, and Windows does **not** tear
@@ -1928,6 +2020,7 @@ reconnection and dispatches every inbound message type to a module:
 | `lobby.js` | `☰ Sessions` overlay (§8) |
 | `move.js` | `/move` — move this session to another account and/or directory (§8) |
 | `diff.js` | Side-by-side edit diffs |
+| `usage.js` | `/usage`: draws the plan limits in the modal, as Claude Code does (§6f) |
 | `commands.js` | Slash-command input + completions |
 | `util.js` | Shared helpers |
 
@@ -3417,7 +3510,9 @@ not the session being closed (`test_loops_survive_restart.py`, section 4), what
 a session carries with it when
 `/move` moves it to another directory (`test_move_directory.py` +
 `move_overlay.test.js`, section 8) and that the move stops the original
-(`test_move_stops_original.py`, section 8), and that a
+(`test_move_stops_original.py`, section 8), what `/usage` asks for and
+how it draws the answer (`test_usage.py`, `test_usage_hub.py` +
+`usage.test.js`, section 6f), and that a
 mistyped launch flag leaves a trace instead of
 evaporating (`test_launch_errors.py`, section 10a).
 
