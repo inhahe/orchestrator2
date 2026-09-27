@@ -554,7 +554,9 @@ def test_the_note_warns_that_the_old_paths_still_resolve(monkeypatch, tmp_path):
         monkeypatch, tmp_path, src_cwd=src_cwd, want_cwd=str(dest))
     note = created.get("session_note") or ""
     assert "still exists" in note, note
-    assert "still be running" in note, "did not mention the original session"
+    # The original is stopped by the move now (2026-09-27); telling the copy
+    # it "may still be running" would send it looking for a twin.
+    assert "was stopped" in note, "did not say what became of the original"
 
 
 def test_an_account_only_move_is_still_worth_saying(monkeypatch, tmp_path):

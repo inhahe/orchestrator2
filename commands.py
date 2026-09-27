@@ -279,7 +279,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         ("/connect",                     "reconnect (revives a dropped browser socket, or the SDK)"),
         ("/resume [id|title]",           "resume a session (or open picker)"),
         ("/rename <name>",               "set the session title -- also the name other sessions address it by"),
-        ("/move [path]",                 "copy this session to another account and/or directory, and continue it here"),
+        ("/move [path]",                 "move this session to another account and/or directory (the original is stopped)"),
         ("/export [path]",               "save conversation as markdown"),
         ("/btw <question>",              "side question, answered in a fork"),
         ("/graphify [path] [flags]",     "build a knowledge graph (graphify)"),

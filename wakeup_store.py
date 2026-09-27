@@ -115,6 +115,22 @@ def save_wakeup(cwd: str, session_id: str | None, *, due_at: float,
         pass
 
 
+def load_wakeup(cwd: str, session_id: str | None) -> dict | None:
+    """The wakeup recorded for *session_id* in *cwd*, if there is a valid one.
+
+    For a caller that has to carry a live loop somewhere else -- ``/move``,
+    which stops the session that holds it (and so erases this record) and
+    re-arms it in the copy.
+    """
+    if not session_id:
+        return None
+    try:
+        rec = json.loads(wakeup_file_for(cwd, session_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return rec if _valid(rec) else None
+
+
 def clear_wakeup(cwd: str, session_id: str | None) -> None:
     """Forget a wakeup, because it fired or was cancelled.
 

@@ -1,14 +1,9 @@
-/* move.js — the `/move` overlay: copy this session somewhere else
- *
- * Named `Move` from when the command could only change *account*.  It is now
- * `/move` (with `/move` kept as an alias, since it is in muscle memory and
- * in older notes).  This module, its file, its CSS classes and the `switch_*`
- * wire messages keep the old name deliberately: they are internal, and
- * renaming them would churn a lot of code for no user-visible gain.
+/* move.js — the `/move` overlay: move this session somewhere else
  *
  * The `/move` command copies the tab's *current* session to another Claude
- * account and/or another project directory, and continues it in the same
- * window.  This overlay drives that flow:
+ * account and/or another project directory, stops the original, and
+ * continues the conversation in the same window (design.md §8, `/move`).
+ * This overlay drives that flow:
  *   1. list the Claude accounts (name + signed-in email) and pick one — the
  *      current one included, since "same account, different directory" is a
  *      perfectly ordinary switch,
@@ -117,9 +112,11 @@ const Move = (() => {
       return;
     }
     let html =
-      '<p class="move-intro">Copy this conversation to another account ' +
-      'and/or another directory, and continue it here. Pick the destination ' +
-      'account — or the current one, to change only the directory:</p>' +
+      '<p class="move-intro">Move this conversation to another account ' +
+      'and/or another directory, and continue it here. The original ' +
+      'session is stopped; its queued prompts and scheduled loop come ' +
+      'along. Pick the destination account — or the current one, to ' +
+      'change only the directory:</p>' +
       '<div class="move-accounts">';
     _accounts.forEach((a, i) => {
       const email = a.email

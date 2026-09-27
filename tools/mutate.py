@@ -986,16 +986,16 @@ MOVECOPY_MUTATIONS = [
 
 MOVESERVER_MUTATIONS = [
     ("a copied session is never told it moved (checklist item 2)",
-     "            session_note=note)",
-     "            session_note=None)"),
+     "            session_note=note, agent_name=",
+     "            session_note=None, agent_name="),
 
     ("the note fires even when nothing moved, so it becomes noise",
      "    note = None\n    if dir_changed or",
      "    note = None\n    if True or"),
 
     ("an account-only move is treated as no move at all",
-     "    note = None\n    if dir_changed or normalize_path_for_compare",
-     "    note = None\n    if dir_changed and normalize_path_for_compare"),
+     "    note = None\n    if dir_changed or account_changed:",
+     "    note = None\n    if dir_changed:"),
 
     ("the note omits where the session came from",
      '            parts.append(f"from {cwd} to {dest_cwd}")',
@@ -1003,9 +1003,8 @@ MOVESERVER_MUTATIONS = [
 
     ("the note drops the part that matters -- that the old paths still work",
      '            "location, which still exists — re-check any path you carry "\n'
-     '            "forward from before this line. The original session is still "\n'
-     '            "there and may still be running."',
-     '            "location."'),
+     '            "forward from before this line. The original session was stopped "',
+     '            "location. The original session was stopped "'),
 
     ("the copy is filed under the old slug, where --resume will never look",
      "    slug = _sanitize_cwd(dest_cwd) if dir_changed else src_dir.name",
@@ -2865,6 +2864,103 @@ SESSIONNAME_SERVER_MUTATIONS = [
      "                                   agent_name=agent_name,\n"),
 ]
 
+# /move stops the session it moves.  tests/test_move_stops_original.py.
+#
+# Not mutated: stopping the original *before* the copy rather than after -- an
+# ordering, not a line that a string swap can move.  The test that pins it
+# (test_it_is_stopped_before_the_copy_is_taken) is kept regardless.
+MOVESTOP_MUTATIONS = [
+    ("the original is never stopped -- the report: both versions running",
+     "    await _teardown_runtime(\n        rt, force=True,\n"
+     "        reason=f\"was moved {where}",
+     "    if False: await _teardown_runtime(\n        rt, force=True,\n"
+     "        reason=f\"was moved {where}"),
+
+    ("the tab doing the move is sent to the lobby with the ones left behind",
+     "    _detach_ws(ws, rt)\n",
+     ""),
+
+    ("a tab left on the original is told only that it was closed",
+     "        viewer_message=(f\"That session was moved",
+     "        viewer_message=None and (f\"That session was moved"),
+
+    ("the copy is told the original may still be running",
+     "\"forward from before this line. The original session was stopped \"",
+     "\"forward from before this line. The original session may still be running \""),
+
+    ("the user is not told what happened to the original",
+     "    await send_to(ws, {\"type\": \"system_msg\", \"subtype\": \"info\",\n"
+     "                       \"data\": {\"message\": \" \".join(said)}})\n",
+     ""),
+
+    ("queued prompts are left behind in the stopped original",
+     "        new_rt.state.queued_prompts.extend(carry[\"queue\"])\n",
+     "        pass\n"),
+
+    ("the loop is left behind, and ends",
+     "    loop_moved = _rearm_carried_wakeup(new_rt, carry[\"wakeup\"])\n",
+     "    loop_moved = False\n"),
+
+    ("the loop comes along but fires on the settle clock, not when it was due",
+     "                float(rec.get(\"due_at\", 0)) - time.time())\n",
+     "                0.0)\n"),
+
+    ("a loop due mid-move fires while the copy's CLI is still connecting",
+     "    delay = max(WAKEUP_RESTORE_SETTLE_S,\n",
+     "    delay = max(1.0,\n"),
+
+    ("the original keeps its queue file, so reopening it re-sends the prompts",
+     "        await asyncio.to_thread(save_persisted_queue, cwd, [], sid)\n",
+     ""),
+
+    ("the queue is taken from the original even when the move then fails",
+     "    return {\n        \"queue\": queue,\n",
+     "    save_persisted_queue(cwd, [], sid)\n"
+     "    return {\n        \"queue\": queue,\n"),
+
+    ("a failed move reopens another account's session without its queue",
+     "        if carry[\"queue\"] and q is not None and not q:\n"
+     "            q.extend(carry[\"queue\"])\n",
+     ""),
+
+    ("a reopen that restored its own queue gets it twice",
+     "        if carry[\"queue\"] and q is not None and not q:\n",
+     "        if carry[\"queue\"] and q is not None:\n"),
+
+    ("the explicit name is left behind",
+     "            session_note=note, agent_name=carry[\"agent_name\"],\n",
+     "            session_note=note, agent_name=None,\n"),
+
+    ("the copy is never told which background tasks died",
+     "    if carry[\"bg_tasks\"]:\n        await asyncio.to_thread(\n",
+     "    if False:\n        await asyncio.to_thread(\n"),
+
+    ("a copy that will not start leaves the user with nothing running",
+     "        await _move_failed(f\"Couldn't start the moved session: {exc}\")\n",
+     "        await send_to(ws, {\"type\": \"move_error\", \"message\": "
+     "f\"Couldn't start the moved session: {exc}\"})\n"),
+
+    ("a failed copy leaves the user with nothing running",
+     "        await _move_failed(f\"Copy failed: {exc}\")\n",
+     "        await send_to(ws, {\"type\": \"move_error\", \"message\": "
+     "f\"Copy failed: {exc}\"})\n"),
+
+    ("a tab whose original could not be reopened is left on the stopped session",
+     "            # still showing -- and able to type into -- a stopped session.\n"
+     "            await _enter_lobby(ws)\n",
+     "            # still showing -- and able to type into -- a stopped session.\n"),
+
+    ("the reopened original has lost its loop",
+     "        _rearm_carried_wakeup(orig, carry[\"wakeup\"])\n",
+     ""),
+]
+
+MOVESTOP_WAKEUP_MUTATIONS = [
+    ("a recorded wakeup can never be read back, so no loop survives a move",
+     "    return rec if _valid(rec) else None\n",
+     "    return None\n"),
+]
+
 # A backlog handed to a visible tab at once (a frozen background tab being
 # shown): one scroll per frame, user scroll intent obeyed at once, and only a
 # prompt typed here forcing the view down.  tests/hidden_window.test.js.
@@ -3530,6 +3626,10 @@ TARGETS = {
                            SESSIONNAME_SERVER_MUTATIONS, "pytest"),
     "sessionname-disk": ("session.py", "tests/test_session_name.py",
                          SESSIONNAME_DISK_MUTATIONS, "pytest"),
+    "movestop": ("server.py", "tests/test_move_stops_original.py",
+                 MOVESTOP_MUTATIONS, "pytest"),
+    "movestop-wakeup": ("wakeup_store.py", "tests/test_move_stops_original.py",
+                        MOVESTOP_WAKEUP_MUTATIONS, "pytest"),
     "scrollburst": ("static/chat.js", "tests/hidden_window.test.js",
                     SCROLLBURST_MUTATIONS, "node"),
     "scrollburst-app": ("static/app.js", "tests/reconnect_on_show.test.js",

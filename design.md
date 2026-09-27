@@ -334,6 +334,9 @@ it at every exit from the armed state — a record that outlives its wakeup is a
 turn waiting to run twice. At startup `_resurrect_scheduled_wakeups()` reopens
 those sessions and re-arms them, because the loops that need this are
 unattended by definition; restoring only on open would be decoration.
+`/move` is the one other reader: it stops the session holding the loop, which
+erases the record, so it reads it first (`load_wakeup`) and re-arms the loop in
+the copy due when it was (§8, `/move`).
 
 It is the riskiest path in the hub — it starts CLIs and then runs turns in
 them, unwatched — so the restraints are the design: session-scoped records that
@@ -2167,17 +2170,93 @@ Claude already knows about offered as one-click fills — the suggestion list is
 a convenience, not the set of legal destinations, since moving a session
 somewhere Claude has never run is exactly the interesting case.
 
-Pinned by `tests/test_move_directory.py` (29), `tests/move_overlay.test.js`
-(16, jsdom) and four mutation targets: `switchcopy` (`copy_session.py` × 8),
-`switchserver` (`server.py` × 15), `switchui` (`static/move.js` × 13) and
+Pinned by `tests/test_move_directory.py` (35), `tests/move_overlay.test.js`
+(16, jsdom) and four mutation targets: `movecopy` (`copy_session.py` × 8),
+`moveserver` (`server.py` × 20), `moveui` (`static/move.js` × 13) and
 `movecmd` (`static/commands.js` × 5, how the command name is matched).
-`switchserver` found three weak tests on its first run — a slug test whose
+`moveserver` (then `switchserver`) found three weak tests on its first run — a slug test whose
 fixture made both implementations agree, a spelling test whose input
 `Path.resolve()` had already canonicalised before the comparison it was meant
 to exercise, and a dedupe test whose newest entry was also its last — all three
 rewritten from the survivors. The browser half is worth testing separately
 because a missing `cwd` field in `move_do` is, server-side, indistinguishable
 from a deliberate "stay where you are".
+
+#### A move stops the original
+
+Until 2026-09-27 it did not. `_do_move` copied the transcript, started a runtime
+on the copy and attached the tab to it — and never touched the original, leaving
+it to the idle timer. That reaps an idle original with no viewers, but the idle
+teardown rightly refuses a session that is *working* (busy, running background
+tasks, holding a scheduled loop), so the sessions most worth moving were exactly
+the ones never stopped. Reported: *"i did a /move to move a session to another
+account, and it apparently never killed the old session. now both versions of
+the session are running."* That is two agents on one conversation, both acting,
+one of them in the account being moved away from. The copy's own note said as
+much ("the original session is still there and may still be running"), which
+documented the defect instead of fixing it.
+
+The move now stops the original through the same forced close as the card's ×
+(`_teardown_runtime(force=True)`, "Closing one session" below). Three things
+about how it does so matter:
+
+* **The original is stopped before the copy is taken**, so the copy starts from
+  its final transcript, not a snapshot it then wrote past. A turn in flight is
+  cut. The copy's CLI picks it back up the way it does after a restart
+  (`CLAUDE_CODE_RESUME_INTERRUPTED_TURN`).
+* **This tab is detached first** (`_detach_ws`), so the evacuation does not send
+  it to the lobby along with the tabs left behind: it follows the conversation.
+  Any other tab still on the original is evacuated with a message naming where
+  the session went (`viewer_message=`), not the generic "closed".
+  While detached it is attached to nothing, and an unattached socket that
+  sends a prompt is attached to the *default* runtime and the prompt runs there
+  (`_dispatch_ws_message`). That cannot happen here only because a socket's
+  messages are handled one at a time. The receive loop awaits each dispatch, so
+  anything this tab sends during the move is read after `_do_move` returns,
+  once the tab is attached to the copy (or to the reopened original). **Making
+  dispatch concurrent would break this.** If both the move and the reopen fail,
+  the tab is sent to the lobby rather than left on a stopped session.
+* **Whatever the stop would destroy is read first** (`_move_carry`) and handed
+  to the copy:
+  - *Queued prompts.* They are also taken *away* from the original. A closed
+    session keeps its queue file on purpose, and reopening one restores that
+    file and sends it, so opening the original from Recent would otherwise run
+    those prompts a second time. The file is emptied only once the copy is
+    running, since a failed move reopens the original from it.
+  - *The loop's pending wakeup.* The stop erases its record, so
+    `wakeup_store.load_wakeup` reads it beforehand, and `_rearm_carried_wakeup`
+    re-arms it in the copy due when it was, rather than restarting the
+    interval. It is never re-armed sooner than `WAKEUP_RESTORE_SETTLE_S`
+    (20 s), the restart path's settle time, for the same reason: the copy's
+    CLI has only just started. A wakeup that fires while it is still
+    connecting finds it "not busy" and injects its prompt next to the
+    interrupted turn the CLI is about to resume. The original would have
+    deferred it behind that turn.
+  - *The background-task record.* Those tasks were the original CLI's processes
+    and cannot move. The record is filed under the copy's cwd and id, so the
+    copy's connect reports which tasks died, the same notice a restart gives.
+  - *Its explicit agent name and labels.* It is the same agent carrying on, and
+    the original's registration left with it.
+
+Stopping first has a cost: a failure *after* the stop (the copy cannot be
+written, or its runtime will not start) would otherwise leave nothing running.
+So `_move_failed` reopens the original — same id, account and name, loop
+re-armed — and says so. The reopen normally restores the queue from its own
+file. For another account's session that restore looks in the wrong
+directory (known-issues.md), so if the reopened queue is empty the carried
+queue is put back by hand. It is never added on top of a restored queue, which
+would run each prompt twice. If even the reopen fails, the user is told the
+original was stopped and has to be opened from the list. Failures *before* the stop (no session, no
+target, a bad directory, a missing source file) change nothing and just report.
+
+The copy's note and the user's confirmation both say the original *was
+stopped*, and the confirmation lists what came along.
+
+Pinned by `tests/test_move_stops_original.py` (20). It drives the real
+`_do_move` and `_teardown_runtime` against a runtime registered with the hub,
+faking only the SDK side. Mutation targets: `movestop` (`server.py` × 19) and
+`movestop-wakeup` (`wakeup_store.py` × 1). Stop-before-copy is an ordering, not
+a line a string swap can move, so a test pins it rather than a mutant.
 
 #### `copy_session.py` no longer imports `textual`
 
@@ -2465,6 +2544,11 @@ Three things separate it from the idle teardown it shares plumbing with:
   dead runtime.
 
 The session's JSONL is untouched, so a closed session reopens from **Recent**.
+
+`/move` is the other caller of this forced close (see `/move` above): it stops
+the session it moved, after detaching the tab doing the move, and passes
+`viewer_message=` so any other tab is told where the conversation went rather
+than only that it closed.
 
 ---
 
@@ -2852,7 +2936,9 @@ name over at all. Now:
   unnamed session it is about to resume, once per session. So a session opened
   with `--agent-name` is still that agent when it comes back from the lobby or
   after a hub restart, with no flag. A session `/move`d elsewhere is a new
-  session and is not named: the original is still running under the name.
+  session id but the same agent carrying on: the move stops the original, whose
+  registration leaves with it, and hands its explicit name and labels to the
+  copy (§8, `/move`).
 * **`--agent-label` works the same way** — it had the same fault: a hub
   started with `--agent-label lane=b` put `lane=b` on every session it opened.
   Labels live in `state.agent_labels` (published by `_agent_labels`), are set
@@ -3070,7 +3156,8 @@ auth throttle (`test_external_access_policy.py`, section 9), that the
 self-paced wakeup loop can be stopped from either side
 (`test_loop_control.py`, section 6), what a session carries with it when
 `/move` moves it to another directory (`test_move_directory.py` +
-`move_overlay.test.js`, section 8), and that a
+`move_overlay.test.js`, section 8) and that the move stops the original
+(`test_move_stops_original.py`, section 8), and that a
 mistyped launch flag leaves a trace instead of
 evaporating (`test_launch_errors.py`, section 10a).
 

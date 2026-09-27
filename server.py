@@ -104,6 +104,7 @@ from session import (
     read_session_title,
     render_session_history,
     resolve_session_ref,
+    save_persisted_bg_tasks,
     save_persisted_queue,
     write_session_title,
 )
@@ -1729,7 +1730,8 @@ def _rearm_restored_wakeup(rt: SessionRuntime, rec: dict, delay: float,
 
 
 async def _teardown_runtime(rt: SessionRuntime, *, force: bool = False,
-                            reason: str = "was closed") -> None:
+                            reason: str = "was closed",
+                            viewer_message: str | None = None) -> None:
     """Stop a runtime's bridge and drop it from the registry.
 
     The default runtime is the process's primary session and is never torn
@@ -1767,7 +1769,7 @@ async def _teardown_runtime(rt: SessionRuntime, *, force: bool = False,
             state = None
         if bridge is rt.bridge:
             bridge = None
-    await _evacuate_viewers(rt)
+    await _evacuate_viewers(rt, viewer_message)
     if rt.bridge is not None:
         try:
             await rt.bridge.stop()
@@ -1788,8 +1790,12 @@ async def _teardown_runtime(rt: SessionRuntime, *, force: bool = False,
     await _push_session_list()
 
 
-async def _evacuate_viewers(rt: SessionRuntime) -> None:
+async def _evacuate_viewers(rt: SessionRuntime,
+                            message: str | None = None) -> None:
     """Send every tab viewing *rt* back to the lobby, and say why.
+
+    *message* replaces the generic "That session was closed" where there is
+    something better to say -- a ``/move`` names where the session went.
 
     Called from ``_teardown_runtime`` once the runtime has already been popped
     from ``runtimes``, so the session list these tabs receive no longer lists
@@ -1805,8 +1811,9 @@ async def _evacuate_viewers(rt: SessionRuntime) -> None:
             await send_to(ws, {
                 "type": "session_closed",
                 "rid": rt.rid,
-                "message": "That session was closed. Pick another below, or "
-                           "reopen it from Recent — its history is kept.",
+                "message": message or (
+                    "That session was closed. Pick another below, or "
+                    "reopen it from Recent — its history is kept."),
             })
             await _enter_lobby(ws)
         except Exception:
@@ -4063,6 +4070,66 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
     new_branch = (await asyncio.to_thread(git_branch_for, dest_cwd)
                   if dir_changed else None)
 
+    account_changed = normalize_path_for_compare(target_cfg or "") != \
+        normalize_path_for_compare(src_cfg or "")
+    where = _move_where(dest_cwd if dir_changed else None,
+                        target_cfg if account_changed else None)
+
+    # **A move stops the original.**  Until 2026-09-27 it did not: the copy
+    # was started, this tab attached to it, and the original was left to the
+    # idle timer -- which never fires on a session that is busy, has
+    # background tasks running or a loop scheduled.  Reported: "it apparently
+    # never killed the old session. now both versions of the session are
+    # running."  Two agents on one conversation, both acting.
+    #
+    # Stopped *before* the copy is taken, so the transcript the copy starts
+    # from is final.  A turn in flight is cut, and the copy's CLI picks it back
+    # up (CLAUDE_CODE_RESUME_INTERRUPTED_TURN).  What would otherwise be lost
+    # with it is read first and carried across: queued prompts, the loop's
+    # pending wakeup (the stop erases its record), the background-task record
+    # (so the copy is told which tasks died), and its explicit name and labels.
+    carry = _move_carry(rt, cwd, sid)
+    # This tab goes with the conversation, not back to the lobby with any
+    # other tab still watching the original.
+    _detach_ws(ws, rt)
+    await _teardown_runtime(
+        rt, force=True,
+        reason=f"was moved {where} as '{new_name}' -- open that from the "
+               f"session list",
+        viewer_message=(f"That session was moved {where} as '{new_name}', and "
+                        f"carries on there. Open it from the list below."))
+
+    async def _move_failed(why: str) -> None:
+        # The original is already stopped: put it back rather than leave the
+        # user with nothing running.  Its transcript is on disk untouched; the
+        # loop needs re-arming, the stop having erased it, and the queue may
+        # need putting back (below).
+        try:
+            orig = await _create_runtime(
+                cwd=cwd, resume=sid, config_dir=src_cfg,
+                agent_name=carry["agent_name"],
+                agent_labels=carry["agent_labels"])
+        except Exception:
+            log.exception("move: could not reopen the original session")
+            await send_to(ws, {"type": "move_error", "message": (
+                f"{why}\nThe original session was stopped for the move and "
+                f"could not be reopened -- open it from the session list.")})
+            # To that list, then: this tab was detached for the move and is
+            # still showing -- and able to type into -- a stopped session.
+            await _enter_lobby(ws)
+            return
+        _rearm_carried_wakeup(orig, carry["wakeup"])
+        # Its queue normally comes back from its own file, as on any reopen --
+        # but that read looks in the session's account and the saves land in
+        # the hub's, so for another account's session it finds nothing.  Put
+        # it back by hand when the reopen did not.
+        q = getattr(orig.state, "queued_prompts", None)
+        if carry["queue"] and q is not None and not q:
+            q.extend(carry["queue"])
+        await send_to(ws, {"type": "move_error", "message": (
+            f"{why}\nThe original session was reopened; nothing was lost.")})
+        await _attach_ws(ws, orig)
+
     # Copy (rewrites sessionId → new_id, and cwd/gitBranch on a move) off the
     # event loop — the JSONL can be hundreds of MB, which would otherwise
     # freeze every tab and the ticker.
@@ -4073,8 +4140,7 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
                               new_cwd=dest_cwd if dir_changed else None,
                               new_branch=new_branch))
     except OSError as exc:
-        await send_to(ws, {"type": "move_error",
-                           "message": f"Copy failed: {exc}"})
+        await _move_failed(f"Copy failed: {exc}")
         return
 
     # Name the copy (append a custom-title record) under the target account.
@@ -4093,33 +4159,49 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
     # agent answering a peer's question by running git against the stale copy.
     # Tell it, once, at the top of its next turn.
     note = None
-    if dir_changed or normalize_path_for_compare(target_cfg or "") != \
-            normalize_path_for_compare(src_cfg or ""):
+    if dir_changed or account_changed:
         parts = []
         if dir_changed:
             parts.append(f"from {cwd} to {dest_cwd}")
-        if normalize_path_for_compare(target_cfg or "") != \
-                normalize_path_for_compare(src_cfg or ""):
+        if account_changed:
             parts.append(f"into the {Path(target_cfg).name} account")
         note = (
             "This session was copied " + " and ".join(parts) + ". "
             "Absolute paths earlier in this transcript refer to the old "
             "location, which still exists — re-check any path you carry "
-            "forward from before this line. The original session is still "
-            "there and may still be running."
+            "forward from before this line. The original session was stopped "
+            "by the move: this is where the work continues."
         )
+
+    # The copy's connect reports background tasks that died with the
+    # original, from this record -- the same notice a session cut off by a
+    # restart gets.  Filed where the copy's bridge will look: its cwd, its id.
+    if carry["bg_tasks"]:
+        await asyncio.to_thread(
+            save_persisted_bg_tasks, dest_cwd, carry["bg_tasks"], new_id)
 
     # Spin up a runtime bound to the target account *and directory*, resuming
     # the copy.  `dest_cwd` is `cwd` unless the move moved it.
     try:
         new_rt = await _create_runtime(
             cwd=dest_cwd, resume=new_id, config_dir=target_cfg,
-            session_note=note)
+            session_note=note, agent_name=carry["agent_name"],
+            agent_labels=carry["agent_labels"])
     except Exception as exc:
         log.exception("move: failed to start runtime for copied session")
-        await send_to(ws, {"type": "move_error",
-                           "message": f"Couldn't start the moved session: {exc}"})
+        await _move_failed(f"Couldn't start the moved session: {exc}")
         return
+    # What was waiting in the original now waits here.  (The deque persists it
+    # under the copy's id and pokes the copy's worker, as any writer does.)
+    if carry["queue"] and getattr(new_rt.state, "queued_prompts", None) is not None:
+        new_rt.state.queued_prompts.extend(carry["queue"])
+        # ...and so it no longer waits *there*.  The stop leaves the original's
+        # queue file on disk -- deliberately, a closed session keeps its queue
+        # -- and reopening the original restores that file and *sends* it, so
+        # the prompts would run twice.  Only now, once the copy has them: a
+        # move that failed reopens the original from this same file.
+        await asyncio.to_thread(save_persisted_queue, cwd, [], sid)
+    loop_moved = _rearm_carried_wakeup(new_rt, carry["wakeup"])
     log.info("switch: %s → %s (account %s, cwd %s)", sid[:8], new_id[:8],
              Path(target_cfg).name, dest_cwd)
 
@@ -4132,6 +4214,80 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
     # Attach THIS socket to the new runtime → history + status flow into the
     # current window, continuing the conversation under the new account.
     await _attach_ws(ws, new_rt)
+    said = [f"Moved {where}. The original session was stopped."]
+    if carry["queue"]:
+        n = len(carry["queue"])
+        said.append(f"{n} queued prompt{'s' if n != 1 else ''} came along.")
+    if loop_moved:
+        said.append("Its scheduled loop came along too.")
+    await send_to(ws, {"type": "system_msg", "subtype": "info",
+                       "data": {"message": " ".join(said)}})
+
+
+def _move_where(dest_cwd: str | None, target_cfg: str | None) -> str:
+    """Where a move went, in words: "to D:\\x", "into the account-b account"."""
+    parts = []
+    if dest_cwd:
+        parts.append(f"to {dest_cwd}")
+    if target_cfg:
+        parts.append(f"into the {Path(target_cfg).name} account")
+    return " and ".join(parts) or "to a new session"
+
+
+def _move_carry(rt: SessionRuntime, cwd: str, sid: str) -> dict[str, Any]:
+    """What ``/move`` must take from the original before stopping it.
+
+    Read defensively: every field has a harmless empty value, so a runtime
+    missing one moves without it rather than failing the move.
+    """
+    st = rt.state
+    queue = list(getattr(st, "queued_prompts", None) or [])
+    bg_tasks = dict(getattr(st, "background_tasks", None) or {})
+    try:
+        wakeup = wakeup_store.load_wakeup(cwd, sid)
+    except Exception:
+        wakeup = None
+    return {
+        "queue": queue,
+        "bg_tasks": bg_tasks,
+        "wakeup": wakeup,
+        "agent_name": getattr(st, "agent_name", None),
+        "agent_labels": dict(getattr(st, "agent_labels", None) or {}),
+    }
+
+
+def _detach_ws(ws: WebSocket, rt: SessionRuntime) -> None:
+    """Take *ws* off *rt* without sending it anywhere or arming an idle timer
+    -- for a tab that is about to be attached somewhere else."""
+    if _ws_runtime.get(ws) is rt:
+        _ws_runtime.pop(ws, None)
+    discard = getattr(rt, "discard_client", None)
+    if callable(discard):
+        discard(ws)
+
+
+def _rearm_carried_wakeup(rt: SessionRuntime, rec: dict | None) -> bool:
+    """Arm *rec* -- a wakeup record read from another session -- on *rt*,
+    due when it was due there.  True if it was armed.
+
+    Never sooner than :data:`WAKEUP_RESTORE_SETTLE_S`, for the reason the
+    restart path waits that long: *rt*'s CLI has only just been started.  A
+    wakeup that fires while it is still connecting finds the session "not
+    busy" and injects its prompt -- alongside the interrupted turn the CLI is
+    about to resume, which the original would have deferred it behind.
+    """
+    br = getattr(rt, "bridge", None)
+    if not rec or br is None:
+        return False
+    delay = max(WAKEUP_RESTORE_SETTLE_S,
+                float(rec.get("due_at", 0)) - time.time())
+    try:
+        br._arm_wakeup(delay, rec["prompt"])
+    except Exception:
+        log.exception("move: could not carry the loop to %s",
+                      getattr(rt, "rid", "?"))
+        return False
+    return True
 
 
 async def _lobby_error(ws: WebSocket, message: str,

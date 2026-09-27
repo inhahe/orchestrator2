@@ -1,5 +1,58 @@
 # Known issues / tech debt — orchestrator2
 
+## `/move` left the original session running — FIXED (2026-09-27)
+
+> "i did a /move to move a session to another account, and it apparently
+> never killed the old session. now both versions of the session are running."
+
+`_do_move` copied the transcript, started a runtime on the copy and attached
+the tab to it. It never touched the original; the idle timer was left to deal
+with it. The idle timer does reap an idle original with no viewers. But it
+correctly refuses to close a session that is busy, running background tasks or
+holding a scheduled loop, and those are the sessions a user is most likely to
+move. So they kept running alongside their copies, both acting on one
+conversation. The copy was even told so: its one-shot note said "the original
+session is still there and may still be running".
+
+Fixed: the move stops the original through the same forced close as the
+card's ×. It does so *before* taking the copy, so the copy starts from the
+final transcript. A turn in flight is cut and resumed by the copy's CLI, as
+after a restart.
+
+What the stop would destroy comes across:
+- queued prompts. They are also removed from the original's queue file,
+  because reopening the original from Recent would otherwise send them again;
+- the loop's pending wakeup, still due when it was, though never sooner than
+  20 s while the copy's CLI starts;
+- the background-task record, so the copy is told which tasks died with the
+  original;
+- the session's explicit name and labels.
+
+The tab doing the move follows the conversation. Any other tab on the original
+is told where it went. If anything fails after the stop, the original is
+reopened with its loop, and the user is told. design.md §8, *A move stops the
+original*.
+
+Not exercised against a live hub. `tests/test_move_stops_original.py` drives
+the real `_do_move` and `_teardown_runtime`, with only the SDK side faked.
+
+## Another account's session never gets its queue back — OPEN (found 2026-09-27)
+
+Found while fixing `/move`. It was not reported, and it has not been checked
+live: this comes from reading the code.
+
+`_create_runtime` calls `_attach_queue_persistence` inside
+`_env_config_dir(config_dir)`. So a session in an account other than the hub's
+*loads* its queue from `<that account>/orchestrator2/queues/`. Every *save*
+happens later, from the deque's `on_change`, outside that context, and lands in
+`<hub account>/orchestrator2/queues/`. Nothing ever writes where the load looks,
+so that session's queued prompts survive neither a hub restart nor a reopen.
+Nothing goes to the wrong session: the files are keyed by session id.
+
+The likely fix is to load outside the context, so that loads and saves both use
+the hub's directory. `/move`'s failure path already works around it by putting
+the queue back itself (design.md §8, *A move stops the original*).
+
 ## Switching to a tab replayed what it missed, visibly, and stole the scroll — FIXED (2026-09-26)
 
 > "i still sometimes see the recent history being replayed at a certain rate
