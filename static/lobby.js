@@ -534,6 +534,9 @@ const Lobby = (() => {
   function _setLanding(on) {
     if (elClose) elClose.classList.toggle('hidden', on);
     if (on) { try { document.title = 'Sessions'; } catch (e) {} }
+    // No session, no state: the plain icon, and it stays plain -- a lobby tab
+    // gets no status updates, so a lit LED would be a stale one.
+    if (typeof Favicon !== 'undefined') Favicon.setLanding(on);
   }
 
   // Called from app.js when an `attached` message arrives — the tab is now

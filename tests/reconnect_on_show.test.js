@@ -19,8 +19,8 @@ const { JSDOM } = require('jsdom');
 
 const ROOT = path.join(__dirname, '..');
 const STATIC = path.join(ROOT, 'static');
-const SCRIPTS = ['util.js', 'diff.js', 'status.js', 'panels.js', 'commands.js',
-                 'chat.js', 'lobby.js', 'move.js', 'app.js'];
+const SCRIPTS = ['util.js', 'favicon.js', 'diff.js', 'status.js', 'panels.js',
+                 'commands.js', 'chat.js', 'lobby.js', 'move.js', 'app.js'];
 
 let failures = 0;
 let passes = 0;
@@ -891,6 +891,73 @@ test('an older hub without busy_since still shows its own bg-wait label', (h) =>
   // hub serving it.
   statusOf(h, { busy_class: 'bg-wait', busy_label: 'bg wait (2) (0:3:00)' });
   assert(stateText(h) === 'bg wait (2) (0:3:00)', stateText(h));
+});
+
+/* ---- the tab's icon (static/favicon.js) --------------------------------- */
+
+// Which LED the tab's icon has lit, as "row colour", or "plain" for the icon
+// with every light off.  favicon.test.js checks the drawing; these check that
+// the page feeds it.  The page's stylesheet is not loaded here, so the colours
+// are the module's defaults -- the default theme's.
+function iconOf(h) {
+  const href = h.win.document.getElementById('favicon').href;
+  if (href.endsWith('/static/favicon.svg')) return 'plain';
+  const svg = decodeURIComponent(href.slice(href.indexOf(',') + 1));
+  const lamps = [...svg.matchAll(/<circle cx="42" cy="(\d+)" r="4.6" fill="([^"]+)"\/>/g)];
+  assert(lamps.length === 1, `${lamps.length} lights on in: ${svg.slice(0, 80)}`);
+  return { 17: 'top', 32: 'middle', 47: 'bottom' }[lamps[0][1]] + ' ' + lamps[0][2];
+}
+
+function attached(h) {
+  h.live.accept();
+  h.live.deliver({ type: 'attached', session: { rid: 's1', cwd: 'D:\\x' } });
+}
+
+test('a tab starts with the plain icon', (h) => {
+  assert(iconOf(h) === 'plain', iconOf(h));
+});
+
+test('the tab icon lights up for the state the status bar shows', (h) => {
+  attached(h);
+  statusOf(h, { busy_class: 'working', busy_label: 'working' });
+  assert(iconOf(h) === 'top #0dbc79', 'working: ' + iconOf(h));
+  statusOf(h, { busy_class: 'bg-wait', busy_label: 'bg wait (1)' });
+  assert(iconOf(h) === 'middle #bc3fbc', 'bg-wait: ' + iconOf(h));
+  statusOf(h, { busy_class: 'idle', wakeup_at: h.now / 1000 + 600 });
+  assert(iconOf(h) === 'bottom #bc3fbc', 'waiting to loop: ' + iconOf(h));
+  statusOf(h, { busy_class: 'idle' });
+  assert(iconOf(h) === 'top #666666', 'idle: ' + iconOf(h));
+});
+
+test('a dropped socket lights the icon yellow, as the status text is', (h) => {
+  attached(h);
+  statusOf(h, { busy_class: 'working' });
+  h.live.drop();
+  assert(iconOf(h) === 'top #e5e510', iconOf(h));
+});
+
+test('a reconnect that has given up lights it red', (h) => {
+  attached(h);
+  statusOf(h, { busy_class: 'working' });
+  h.exhaustRetries();
+  assert(iconOf(h) === 'top #cd3131', iconOf(h));
+});
+
+test('a tab whose session is closed goes back to the plain icon', (h) => {
+  attached(h);
+  statusOf(h, { busy_class: 'working' });
+  h.live.deliver({ type: 'session_closed', rid: 's1', message: 'closed' });
+  assert(iconOf(h) === 'plain', iconOf(h));
+});
+
+test('and keeps it when its socket drops: a lobby tab has no state to show', (h) => {
+  // Nothing would ever clear a light lit here -- a lobby tab gets no status
+  // updates -- so a drop must not light one.
+  attached(h);
+  statusOf(h, { busy_class: 'working' });
+  h.live.deliver({ type: 'session_closed', rid: 's1', message: 'closed' });
+  h.live.drop();
+  assert(iconOf(h) === 'plain', iconOf(h));
 });
 
 console.log(`\n${passes}/${passes + failures} passed`);

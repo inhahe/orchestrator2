@@ -1826,15 +1826,67 @@ reconnection and dispatches every inbound message type to a module:
 | `app.js` | WS connect/reconnect, message router, URL/`?rid=` handling, global keys |
 | `chat.js` | Message stream: text, tool calls, thinking blocks, results |
 | `status.js` | Top status bar from `status_update` |
+| `favicon.js` | The tab's icon: one LED lit for the session's state (below) |
 | `panels.js` | Live tool / background-task / todo panels from `panel_update` |
 | `lobby.js` | `☰ Sessions` overlay (§8) |
-| `switch.js` | `/move` — copy this session to another account and/or directory. Module/file/CSS keep the old `switch` name; see §8 |
+| `move.js` | `/move` — move this session to another account and/or directory (§8) |
 | `diff.js` | Side-by-side edit diffs |
 | `commands.js` | Slash-command input + completions |
 | `util.js` | Shared helpers |
 
 Styling: `styles.css` holds layout/structure; `theme.py` generates the CSS
 variables it consumes, so themes never require CSS edits.
+
+### The tab's icon shows the session's state
+
+Asked for so that a session can be read from the tab strip without switching
+to it. The icon is the rack in `favicon.svg`, whose three LEDs are drawn
+*off*. `Status.update` hands every snapshot to `Favicon.update`, which lights
+one LED in the colour the status bar writes that state in:
+
+| LED | Colour | State |
+|---|---|---|
+| top | green | working (and compacting, which happens inside a turn) |
+| top | grey | idle |
+| top | yellow | connecting; disconnected and reconnecting |
+| top | red | disconnected for good, server shut down, or an error |
+| middle | purple | bg-wait |
+| bottom | purple | waiting to loop: idle with a wakeup scheduled |
+
+Position does one job: it tells apart the two states that share a colour.
+The loop field is written in the bg-wait purple, so those two get different
+LEDs, and everything else is told apart by colour on the top one. A scheduled
+loop shows only when the session is otherwise idle. Working or bg-wait with a
+loop armed shows the working or bg-wait light, because that is what the
+session is doing now.
+
+- **Colours are read, not copied.** `getComputedStyle` on the page's CSS
+  variables resolves through `var()` chains (checked in Edge), so a theme that
+  changes `--green` changes the light. Only plain colour syntax is used; a
+  theme value that is anything else falls back to the default theme's colour
+  rather than being written into the SVG.
+- **The icon only changes when the state does.** Snapshots arrive every
+  couple of seconds, and rewriting the `<link>` each time makes some browsers
+  refetch it.
+- **A tab with no session shows the plain icon and keeps it.** `lobby.js`'s
+  `_setLanding` switches the icon off, and updates are ignored until the tab
+  attaches again. A lobby tab gets no status updates, so any light it showed
+  would be stale, including the yellow a socket drop would otherwise light
+  with nothing ever to clear it.
+- **`favicon.svg` is that same rack with every light off**, and
+  `favicon.test.js` checks it matches what the module draws, so the icon
+  doesn't change shape when a session attaches.
+
+Limit: a background tab that the browser has *frozen* runs no script, so its
+icon catches up only when the tab is shown. A throttled tab still handles
+socket messages, and so still updates.
+
+Pinned by `tests/favicon.test.js` (23; each state, the two purples, the
+theme, sanitising, rewrite suppression, the lobby) and six tests in
+`reconnect_on_show.test.js` that drive the real page: status updates, a
+dropped socket, an exhausted reconnect, a closed session. Mutation targets
+are `favicon` (`favicon.js` × 17), `favicon-status` and `favicon-lobby` (the
+two wiring lines).
 
 ### A sent prompt is tracked by id, not by "did anything come back"
 

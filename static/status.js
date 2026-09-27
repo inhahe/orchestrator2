@@ -141,6 +141,12 @@ const Status = (() => {
   function update(status) {
     if (!status) return;
 
+    // The tab's icon lights up for the state too, so a background tab can be
+    // read from the tab strip.  First, so no early return below can skip it.
+    // `typeof`, not `window.Favicon`: a top-level const is not a property of
+    // window, so that check would be false in a real browser.
+    if (typeof Favicon !== 'undefined') Favicon.update(status);
+
     // Indicator dot + state text.
     const cls = status.busy_class || 'idle';
     const stateLabel = status.busy_label || 'idle';

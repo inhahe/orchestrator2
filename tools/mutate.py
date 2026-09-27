@@ -2963,6 +2963,89 @@ MOVESTOP_WAKEUP_MUTATIONS = [
      "    return None\n"),
 ]
 
+# The tab's icon shows the session's state.  tests/favicon.test.js.
+FAVICON_MUTATIONS = [
+    ("working lights the wrong LED",
+     "      case 'compacting':   return { row: 'top', cssVar: '--indicator-working' };",
+     "      case 'compacting':   return { row: 'middle', cssVar: '--indicator-working' };"),
+
+    ("compacting reads as idle rather than working",
+     "      case 'working':\n      case 'compacting':",
+     "      case 'working':\n      case 'compacting-no':"),
+
+    ("bg-wait and the loop share a position, so the two purples cannot be told apart",
+     "      case 'bg-wait':      return { row: 'middle', cssVar: '--indicator-bg-wait' };",
+     "      case 'bg-wait':      return { row: 'bottom', cssVar: '--indicator-bg-wait' };"),
+
+    ("waiting to loop lights bg-wait's LED",
+     "          ? { row: 'bottom', cssVar: '--indicator-bg-wait' }",
+     "          ? { row: 'middle', cssVar: '--indicator-bg-wait' }"),
+
+    ("a scheduled loop is never shown",
+     "        return (status && typeof status.wakeup_at === 'number')",
+     "        return (false)"),
+
+    ("idle is lit in another state's colour",
+     "          : { row: 'top', cssVar: '--indicator-idle' };",
+     "          : { row: 'top', cssVar: '--indicator-working' };"),
+
+    ("reconnecting is red, though its text is yellow",
+     "      case 'reconnecting': return { row: 'top', cssVar: '--system-warning' };",
+     "      case 'reconnecting': return { row: 'top', cssVar: '--system-error' };"),
+
+    ("connecting is not shown as not connected",
+     "      case 'connecting':   return { row: 'top', cssVar: '--indicator-connecting' };",
+     "      case 'connecting-no': return { row: 'top', cssVar: '--indicator-connecting' };"),
+
+    ("a reconnect that gave up reads as idle",
+     "      case 'shutdown':\n      case 'error':",
+     "      case 'shutdown-no':\n      case 'error':"),
+
+    ("an error reads as idle",
+     "      case 'shutdown':\n      case 'error':        return",
+     "      case 'shutdown':\n      case 'error-no':        return"),
+
+    ("the theme is ignored: the lights are always the default colours",
+     "    return COLOUR.test(v) ? v : FALLBACK[cssVar];",
+     "    return FALLBACK[cssVar];"),
+
+    ("anything a theme says is written into the SVG",
+     "    return COLOUR.test(v) ? v : FALLBACK[cssVar];",
+     "    return v || FALLBACK[cssVar];"),
+
+    ("the icon is rewritten on every status snapshot",
+     "    if (key === _key) return;\n",
+     ""),
+
+    ("more than one LED lights",
+     "      if (name === row) {",
+     "      if (name !== null) {"),
+
+    ("a tab with no session still lights up",
+     "    if (_landing) return;\n",
+     ""),
+
+    ("landing leaves the last session's light on",
+     "    if (_landing) _show(null, DEFAULT_HREF);",
+     "    if (_landing) {}"),
+
+    ("a tab that attaches again stays dark",
+     "    _landing = !!on;",
+     "    _landing = _landing || !!on;"),
+]
+
+FAVICON_STATUS_MUTATIONS = [
+    ("the status bar never tells the icon",
+     "    if (typeof Favicon !== 'undefined') Favicon.update(status);\n",
+     ""),
+]
+
+FAVICON_LOBBY_MUTATIONS = [
+    ("a tab whose session closed keeps its last light",
+     "    if (typeof Favicon !== 'undefined') Favicon.setLanding(on);\n",
+     ""),
+]
+
 # A loop survives the hub restarting; closing a session still ends it.
 # tests/test_loops_survive_restart.py and tests/test_wakeup_store.py.
 LOOPKEEP_BRIDGE_MUTATIONS = [
@@ -3711,6 +3794,12 @@ TARGETS = {
                  MOVESTOP_MUTATIONS, "pytest"),
     "movestop-wakeup": ("wakeup_store.py", "tests/test_move_stops_original.py",
                         MOVESTOP_WAKEUP_MUTATIONS, "pytest"),
+    "favicon": ("static/favicon.js", "tests/favicon.test.js",
+                FAVICON_MUTATIONS, "node"),
+    "favicon-status": ("static/status.js", "tests/reconnect_on_show.test.js",
+                       FAVICON_STATUS_MUTATIONS, "node"),
+    "favicon-lobby": ("static/lobby.js", "tests/reconnect_on_show.test.js",
+                      FAVICON_LOBBY_MUTATIONS, "node"),
     "loopkeep-bridge": ("sdk_bridge.py", "tests/test_loops_survive_restart.py",
                         LOOPKEEP_BRIDGE_MUTATIONS, "pytest"),
     "loopkeep-server": ("server.py", "tests/test_loops_survive_restart.py",
