@@ -104,8 +104,11 @@ from session import (
     read_session_title,
     render_session_history,
     resolve_session_ref,
+    resumable_sessions,
     save_persisted_bg_tasks,
     save_persisted_queue,
+    sessions_anywhere,
+    sessions_titled,
     write_session_title,
 )
 from commands import (
@@ -2631,6 +2634,14 @@ async def _reconfigure(
         # see session.resolve_session_ref.
         new_resume = resolve_session_ref(resume, new_cwd, config.config_dir)
         if find_session_dir(new_resume, config.config_dir) is None:
+            several = sessions_titled(resume, new_cwd, config.config_dir)
+            if len(several) > 1:
+                # "Not found" is wrong here, and it is what sent the user of
+                # three "OS F" sessions to rename the wrong one (2026-09-27).
+                return False, (
+                    f"{len(several)} sessions here are called '{resume}': "
+                    + ", ".join(sid for sid, _t in several)
+                    + ". /resume <id> picks one.")
             return False, f"session not found: {resume}"
 
     # --- Stop existing bridge ---
@@ -2786,10 +2797,21 @@ async def api_restart() -> dict[str, Any]:
     # Rebuild argv from our own launch command, normalising the bits that
     # must change for an in-place restart.
     argv = sys.argv
+    # The session the restart resumes.  Its own directory is where it has to
+    # be resumed from, so the launch's --cwd is dropped with it: after /cwd
+    # or /resume it names the wrong directory, and the new process follows
+    # the session to the right one (_settle_launch_resume).
+    sid = state.session_id if state is not None else None
     child = [sys.executable, argv[0]]
     i = 1
     while i < len(argv):
         a = argv[i]
+        if sid and a == "--cwd":
+            i += 2
+            continue
+        if sid and a.startswith("--cwd="):
+            i += 1
+            continue
         if a in ("--detach", "--open", "--copy", "--wait-port",
                  "--skip-auto-login", "--no-continue", "--continue"):
             i += 1
@@ -2828,7 +2850,6 @@ async def api_restart() -> dict[str, Any]:
         i += 1
     child.extend(["--port", str(port), "--skip-auto-login", "--wait-port"])
     # Resume exactly the current primary session on the fresh process.
-    sid = state.session_id if state is not None else None
     if sid:
         child.extend(["--resume", sid])
     # ...under the name it has *now*, rather than whatever the launch command
@@ -5345,6 +5366,190 @@ def _probe_hub(port: int) -> dict | None:
     return None
 
 
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def _same_path(a: str | None, b: str | None) -> bool:
+    return bool(a and b) and normalize_path_for_compare(a) == normalize_path_for_compare(b)
+
+
+def _when(mtime: float, now: float | None = None) -> str:
+    """When a session was last active, as a person reads it."""
+    t = datetime.datetime.fromtimestamp(mtime)
+    today = datetime.datetime.fromtimestamp(time.time() if now is None else now).date()
+    if t.date() == today:
+        return f"{t:%H:%M} today"
+    if (today - t.date()).days == 1:
+        return f"yesterday {t:%H:%M}"
+    return f"{t:%b} {t.day} {t:%H:%M}"
+
+
+def _session_line(s: dict[str, Any], account: str, *, title: bool = False) -> str:
+    """One session, as a launch error lists it: enough to tell copies apart."""
+    line = f"  {s['session_id']}"
+    if title and s.get("title"):
+        line += f"  '{s['title']}'"
+    line += f"  last active {_when(s.get('mtime') or 0)}"
+    if s.get("cwd"):
+        line += f"  in {s['cwd']}"
+    if s.get("config_dir") and not _same_path(s["config_dir"], account):
+        line += f"  on account {Path(s['config_dir']).name}"
+    return line
+
+
+def _settle_launch_resume(cfg: Config) -> tuple[Config, str | None, str | None]:
+    """Settle ``--resume <title|id>`` before the launch goes anywhere.
+
+    Returns ``(config, note, error)``.  ``config`` is what to launch with: the
+    session's id in place of its title, and the session's own directory and
+    account when the launch did not ask for others.  ``note`` is a line to
+    print on the way.  ``error`` means the launch must not go ahead.
+
+    Reported 2026-09-27: ``py server.py --resume "OS F old 2"``, run from the
+    orchestrator2 checkout, printed "Joined running orchestrator2 hub on port
+    8420 (session s12)." and nothing else.  The session is in
+    ``E:\\visual studio projects\\os``, and a title resolves only in the
+    launch's own directory, so the hub opened a session that could never
+    connect.  It said so only inside that session, in a tab that was never
+    opened.  The same day, three sessions were called "OS F", one of them on
+    another account, and nothing said which two ``--resume "OS F"`` meant.
+    Now the terminal is told, before the hub is asked for anything:
+
+    * A title that is one session's in the launch directory is that session.
+    * Several there: an error naming each, when it was last active, and any
+      session of that name elsewhere, which is not one of them.
+    * None there: every directory and account on this machine is searched.
+      Exactly one session of that name, and the launch follows it -- to its
+      directory unless ``--cwd`` was given, to its account unless one was
+      chosen -- and says so.  Otherwise an error saying where each session of
+      that name is, or what the launch directory does have.
+
+    An id is followed the same way; the terminal picker has always done that
+    ("resume is cwd-scoped").
+    """
+    ref = (cfg.resume or "").strip()
+    if not ref or ref == _PICKER_SENTINEL:
+        return cfg, None, None
+    account = (cfg.config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
+               or str(Path.home() / ".claude"))
+    account_given = bool(cfg.config_dir or os.environ.get("CLAUDE_CONFIG_DIR"))
+    everything: list[dict[str, Any]] | None = None
+
+    def _all() -> list[dict[str, Any]]:
+        nonlocal everything
+        if everything is None:
+            everything = sessions_anywhere()
+        return everything
+
+    def _follow(s: dict[str, Any]) -> tuple[Config, str | None, str | None]:
+        new = dataclasses.replace(cfg, resume=s["session_id"])
+        moved = []
+        where = s.get("cwd")
+        if where and not _same_path(where, cfg.cwd) and not cfg.cwd_given:
+            if not Path(where).is_dir():
+                return cfg, None, (
+                    f"Session {s['session_id']} is in {where}, which does not "
+                    f"exist on this machine any more.")
+            new = dataclasses.replace(new, cwd=str(Path(where).resolve()))
+            moved.append(f"in {where}")
+        if not _same_path(s.get("config_dir"), account) and not account_given:
+            new = dataclasses.replace(new, config_dir=s["config_dir"])
+            moved.append(f"on account {Path(s['config_dir']).name}")
+        if not moved:
+            return new, None, None
+        what = f"'{s['title']}'" if s.get("title") else f"Session {s['session_id']}"
+        return new, f"{what} is {' and '.join(moved)}: resuming it there.", None
+
+    # --- An id ---
+    if find_session_dir(ref, account) is not None:
+        where = find_session_cwd(ref, account)
+        if cfg.cwd_given and where and not _same_path(where, cfg.cwd):
+            # The CLI looks for the transcript only under the launch
+            # directory's project (getProjectDir(getOriginalCwd())).
+            return cfg, None, (
+                f"Session {ref} is in {where}, not {cfg.cwd}, and a session "
+                f"can be resumed only from its own directory. Leave out "
+                f"--cwd, or use --cwd \"{where}\".")
+        return _follow({"session_id": ref, "cwd": where, "config_dir": account,
+                        "title": None})
+    holders = [s for s in _all() if s["session_id"] == ref]
+    if holders:
+        if account_given:
+            s = holders[0]
+            return cfg, None, (
+                f"Session {ref} is on account {Path(s['config_dir']).name} "
+                f"({s['config_dir']}), not this launch's ({account}). Add "
+                f"--config-dir \"{s['config_dir']}\" to resume it.")
+        return _follow(holders[0])
+
+    # --- A title: in the launch directory first, as the CLI looks ---
+    here = sessions_titled(ref, cfg.cwd, account)
+    if len(here) == 1:
+        return dataclasses.replace(cfg, resume=here[0][0]), None, None
+    want = ref.casefold()
+    named = [s for s in _all()
+             if s["title"] and s["title"].strip().casefold() == want]
+    if len(here) > 1:
+        ids = {sid for sid, _t in here}
+        mine = [s for s in named if s["session_id"] in ids]
+        # A session the index had not seen yet: still list it, by id.
+        mine += [{"session_id": sid, "mtime": 0, "cwd": cfg.cwd,
+                  "config_dir": account}
+                 for sid in ids - {s["session_id"] for s in mine}]
+        mine.sort(key=lambda s: s.get("mtime") or 0, reverse=True)
+        lines = [f"More than one session in {cfg.cwd} is called '{ref}', so "
+                 f"none was resumed:"]
+        lines += [_session_line(s, account) for s in mine]
+        lines.append("Resume one by its id (--resume <id>), or rename the "
+                     "others first.")
+        others = [s for s in named if s["session_id"] not in ids]
+        if others:
+            lines.append(f"Also called '{ref}', but somewhere else, so not one "
+                         f"of those:")
+            lines += [_session_line(s, account) for s in others]
+        return cfg, None, "\n".join(lines)
+    usable = [s for s in named
+              if (not cfg.cwd_given or _same_path(s.get("cwd"), cfg.cwd))
+              and (not account_given or _same_path(s.get("config_dir"), account))]
+    if len(usable) == 1:
+        return _follow(usable[0])
+
+    # --- Nothing to follow: say what there is ---
+    if _UUID_RE.fullmatch(ref):
+        return cfg, None, f"There is no session {ref} on this machine."
+    lines = [f"No session in {cfg.cwd} is called '{ref}'."]
+    if named:
+        lines.append(f"Sessions called '{ref}':")
+        lines += [_session_line(s, account) for s in named]
+        if len(named) == 1:
+            # Ruled out by the --cwd or account the launch asked for.
+            s = named[0]
+            need = []
+            if s.get("cwd") and not _same_path(s["cwd"], cfg.cwd):
+                need.append(f"--cwd \"{s['cwd']}\"")
+            if s.get("config_dir") and not _same_path(s["config_dir"], account):
+                need.append(f"--config-dir \"{s['config_dir']}\"")
+            lines.append(f"Resume it with {' '.join(need)}." if need else
+                         "Resume it by its id (--resume <id>).")
+        else:
+            lines.append("Resume one by its id (--resume <id>), with the --cwd "
+                         "and --config-dir it needs.")
+        return cfg, None, "\n".join(lines)
+    similar = [s for s in _all() if s["title"] and want in s["title"].casefold()]
+    if similar:
+        lines.append("Sessions with a title like it:")
+        lines += [_session_line(s, account, title=True) for s in similar[:8]]
+    else:
+        here_all = resumable_sessions(cfg.cwd, account)
+        if here_all:
+            lines.append("Sessions here: " + ", ".join(
+                f"'{t}' ({sid[:8]})" if t else sid[:8] for sid, t in here_all) + ".")
+        else:
+            lines.append("There are no sessions in that directory.")
+    return cfg, None, "\n".join(lines)
+
+
 def _hub_launch_kwargs(cfg: Config, config_dir: str | None) -> dict[str, Any]:
     """Everything a launch that joins a running hub hands over.
 
@@ -5417,10 +5622,10 @@ def _detach_child_argv(argv: list[str], cfg: Config, actual_port: int) -> list[s
             i += 1
             continue
         # Re-added below from what this launch resolved.
-        if a == "--agent-name":
+        if a in ("--agent-name", "--config-dir"):
             i += 2
             continue
-        if a.startswith("--agent-name="):
+        if a.startswith(("--agent-name=", "--config-dir=")):
             i += 1
             continue
         child_argv.append(a)
@@ -5437,7 +5642,26 @@ def _detach_child_argv(argv: list[str], cfg: Config, actual_port: int) -> list[s
     # child inherits the environment as it is now.
     if cfg.agent_name:
         child_argv.extend(["--agent-name", cfg.agent_name])
+    # And the account: --resume may have followed the session to another one.
+    if cfg.config_dir:
+        child_argv.extend(["--config-dir", cfg.config_dir])
     return child_argv
+
+
+def _announce_joined(port: int, rid: str, open_browser: bool) -> None:
+    """Say where the joined session is, and open it if asked to.
+
+    The address is printed either way.  Without --open, "(session s12)" was
+    all a launch said, and nothing on screen led to the session -- reported
+    2026-09-27 as "nothing ever loaded in a new tab".
+    """
+    url = f"http://localhost:{port}/?rid={rid}"
+    print(f"Joined running orchestrator2 hub on port {port}: session {rid} "
+          f"at {url}")
+    if open_browser:
+        webbrowser.open(f"{url}&t={int(time.time())}")
+    else:
+        print("(Not opened in a tab; --open does that.)")
 
 
 def _launch_into_hub(
@@ -5818,7 +6042,7 @@ def _run_launch_picker(mode: str, launch_cwd: str | None = None) -> dict | None:
 LAUNCH_ERROR_LOG = Path(__file__).resolve().parent / "launch-error.log"
 
 
-def _report_launch_failure(message: str) -> None:
+def _report_launch_failure(message: str, *, dialog: bool = False) -> None:
     """Make a startup argument error visible when nothing else can be.
 
     ``orch2.bat`` starts the server via ``start /MIN`` + ``tray_minimizer``,
@@ -5836,7 +6060,8 @@ def _report_launch_failure(message: str) -> None:
     attributed to whatever *did* happen next.
 
     So: always leave a file, and pop a dialog when the console is hidden, which
-    is exactly the case where stderr goes nowhere a human will look.
+    is exactly the case where stderr goes nowhere a human will look -- or when
+    the caller says so (*dialog*), for a launch that meant to open a tab.
     """
     text = message.strip() or "Invalid command-line arguments."
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -5846,7 +6071,7 @@ def _report_launch_failure(message: str) -> None:
             fh.write(f"--- {stamp} ---\n{body}\n\n")
     except OSError:
         pass
-    if _console_is_hidden() and not os.environ.get("ORCH2_NO_DIALOG"):
+    if (dialog or _console_is_hidden()) and not os.environ.get("ORCH2_NO_DIALOG"):
         _show_error_dialog("orchestrator2 — launch failed", body)
 
 
@@ -6000,6 +6225,24 @@ def main() -> None:
         # A cancelled resume picker leaves the sentinel in place, so the
         # in-browser picker still appears.
 
+    # --- Settle --resume before anything is started or joined --------------
+    # A title that names no session here, or several, used to reach the CLI
+    # unresolved: the launch "joined" the hub with a session that could never
+    # connect, and said so only in a tab nobody had opened.  See
+    # _settle_launch_resume.
+    config, _note, _err = _settle_launch_resume(config)
+    if _err:
+        print(_err, file=sys.stderr)
+        # A launch that meant to open a tab gets a dialog too: no tab is
+        # coming, and its console may close before anyone reads it.
+        _report_launch_failure(_err, dialog=config.open_browser)
+        sys.exit(2)
+    if _note:
+        print(_note)
+    if config.config_dir:
+        # The session may be on another account: pin it as above.
+        os.environ["CLAUDE_CONFIG_DIR"] = str(Path(config.config_dir).resolve())
+
     # --- Central-hub reuse -------------------------------------------------
     # If an orchestrator2 hub is already serving on our port, join it — open
     # the launched session there and point a browser at it — instead of
@@ -6026,11 +6269,7 @@ def main() -> None:
                 or str(Path.home() / ".claude")),
         )
         if rid:
-            url = f"http://localhost:{config.port}/?rid={rid}"
-            print(f"Joined running orchestrator2 hub on port {config.port} "
-                  f"(session {rid}).")
-            if config.open_browser:
-                webbrowser.open(f"{url}&t={int(time.time())}")
+            _announce_joined(config.port, rid, config.open_browser)
             sys.exit(0)
         # Hub was up but couldn't open the session — fall through and start
         # our own server on a free port.
@@ -6176,11 +6415,7 @@ def main() -> None:
                         break
                 _time.sleep(0.5)
             if rid:
-                url = f"http://localhost:{config.port}/?rid={rid}"
-                print(f"Joined running orchestrator2 hub on port "
-                      f"{config.port} (session {rid}).")
-                if config.open_browser:
-                    webbrowser.open(f"{url}&t={int(time.time())}")
+                _announce_joined(config.port, rid, config.open_browser)
                 sys.exit(0)
             # Couldn't join after retrying — fall back to a standalone server
             # on a fresh port so the user at least gets a working instance.

@@ -33,7 +33,7 @@ python server.py --cwd "%cd%" --open
 ```
 
 - `--cwd "%cd%"` — the working directory Claude operates in (defaults to the current directory).
-- `--open` — open the browser automatically. Otherwise browse to the printed URL (default `http://localhost:8420`; it auto-picks a free port if 8420 is taken).
+- `--open` — open the browser automatically. Otherwise browse to the printed URL (default `http://localhost:8420`; it auto-picks a free port if 8420 is taken). A launch that joins a hub that is already running prints its session's own address (`http://localhost:8420/?rid=s12`), and opens it only with `--open`.
 
 The server starts serving and the browser opens **immediately**; the status bar shows **`connecting…`** while the Claude SDK finishes loading in the background, then flips to `idle` when it's ready to take your first message.
 
@@ -344,9 +344,9 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 | `--no-replay` | off | When resuming, don't replay prior messages into backscroll |
 | `--allow-duplicate-session` | off | Connect even when another Claude process is already resuming the same session id. Off by default because two agents sharing one session file and working directory commit over each other — see [Session safety](#session-safety) |
 | `--disable-prompt-cache` | off | Turn off Claude prompt caching in the CLI (sets `DISABLE_PROMPT_CACHING`). Workaround for the bundled CLI's `ttl='1h' cache_control must not come after ttl='5m'` API 400 on long resumed sessions; costs cache savings, so leave off unless you hit that error |
-| `--resume [SESSION_ID\|TITLE]` | -- | Resume a specific session by ID or by its title — the whole title, in any case, of one session in this directory (as `claude --resume` accepts; part of a title does not count, and a title two sessions share opens neither and says so) — or omit it to open a full-screen terminal picker (grouped by project) before the server starts. Works the same whether the launch starts a hub or joins one that is already running |
+| `--resume [SESSION_ID\|TITLE]` | -- | Resume a specific session by ID or by its title — the whole title, in any case, of one session in this directory (as `claude --resume` accepts; part of a title does not count, and a title two sessions share opens neither and says so) — or omit it to open a full-screen terminal picker (grouped by project) before the server starts. Works the same whether the launch starts a hub or joins one that is already running. It is checked before anything starts. If this directory has no session by that name but exactly one session elsewhere does, the launch follows it: to its directory (unless you gave `--cwd`) and to its account (unless you chose one with `--config-dir` or `CLAUDE_CONFIG_DIR`), and says so. Otherwise, and for a name several sessions share, the launch stops and lists each candidate's id, last activity, directory and account, so you can pass the right id |
 | `--copy` | off | Open a full-screen terminal wizard to copy a session between Claude accounts: pick source account + session, destination account, and a name. If copied into the current account it asks whether to open it now. Whenever nothing gets opened (cancelled, declined, or a cross-account copy) it then asks what to open — the current directory's most-recent session (the default), pick another, or a fresh empty session |
-| `--cwd PATH` | `.` | Working directory Claude operates in |
+| `--cwd PATH` | `.` | Working directory Claude operates in. Without it, a `--resume`d session runs in its own directory |
 
 ### Model & Effort
 

@@ -1,5 +1,37 @@
 # Known issues / tech debt — orchestrator2
 
+## `--resume` of a name that meant something else, or nothing, "joined" anyway — FIXED (2026-09-27)
+
+> "i tried to --resume "OS F" and it said there were two of that name. so i
+> picked the old one and renamed it "OS F old". then i tried to --resume
+> "OS F" again and i got the same message again. so i checked sessions again.
+> and it lists two "OS F"s again"
+>
+> "i tried `D:\visual studio projects\orchestrator2>py server.py --resume "OS
+> F old 2"`, it said `Joined running orchestrator2 hub on port 8420 (session
+> s12).`, and nothing ever loaded in a new tab."
+
+- **Three sessions were called "OS F"**, not two. They were copies of one
+  transcript that split on Sep 26: `13d470f2` and `c2b5d5b6` on the default
+  account, and `87a51d5c` on account-c. A title resolves in the launch's
+  directory on the launch's account, so "two of that name" meant the first two.
+  Nothing said which two, and the session list showed three. The one renamed
+  first was the account-c copy.
+- **The launch that "joined" had no session to show.** It ran from the
+  orchestrator2 checkout, and a title resolves only in the launch's own
+  directory; "OS F old 2" is in the Slate OS one. The hub opened a session that
+  could never connect. It said so only inside that session, and without
+  `--open` no tab was opened; the launch printed "(session s12)" and no
+  address.
+
+Now the launch settles `--resume` before it starts or joins anything. It
+follows a session it can find to that session's directory and account, unless
+those were asked for, and says so. Otherwise it stops at the terminal, and in
+`launch-error.log`, with each candidate's id, last activity, directory and
+account. A joining launch prints its session's address. `/resume <title>` in a
+session names the sessions that share a title rather than saying "not found".
+design.md §4, *The launch settles `--resume`*.
+
 ## A launch's `--initial-prompt` went to sessions that never asked for it — FIXED (2026-09-27)
 
 > "i just started a bunch of Slate OS sessions with an --initial-prompt, and

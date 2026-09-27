@@ -445,6 +445,10 @@ class Config:
     # and working tree commit over each other.
     allow_duplicate_session: bool = False
     cwd: str = "."
+    # Whether ``cwd`` came from --cwd rather than the directory the launch ran
+    # in.  A ``--resume`` of a session that lives in another directory follows
+    # it there only when the directory was not asked for.
+    cwd_given: bool = False
     # Workaround for a bundled-CLI prompt-cache bug: when the 1h-vs-5m
     # cache_control TTL flips mid-session (e.g. rate-limit overage toggles
     # eligibility) the request is rejected with "API Error: 400 ... a ttl='1h'
@@ -698,8 +702,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
     )
     ap.add_argument(
         "--cwd",
-        default=".",
-        help="Working directory Claude operates in.",
+        default=None,
+        help=(
+            "Working directory Claude operates in. Default: the directory "
+            "you launch from, or the resumed session's own directory."
+        ),
     )
     ap.add_argument(
         "--no-thinking",
@@ -1150,7 +1157,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         copy=args.copy,
         no_replay=args.no_replay,
         disable_prompt_cache=args.disable_prompt_cache,
-        cwd=str(Path(args.cwd).resolve()),
+        cwd=str(Path(args.cwd if args.cwd is not None else ".").resolve()),
+        cwd_given=args.cwd is not None,
         model=args.model,
         effort=args.effort,
         no_thinking=args.no_thinking,

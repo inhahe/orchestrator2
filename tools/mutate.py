@@ -3988,10 +3988,8 @@ AGENTNAME_SERVER_MUTATIONS = [
      ""),
 
     ("a detached child is named twice",
-     '        if a == "--agent-name":\n            i += 2\n            continue\n'
-     '        if a.startswith("--agent-name="):\n            i += 1\n            continue\n'
-     "        child_argv.append(a)\n",
-     "        child_argv.append(a)\n"),
+     '        if a in ("--agent-name", "--config-dir"):\n',
+     '        if a in ("--config-dir",):\n'),
 
     ("a restart re-applies the name the launch command once said",
      '        if a in ("--agent-name", "--agent-label"):\n',
@@ -4748,6 +4746,165 @@ INITPROMPT_SERVER_MUTATIONS = [
 ]
 
 
+# --resume is settled before a launch starts or joins anything; a joining
+# launch says where its session is.  tests/test_launch_resume.py.
+LAUNCHRESUME_SERVER_MUTATIONS = [
+    ("the title in the launch directory does not win",
+     "    if len(here) == 1:\n        return dataclasses.replace(cfg, resume=here[0][0]), None, None\n",
+     ""),
+
+    ("several here are not refused",
+     "    if len(here) > 1:\n        ids = {sid for sid, _t in here}\n",
+     "    if False:\n        ids = {sid for sid, _t in here}\n"),
+
+    ("a copy elsewhere is not told apart from them",
+     "        others = [s for s in named if s[\"session_id\"] not in ids]\n",
+     "        others = []\n"),
+
+    ("they are not newest first",
+     "        mine.sort(key=lambda s: s.get(\"mtime\") or 0, reverse=True)\n",
+     "        mine.sort(key=lambda s: s.get(\"mtime\") or 0)\n"),
+
+    ("a session found elsewhere is not followed",
+     "    if len(usable) == 1:\n        return _follow(usable[0])\n",
+     ""),
+
+    ("a given directory is not respected",
+     "              if (not cfg.cwd_given or _same_path(s.get(\"cwd\"), cfg.cwd))\n",
+     "              if True\n"),
+
+    ("a chosen account is not respected",
+     "              and (not account_given or _same_path(s.get(\"config_dir\"), account))]",
+     "              ]"),
+
+    ("the environment's account is not a choice",
+     "    account_given = bool(cfg.config_dir or os.environ.get(\"CLAUDE_CONFIG_DIR\"))",
+     "    account_given = bool(cfg.config_dir)"),
+
+    ("the title elsewhere must match its case",
+     "             if s[\"title\"] and s[\"title\"].strip().casefold() == want]",
+     "             if s[\"title\"] and s[\"title\"].strip() == ref]"),
+
+    ("the directory is not followed",
+     "            new = dataclasses.replace(new, cwd=str(Path(where).resolve()))\n",
+     ""),
+
+    ("the account is not followed",
+     "            new = dataclasses.replace(new, config_dir=s[\"config_dir\"])\n",
+     ""),
+
+    ("a directory that is gone is followed",
+     "            if not Path(where).is_dir():\n",
+     "            if False:\n"),
+
+    ("following says nothing",
+     "        return new, f\"{what} is {' and '.join(moved)}: resuming it there.\", None",
+     "        return new, None, None"),
+
+    ("an id with a --cwd it is not in goes ahead",
+     "        if cfg.cwd_given and where and not _same_path(where, cfg.cwd):\n",
+     "        if False:\n"),
+
+    ("an id is not followed to its directory",
+     "        return _follow({\"session_id\": ref, \"cwd\": where, \"config_dir\": account,",
+     "        return _follow({\"session_id\": ref, \"cwd\": None, \"config_dir\": account,"),
+
+    ("an id on another account is not recognised",
+     "    holders = [s for s in _all() if s[\"session_id\"] == ref]\n",
+     "    holders = []\n"),
+
+    ("an id on another account is followed past a chosen account",
+     "        if account_given:\n            s = holders[0]\n",
+     "        if False:\n            s = holders[0]\n"),
+
+    ("an id nobody has is taken for a title",
+     "    if _UUID_RE.fullmatch(ref):\n",
+     "    if False:\n"),
+
+    ("no titles like it are offered",
+     "    similar = [s for s in _all() if s[\"title\"] and want in s[\"title\"].casefold()]\n",
+     "    similar = []\n"),
+
+    ("the directory's own sessions are not listed",
+     "        here_all = resumable_sessions(cfg.cwd, account)\n",
+     "        here_all = []\n"),
+
+    ("the one flag it needs is not named",
+     "            lines.append(f\"Resume it with {' '.join(need)}.\" if need else\n",
+     "            lines.append(\"Resume it by its id (--resume <id>).\" if need else\n"),
+
+    ("the picker is settled as a title",
+     "    if not ref or ref == _PICKER_SENTINEL:\n        return cfg, None, None\n    account = (",
+     "    if not ref:\n        return cfg, None, None\n    account = ("),
+
+    ("an unsettled launch goes on to the hub",
+     "    if _err:\n        print(_err, file=sys.stderr)\n",
+     "    if False:\n        print(_err, file=sys.stderr)\n"),
+
+    ("an unsettled launch leaves no log",
+     "        _report_launch_failure(_err, dialog=config.open_browser)\n",
+     ""),
+
+    ("the note is not printed",
+     "    if _note:\n        print(_note)\n",
+     "    if _note:\n        pass\n"),
+
+    ("a followed account is not pinned",
+     "        # The session may be on another account: pin it as above.\n"
+     "        os.environ[\"CLAUDE_CONFIG_DIR\"] = str(Path(config.config_dir).resolve())\n",
+     "        pass\n"),
+
+    ("a joined launch prints no address",
+     "    print(f\"Joined running orchestrator2 hub on port {port}: session {rid} \"\n"
+     "          f\"at {url}\")\n",
+     "    print(f\"Joined running orchestrator2 hub on port {port}: session {rid}\")\n"),
+
+    ("a joined launch opens a tab without --open",
+     "    if open_browser:\n        webbrowser.open(f\"{url}&t={int(time.time())}\")\n",
+     "    if True:\n        webbrowser.open(f\"{url}&t={int(time.time())}\")\n"),
+
+    ("nothing says why no tab opened",
+     "        print(\"(Not opened in a tab; --open does that.)\")\n",
+     "        pass\n"),
+
+    ("a detached child is not given the account",
+     "    if cfg.config_dir:\n        child_argv.extend([\"--config-dir\", cfg.config_dir])\n",
+     ""),
+
+    ("a detached child keeps the typed account too",
+     "        if a in (\"--agent-name\", \"--config-dir\"):\n",
+     "        if a in (\"--agent-name\",):\n"),
+
+    ("a restart keeps the launch's --cwd",
+     "        if sid and a == \"--cwd\":\n            i += 2\n            continue\n",
+     ""),
+
+    ("a restart drops --cwd with no session to follow",
+     "        if sid and a == \"--cwd\":\n",
+     "        if a == \"--cwd\":\n"),
+
+    ("/resume in a session says a shared title is not found",
+     "            if len(several) > 1:\n",
+     "            if False:\n"),
+]
+
+LAUNCHRESUME_CONFIG_MUTATIONS = [
+    ("--cwd is never counted as given",
+     "        cwd_given=args.cwd is not None,\n",
+     "        cwd_given=False,\n"),
+]
+
+LAUNCHRESUME_SESSION_MUTATIONS = [
+    ("other accounts are not searched",
+     "        dirs = [str(p) for p in discover_claude_dirs()]\n",
+     "        dirs = [str(p) for p in discover_claude_dirs()][:1]\n"),
+
+    ("a session is listed once per account that has it",
+     "                if not sid or sid in seen:\n",
+     "                if not sid:\n"),
+]
+
+
 TARGETS = {
     "chat": ("static/chat.js", "tests/hidden_window.test.js",
              CHAT_MUTATIONS, "node"),
@@ -4953,6 +5110,12 @@ TARGETS = {
                           INITPROMPT_BRIDGE_MUTATIONS, "pytest"),
     "initprompt-server": ("server.py", "tests/test_initial_prompt.py",
                           INITPROMPT_SERVER_MUTATIONS, "pytest"),
+    "launchresume-server": ("server.py", "tests/test_launch_resume.py",
+                            LAUNCHRESUME_SERVER_MUTATIONS, "pytest"),
+    "launchresume-config": ("config.py", "tests/test_launch_resume.py",
+                            LAUNCHRESUME_CONFIG_MUTATIONS, "pytest"),
+    "launchresume-session": ("session.py", "tests/test_launch_resume.py",
+                             LAUNCHRESUME_SESSION_MUTATIONS, "pytest"),
     "extauth": ("server.py",
                 "tests/test_external_access_policy.py tests/test_external_auth.py",
                 EXTAUTH_MUTATIONS, "pytest"),

@@ -843,6 +843,46 @@ def resolve_session_ref(ref: str, cwd: str, config_dir: str | None = None) -> st
     return matches[0][0] if len(matches) == 1 else ref
 
 
+def sessions_anywhere() -> list[dict[str, Any]]:
+    """Every session on this machine, in every account and directory, newest
+    first: ``session_id``, ``title``, ``cwd``, ``config_dir``, ``mtime``.
+
+    What a ``--resume`` that names nothing in its own directory looks through
+    before it gives up.  The reported launch ran from the orchestrator2
+    checkout with ``--resume "OS F old 2"``, a session in
+    ``E:\\visual studio projects\\os``.  The lobby lists sessions the same way,
+    and titles come from the on-disk index, so this is cheap: 39 sessions in
+    0.5 s cold, measured 2026-09-27.
+    """
+    try:
+        from copy_session import discover_claude_dirs
+        dirs = [str(p) for p in discover_claude_dirs()]
+    except Exception:
+        dirs = [os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")]
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for cdir in dirs:
+        try:
+            projects = list_projects(config_dir=cdir)
+        except OSError:
+            continue
+        for proj in projects:
+            for sess in list_sessions_for_project(Path(proj["project_dir"])):
+                sid = sess.get("session_id")
+                if not sid or sid in seen:
+                    continue
+                seen.add(sid)
+                out.append({
+                    "session_id": sid,
+                    "title": sess.get("title"),
+                    "cwd": proj.get("cwd"),
+                    "config_dir": cdir,
+                    "mtime": sess.get("mtime", 0.0),
+                })
+    out.sort(key=lambda s: s["mtime"], reverse=True)
+    return out
+
+
 def resumable_sessions(cwd: str, config_dir: str | None = None, *,
                        limit: int | None = 6) -> list[tuple[str, str | None]]:
     """``(session_id, title)`` for the sessions in *cwd*, newest first.

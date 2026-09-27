@@ -141,7 +141,8 @@ splash listening on a bound socket with a traceback behind it.
 
 A launch probes `/api/whoami`. If a hub for the **same account
 (`CLAUDE_CONFIG_DIR`) and port** is already up, it POSTs `/api/session/launch`
-and opens the browser at `/?rid=<rid>` instead of starting a second server.
+instead of starting a second server. It prints the session's address,
+`/?rid=<rid>`, and opens it in the browser if `--open` was given.
 `--standalone` opts out. If 8420 is held by something that isn't such a hub, it
 binds an auto-picked free port.
 
@@ -190,9 +191,44 @@ passed the title through: the CLI resumed the right session, but the runtime
 was seeded with the title as its session id until the first turn — no
 transcript, "OS Lane" in the status bar, `/rename` looking for a session
 called "OS Lane A" on disk — and the reuse check could never match the
-runtime already open on it. An unknown or ambiguous title is handed through
-unchanged for the CLI to refuse; the connect loop reports either, each in its
-own words.
+runtime already open on it. At the hub, an unknown or ambiguous title is
+handed through unchanged for the CLI to refuse; the connect loop reports
+either, each in its own words.
+
+**The launch settles `--resume` before it starts or joins anything**
+(`_settle_launch_resume`, in `main()` after the terminal picker). Reported
+2026-09-27. `py server.py --resume "OS F old 2"`, run from the orchestrator2
+checkout, printed "Joined running orchestrator2 hub on port 8420 (session
+s12)." The session was in the Slate OS directory, so the runtime could never
+connect, and it said so only inside itself, in a tab never opened. The same
+afternoon, three sessions were called "OS F". They were copies of one
+transcript, two on the default account and one on account-c. The CLI's "two of
+that name" meant the first two, and the user renamed the third. Now:
+
+- A title that is one session's in the launch directory is that session.
+- If several sessions there have it, the launch stops with an error that
+  gives each one's id and when it was last active. It also names any session
+  of that name elsewhere, which "is not one of those".
+- If none there has it, every account's sessions are searched
+  (`session.sessions_anywhere`: the lobby's scan, through the title index,
+  0.5 s). If exactly one session has the title, the launch follows it: to its
+  directory unless `--cwd` was given (`Config.cwd_given`), and to its account
+  unless one was chosen (`--config-dir` or `CLAUDE_CONFIG_DIR`). It prints a
+  note saying so, and pins the account. Otherwise the launch stops and says
+  where each session of that name is, or which titles are like it, or what the
+  directory has.
+- An id is followed the same way. The terminal picker always did this ("resume
+  is cwd-scoped"). An id with a `--cwd` it is not in is refused, because the
+  CLI looks for the transcript only under the launch directory's project
+  (`getProjectDir(getOriginalCwd())`).
+
+The error goes to stderr and `launch-error.log`. A dialog also appears when
+the console is hidden, or when the launch has `--open`, since no tab is
+coming. ⟳ Restart drops the launch's `--cwd` when it resumes a session: after
+`/cwd` or `/resume` that `--cwd` names the wrong directory, and the new
+process follows the session to its own. `--detach` hands its child the
+account the launch followed. In a session, `/resume <title>` that several
+sessions share now says so, listing them, instead of "session not found".
 
 **`_create_runtime` refuses a working directory it cannot see**, raising
 `NotADirectoryError` naming both the requested and resolved forms. It is the
@@ -3565,7 +3601,8 @@ a session carries with it when
 how it draws the answer (`test_usage.py`, `test_usage_hub.py` +
 `usage.test.js`, section 6f), which session a launch's `--initial-prompt`
 goes to, and that it is shown and kept out of the CLI's own turns
-(`test_initial_prompt.py`, section 6), and that a
+(`test_initial_prompt.py`, section 6), that `--resume` is settled before a
+launch starts or joins anything (`test_launch_resume.py`, section 4), and that a
 mistyped launch flag leaves a trace instead of
 evaporating (`test_launch_errors.py`, section 10a).
 
