@@ -1088,10 +1088,12 @@ LOOP_MUTATIONS = [
      "        self._wakeup_fire_at = None\n"
      "        self.state.wakeup_at = None\n"
      "        self.state.wakeup_defers = 0\n"
-     "        clear_wakeup(self.config.cwd, self.state.session_id)\n"
+     "        if forget:\n"
+     "            clear_wakeup(self.config.cwd, self.state.session_id)\n"
      "        if t is None or t.done():",
      "        self._wakeup_fire_at = None\n"
-     "        clear_wakeup(self.config.cwd, self.state.session_id)\n"
+     "        if forget:\n"
+     "            clear_wakeup(self.config.cwd, self.state.session_id)\n"
      "        if t is None or t.done():"),
 
     ("a fired wakeup leaves its countdown running",
@@ -2397,7 +2399,7 @@ WAKEREVIVE_MUTATIONS = [
 
     ("a session that is already running is resurrected a second time, putting "
      "two bridges on one conversation",
-     "        if sid in live_sids:",
+     "        if live_rt is not None:",
      "        if False:"),
 
     ("an overdue wakeup fires the instant the process comes up, before any tab "
@@ -2959,6 +2961,85 @@ MOVESTOP_WAKEUP_MUTATIONS = [
     ("a recorded wakeup can never be read back, so no loop survives a move",
      "    return rec if _valid(rec) else None\n",
      "    return None\n"),
+]
+
+# A loop survives the hub restarting; closing a session still ends it.
+# tests/test_loops_survive_restart.py and tests/test_wakeup_store.py.
+LOOPKEEP_BRIDGE_MUTATIONS = [
+    ("every stop erases the loop again -- the bug: a restart ends every loop",
+     "            self._cancel_wakeup(forget=not hub_exiting)\n",
+     "            self._cancel_wakeup()\n"),
+
+    ("no stop erases it, so a closed session comes back at the next start",
+     "            self._cancel_wakeup(forget=not hub_exiting)\n",
+     "            self._cancel_wakeup(forget=False)\n"),
+
+    ("the record is erased whatever forget says",
+     "        if forget:\n            clear_wakeup(",
+     "        if True:\n            clear_wakeup("),
+
+    ("stop() drops what it was told on the way to _shutdown",
+     "        await asyncio.shield(self._shutdown(hub_exiting=hub_exiting))\n",
+     "        await asyncio.shield(self._shutdown())\n"),
+]
+
+LOOPKEEP_SERVER_MUTATIONS = [
+    ("the lobby's Shut down erases every session's loop",
+     "                # Scheduled loops come back at the next start (SDKBridge.stop).\n"
+     "                await rt.bridge.stop(hub_exiting=True)\n",
+     "                await rt.bridge.stop()\n"),
+
+    ("the lobby's Restart erases every session's loop",
+     "                # restore was built for (SDKBridge.stop).\n"
+     "                await rt.bridge.stop(hub_exiting=True)\n",
+     "                await rt.bridge.stop()\n"),
+
+    ("the no-tabs auto-shutdown erases every session's loop",
+     "                    # A hub exit, so scheduled loops survive it (SDKBridge.stop).\n"
+     "                    await rt.bridge.stop(hub_exiting=True)\n",
+     "                    await rt.bridge.stop()\n"),
+
+    ("Ctrl+C erases the primary session's loop",
+     "        await bridge.stop(hub_exiting=True)\n",
+     "        await bridge.stop()\n"),
+
+    ("closing a session from the lobby keeps its loop, so it comes back",
+     "            await rt.bridge.stop()\n        except asyncio.CancelledError:",
+     "            await rt.bridge.stop(hub_exiting=True)\n        except asyncio.CancelledError:"),
+
+    ("/quit keeps the session's loop, so it comes back",
+     "            await bridge.stop()\n"
+     "            await send_to(ws, {\"type\": \"system_msg\", \"subtype\": \"shutdown\",",
+     "            await bridge.stop(hub_exiting=True)\n"
+     "            await send_to(ws, {\"type\": \"system_msg\", \"subtype\": \"shutdown\","),
+
+    ("/cwd and /resume keep the session they leave's loop",
+     "            await bridge.stop()\n        except Exception:",
+     "            await bridge.stop(hub_exiting=True)\n        except Exception:"),
+]
+
+LOOPKEEP_RESTORE_MUTATIONS = [
+    ("an already-open session's loop is dropped -- the primary's, every restart",
+     "            await _rearm_live_wakeup(live_rt, rec)\n",
+     ""),
+
+    ("a loop the running session armed itself is overwritten by the old record",
+     "    if getattr(getattr(rt, \"state\", None), \"wakeup_at\", None) is not None:\n",
+     "    if False:\n"),
+
+    ("an overdue loop in a running session fires before it settles",
+     "        else WAKEUP_RESTORE_SETTLE_S\n"
+     "    log.warning(\"wakeup restore: %s is already open as %s",
+     "        else 0.0\n"
+     "    log.warning(\"wakeup restore: %s is already open as %s"),
+
+    ("a session that was already open is told it was reopened automatically",
+     "    _rearm_restored_wakeup(rt, rec, delay, plan, reopened=False)\n",
+     "    _rearm_restored_wakeup(rt, rec, delay, plan, reopened=True)\n"),
+
+    ("every restored loop claims its session was reopened automatically",
+     "    if reopened:\n        message +=",
+     "    if True:\n        message +="),
 ]
 
 # A backlog handed to a visible tab at once (a frozen background tab being
@@ -3630,6 +3711,12 @@ TARGETS = {
                  MOVESTOP_MUTATIONS, "pytest"),
     "movestop-wakeup": ("wakeup_store.py", "tests/test_move_stops_original.py",
                         MOVESTOP_WAKEUP_MUTATIONS, "pytest"),
+    "loopkeep-bridge": ("sdk_bridge.py", "tests/test_loops_survive_restart.py",
+                        LOOPKEEP_BRIDGE_MUTATIONS, "pytest"),
+    "loopkeep-server": ("server.py", "tests/test_loops_survive_restart.py",
+                        LOOPKEEP_SERVER_MUTATIONS, "pytest"),
+    "loopkeep-restore": ("server.py", "tests/test_wakeup_store.py",
+                         LOOPKEEP_RESTORE_MUTATIONS, "pytest"),
     "scrollburst": ("static/chat.js", "tests/hidden_window.test.js",
                     SCROLLBURST_MUTATIONS, "node"),
     "scrollburst-app": ("static/app.js", "tests/reconnect_on_show.test.js",

@@ -270,17 +270,26 @@ class _FakeRT:
         self.sent.append(msg)
 
 
-def _revive(monkeypatch, *, live=()):
-    """Drive the real resurrection with fake runtimes.  Returns (created, rts)."""
+def _revive(monkeypatch, *, live=(), live_rts=None, live_armed_at=None):
+    """Drive the real resurrection with fake runtimes.  Returns (created, rts).
+
+    *live* sessions are already running -- as the primary is after a restart.
+    Their fakes are appended to *live_rts*; *live_armed_at* gives them a loop
+    of their own already armed.
+    """
     import asyncio
     import server
 
-    class _Live:
-        def __init__(self, sid):
-            self.state = type("S", (), {"session_id": sid})()
+    class _Live(_FakeRT):
+        def __init__(self, i, sid):
+            super().__init__(rid=f"live{i}")
+            self.state = type("S", (), {"session_id": sid,
+                                        "wakeup_at": live_armed_at})()
 
-    monkeypatch.setattr(server, "runtimes",
-                        {f"live{i}": _Live(sid) for i, sid in enumerate(live)})
+    lives = {f"live{i}": _Live(i, sid) for i, sid in enumerate(live)}
+    if live_rts is not None:
+        live_rts.extend(lives.values())
+    monkeypatch.setattr(server, "runtimes", lives)
     created, rts = [], []
 
     async def _fake_create(**kw):
@@ -328,7 +337,7 @@ def test_the_soonest_due_loops_are_the_ones_revived(monkeypatch):
     assert last in revived, "the soonest-due loop was not among those revived"
 
 
-def test_a_session_already_running_is_left_alone(monkeypatch):
+def test_a_session_already_running_is_not_opened_twice(monkeypatch):
     """Resurrecting it again would put two bridges on one conversation — the
     duplicate-session hazard proc_guard exists to prevent, self-inflicted."""
     save_wakeup(CWD, SID, due_at=time.time() + 300, prompt="Resume work now",
@@ -337,6 +346,61 @@ def test_a_session_already_running_is_left_alone(monkeypatch):
     created, _rts = _revive(monkeypatch, live=(SID,))
 
     assert created == [], "a live session was resurrected on top of itself"
+
+
+def test_a_session_already_running_gets_its_loop_back(monkeypatch):
+    """The primary: a restart relaunches it with --resume, so the restore
+    always finds it open.  Skipping it -- as this once did -- dropped its loop
+    on every restart."""
+    save_wakeup(CWD, SID, due_at=time.time() + 300, prompt="Resume work now",
+                armed_at=time.time())
+    live = []
+
+    _revive(monkeypatch, live=(SID,), live_rts=live)
+
+    [(delay, prompt)] = live[0].bridge.armed
+    assert prompt == "Resume work now"
+    assert 250 < delay <= 300
+
+
+def test_a_session_already_running_is_not_told_it_was_reopened(monkeypatch):
+    """It was already open: "reopened automatically ... nobody typed anything"
+    would be false, and that sentence exists to be believed."""
+    save_wakeup(CWD, SID, due_at=time.time() + 300, prompt="Resume work now",
+                armed_at=time.time())
+    live = []
+
+    _revive(monkeypatch, live=(SID,), live_rts=live)
+
+    text = " ".join((m.get("data") or {}).get("message", "")
+                    for m in live[0].sent if m.get("type") == "system_msg")
+    assert "restored" in text
+    assert "reopened automatically" not in text
+
+
+def test_a_loop_the_running_session_armed_itself_is_kept(monkeypatch):
+    """If it has scheduled its own since it opened, that is fresher than the
+    record from before the restart."""
+    save_wakeup(CWD, SID, due_at=time.time() + 300, prompt="Resume work now",
+                armed_at=time.time())
+    live = []
+
+    _revive(monkeypatch, live=(SID,), live_rts=live,
+            live_armed_at=time.time() + 60)
+
+    assert live[0].bridge.armed == []
+
+
+def test_an_overdue_loop_in_a_running_session_waits_to_settle(monkeypatch):
+    save_wakeup(CWD, SID, due_at=time.time() - 30, prompt="Resume work now",
+                armed_at=time.time() - 330)
+    live = []
+    import server
+
+    _revive(monkeypatch, live=(SID,), live_rts=live)
+
+    [(delay, _prompt)] = live[0].bridge.armed
+    assert delay == server.WAKEUP_RESTORE_SETTLE_S
 
 
 def test_an_overdue_wakeup_is_re_armed_with_the_settle_delay(monkeypatch):

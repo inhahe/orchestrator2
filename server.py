@@ -1328,7 +1328,9 @@ async def lifespan(app: FastAPI):
     # --- Shutdown ---
     await _broadcast_shutdown("Server shutting down.")
     if bridge:
-        await bridge.stop()
+        # The hub is exiting, not this session closing: its loop is restored
+        # at the next start (SDKBridge.stop).
+        await bridge.stop(hub_exiting=True)
     if _ticker_task and not _ticker_task.done():
         # asyncio.wait, NOT `await task` inside `except asyncio.CancelledError: pass`:
         # that cannot tell the ticker's cancellation from one aimed at *us*, so it
@@ -1640,14 +1642,17 @@ async def _resurrect_scheduled_wakeups() -> None:
     Every restraint lives in :mod:`wakeup_store`: a record is session-scoped
     and must match its own slot, expires, and may only fire late by its own
     cadence.  This function adds the two that need the hub's view: it never
-    resurrects a session that is *already* running, and it stops after
-    ``MAX_RESURRECT`` so a boot cannot spawn an unbounded number of CLIs on a
-    machine that has exhausted its commit limit before.
+    opens a second runtime on a session that is *already* running (it re-arms
+    the loop in the one that is -- see :func:`_rearm_live_wakeup`), and it
+    stops after ``MAX_RESURRECT`` so a boot cannot spawn an unbounded number of
+    CLIs on a machine that has exhausted its commit limit before.
 
     A ``PAUSED`` record -- one that went stale while the hub was down -- is
-    deliberately left on disk and *not* run.  Opening that session is what
-    surfaces it; charging ahead on a plan from eight hours ago is the outcome
-    this whole path is written to avoid.
+    deliberately left on disk and *not* run: charging ahead on a plan from
+    eight hours ago is the outcome this whole path is written to avoid.  It was
+    meant to be surfaced when the session is next opened, but nothing does that
+    yet -- the only trace is the log line (known-issues.md, "A loop too late to
+    run is never mentioned").
     """
     try:
         records = list(wakeup_store.iter_pending_wakeups())
@@ -1657,8 +1662,8 @@ async def _resurrect_scheduled_wakeups() -> None:
     if not records:
         return
 
-    live_sids = {
-        getattr(getattr(rt, "state", None), "session_id", None)
+    live = {
+        getattr(getattr(rt, "state", None), "session_id", None): rt
         for rt in runtimes.values()
     }
     revived = 0
@@ -1671,12 +1676,16 @@ async def _resurrect_scheduled_wakeups() -> None:
             wakeup_store.clear_wakeup(rec.get("cwd", ""), sid)
             continue
         if plan.action == wakeup_store.PAUSED:
-            # Left on disk on purpose: the session should say so when opened.
+            # Left on disk on purpose, and not run.  (Nothing announces it yet.)
             log.warning("wakeup restore: %s is %s", (sid or "?")[:8], plan.reason)
             continue
-        if sid in live_sids:
-            log.info("wakeup restore: %s is already running — leaving it alone",
-                     (sid or "?")[:8])
+        live_rt = live.get(sid) if sid else None
+        if live_rt is not None:
+            # Already open -- in practice the primary, which the launch itself
+            # resumed.  Never a second runtime (two bridges on one
+            # conversation), but not skipped either: that dropped the primary's
+            # loop on every restart.  Opens no CLI, so it is not capped.
+            await _rearm_live_wakeup(live_rt, rec)
             continue
         if revived >= wakeup_store.MAX_RESURRECT:
             log.warning(
@@ -1701,13 +1710,49 @@ async def _resurrect_scheduled_wakeups() -> None:
         _rearm_restored_wakeup(rt, rec, delay, plan)
 
 
+#: How long the restore waits for the primary session's bridge, which is built
+#: off the startup path (the import behind it is slow on a cold or HDD start).
+LIVE_BRIDGE_WAIT_S = 120.0
+
+
+async def _rearm_live_wakeup(rt: SessionRuntime, rec: dict) -> None:
+    """Restore *rec*'s loop in a session that is already running.
+
+    In practice that is the primary: a restart relaunches it itself
+    (``--resume``), so the restore always finds it open.  Its bridge is built
+    in ``_deferred_bridge_startup``, which may not have finished, so wait for
+    it -- and then decide again, because the wait took time and an ``ARM``
+    can have become a ``FIRE`` meanwhile.
+    """
+    if getattr(rt, "bridge", None) is None and rt is _default_runtime:
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(_bridge_ready.wait(), LIVE_BRIDGE_WAIT_S)
+    sid = (rec.get("session_id") or "?")[:8]
+    if getattr(getattr(rt, "state", None), "wakeup_at", None) is not None:
+        # It has armed a loop of its own since it opened, which is fresher.
+        log.info("wakeup restore: %s already has a loop armed — keeping it", sid)
+        return
+    plan = wakeup_store.plan_restore(rec)
+    if plan.action not in (wakeup_store.ARM, wakeup_store.FIRE):
+        log.warning("wakeup restore: %s is %s", sid, plan.reason)
+        return
+    delay = max(0.0, plan.delay) if plan.action == wakeup_store.ARM \
+        else WAKEUP_RESTORE_SETTLE_S
+    log.warning("wakeup restore: %s is already open as %s — re-armed its loop "
+                "for %.0fs (%s)", sid, getattr(rt, "rid", "?"), delay, plan.reason)
+    _rearm_restored_wakeup(rt, rec, delay, plan, reopened=False)
+
+
 def _rearm_restored_wakeup(rt: SessionRuntime, rec: dict, delay: float,
-                           plan: "wakeup_store.Plan") -> None:
+                           plan: "wakeup_store.Plan", *,
+                           reopened: bool = True) -> None:
     """Re-arm a restored wakeup once its bridge is ready, and say so.
 
     Announced in the session rather than only logged: a turn that starts by
     itself, in a session the user did not open, with no explanation, is the
     shape of every "why is it doing that?" report this project has collected.
+    *reopened* is False for a session that was already open, which must not
+    be told it was reopened automatically.
     """
     br = getattr(rt, "bridge", None)
     if br is None:
@@ -1718,14 +1763,15 @@ def _rearm_restored_wakeup(rt: SessionRuntime, rec: dict, delay: float,
     except Exception:
         log.exception("wakeup restore: re-arming %s failed", rt.rid)
         return
+    message = (f"This session's scheduled loop survived a hub restart and was "
+               f"restored ({plan.reason}).")
+    if reopened:
+        message += (" It was reopened automatically because it had work "
+                    "scheduled — nobody typed anything here.")
     asyncio.create_task(rt.broadcast({
         "type": "system_msg",
         "subtype": "info",
-        "data": {"message": (
-            f"This session's scheduled loop survived a hub restart and was "
-            f"restored ({plan.reason}). It was reopened automatically because "
-            f"it had work scheduled — nobody typed anything here."
-        )},
+        "data": {"message": message},
     }), name=f"wakeup-restore-notice-{rt.rid}")
 
 
@@ -2676,7 +2722,8 @@ async def api_shutdown() -> dict[str, Any]:
     for rt in list(runtimes.values()):
         if rt.bridge is not None:
             try:
-                await rt.bridge.stop()
+                # Scheduled loops come back at the next start (SDKBridge.stop).
+                await rt.bridge.stop(hub_exiting=True)
             except Exception:
                 pass
     # Schedule a hard exit after a short delay so the response gets sent.
@@ -2811,7 +2858,9 @@ async def api_restart() -> dict[str, Any]:
     for rt in list(runtimes.values()):
         if rt.bridge is not None:
             try:
-                await rt.bridge.stop()
+                # The replacement restores every scheduled loop -- the case the
+                # restore was built for (SDKBridge.stop).
+                await rt.bridge.stop(hub_exiting=True)
             except Exception:
                 pass
     asyncio.get_event_loop().call_later(0.5, lambda: os._exit(0))
@@ -3590,7 +3639,8 @@ async def _shutdown_after_grace() -> None:
         for rt in list(runtimes.values()):
             if rt.bridge is not None:
                 try:
-                    await rt.bridge.stop()
+                    # A hub exit, so scheduled loops survive it (SDKBridge.stop).
+                    await rt.bridge.stop(hub_exiting=True)
                 except Exception:
                     pass
         os._exit(0)

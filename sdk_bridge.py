@@ -3146,8 +3146,14 @@ class SDKBridge:
         except Exception as exc:
             log.warning("wakeup-dropped notice failed: %r", exc)
 
-    def _cancel_wakeup(self) -> None:
+    def _cancel_wakeup(self, *, forget: bool = True) -> None:
         """Cancel any pending wakeup timer (idempotent).
+
+        *forget* erases the on-disk record as well, which is right for every
+        exit from the armed state but one: the hub itself going down (see
+        :meth:`stop`).  Outliving the process is the one thing the record is
+        *for*; a record that outlives its *wakeup* is the hazard, and a hub
+        exit ends neither the wakeup nor the loop -- only the process.
 
         **Never cancels the calling task.**  ``_wakeup_timer`` re-arms itself
         when it fires mid-turn, and ``_arm_wakeup`` starts by cancelling the
@@ -3163,7 +3169,8 @@ class SDKBridge:
         self._wakeup_fire_at = None
         self.state.wakeup_at = None
         self.state.wakeup_defers = 0
-        clear_wakeup(self.config.cwd, self.state.session_id)
+        if forget:
+            clear_wakeup(self.config.cwd, self.state.session_id)
         if t is None or t.done():
             return
         try:
@@ -6522,8 +6529,20 @@ class SDKBridge:
         except Exception:
             log.debug("agent deregistration failed", exc_info=True)
 
-    async def stop(self) -> None:
+    async def stop(self, *, hub_exiting: bool = False) -> None:
         """Gracefully shut down.
+
+        *hub_exiting* says the whole hub is going down, as opposed to this one
+        session being closed, and it decides what happens to a scheduled loop.
+        Closing a session -- the lobby's ×, ``/quit``, ``/move``, the idle
+        timer -- ends its loop for good: the wakeup record is erased, so the
+        next hub start does not bring the session back.  The hub exiting ends
+        only the process, so the record is left for
+        ``server._resurrect_scheduled_wakeups`` to restore.  Until 2026-09-27
+        every stop erased it, so restarting the hub the ordinary way
+        (Shut down / ⟳ Restart, both of which stop every session cleanly)
+        silently ended every loop, and the restore -- built for exactly "you
+        restart the hub to pick up a change" -- only ever worked after a crash.
 
         **Shielded**, so a cancellation aimed at whoever called us cannot leave
         a ``claude.exe`` running.  Shutdown here is not a request that can be
@@ -6539,14 +6558,14 @@ class SDKBridge:
         The caller still sees the cancellation — the shield re-raises it — but
         the teardown itself runs to completion in the background.
         """
-        await asyncio.shield(self._shutdown())
+        await asyncio.shield(self._shutdown(hub_exiting=hub_exiting))
 
-    async def _shutdown(self) -> None:
+    async def _shutdown(self, *, hub_exiting: bool = False) -> None:
         """The actual shutdown sequence.  Never raises; see :meth:`stop`."""
         try:
             self.stop_event.set()
             self._cancel_compact_turn_end_timer()
-            self._cancel_wakeup()
+            self._cancel_wakeup(forget=not hub_exiting)
             self._cancel_bg_done_bell()
             # Leave the registry before the slow part of the teardown: a clean
             # exit should not look "live" to a sibling for the seconds it takes

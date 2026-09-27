@@ -338,12 +338,35 @@ unattended by definition; restoring only on open would be decoration.
 erases the record, so it reads it first (`load_wakeup`) and re-arms the loop in
 the copy due when it was (§8, `/move`).
 
+**The hub exiting is not an exit from the armed state.** Stopping a session
+cancels its wakeup (`SDKBridge._shutdown` → `_cancel_wakeup`), and until
+2026-09-27 that always erased the record too. The hub's own ways of going down
+all stop their sessions cleanly: the lobby's Shut down and ⟳ Restart
+(`api_shutdown`, `api_restart`), the no-tabs auto-shutdown, and Ctrl+C
+(`lifespan`, primary only). So the record was gone before the restart finished,
+and the restore only ever had anything to restore after a crash, although "you
+restart the hub to pick up a change" was the case it was built for. Now
+`stop(hub_exiting=True)` leaves the record, and exactly those four callers pass
+it. Every other stop is a session ending (the lobby's ×, the idle timer,
+`/move`, `/quit`, `/cwd` or `/resume` leaving a session) and still erases it,
+because keeping it would bring back, at the next start, a session the user
+shut. `test_loops_survive_restart.py` pins the split by walking `server.py`'s
+AST, so a new stop site must pick a side.
+
+The other half: a restart relaunches the primary itself (`--resume`), so the
+restore always finds it already open. Skipping it was right about not opening a
+second runtime, but it dropped the primary's loop, so now the loop is re-armed
+in the running session instead (`_rearm_live_wakeup`). That waits for the
+primary's bridge, which is built off the startup path, and then plans again. It
+leaves alone a loop the session has armed for itself since opening. And it does
+not claim the session was "reopened automatically".
+
 It is the riskiest path in the hub — it starts CLIs and then runs turns in
 them, unwatched — so the restraints are the design: session-scoped records that
 must match their own slot, a freshness cap, a cap on how many sessions one boot
-may revive, never reviving one that is already running, a settling delay before
-an overdue wakeup fires, and an announcement in the session saying nobody typed
-anything. The **lateness budget** is the load-bearing rule: a wakeup may fire
+may revive, never opening a second runtime on one that is already running, a
+settling delay before an overdue wakeup fires, and an announcement in the
+session saying nobody typed anything. The **lateness budget** is the load-bearing rule: a wakeup may fire
 late by at most its own cadence (bounded 1 min–1 h), and past that it is left
 *paused* on disk rather than run, because an eight-hour-late loop is acting on
 a plan that has gone stale.
@@ -3154,7 +3177,9 @@ section 6), which sessions the lobby calls running
 (`test_foreign_running_sessions.py`, section 8), external-access policy and the
 auth throttle (`test_external_access_policy.py`, section 9), that the
 self-paced wakeup loop can be stopped from either side
-(`test_loop_control.py`, section 6), what a session carries with it when
+(`test_loop_control.py`, section 6), that it survives the hub restarting but
+not the session being closed (`test_loops_survive_restart.py`, section 4), what
+a session carries with it when
 `/move` moves it to another directory (`test_move_directory.py` +
 `move_overlay.test.js`, section 8) and that the move stops the original
 (`test_move_stops_original.py`, section 8), and that a

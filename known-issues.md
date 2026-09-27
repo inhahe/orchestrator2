@@ -1,5 +1,54 @@
 # Known issues / tech debt — orchestrator2
 
+## Restarting the hub ended every scheduled loop — FIXED (2026-09-27)
+
+Found while answering *"if i restart the server, the old session will die,
+then how will i /move it again?"*. It was never reported: it removes a loop
+without a trace, which is how it survived.
+
+`wakeup_store` keeps each armed loop on disk so that it outlives the hub. Its
+own tests call "you restart the hub to pick up a change" the case it exists
+for. But `SDKBridge._shutdown` cancelled the wakeup *and erased the record* on
+every stop. All four of the hub's ways of going down stop their sessions
+cleanly:
+- the lobby's Shut down (also used by `--detach` to take over the port);
+- ⟳ Restart;
+- the no-tabs auto-shutdown;
+- Ctrl+C, which stops only the primary.
+
+So the record was gone before the restart finished, and at the next start
+`_resurrect_scheduled_wakeups` found nothing. The restore could only ever act
+after a crash. Checked against the real bridge: armed, stopped, record erased.
+
+Fixed in two parts:
+
+1. **`stop(hub_exiting=True)` leaves the record, and only those four callers
+   pass it.** Closing a session (×, idle, `/move`, `/quit`, `/cwd` and
+   `/resume` leaving one) still erases it; keeping it there would bring back a
+   session the user shut. A test walks `server.py`'s AST, so a new stop site
+   has to pick a side.
+2. **The primary's loop comes back too.** A restart relaunches the primary
+   itself, so the restore always found it already running and skipped it.
+   Not opening it twice was right; dropping its loop was not. The loop is now
+   re-armed in the running session.
+
+Checked by `tests/test_loops_survive_restart.py`, which runs the real bridge,
+`api_shutdown` and `close_runtime`, plus five new tests in
+`test_wakeup_store.py`. It has not been checked across a real restart. Loops
+that exist when a hub still running the old code is shut down are erased by
+that shutdown; this fix applies from the restart after it.
+
+## A loop too late to run is never mentioned — OPEN (found 2026-09-27)
+
+A restored loop whose wakeup is later than its own cadence (1 min–1 h) is
+*paused*: left on disk and not run, which is right, because a plan that stale
+should not run unattended. `_resurrect_scheduled_wakeups`'s docstring says
+"opening that session is what surfaces it", but nothing does. No code reads a
+paused record when a session is opened. So after a long shutdown the loop is
+simply gone, with nothing in the session to say so; the only trace is a log
+line. Now that a restart actually keeps records, this is the path a slow
+restart takes.
+
 ## `/move` left the original session running — FIXED (2026-09-27)
 
 > "i did a /move to move a session to another account, and it apparently

@@ -134,7 +134,9 @@ def load_wakeup(cwd: str, session_id: str | None) -> dict | None:
 def clear_wakeup(cwd: str, session_id: str | None) -> None:
     """Forget a wakeup, because it fired or was cancelled.
 
-    Called on *every* exit from the armed state.  A record that outlives its
+    Called on *every* exit from the armed state -- which the hub itself going
+    down is not: that ends the process, not the loop, so ``SDKBridge.stop``
+    leaves the record for the next start to restore.  A record that outlives its
     wakeup is a turn waiting to be run twice.
     """
     if not session_id:
