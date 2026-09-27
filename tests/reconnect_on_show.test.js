@@ -806,5 +806,92 @@ test('the tooltip says when the session is not in the registry', (h) => {
   assert(/halts/.test(els.field.title), els.field.title);
 });
 
+/* ---- only a prompt typed here pulls the view down ----------------------- */
+
+test('the echo of a prompt typed here is marked as local', (h) => {
+  // Chat lets exactly this user message force the view to the bottom; every
+  // other one -- queued, replayed, from another tab -- follows only a reader
+  // who is already there.  The mark is what tells them apart.
+  h.live.accept();
+  const chat = h.win.__mods.Chat;
+  const real = chat.handleMessage;
+  const echoes = [];
+  chat.handleMessage = (m) => {
+    if (m && m.type === 'user_message') echoes.push(m);
+    return real(m);
+  };
+  typeCommand(h, 'hello there');
+  assert(echoes.length === 1, `expected one echo, got ${echoes.length}`);
+  assert(echoes[0].local === true, 'the echo is not marked as typed here');
+});
+
+/* ---- timers count from when the state began ------------------------------ *
+ *
+ * Reported 2026-09-26: "once i even saw the bg-wait time quickly catching up
+ * to present."  bg-wait showed the clock baked into the server's label -- the
+ * time each snapshot was *sent* -- and a background tab the browser froze is
+ * handed every snapshot it missed at once.  The server now says when the state
+ * began (busy_since, epoch seconds), and the bar counts from that.
+ */
+
+function stateText(h) {
+  return h.win.document.getElementById('status-state').textContent;
+}
+
+test('bg-wait counts from when it began, whatever snapshot is shown', (h) => {
+  // A snapshot sent five minutes ago, processed now: its label says 0:0:30,
+  // but the wait began 5m30s ago -- and that is what must be shown.
+  statusOf(h, { busy_class: 'bg-wait', busy_label: 'bg wait (2) (0:0:30)',
+                busy_prefix: 'bg wait (2)', busy_since: h.now / 1000 - 330 });
+  assert(stateText(h) === 'bg wait (2) (0:5:30)', stateText(h));
+});
+
+test('a backlog of old snapshots does not count through old times', (h) => {
+  const since = h.now / 1000 - 600;
+  for (let i = 0; i < 5; i++) {
+    statusOf(h, { busy_class: 'bg-wait', busy_label: `bg wait (1) (0:0:${10 + i})`,
+                  busy_prefix: 'bg wait (1)', busy_since: since });
+    assert(stateText(h) === 'bg wait (1) (0:10:00)',
+           `snapshot ${i} showed ${stateText(h)}`);
+  }
+});
+
+test('bg-wait keeps ticking between snapshots', (h) => {
+  statusOf(h, { busy_class: 'bg-wait', busy_prefix: 'bg wait (1)',
+                busy_since: h.now / 1000 - 60 });
+  h.tickIntervals(5);
+  assert(stateText(h) === 'bg wait (1) (0:1:05)', stateText(h));
+});
+
+test('a turn already under way shows how long it has been going', (h) => {
+  // "working" counted from this tab's first sight of the state, so a tab opened
+  // four minutes into a turn read "working (0:0:00)".
+  statusOf(h, { busy_class: 'working', busy_label: 'working (0:4:00)',
+                busy_prefix: 'working', busy_since: h.now / 1000 - 240 });
+  assert(stateText(h) === 'working (0:4:00)', stateText(h));
+});
+
+test('a new turn restarts the clock', (h) => {
+  statusOf(h, { busy_class: 'working', busy_prefix: 'working',
+                busy_since: h.now / 1000 - 240 });
+  statusOf(h, { busy_class: 'working', busy_prefix: 'working',
+                busy_since: h.now / 1000 - 3 });
+  assert(stateText(h) === 'working (0:0:03)', stateText(h));
+});
+
+test('a changed task count is shown without waiting for the next tick', (h) => {
+  const since = h.now / 1000 - 60;
+  statusOf(h, { busy_class: 'bg-wait', busy_prefix: 'bg wait (2)', busy_since: since });
+  statusOf(h, { busy_class: 'bg-wait', busy_prefix: 'bg wait (1)', busy_since: since });
+  assert(stateText(h).startsWith('bg wait (1)'), stateText(h));
+});
+
+test('an older hub without busy_since still shows its own bg-wait label', (h) => {
+  // Static files are re-read per request, so this page can be newer than the
+  // hub serving it.
+  statusOf(h, { busy_class: 'bg-wait', busy_label: 'bg wait (2) (0:3:00)' });
+  assert(stateText(h) === 'bg wait (2) (0:3:00)', stateText(h));
+});
+
 console.log(`\n${passes}/${passes + failures} passed`);
 process.exit(failures ? 1 : 0);

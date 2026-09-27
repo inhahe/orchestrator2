@@ -253,6 +253,36 @@ const Chat = (() => {
     // transition itself has to be an event we handle.  See _onVisibilityChange.
     document.addEventListener('visibilitychange', _onVisibilityChange);
 
+    // Stop following the moment the user reaches for older text -- not when the
+    // throttled check below gets round to it.  That check runs 60 ms after the
+    // scroll, and a message landing inside those 60 ms scrolled back to the
+    // bottom first, so the check then saw "at the bottom" and kept following:
+    // while a backlog was arriving, every attempt to scroll up was undone.
+    // Wheel up, a finger dragging the content down, the keys that page back, a
+    // press on the scrollbar -- each is unambiguous intent, known at once.
+    // (Coming back down re-arms following through the check below, as before.)
+    const _stopFollowing = () => { _autoScroll = false; };
+    elMessages.addEventListener('wheel', (e) => {
+      if (e.deltaY < 0) _stopFollowing();
+    }, { passive: true });
+    let _touchY = null;
+    elMessages.addEventListener('touchstart', (e) => {
+      _touchY = e.touches && e.touches.length ? e.touches[0].clientY : null;
+    }, { passive: true });
+    elMessages.addEventListener('touchmove', (e) => {
+      if (_touchY === null || !e.touches || !e.touches.length) return;
+      if (e.touches[0].clientY > _touchY + 8) _stopFollowing();
+    }, { passive: true });
+    elMessages.addEventListener('keydown', (e) => {
+      if (e.key === 'PageUp' || e.key === 'ArrowUp' || e.key === 'Home') {
+        _stopFollowing();
+      }
+    });
+    elMessages.addEventListener('mousedown', (e) => {
+      // offsetX past the content box is the scrollbar.
+      if (e.offsetX >= elMessages.clientWidth) _stopFollowing();
+    });
+
     // Auto-scroll tracking: only scroll if user is near bottom.
     // Throttled to avoid layout thrashing on every pixel of scroll.
     let _scrollThrottle = null;
@@ -322,20 +352,41 @@ const Chat = (() => {
       _maybeTrimOldMessages();
       return;
     }
+    // Visible: once per *frame*, not once per message.  Only the last scroll
+    // before a paint is ever seen, and each one is that same forced layout of
+    // the whole list.  Per message, it is what made a backlog visibly drip in:
+    // a background tab the browser has frozen is handed everything that
+    // happened meanwhile the moment it is shown, and it processed that one
+    // layout at a time -- the transcript scrolling line by line, the status bar
+    // counting through old values, and the view pinned to the bottom the whole
+    // way ("i can't read the backscroll because it keeps stealing the scroll").
+    // A scroll, unlike the trim, may wait for a frame: it matters only when
+    // something is painted, which is precisely when frames exist.
+    if (!_scrollFrame) {
+      _scrollFrame = true;
+      // Somewhere with no frames at all, scroll now rather than never.
+      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(_scrollNow);
+      else _scrollNow();
+    }
+    _maybeTrimOldMessages();
+  }
+
+  // True while a _scrollNow frame is requested and has not run.
+  let _scrollFrame = false;
+
+  function _scrollNow() {
+    _scrollFrame = false;
     if (_gapActive) {
       _maintainGap();
-      _maybeTrimOldMessages();
       return;
     }
     if (_shortGapActive) {
       _maintainShortGap();
-      _maybeTrimOldMessages();
       return;
     }
     if (_autoScroll) {
       elMessages.scrollTop = elMessages.scrollHeight;
     }
-    _maybeTrimOldMessages();
   }
 
   // Re-size the bottom gap so the frozen viewport top stays put while new
@@ -448,6 +499,14 @@ const Chat = (() => {
       // Likewise a trim that was already waiting on a frame: that frame is now
       // never coming.  See _reclaimStrandedTrim.
       _reclaimStrandedTrim();
+      // And a scroll waiting on one.  Released rather than left latched --
+      // while _scrollFrame stays true no later scroll is ever requested -- and
+      // carried over to the catch-up scroll on show.  Should the orphaned frame
+      // still fire, _scrollNow is harmless to run twice.
+      if (_scrollFrame) {
+        _scrollFrame = false;
+        _scrollPendingOnShow = true;
+      }
       return;
     }
     // One catch-up scroll for the whole backlog, instead of the one-per-message
@@ -529,7 +588,7 @@ const Chat = (() => {
 
   function _dispatchMessage(msg) {
     switch (msg.type) {
-      case 'user_message':    _addUserMessage(msg.content); break;
+      case 'user_message':    _addUserMessage(msg.content, msg.local === true); break;
       case 'injected_prompt': _addInjectedPrompt(msg); break;
       case 'assistant_text':  _addAssistantText(msg); break;
       case 'tool_use':        _addToolUse(msg); break;
@@ -560,7 +619,7 @@ const Chat = (() => {
 
   // --- User messages ---
 
-  function _addUserMessage(content) {
+  function _addUserMessage(content, local) {
     _flushStreaming();
     _collapseActivity();
     const el = document.createElement('div');
@@ -568,14 +627,23 @@ const Chat = (() => {
     el.innerHTML = `<div class="msg-label">You</div>
                     <div class="msg-content">${_esc(content)}</div>`;
     elMessages.appendChild(el);
-    // Force scroll — the user's own message should always be visible.
-    // (The normal _autoScroll flag may be false due to the input textarea
-    // expanding on paste, which shifts the layout and trips the scroll
-    // listener before the message is appended.)  Release any open collapse
-    // gap so the new turn settles at the true bottom.
-    _cancelGap();
-    _cancelShortGap();
-    _autoScroll = true;
+    // Force scroll for a prompt the user just sent from *this* tab -- their own
+    // message should always be visible.  (The normal _autoScroll flag may be
+    // false due to the input textarea expanding on paste, which shifts the
+    // layout and trips the scroll listener before the message is appended.)
+    //
+    // Only that one: app.js marks its echo `local`.  Every other user_message
+    // -- a queued prompt starting, a loop wakeup, a peer's message, a prompt
+    // typed in another tab, and all of those replayed from a backlog -- used to
+    // force the scroll too, dragging back down a user who had scrolled up to
+    // read.  Those follow the bottom only if the user already was.
+    if (local || _autoScroll) {
+      // Release any open collapse gap so the new turn settles at the true
+      // bottom.
+      _cancelGap();
+      _cancelShortGap();
+    }
+    if (local) _autoScroll = true;
     _scrollToBottom();
   }
 

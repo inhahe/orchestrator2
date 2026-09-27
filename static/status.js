@@ -78,32 +78,50 @@ const Status = (() => {
     if (el[prop] !== val) el[prop] = val;
   }
 
-  // Local elapsed-time ticker for connecting/working states.
-  // The backend ticker fires every ~2s and can stall when the SDK's
-  // connect() blocks the event loop.  The frontend keeps its own 1s
-  // interval so the displayed timer never freezes.
+  // Local elapsed-time ticker for the timed states: connecting, compacting,
+  // working, and bg-wait.  The backend ticker fires every ~2s and can stall
+  // when the SDK's connect() blocks the event loop.  The frontend keeps its own
+  // 1s interval so the displayed timer never freezes.
+  //
+  // It counts from when the state *began*, as the server reports it
+  // (``busy_since``), not from when this tab happened to hear of it.  Reported
+  // 2026-09-26: "once i even saw the bg-wait time quickly catching up to
+  // present".  bg-wait showed the server's label, whose clock is the time each
+  // snapshot was *sent*; a background tab the browser froze is handed every
+  // snapshot it missed at once, and showed each old clock in turn.  "working"
+  // had the mirror-image fault: it counted from this tab's first sight of the
+  // state, so a tab opened four minutes into a turn read "working (0:0:00)".
   let _localTimerInterval = null;
   let _localTimerClass = null;    // busy_class being timed
-  let _localTimerStart = null;    // Date.now() when the state started
+  let _localTimerStart = null;    // epoch ms when the state began
+  let _localTimerPrefix = null;   // the label before its clock: "bg wait (2)"
 
-  function _startLocalTimer(cls) {
-    _stopLocalTimer();
+  function _renderLocalTimer() {
+    if (!_localTimerClass) return;
+    const secs = Math.max(0, Math.round((Date.now() - _localTimerStart) / 1000));
+    const label = _localTimerClass === 'connecting'
+      ? `${_localTimerPrefix} (${secs}s)`
+      : `${_localTimerPrefix} (${_fmtDuration(secs)})`;
+    _set(elState, 'textContent', label);
+  }
+
+  function _timeState(cls, sinceMs, prefix) {
+    // Without a start from the server (a hub older than this page -- static
+    // files are re-read per request, so a page can be newer than its hub),
+    // count from the moment this tab saw the state begin, as before.
+    const start = sinceMs !== null ? sinceMs
+      : (_localTimerClass === cls ? _localTimerStart : Date.now());
+    const pre = prefix || cls;
+    if (_localTimerClass === cls && _localTimerStart === start
+        && _localTimerPrefix === pre) return;
     _localTimerClass = cls;
-    _localTimerStart = Date.now();
-    const render = () => {
-      if (!_localTimerClass) return;
-      const secs = Math.round((Date.now() - _localTimerStart) / 1000);
-      let label;
-      if (_localTimerClass === 'connecting') label = `connecting (${secs}s)`;
-      else if (_localTimerClass === 'compacting') label = `compacting (${_fmtDuration(secs)})`;
-      else label = `working (${_fmtDuration(secs)})`;
-      _set(elState, 'textContent', label);
-    };
+    _localTimerStart = start;
+    _localTimerPrefix = pre;
     // Paint the label right away so it flips in the SAME frame as the colour
     // change below — otherwise the colour turns green (working) while the text
     // still reads "idle" until the first 1s interval tick.
-    render();
-    _localTimerInterval = setInterval(render, 1000);
+    _renderLocalTimer();
+    if (!_localTimerInterval) _localTimerInterval = setInterval(_renderLocalTimer, 1000);
   }
 
   function _stopLocalTimer() {
@@ -113,6 +131,7 @@ const Status = (() => {
     }
     _localTimerClass = null;
     _localTimerStart = null;
+    _localTimerPrefix = null;
   }
 
   function _fmtDuration(totalSecs) {
@@ -131,10 +150,14 @@ const Status = (() => {
       _prev.indicatorCls = indicatorCls;
     }
 
-    // Start/stop local timer for connecting and working states.
-    const timedStates = ['connecting', 'working', 'compacting'];
-    if (timedStates.includes(cls)) {
-      if (_localTimerClass !== cls) _startLocalTimer(cls);
+    // Start/stop the local timer for the timed states.  bg-wait joins them only
+    // when the server says when it began; without that its own label is all
+    // there is to show.
+    const since = typeof status.busy_since === 'number' ? status.busy_since * 1000 : null;
+    const timed = ['connecting', 'working', 'compacting'].includes(cls)
+                  || (cls === 'bg-wait' && since !== null);
+    if (timed) {
+      _timeState(cls, since, status.busy_prefix);
       // Don't overwrite the local timer's label — it updates every 1s.
     } else {
       _stopLocalTimer();

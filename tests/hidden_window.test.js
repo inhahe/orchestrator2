@@ -141,6 +141,8 @@ function makePage({ hidden = false } = {}) {
     get layoutReads() { return layoutReads; },
     get scrollWrites() { return scrollWrites; },
     resetCounters() { layoutReads = 0; scrollWrites = 0; },
+    /** Discard every pending frame, as a browser may for a hidden page. */
+    dropFrames() { frames.length = 0; },
     /** Deliver every pending frame (only possible while visible). */
     flushFrames() {
       for (let guard = 0; frames.length && guard < 100; guard++) {
@@ -333,8 +335,128 @@ test('a visible window still follows the bottom', () => {
   const p = makePage({ hidden: false });
   p.resetCounters();
   p.send(20);
-  assert(p.scrollWrites >= 20,
-    `only ${p.scrollWrites} scroll writes while visible; auto-follow broke`);
+  p.flushFrames();
+  assert(p.scrollWrites >= 1,
+    `no scroll write while visible; auto-follow broke`);
+});
+
+
+// -------------------------------------------------------------------------
+// A backlog delivered to a visible window
+// -------------------------------------------------------------------------
+//
+// Reported 2026-09-26: "i still sometimes see the recent history being replayed
+// at a certain rate when i switch to a tab ... once i even saw the bg-wait time
+// quickly catching up to present.  also ... i can't read the backscroll because
+// it keeps stealing the scroll down to the bottom."
+//
+// A background tab the browser has *frozen* runs no script at all, so
+// WebSocket messages wait for it -- and are handed over together the moment it
+// is shown.  By then the window is visible, so the hidden path above does not
+// apply: each message did its own scroll, its own forced layout of the whole
+// list, one after another, with a paint between some of them.
+
+test('a burst while visible costs one scroll, not one per message', () => {
+  const p = makePage({ hidden: false });
+  p.resetCounters();
+  p.send(200);
+  const beforeFrame = p.scrollWrites;
+  const readsBeforeFrame = p.layoutReads;
+  p.flushFrames();
+  assert(beforeFrame === 0,
+    `scrolled ${beforeFrame} times before the frame -- once per message again`);
+  assert(readsBeforeFrame < 200,
+    `${readsBeforeFrame} layout reads for 200 messages -- one per message again`);
+  assert(p.scrollWrites === 1,
+    `expected one scroll for the whole burst, got ${p.scrollWrites}`);
+});
+
+function wheelUp(p) {
+  const ev = new p.win.WheelEvent('wheel', { deltaY: -120, bubbles: true });
+  p.el.dispatchEvent(ev);
+}
+
+test('scrolling up stops the backlog pulling the view down', () => {
+  const p = makePage({ hidden: false });
+  p.send(5);
+  p.flushFrames();
+  wheelUp(p);
+  p.resetCounters();
+  p.send(50);
+  p.flushFrames();
+  assert(p.scrollWrites === 0,
+    `the view was scrolled ${p.scrollWrites} times after the user scrolled up`);
+});
+
+test('a finger dragging the content down stops it too', () => {
+  const p = makePage({ hidden: false });
+  p.send(5);
+  p.flushFrames();
+  const touch = (type, y) => {
+    const ev = new p.win.Event(type, { bubbles: true });
+    ev.touches = [{ clientY: y }];
+    p.el.dispatchEvent(ev);
+  };
+  touch('touchstart', 100);
+  touch('touchmove', 160);
+  p.resetCounters();
+  p.send(10);
+  p.flushFrames();
+  assert(p.scrollWrites === 0, `scrolled ${p.scrollWrites} times after a drag up`);
+});
+
+test('a user message from elsewhere does not drag a reader back down', () => {
+  // A queued prompt starting, a loop wakeup, another tab's prompt -- any of
+  // them replayed from a backlog used to force the scroll.
+  const p = makePage({ hidden: false });
+  p.send(5);
+  p.flushFrames();
+  wheelUp(p);
+  p.resetCounters();
+  p.Chat.handleMessage({ type: 'user_message', content: 'a queued prompt' });
+  p.flushFrames();
+  assert(p.scrollWrites === 0,
+    `a user_message not typed here scrolled the view ${p.scrollWrites} times`);
+});
+
+test('a prompt typed in this tab still brings the view down', () => {
+  const p = makePage({ hidden: false });
+  p.send(5);
+  p.flushFrames();
+  wheelUp(p);
+  p.resetCounters();
+  p.Chat.handleMessage({ type: 'user_message', content: 'mine', local: true });
+  p.flushFrames();
+  assert(p.scrollWrites >= 1, 'the user’s own prompt was left out of view');
+});
+
+test('a scroll orphaned by hiding the window does not stop following for good', () => {
+  // Requested while visible, then the window is hidden before the frame runs.
+  // Should that frame never come, the "already requested" latch must not stay
+  // set -- or no scroll would ever be requested again.
+  const p = makePage({ hidden: false });
+  p.send(1);                        // a scroll frame is now pending
+  p.setHidden(true);
+  p.dropFrames();                   // a browser that discards it
+  p.resetCounters();
+  p.setHidden(false);
+  assert(p.scrollWrites === 1,
+    `the scroll the dropped frame owed was not made on show (${p.scrollWrites})`);
+  p.resetCounters();
+  p.send(1);
+  p.flushFrames();
+  assert(p.scrollWrites >= 1, 'the view stopped following after a hide/show');
+});
+
+test('paging back with the keyboard stops following too', () => {
+  const p = makePage({ hidden: false });
+  p.send(5);
+  p.flushFrames();
+  p.el.dispatchEvent(new p.win.KeyboardEvent('keydown', { key: 'PageUp', bubbles: true }));
+  p.resetCounters();
+  p.send(10);
+  p.flushFrames();
+  assert(p.scrollWrites === 0, `scrolled ${p.scrollWrites} times after PageUp`);
 });
 
 test('becoming visible catches up with one scroll, not one per message', () => {

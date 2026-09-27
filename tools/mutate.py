@@ -199,8 +199,9 @@ CHAT_MUTATIONS = [
      ""),
 
     ("hiding leaves the collapse gaps open (they wedge the trimmer shut)",
-     "      _cancelGap();\n      _cancelShortGap();\n",
-     ""),
+     "      _cancelGap();\n      _cancelShortGap();\n"
+     "      // Likewise a trim that was already waiting on a frame",
+     "      // Likewise a trim that was already waiting on a frame"),
 
     ("hiding does not reclaim a trim stranded on a frame",
      "      _reclaimStrandedTrim();\n",
@@ -2864,6 +2865,123 @@ SESSIONNAME_SERVER_MUTATIONS = [
      "                                   agent_name=agent_name,\n"),
 ]
 
+# A backlog handed to a visible tab at once (a frozen background tab being
+# shown): one scroll per frame, user scroll intent obeyed at once, and only a
+# prompt typed here forcing the view down.  tests/hidden_window.test.js.
+#
+# Not mutated: the scrollbar mousedown.  jsdom has no offsetX, so no test here
+# can press on a scrollbar.
+SCROLLBURST_MUTATIONS = [
+    ("a visible window scrolls once per message again -- the reported drip",
+     "      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(_scrollNow);\n",
+     "      if (typeof requestAnimationFrame === 'function') _scrollNow();\n"),
+
+    ("every call asks for a frame of its own",
+     "    if (!_scrollFrame) {\n      _scrollFrame = true;\n",
+     "    if (true) {\n      _scrollFrame = true;\n"),
+
+    ("a scroll frame orphaned by hiding leaves the latch set, and the view "
+     "never follows again",
+     "      if (_scrollFrame) {\n        _scrollFrame = false;\n"
+     "        _scrollPendingOnShow = true;\n      }\n",
+     ""),
+
+    ("a scroll owed by an orphaned frame is not made on show",
+     "        _scrollFrame = false;\n        _scrollPendingOnShow = true;\n",
+     "        _scrollFrame = false;\n"),
+
+    ("wheeling up waits for the throttled check, and the backlog wins the race",
+     "      if (e.deltaY < 0) _stopFollowing();\n",
+     "      if (false) _stopFollowing();\n"),
+
+    ("dragging the content down with a finger does not stop following",
+     "      if (e.touches[0].clientY > _touchY + 8) _stopFollowing();\n",
+     "      if (false) _stopFollowing();\n"),
+
+    ("paging back with the keyboard does not stop following",
+     "      if (e.key === 'PageUp' || e.key === 'ArrowUp' || e.key === 'Home') {\n",
+     "      if (false) {\n"),
+
+    ("every user message drags a reader back to the bottom -- the reported "
+     "theft",
+     "    if (local) _autoScroll = true;\n",
+     "    _autoScroll = true;\n"),
+
+    ("a prompt typed here is left out of view",
+     "    if (local) _autoScroll = true;\n",
+     ""),
+
+    ("the local mark is dropped on the way in",
+     "_addUserMessage(msg.content, msg.local === true)",
+     "_addUserMessage(msg.content, false)"),
+]
+
+SCROLLBURST_APP_MUTATIONS = [
+    ("the echo of a typed prompt is not marked as local, so it no longer "
+     "brings the view down",
+     "Chat.handleMessage({ type: 'user_message', content: msg.text, local: true });",
+     "Chat.handleMessage({ type: 'user_message', content: msg.text });"),
+]
+
+# The status bar's timers count from when the state began.
+# tests/reconnect_on_show.test.js and tests/test_status_busy_since.py.
+STATUSTIMER_MUTATIONS = [
+    ("the server's start is ignored, so each tab counts from when it looked",
+     "    const start = sinceMs !== null ? sinceMs\n",
+     "    const start = false ? sinceMs\n"),
+
+    ("bg-wait shows each snapshot's own old clock -- the reported catch-up",
+     "                  || (cls === 'bg-wait' && since !== null);\n",
+     "                  || false;\n"),
+
+    ("an older hub's bg-wait is timed from nothing and reads 0:0:00",
+     "                  || (cls === 'bg-wait' && since !== null);\n",
+     "                  || (cls === 'bg-wait');\n"),
+
+    ("the label loses what it is counting",
+     "    const pre = prefix || cls;\n",
+     "    const pre = cls;\n"),
+
+    ("a new turn, or a new task count, keeps the old clock",
+     "    if (_localTimerClass === cls && _localTimerStart === start\n"
+     "        && _localTimerPrefix === pre) return;\n",
+     "    if (_localTimerClass === cls) return;\n"),
+
+    ("the clock stops between snapshots",
+     "    if (!_localTimerInterval) _localTimerInterval = setInterval(_renderLocalTimer, 1000);\n",
+     ""),
+]
+
+BUSYSINCE_MUTATIONS = [
+    ("the start jitters, so every snapshot differs and none is suppressed",
+     "    busy_since = (round(time.time() - (time.monotonic() - since_mono))\n",
+     "    busy_since = ((time.time() - (time.monotonic() - since_mono))\n"),
+
+    ("a turn does not say when it began",
+     '        busy_prefix, since_mono = "working", state.turn_started_at\n',
+     '        busy_prefix, since_mono = "working", None\n'),
+
+    ("bg-wait does not say when it began",
+     "        since_mono = oldest\n",
+     "        since_mono = None\n"),
+
+    ("bg-wait loses its task count",
+     '        busy_prefix = f"bg wait ({len(state.background_tasks)})"\n',
+     '        busy_prefix = "bg wait"\n'),
+
+    ("connecting does not say when it began",
+     '        busy_prefix, since_mono = "connecting", state.connect_started_at\n',
+     '        busy_prefix, since_mono = "connecting", None\n'),
+
+    ("compacting does not say when it began",
+     '        busy_prefix, since_mono = "compacting", state.cli_status_started_at\n',
+     '        busy_prefix, since_mono = "compacting", None\n'),
+
+    ("the start never reaches the status bar",
+     '        "busy_since": busy_since,\n',
+     '        "busy_since": None,\n'),
+]
+
 # The status bar's agent name.  tests/test_status_agent_name.py and, for the
 # field itself, tests/reconnect_on_show.test.js.
 STATUSAGENT_JS_MUTATIONS = [
@@ -3412,6 +3530,14 @@ TARGETS = {
                            SESSIONNAME_SERVER_MUTATIONS, "pytest"),
     "sessionname-disk": ("session.py", "tests/test_session_name.py",
                          SESSIONNAME_DISK_MUTATIONS, "pytest"),
+    "scrollburst": ("static/chat.js", "tests/hidden_window.test.js",
+                    SCROLLBURST_MUTATIONS, "node"),
+    "scrollburst-app": ("static/app.js", "tests/reconnect_on_show.test.js",
+                        SCROLLBURST_APP_MUTATIONS, "node"),
+    "statustimer": ("static/status.js", "tests/reconnect_on_show.test.js",
+                    STATUSTIMER_MUTATIONS, "node"),
+    "busysince": ("state.py", "tests/test_status_busy_since.py",
+                  BUSYSINCE_MUTATIONS, "pytest"),
     "statusagent-js": ("static/status.js", "tests/reconnect_on_show.test.js",
                        STATUSAGENT_JS_MUTATIONS, "node"),
     "statusagent": ("sdk_bridge.py", "tests/test_status_agent_name.py",

@@ -1957,6 +1957,46 @@ The rule, and how `chat.js` holds it:
   delta for nobody. `_flushStreaming` cancels it and renders synchronously, so a
   turn ending while hidden still lands its text.
 
+**A frozen tab is the other half.** Everything above assumes the hidden
+window still *runs script*, so messages are appended as they arrive. A
+background tab the browser has **frozen** (Chrome/Edge freeze eligible
+background tabs to save power) runs none at all: its WebSocket messages wait,
+and are handed over together the moment it is shown — when `_hidden()` is
+already false. Reported 2026-09-26: *"the recent history being replayed at a
+certain rate when i switch to a tab ... the bg-wait time quickly catching up
+to present ... i can't read the backscroll because it keeps stealing the
+scroll down to the bottom."* Each message did its own `scrollTop =
+scrollHeight`, a forced layout of up to ~95k elements, with paints in
+between: the drip, and the view pinned to the bottom throughout. Now:
+
+- **`_scrollToBottom()` scrolls once per frame**, not once per call: it requests
+  one `_scrollNow` frame (latched by `_scrollFrame`), which does the gap
+  maintenance and the scroll. Only the last scroll before a paint is ever
+  seen, so nothing visible is lost, and a whole backlog costs one layout. A
+  scroll may wait for a frame where the trim may not: it matters only when
+  something is painted, which is when frames exist. Hiding releases the latch
+  into `_scrollPendingOnShow`, so a frame a browser discards cannot leave it
+  set — the `_trimPending` bug's shape.
+- **User intent stops following at once** — wheel up, a touch drag down,
+  PageUp/ArrowUp/Home, a press on the scrollbar. The throttled scroll check
+  decided 60 ms after the fact, and a message landing inside those 60 ms had
+  already scrolled back to the bottom, so it saw "at the bottom" and kept
+  following. Coming back down re-arms it through that check, as before.
+- **Only a prompt typed in this tab forces the view down.** `app.js` marks its
+  echo `local`; every other `user_message` — a queued prompt starting, a
+  loop wakeup, a peer's message, another tab's prompt, any of them from a
+  backlog — follows only a reader already at the bottom.
+- **Timers count from when the state began.** The clock in `busy_label` is
+  the time the snapshot was *sent*, so a backlog of bg-wait snapshots counted
+  through old times. `state_to_status_dict` now also sends `busy_since` (epoch
+  seconds, rounded so an unchanged state still serialises identically and the
+  ticker still suppresses it) and `busy_prefix`, and `status.js` counts from
+  the start for connecting, compacting, working and bg-wait. "working" gains
+  too: it counted from the tab's first sight of the state, so a tab opened
+  mid-turn read 0:0:00. A hub too old to send `busy_since` gets the old
+  behaviour — static files are re-read per request, so a page can be newer
+  than its hub.
+
 The same reasoning applies to the **transport**, not just the rendering, and
 that half is the more damaging one. `app.js` runs its reconnect backoff on a
 `setTimeout`, so a hidden window retries on the throttled clock: the 20-attempt

@@ -1,5 +1,40 @@
 # Known issues / tech debt — orchestrator2
 
+## Switching to a tab replayed what it missed, visibly, and stole the scroll — FIXED (2026-09-26)
+
+> "i still sometimes see the recent history being replayed at a certain rate
+> when i switch to a tab, while sometimes the recent history seems to come up
+> instantly. once i even saw the bg-wait time quickly catching up to present.
+> also, while the recent history is being replayed (meaning what's being
+> updated since last view), i can't read the backscroll because it keeps
+> stealing the scroll down to the bottom."
+
+The hidden-window work (2026-09-14) assumed a hidden tab still runs script,
+so messages are appended while hidden and settled with one scroll on show. A
+tab the browser has **frozen** runs none: its WebSocket messages wait and are
+all handed over the moment it is shown — when it is visible, so none of that
+applied. The "sometimes" is whether the browser froze the tab or merely
+throttled it.
+
+Three things then happened per message. `scrollTop = scrollHeight` forced a
+layout of the whole transcript (up to ~95k elements), with paints in between:
+the drip. Every one of those scrolls pinned the view; the check that should
+have noticed the user scrolling up ran 60 ms late, after the next message had
+already scrolled back down. And every `user_message` in the backlog — queued
+prompts, wakeups, peers, other tabs — forced following back on by itself.
+Separately, bg-wait's clock was baked into each snapshot when it was sent, so
+a backlog of snapshots counted through old times.
+
+Fixed: one scroll per frame; following stops the instant the user wheels,
+drags, pages or grabs the scrollbar upward; only a prompt typed in this tab
+forces the view down; and the status bar counts from when the state began
+(`busy_since`), which also fixes "working" reading 0:0:00 in a tab opened
+mid-turn. design.md §7, *A frozen tab is the other half*.
+
+Not verified in a real frozen tab — no browser automation here can freeze
+one. The tests model what freezing produces: a burst of messages delivered to
+a visible page.
+
 ## `--resume <title>` into a running hub kept the title as the session id — FIXED (2026-09-24)
 
 > "i tried '/rename OS A' and I got "Rename failed: session OS Lane A not found

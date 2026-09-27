@@ -271,7 +271,9 @@ const App = (() => {
       }
       ws.send(JSON.stringify(msg));
       if (willEcho) {
-        Chat.handleMessage({ type: 'user_message', content: msg.text });
+        // `local`: typed here, just now -- the one user message that may pull
+        // the view to the bottom (see Chat._addUserMessage).
+        Chat.handleMessage({ type: 'user_message', content: msg.text, local: true });
         // Watchdog: a prompt must reach a state that *explains* it within a few
         // seconds — running, or visibly parked in the pending queue.  See
         // _armPromptWatchdog for why "any reply arrived" is not that state.

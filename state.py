@@ -746,6 +746,17 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
     now_ts = int(time.time())
 
     # --- Busy label + class ---
+    # For the timed states, also *when* the state began (``busy_since``, epoch
+    # seconds) and the label without its clock (``busy_prefix``), so the status
+    # bar can compute the elapsed time itself.  Reported 2026-09-26: "once i
+    # even saw the bg-wait time quickly catching up to present".  The clock in
+    # ``busy_label`` is the time *this snapshot was sent*, and a background tab
+    # the browser froze is handed every snapshot it missed at once -- replayed
+    # in order, each one's old clock was shown in turn.  A start time is right
+    # whenever it is read.  Rounded to the second so an unchanged state
+    # serialises identically and the ticker still suppresses it.
+    busy_prefix: str | None = None
+    since_mono: float | None = None
     rate_limited = (
         state.rate_limit_status == "rejected"
         and state.rate_limit_resets_at
@@ -761,6 +772,7 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         else:
             busy_label = "connecting"
         busy_class = "connecting"
+        busy_prefix, since_mono = "connecting", state.connect_started_at
     elif state.cli_status == "compacting":
         # Ranked above ``busy`` on purpose: a compaction happens *inside* a
         # turn, so busy is also true, and "compacting" is the more informative
@@ -773,6 +785,7 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         else:
             busy_label = "compacting"
         busy_class = "compacting"
+        busy_prefix, since_mono = "compacting", state.cli_status_started_at
     elif state.busy:
         if state.turn_started_at is not None:
             elapsed = fmt_duration(time.monotonic() - state.turn_started_at)
@@ -780,6 +793,7 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         else:
             busy_label = "working"
         busy_class = "working"
+        busy_prefix, since_mono = "working", state.turn_started_at
     elif state.background_tasks:
         oldest = min(
             (t.get("started_at", time.monotonic())
@@ -792,6 +806,8 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         else:
             busy_label = f"bg wait ({len(state.background_tasks)})"
         busy_class = "bg-wait"
+        busy_prefix = f"bg wait ({len(state.background_tasks)})"
+        since_mono = oldest
     elif state.auth_error:
         # The stored Claude login is dead (a turn 401'd, or the CLI reported an
         # auth failure at connect).  Surfaced prominently since nothing works
@@ -810,6 +826,8 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
     else:
         busy_label = "idle"
         busy_class = "idle"
+    busy_since = (round(time.time() - (time.monotonic() - since_mono))
+                  if since_mono is not None else None)
 
     # --- Session ---
     session_title = state.session_title
@@ -908,6 +926,8 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         "cwd": config.cwd,
         "busy_label": busy_label,
         "busy_class": busy_class,
+        "busy_prefix": busy_prefix,
+        "busy_since": busy_since,
         "turns": state.turns,
         "plan_field": plan_field,
         "config_dir": str(config_dir_path(getattr(config, "config_dir", None))),
