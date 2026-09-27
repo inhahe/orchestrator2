@@ -895,17 +895,19 @@ test('an older hub without busy_since still shows its own bg-wait label', (h) =>
 
 /* ---- the tab's icon (static/favicon.js) --------------------------------- */
 
-// Which LED the tab's icon has lit, as "row colour", or "plain" for the icon
-// with every light off.  favicon.test.js checks the drawing; these check that
-// the page feeds it.  The page's stylesheet is not loaded here, so the colours
-// are the module's defaults -- the default theme's.
+// Which LEDs the tab's icon has lit, as "row colour, row colour" in rack
+// order, or "plain" for the icon with every light off.  favicon.test.js checks
+// the drawing; these check that the page feeds it.  The page's stylesheet is
+// not loaded here, so the colours are the module's defaults -- the default
+// theme's.
 function iconOf(h) {
   const href = h.win.document.getElementById('favicon').href;
   if (href.endsWith('/static/favicon.svg')) return 'plain';
   const svg = decodeURIComponent(href.slice(href.indexOf(',') + 1));
   const lamps = [...svg.matchAll(/<circle cx="42" cy="(\d+)" r="4.6" fill="([^"]+)"\/>/g)];
-  assert(lamps.length === 1, `${lamps.length} lights on in: ${svg.slice(0, 80)}`);
-  return { 17: 'top', 32: 'middle', 47: 'bottom' }[lamps[0][1]] + ' ' + lamps[0][2];
+  assert(lamps.length, `no light on in: ${svg.slice(0, 80)}`);
+  const row = { 17: 'top', 32: 'middle', 47: 'bottom' };
+  return lamps.map((m) => row[m[1]] + ' ' + m[2]).join(', ');
 }
 
 function attached(h) {
@@ -923,24 +925,33 @@ test('the tab icon lights up for the state the status bar shows', (h) => {
   assert(iconOf(h) === 'top #0dbc79', 'working: ' + iconOf(h));
   statusOf(h, { busy_class: 'bg-wait', busy_label: 'bg wait (1)' });
   assert(iconOf(h) === 'middle #bc3fbc', 'bg-wait: ' + iconOf(h));
+  statusOf(h, { busy_class: 'compacting', busy_label: 'compacting' });
+  assert(iconOf(h) === 'top #e5e510', 'compacting: ' + iconOf(h));
   statusOf(h, { busy_class: 'idle', wakeup_at: h.now / 1000 + 600 });
   assert(iconOf(h) === 'bottom #bc3fbc', 'waiting to loop: ' + iconOf(h));
   statusOf(h, { busy_class: 'idle' });
   assert(iconOf(h) === 'top #666666', 'idle: ' + iconOf(h));
 });
 
+test('two things at once light two LEDs', (h) => {
+  // Asked 2026-09-27: "for example, compacting during bg-wait".
+  attached(h);
+  statusOf(h, { busy_class: 'compacting', busy_label: 'compacting', bg_count: 2 });
+  assert(iconOf(h) === 'top #e5e510, middle #bc3fbc', iconOf(h));
+});
+
 test('a dropped socket lights the icon yellow, as the status text is', (h) => {
   attached(h);
   statusOf(h, { busy_class: 'working' });
   h.live.drop();
-  assert(iconOf(h) === 'top #e5e510', iconOf(h));
+  assert(iconOf(h) === 'top #e5e510, middle #e5e510, bottom #e5e510', iconOf(h));
 });
 
 test('a reconnect that has given up lights it red', (h) => {
   attached(h);
   statusOf(h, { busy_class: 'working' });
   h.exhaustRetries();
-  assert(iconOf(h) === 'top #cd3131', iconOf(h));
+  assert(iconOf(h) === 'top #cd3131, middle #cd3131, bottom #cd3131', iconOf(h));
 });
 
 test('a tab whose session is closed goes back to the plain icon', (h) => {

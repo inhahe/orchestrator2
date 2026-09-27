@@ -1903,24 +1903,35 @@ variables it consumes, so themes never require CSS edits.
 
 Asked for so that a session can be read from the tab strip without switching
 to it. The icon is the rack in `favicon.svg`, whose three LEDs are drawn
-*off*. `Status.update` hands every snapshot to `Favicon.update`, which lights
-one LED in the colour the status bar writes that state in:
+*off*. `Status.update` hands every snapshot to `Favicon.update`. **Each LED
+stands for one fact, and they light independently**, each in the colour the
+status bar writes that fact in:
 
-| LED | Colour | State |
+| LED | Lit | Meaning |
 |---|---|---|
-| top | green | working (and compacting, which happens inside a turn) |
-| top | grey | idle |
-| top | yellow | connecting; disconnected and reconnecting |
-| top | red | disconnected for good, server shut down, or an error |
-| middle | purple | bg-wait |
-| bottom | purple | waiting to loop: idle with a wakeup scheduled |
+| top | green / yellow / red | the turn: working / compacting / an error (rate limited, not authed, api error, open elsewhere) |
+| top | grey | idle — only when no other LED is lit |
+| middle | purple | background tasks running (`bg_count`, so during a turn too) |
+| bottom | purple | a loop is scheduled (`wakeup_at`) |
+| all three | yellow | not connected: connecting, or disconnected and reconnecting |
+| all three | red | disconnected for good, or the server shut down |
 
-Position does one job: it tells apart the two states that share a colour.
-The loop field is written in the bg-wait purple, so those two get different
-LEDs, and everything else is told apart by colour on the top one. A scheduled
-loop shows only when the session is otherwise idle. Working or bg-wait with a
-loop armed shows the working or bg-wait light, because that is what the
-session is doing now.
+One fact per LED came from a request: *"multiple lights should be able to show
+at once if it's doing two things at once… for example, compacting during
+bg-wait"*. The first version lit a single LED, chosen by priority, and put
+compacting on the middle LED beside bg-wait, so the two could never show
+together. Now compacting during bg-wait is top yellow plus middle purple, and
+a turn with a loop armed is green plus purple.
+
+Position still tells apart things that share a colour. The loop field is
+written in the bg-wait purple, so they get different LEDs.
+`--indicator-compacting` is `$yellow`, a theme token `styles.css` has no
+default for, so the theme always emits it. That makes compacting the same
+yellow as a dropped connection, which is why "not connected" lights all three
+LEDs rather than one: a single yellow would read as compacting. Nothing else
+about the session is known while disconnected anyway, and the status bar hides
+its loop field then too. Idle's grey appears only alone. A session waiting on
+background tasks or a loop is not idle, it is waiting on them.
 
 - **Colours are read, not copied.** `getComputedStyle` on the page's CSS
   variables resolves through `var()` chains (checked in Edge), so a theme that
@@ -1943,12 +1954,13 @@ Limit: a background tab that the browser has *frozen* runs no script, so its
 icon catches up only when the tab is shown. A throttled tab still handles
 socket messages, and so still updates.
 
-Pinned by `tests/favicon.test.js` (23; each state, the two purples, the
-theme, sanitising, rewrite suppression, the lobby) and six tests in
-`reconnect_on_show.test.js` that drive the real page: status updates, a
-dropped socket, an exhausted reconnect, a closed session. Mutation targets
-are `favicon` (`favicon.js` × 17), `favicon-status` and `favicon-lobby` (the
-two wiring lines).
+Pinned by `tests/favicon.test.js` (31; each fact alone and in combination,
+grey only alone, the not-connected pattern, the colours that must not look
+alike, the theme, sanitising, rewrite suppression, the lobby) and seven tests
+in `reconnect_on_show.test.js` that drive the real page: status updates, two
+lights at once, a dropped socket, an exhausted reconnect, a closed session.
+Mutation targets are `favicon` (`favicon.js` × 24), `favicon-status` and
+`favicon-lobby` (the two wiring lines).
 
 ### A sent prompt is tracked by id, not by "did anything come back"
 

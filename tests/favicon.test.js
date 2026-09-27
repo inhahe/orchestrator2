@@ -6,7 +6,10 @@
  * red for not connected - whichever color disconnected shows up as in the
  * text, and one color for waiting to loop, maybe purple for that too since
  * that's the color 'loop' shows up in, but at a different spot from the
- * bg-wait purple?"
+ * bg-wait purple?"  Then: "add a yellow light to the browser tab icon for
+ * when it's compacting", and "multiple lights should be able to show at once
+ * if it's doing two things at once that show lights. for example, compacting
+ * during bg-wait."
  *
  * These drive static/favicon.js on its own.  That the page wires it up -- the
  * status bar feeding it, the lobby switching it off -- is checked in
@@ -84,133 +87,172 @@ function circles(svg) {
   });
 }
 
-/* The lit LED: {row, colour} -- and how many are off. */
+/* What the icon shows: "top=#..., middle=#..." for the lit LEDs, in rack
+ * order, or "" when none is.  Checks every LED is either lit or drawn off. */
 function lights(svg) {
   const all = circles(svg);
   const lamps = all.filter((c) => c.fill !== OFF && c.fill !== '#fff' && !c.opacity);
-  assert(lamps.length <= 1, `${lamps.length} lights on at once`);
-  return {
-    lit: lamps.length ? { row: ROW[lamps[0].cy], colour: lamps[0].fill } : null,
-    off: all.filter((c) => c.fill === OFF).length,
-  };
+  const off = all.filter((c) => c.fill === OFF).length;
+  assert(lamps.length + off === 3, `${lamps.length} lit + ${off} off is not three LEDs`);
+  return lamps.map((c) => `${ROW[c.cy]}=${c.fill}`).join(', ');
 }
 
 function shown(status, theme) {
   const p = page(theme);
   p.F.update(status);
   assert(p.svg, 'the icon was not replaced: ' + p.link.href);
-  return lights(p.svg).lit;
+  return lights(p.svg);
 }
 
-function is(lit, row, colour, what) {
-  assert(lit && lit.row === row && lit.colour === colour,
-         `${what}: expected the ${row} light ${colour}, got `
-         + (lit ? `the ${lit.row} light ${lit.colour}` : 'no light'));
+function is(status, expected, what, theme) {
+  const got = shown(status, theme);
+  assert(got === expected, `${what}: expected "${expected}", got "${got}"`);
 }
+
+const LOOP = 1790000000;
 
 console.log('\nfavicon\n');
 
-// ---- each state ----------------------------------------------------------
+// ---- each state on its own ----------------------------------------------
 
 test('working lights the top LED green', () => {
-  is(shown({ busy_class: 'working' }), 'top', GREEN, 'working');
+  is({ busy_class: 'working' }, `top=${GREEN}`, 'working');
 });
 
-test('compacting is working: it happens inside a turn', () => {
-  is(shown({ busy_class: 'compacting' }), 'top', GREEN, 'compacting');
+test('compacting lights the top LED yellow', () => {
+  // Yellow is also the status bar's compacting colour.
+  is({ busy_class: 'compacting' }, `top=${YELLOW}`, 'compacting');
 });
 
 test('bg-wait lights the middle LED purple', () => {
-  is(shown({ busy_class: 'bg-wait' }), 'middle', PURPLE, 'bg-wait');
+  is({ busy_class: 'bg-wait', bg_count: 2 }, `middle=${PURPLE}`, 'bg-wait');
 });
 
 test('waiting to loop lights the bottom LED, in the loop field\'s purple', () => {
-  is(shown({ busy_class: 'idle', wakeup_at: 1790000000 }), 'bottom', PURPLE,
-     'waiting to loop');
+  is({ busy_class: 'idle', wakeup_at: LOOP }, `bottom=${PURPLE}`, 'waiting to loop');
 });
 
 test('idle lights the top LED grey', () => {
-  is(shown({ busy_class: 'idle' }), 'top', GREY, 'idle');
+  is({ busy_class: 'idle' }, `top=${GREY}`, 'idle');
 });
 
-test('disconnected is yellow while it reconnects, as its text is', () => {
-  is(shown({ busy_label: 'disconnected', busy_class: 'reconnecting' }),
-     'top', YELLOW, 'reconnecting');
-});
-
-test('and red once it has given up, as its text then is', () => {
-  is(shown({ busy_label: 'disconnected', busy_class: 'shutdown' }),
-     'top', RED, 'given up');
-});
-
-test('connecting is yellow, as its text is', () => {
-  is(shown({ busy_class: 'connecting' }), 'top', YELLOW, 'connecting');
-});
-
-test('an error is red, as its text is', () => {
-  is(shown({ busy_class: 'error', busy_label: 'api error' }), 'top', RED, 'error');
+test('an error lights the top LED red, as its text is', () => {
+  is({ busy_class: 'error', busy_label: 'api error' }, `top=${RED}`, 'error');
 });
 
 test('a snapshot with no state reads as idle', () => {
-  is(shown({}), 'top', GREY, 'no busy_class');
+  is({}, `top=${GREY}`, 'no busy_class');
 });
 
-// ---- the two purples, and what outranks the loop ----------------------
+// ---- two things at once ---------------------------------------------------
 
-test('bg-wait and the loop are told apart by position', () => {
-  const bg = shown({ busy_class: 'bg-wait' });
-  const loop = shown({ busy_class: 'idle', wakeup_at: 1790000000 });
-  assert(bg.colour === loop.colour, 'the same purple, as the status bar has it');
-  assert(bg.row !== loop.row, `both lit the ${bg.row} LED`);
+test('compacting during bg-wait shows both', () => {
+  // The example the request gave.
+  is({ busy_class: 'compacting', bg_count: 1 },
+     `top=${YELLOW}, middle=${PURPLE}`, 'compacting with bg tasks');
 });
 
-test('a loop scheduled during a turn still shows working', () => {
-  is(shown({ busy_class: 'working', wakeup_at: 1790000000 }), 'top', GREEN,
-     'working with a loop armed');
+test('a turn with background tasks running shows both', () => {
+  is({ busy_class: 'working', bg_count: 3 },
+     `top=${GREEN}, middle=${PURPLE}`, 'working with bg tasks');
 });
 
-test('a loop scheduled during bg-wait still shows bg-wait', () => {
-  is(shown({ busy_class: 'bg-wait', wakeup_at: 1790000000 }), 'middle', PURPLE,
-     'bg-wait with a loop armed');
+test('a turn with a loop scheduled shows both', () => {
+  is({ busy_class: 'working', wakeup_at: LOOP },
+     `top=${GREEN}, bottom=${PURPLE}`, 'working with a loop');
 });
 
-test('a dropped connection outranks a scheduled loop', () => {
-  is(shown({ busy_class: 'reconnecting', wakeup_at: 1790000000 }), 'top', YELLOW,
-     'reconnecting with a loop armed');
+test('bg-wait with a loop scheduled shows both', () => {
+  is({ busy_class: 'bg-wait', bg_count: 1, wakeup_at: LOOP },
+     `middle=${PURPLE}, bottom=${PURPLE}`, 'bg-wait with a loop');
 });
 
-test('one light is on and the other two are off, in every state', () => {
-  for (const cls of ['working', 'bg-wait', 'idle', 'reconnecting', 'shutdown']) {
-    for (const loop of [false, true]) {
-      const p = page();
-      p.F.update(loop ? { busy_class: cls, wakeup_at: 1 } : { busy_class: cls });
-      const l = lights(p.svg);
-      assert(l.lit && l.off === 2, `${cls}${loop ? ' + loop' : ''}: `
-             + `${l.lit ? 1 : 0} on, ${l.off} off`);
-    }
-  }
+test('all three at once', () => {
+  is({ busy_class: 'compacting', bg_count: 1, wakeup_at: LOOP },
+     `top=${YELLOW}, middle=${PURPLE}, bottom=${PURPLE}`, 'everything');
+});
+
+test('an error with background tasks running shows both', () => {
+  is({ busy_class: 'error', bg_count: 1 },
+     `top=${RED}, middle=${PURPLE}`, 'error with bg tasks');
+});
+
+test('idle\'s grey never sits beside another light', () => {
+  // Grey means nothing is happening: with background tasks or a loop, it is
+  // not idle, it is waiting on them.
+  is({ busy_class: 'idle', wakeup_at: LOOP }, `bottom=${PURPLE}`, 'idle + loop');
+  is({ busy_class: 'idle', bg_count: 1 }, `middle=${PURPLE}`, 'idle + bg');
+});
+
+test('an older hub that sends no bg_count still shows bg-wait', () => {
+  is({ busy_class: 'bg-wait' }, `middle=${PURPLE}`, 'bg-wait without a count');
+});
+
+test('no background tasks, no middle light', () => {
+  is({ busy_class: 'working', bg_count: 0 }, `top=${GREEN}`, 'bg_count 0');
+});
+
+// ---- not connected ---------------------------------------------------------
+
+test('disconnected and reconnecting lights all three yellow, as its text is', () => {
+  is({ busy_label: 'disconnected', busy_class: 'reconnecting' },
+     `top=${YELLOW}, middle=${YELLOW}, bottom=${YELLOW}`, 'reconnecting');
+});
+
+test('and all three red once it has given up, as its text then is', () => {
+  is({ busy_label: 'disconnected', busy_class: 'shutdown' },
+     `top=${RED}, middle=${RED}, bottom=${RED}`, 'given up');
+});
+
+test('connecting is not connected yet: all three yellow', () => {
+  is({ busy_class: 'connecting' },
+     `top=${YELLOW}, middle=${YELLOW}, bottom=${YELLOW}`, 'connecting');
+});
+
+test('nothing else shows while not connected: it is not known', () => {
+  is({ busy_class: 'reconnecting', bg_count: 2, wakeup_at: LOOP },
+     `top=${YELLOW}, middle=${YELLOW}, bottom=${YELLOW}`, 'stale facts');
+});
+
+// ---- the same colour twice is told apart ----------------------------------
+
+test('background tasks and the loop are told apart by position', () => {
+  const bg = shown({ busy_class: 'bg-wait', bg_count: 1 });
+  const loop = shown({ busy_class: 'idle', wakeup_at: LOOP });
+  assert(bg !== loop, `both show "${bg}"`);
+});
+
+test('compacting and a dropped connection do not look alike', () => {
+  const compacting = shown({ busy_class: 'compacting' });
+  const dropped = shown({ busy_class: 'reconnecting' });
+  assert(compacting !== dropped, `both show "${compacting}"`);
+});
+
+test('an error and a lost connection do not look alike', () => {
+  assert(shown({ busy_class: 'error' }) !== shown({ busy_class: 'shutdown' }));
 });
 
 // ---- colours come from the theme --------------------------------------
 
 test('the lights are the theme\'s colours, not fixed ones', () => {
-  is(shown({ busy_class: 'working' }, { '--indicator-working': '#12ab34' }),
-     'top', '#12ab34', 'themed working');
-  is(shown({ busy_class: 'idle', wakeup_at: 1 },
-           { '--indicator-bg-wait': 'rgb(200, 100, 250)' }),
-     'bottom', 'rgb(200, 100, 250)', 'themed loop');
+  is({ busy_class: 'working' }, 'top=#12ab34', 'themed working',
+     { '--indicator-working': '#12ab34' });
+  is({ busy_class: 'idle', wakeup_at: 1 }, 'bottom=rgb(200, 100, 250)', 'themed loop',
+     { '--indicator-bg-wait': 'rgb(200, 100, 250)' });
+  is({ busy_class: 'compacting' }, 'top=#aabb00', 'themed compacting',
+     { '--indicator-compacting': '#aabb00' });
 });
 
 test('a theme value that is not a colour never reaches the icon', () => {
   const p = page({ '--indicator-working': '"/><script>alert(1)</script><x a="' });
   p.F.update({ busy_class: 'working' });
   assert(!/script/i.test(p.svg), 'the theme value was written into the SVG');
-  is(lights(p.svg).lit, 'top', GREEN, 'fell back to the default');
+  assert(lights(p.svg) === `top=${GREEN}`, 'did not fall back to the default');
 });
 
 test('the icon is a well-formed SVG image', () => {
   const p = page();
-  p.F.update({ busy_class: 'bg-wait' });
+  p.F.update({ busy_class: 'compacting', bg_count: 1, wakeup_at: LOOP });
   const doc = new p.win.DOMParser().parseFromString(p.svg, 'image/svg+xml');
   assert(!doc.getElementsByTagName('parsererror').length, 'the SVG does not parse');
   assert(doc.documentElement.nodeName === 'svg', 'not an <svg> document');
@@ -222,11 +264,11 @@ test('an unchanged state does not rewrite the icon', () => {
   // Status snapshots arrive every couple of seconds; rewriting the link each
   // time makes some browsers refetch and flicker the tab.
   const p = page();
-  p.F.update({ busy_class: 'working', busy_label: 'working (1s)' });
-  p.F.update({ busy_class: 'working', busy_label: 'working (3s)' });
-  assert(p.writes === 1, `wrote the icon ${p.writes} times for one state`);
-  p.F.update({ busy_class: 'idle' });
-  assert(p.writes === 2, 'a new state did not change the icon');
+  p.F.update({ busy_class: 'working', busy_label: 'working (1s)', bg_count: 1 });
+  p.F.update({ busy_class: 'working', busy_label: 'working (3s)', bg_count: 2 });
+  assert(p.writes === 1, `wrote the icon ${p.writes} times for one set of lights`);
+  p.F.update({ busy_class: 'working', bg_count: 0 });
+  assert(p.writes === 2, 'a light going out did not change the icon');
 });
 
 test('a tab with no session shows the plain icon, and keeps it', () => {
@@ -244,8 +286,8 @@ test('and lights up again once it has a session', () => {
   const p = page();
   p.F.setLanding(true);
   p.F.setLanding(false);
-  p.F.update({ busy_class: 'bg-wait' });
-  is(lights(p.svg).lit, 'middle', PURPLE, 'after attaching');
+  p.F.update({ busy_class: 'bg-wait', bg_count: 1 });
+  assert(lights(p.svg) === `middle=${PURPLE}`, 'after attaching: ' + lights(p.svg));
 });
 
 test('landing again after a state was shown really restores the icon', () => {
@@ -265,8 +307,7 @@ test('the plain icon is this same rack with every light off', () => {
   const F = page().F;
   assert(norm(PLAIN_SVG) === norm(F.svg(null)),
          'static/favicon.svg and favicon.js draw different racks');
-  const l = lights(F.svg(null));
-  assert(!l.lit && l.off === 3, `the plain icon has ${l.off} lights off`);
+  assert(lights(F.svg({})) === '', 'the plain icon has a light on');
 });
 
 console.log(`\n${ran - failures}/${ran} passed`);

@@ -3100,44 +3100,68 @@ CLIQUEUE_CHAT_MUTATIONS = [
 # The tab's icon shows the session's state.  tests/favicon.test.js.
 FAVICON_MUTATIONS = [
     ("working lights the wrong LED",
-     "      case 'compacting':   return { row: 'top', cssVar: '--indicator-working' };",
-     "      case 'compacting':   return { row: 'middle', cssVar: '--indicator-working' };"),
+     "    if (cls === 'working')         lit.top = '--indicator-working';",
+     "    if (cls === 'working')         lit.middle = '--indicator-working';"),
 
-    ("compacting reads as idle rather than working",
-     "      case 'working':\n      case 'compacting':",
-     "      case 'working':\n      case 'compacting-no':"),
+    ("compacting is lit in working's green",
+     "    else if (cls === 'compacting') lit.top = '--indicator-compacting';",
+     "    else if (cls === 'compacting') lit.top = '--indicator-working';"),
 
-    ("bg-wait and the loop share a position, so the two purples cannot be told apart",
-     "      case 'bg-wait':      return { row: 'middle', cssVar: '--indicator-bg-wait' };",
-     "      case 'bg-wait':      return { row: 'bottom', cssVar: '--indicator-bg-wait' };"),
+    ("compacting lights nothing",
+     "    else if (cls === 'compacting') lit.top",
+     "    else if (cls === 'compacting-no') lit.top"),
 
-    ("waiting to loop lights bg-wait's LED",
-     "          ? { row: 'bottom', cssVar: '--indicator-bg-wait' }",
-     "          ? { row: 'middle', cssVar: '--indicator-bg-wait' }"),
+    ("an error lights nothing",
+     "    else if (cls === 'error')      lit.top",
+     "    else if (cls === 'error-no')      lit.top"),
+
+    ("background tasks show only when idle -- compacting during bg-wait shows one light",
+     "    if (s.bg_count > 0 || cls === 'bg-wait') lit.middle",
+     "    if (cls === 'bg-wait') lit.middle"),
+
+    ("an older hub's bg-wait shows nothing",
+     "    if (s.bg_count > 0 || cls === 'bg-wait') lit.middle",
+     "    if (s.bg_count > 0) lit.middle"),
+
+    ("background tasks and the loop share a position",
+     "cls === 'bg-wait') lit.middle = '--indicator-bg-wait';",
+     "cls === 'bg-wait') lit.bottom = '--indicator-bg-wait';"),
 
     ("a scheduled loop is never shown",
-     "        return (status && typeof status.wakeup_at === 'number')",
-     "        return (false)"),
+     "    if (typeof s.wakeup_at === 'number')     lit.bottom",
+     "    if (false)     lit.bottom"),
 
-    ("idle is lit in another state's colour",
-     "          : { row: 'top', cssVar: '--indicator-idle' };",
-     "          : { row: 'top', cssVar: '--indicator-working' };"),
+    ("idle's grey is lit beside another light",
+     "    if (!lit.top && !lit.middle && !lit.bottom) lit.top = '--indicator-idle';",
+     "    if (!lit.top) lit.top = '--indicator-idle';"),
+
+    ("idle lights nothing",
+     "    if (!lit.top && !lit.middle && !lit.bottom) lit.top = '--indicator-idle';\n",
+     ""),
+
+    ("a dropped connection lights one yellow, the same as compacting",
+     "    if (cls === 'reconnecting') return _all('--system-warning');",
+     "    if (cls === 'reconnecting') return { top: '--system-warning' };"),
 
     ("reconnecting is red, though its text is yellow",
-     "      case 'reconnecting': return { row: 'top', cssVar: '--system-warning' };",
-     "      case 'reconnecting': return { row: 'top', cssVar: '--system-error' };"),
+     "    if (cls === 'reconnecting') return _all('--system-warning');",
+     "    if (cls === 'reconnecting') return _all('--system-error');"),
 
-    ("connecting is not shown as not connected",
-     "      case 'connecting':   return { row: 'top', cssVar: '--indicator-connecting' };",
-     "      case 'connecting-no': return { row: 'top', cssVar: '--indicator-connecting' };"),
+    ("a dropped connection still shows what was last known",
+     "    if (cls === 'reconnecting') return _all('--system-warning');\n",
+     ""),
 
-    ("a reconnect that gave up reads as idle",
-     "      case 'shutdown':\n      case 'error':",
-     "      case 'shutdown-no':\n      case 'error':"),
+    ("giving up is yellow, though its text is red",
+     "    if (cls === 'shutdown')     return _all('--system-error');",
+     "    if (cls === 'shutdown')     return _all('--system-warning');"),
 
-    ("an error reads as idle",
-     "      case 'shutdown':\n      case 'error':        return",
-     "      case 'shutdown':\n      case 'error-no':        return"),
+    ("connecting reads as idle",
+     "    if (cls === 'connecting')   return",
+     "    if (cls === 'connecting-no')   return"),
+
+    ("compacting has no colour when the theme gives none",
+     "    '--indicator-compacting': '#e5e510',\n",
+     ""),
 
     ("the theme is ignored: the lights are always the default colours",
      "    return COLOUR.test(v) ? v : FALLBACK[cssVar];",
@@ -3151,9 +3175,13 @@ FAVICON_MUTATIONS = [
      "    if (key === _key) return;\n",
      ""),
 
-    ("more than one LED lights",
-     "      if (name === row) {",
-     "      if (name !== null) {"),
+    ("a light going out does not change the icon",
+     "    const key = Object.keys(ROWS).map((r) => r + '=' + (lit[r] || '')).join(' ');",
+     "    const key = 'lit';"),
+
+    ("lit LEDs are drawn off and off ones lit",
+     "      if (colour) {",
+     "      if (!colour) {"),
 
     ("a tab with no session still lights up",
      "    if (_landing) return;\n",
