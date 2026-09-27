@@ -155,7 +155,11 @@ def test_no_you_echo_while_it_waits():
 
 def test_the_prompt_goes_out_when_the_ghost_turn_ends():
     """Declining is only safe because the end of the ghost turn re-pokes --
-    the same contract ``connect()`` has for the ``state.connecting`` case."""
+    the same contract ``connect()`` has for the ``state.connecting`` case.
+
+    It goes out ``TURN_END_SETTLE_S`` after the end rather than at it, in case
+    the CLI starts a turn of its own there (test_cli_queue_race.py)."""
+    import sdk_bridge
     br, state, _sent = _bridge()
 
     async def go():
@@ -165,7 +169,7 @@ def test_the_prompt_goes_out_when_the_ghost_turn_ends():
         waiter = asyncio.create_task(br._await_next_prompt())
         await asyncio.sleep(0.05)
         await _ghost_end(br)
-        return await asyncio.wait_for(waiter, 1.0)
+        return await asyncio.wait_for(waiter, sdk_bridge.TURN_END_SETTLE_S + 1.0)
 
     assert asyncio.run(go()) == "my prompt"
 

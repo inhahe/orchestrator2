@@ -576,6 +576,30 @@ html, body {
 .msg-user .msg-content {
   white-space: pre-wrap;
 }
+/* A prompt handed to a turn already running (history only). */
+.msg-user .msg-midturn {
+  font-weight: normal;
+  color: var(--text-muted);
+  cursor: help;
+}
+
+/* A message relayed from another session: someone else's words, so not in
+   the user's colour, and labelled with the sender. */
+.msg-peer {
+  background: var(--bg-msg-user);
+  border-left: 3px solid var(--purple);
+  align-self: flex-start;
+  max-width: 90%;
+}
+.msg-peer .msg-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--purple);
+  margin-bottom: 2px;
+}
+.msg-peer .msg-content {
+  white-space: pre-wrap;
+}
 
 /* Synthetic prompts the CLI harness injects (autonomous-loop ticks,
    /loop reschedules, system reminders, post-compact nudges).

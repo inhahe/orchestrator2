@@ -389,6 +389,25 @@ def _heavy_lock() -> asyncio.Lock:
 # should never have rung costs the user's attention.
 BG_DONE_BELL_GRACE = 10.0
 
+# --- A queued prompt waits for the CLI's own queue --------------------------
+#
+# The CLI keeps a queue of its own, separate from ours: messages from peer
+# sessions, background-task notifications.  It starts the head of that queue
+# the instant a turn ends, and a prompt of ours that arrives in the same
+# instant does not get a turn -- the CLI folds it into the one it just started
+# (a ``queued_command`` attachment, "the user sent a new message while you
+# were working").  Reported 2026-09-27: interrupted a ghost turn and sent a
+# message; the CLI had a peer's message queued three seconds earlier, started
+# it on the interrupt, and our prompt, sent 12 ms later, went into that turn.
+# The model answered the peer ("Reply sent.") and carried on; the user's
+# message was never answered.
+#
+# So a queued prompt is not sent until this long after a turn ends.  A turn the
+# CLI starts itself announces itself within milliseconds -- its first message
+# begins a ghost turn -- and the prompt then waits for that turn, getting one
+# of its own after it.  1.5 s costs a queued prompt nothing it would notice.
+TURN_END_SETTLE_S = 1.5
+
 # --- Recovering from a dead CLI subprocess ---------------------------------
 #
 # When ``claude.exe`` dies the session becomes a zombie: state is clean, the
@@ -829,6 +848,9 @@ class SDKBridge:
         # See _await_ghost_settled().
         self._ghost_settled = asyncio.Event()
         self._ghost_settled.set()
+        # When the last turn -- ours or a ghost -- ended (monotonic).  A queued
+        # prompt waits TURN_END_SETTLE_S past it; see _pop_queued_prompt().
+        self._turn_ended_at: float | None = None
 
         self._dispatcher_task: asyncio.Task | None = None
         self._worker_task: asyncio.Task | None = None
@@ -2775,6 +2797,18 @@ class SDKBridge:
             # what the harness is feeding into Claude.
             content = msg.content if hasattr(msg, "content") else None
 
+            # A message relayed from another session starts a turn of its own.
+            # Its text classifies as *typed by the user* -- it has no harness
+            # prefix -- so it used to be skipped here as a duplicate of an echo
+            # that never existed, and the user saw only the reply ("Reply
+            # sent.") to a message they were never shown.
+            peer = self._peer_origin(msg)
+            if peer is not None:
+                if not await self._begin_ghost_turn_if_needed():
+                    return
+                await self._broadcast_peer_message(peer, msg, during_turn=False)
+                return
+
             injected = self._extract_injected_text(msg)
             if injected is not None:
                 log.warning(
@@ -2929,6 +2963,81 @@ class SDKBridge:
             joined = "\n".join(parts)
             return joined if _classify_user_text(joined) == "injected_prompt" else None
         return None
+
+    @staticmethod
+    def _peer_origin(msg: Any) -> dict | None:
+        """The ``origin`` of a message relayed from another session, else None.
+
+        Read from provenance, not text: the CLI stamps ``origin.kind ==
+        "peer"`` on these, and the text itself carries no harness prefix, so
+        by content it is indistinguishable from something the user typed.
+        """
+        origin = getattr(msg, "origin", None)
+        if isinstance(origin, dict) and origin.get("kind") == "peer":
+            return origin
+        return None
+
+    async def _broadcast_peer_message(self, origin: dict, msg: Any, *,
+                                      during_turn: bool) -> None:
+        """Show a peer's message as the peer's -- who sent it, and what."""
+        body = origin.get("body")
+        if not isinstance(body, str) or not body.strip():
+            # The decoded body is the CLI's to give; without it, show the
+            # message as the model received it rather than nothing.
+            content = getattr(msg, "content", None)
+            if isinstance(content, str):
+                body = content
+            else:
+                body = "\n".join((getattr(b, "text", "") or "")
+                                 for b in (content or []))
+        name = origin.get("name") or origin.get("from") or "another session"
+        log.info("peer message from %s (%d chars)%s", name, len(body or ""),
+                 " during a turn" if during_turn else "")
+        await self.broadcast({
+            "type": "peer_message",
+            "name": name,
+            "body": (body or "").strip(),
+            "during_turn": during_turn,
+        })
+
+    async def _announce_if_not_our_turn(self, result: Any) -> None:
+        """Say so when the turn a run_turn waited on was not its prompt's.
+
+        ``ResultMessage.origin`` names what triggered the turn: absent (or
+        ``human``) for a prompt we sent, anything else for a turn the CLI
+        started itself.
+        """
+        origin = getattr(result, "origin", None)
+        if not isinstance(origin, dict):
+            return
+        kind = origin.get("kind")
+        if not kind or kind == "human":
+            return
+        if kind == "peer":
+            what = "a message from " + (origin.get("name") or "another session")
+        elif kind == "task-notification":
+            what = ("a scheduled task" if origin.get("subkind") == "scheduled-trigger"
+                    else "a background task finishing")
+        else:
+            what = "something the session started on its own"
+        log.warning("run_turn ended on a turn that was not ours: origin=%s", kind)
+        try:
+            await self.broadcast({
+                "type": "system_msg",
+                "subtype": "warning",
+                # Hedged on purpose: the CLI hands a queued prompt to the
+                # running turn at its next tool call, but runs it as the next
+                # turn if that one ends first -- and nothing on the stream
+                # says which.
+                "data": {"message": (
+                    f"That reply was to {what}, not to your message: the "
+                    f"session started that turn just as yours arrived, so "
+                    f"yours went in during it, or runs next. If nothing "
+                    f"answers it, send it again."
+                )},
+            })
+        except Exception as exc:
+            log.warning("not-our-turn notice failed: %r", exc)
 
     async def _broadcast_injected_prompt(self, text: str, *, during_turn: bool) -> None:
         """Surface a synthetic user prompt to the frontend."""
@@ -3404,6 +3513,7 @@ class SDKBridge:
         state.turn_started_at = None
         state.active_tools.clear()
         self._ghost_settled.set()
+        self._turn_ended_at = time.monotonic()
         # The prompt a parked worker declined to pop while this was
         # streaming is sendable now.  Nothing extra is needed here: the
         # queue-edit-done poke further down already exists for exactly
@@ -4465,12 +4575,17 @@ class SDKBridge:
                 elif isinstance(msg, UserMessage):
                     content = msg.content if hasattr(msg, "content") else None
 
+                    # A peer's message, when the turn it starts is the one this
+                    # run_turn is consuming (our prompt went in as it began).
+                    peer = self._peer_origin(msg)
                     # Synthetic prompts the harness fed to Claude
                     # (autonomous-loop ticks, /loop reschedules, system
                     # reminders) — surface them so the user can see
                     # what's actually entering the conversation.
-                    injected = self._extract_injected_text(msg)
-                    if injected is not None:
+                    injected = None if peer else self._extract_injected_text(msg)
+                    if peer is not None:
+                        await self._broadcast_peer_message(peer, msg, during_turn=True)
+                    elif injected is not None:
                         log.info("injected prompt during turn: %r", injected[:120])
                         await self._broadcast_injected_prompt(injected, during_turn=True)
                     elif isinstance(content, list):
@@ -4540,6 +4655,15 @@ class SDKBridge:
                     if interrupted:
                         await _finish_interrupt()
                         break
+
+                    # Whose turn that was.  Our prompts carry no origin; a
+                    # result naming one means the CLI ran a turn of its own
+                    # (a peer's message, a task notification) and our prompt
+                    # went into it mid-turn instead of getting a turn.  The
+                    # settle in _pop_queued_prompt makes that rare; when it
+                    # still happens, the user is told rather than left with a
+                    # reply to someone else.
+                    await self._announce_if_not_our_turn(msg)
 
                     subtype = getattr(msg, "subtype", None) or "unknown"
                     state.last_result_subtype = subtype
@@ -4755,6 +4879,7 @@ class SDKBridge:
             self.turn_active.clear()
             state.busy = False
             state.turn_started_at = None
+            self._turn_ended_at = time.monotonic()
             # Belt and braces: this turn consumed whatever was on the wire, so
             # no wind-down can still be outstanding.  Guarantees a stale clear
             # can never survive a turn and stall the next one.
@@ -5010,6 +5135,24 @@ class SDKBridge:
         state = self.state
         if not state.queued_prompts or state.queue_editing_index == 0:
             return None
+        # Not in the instant a turn ends: the CLI may be starting one of its
+        # own, and a prompt sent into that would be folded into it rather than
+        # get a turn (TURN_END_SETTLE_S).  If it does start one, that begins a
+        # ghost turn, and this prompt waits for it -- None is "wait for a
+        # poke", which every caller handles, and _end_ghost_turn pokes.
+        if self._turn_ended_at is not None:
+            wait = self._turn_ended_at + TURN_END_SETTLE_S - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+                if self.stop_event.is_set():
+                    return None
+                if state.busy or self.turn_active.is_set():
+                    log.info("queued prompt held: the CLI started a turn of its "
+                             "own as the last one ended (%d queued)",
+                             len(state.queued_prompts))
+                    return None
+                if not state.queued_prompts or state.queue_editing_index == 0:
+                    return None
         prompt = state.queued_prompts.popleft()
         state.queue_editing_index = None
         state.needs_user_attention = None

@@ -1377,6 +1377,68 @@ logs loudly.
 
 Tests: `tests/test_prompt_during_ghost_turn.py`; mutation target `ghostqueue`.
 
+### A prompt sent as the CLI starts a turn of its own
+
+The neighbouring race, from the other side: the ghost turn has *ended*, so
+`state.busy` is False and the decline above no longer applies. But the CLI
+keeps a queue of its own, separate from ours: messages from peer sessions and
+background-task notifications. It starts the head of that queue the instant a
+turn ends. Reported 2026-09-27 (session "OS D"), from the hub log plus the
+transcript:
+
+1. 11:41:50 — a message from peer session Lane-A arrives, and the CLI queues it.
+2. 11:41:52 — the user types a prompt during a ghost turn, and we hold it.
+3. 11:41:53.947 — the user's interrupt ends the ghost turn.
+4. Same second — the CLI starts Lane-A's turn.
+5. 11:41:53.959 — 12 ms later, we send the held prompt.
+6. The CLI folds it into Lane-A's turn as a `queued_command` attachment
+   ("The user sent a new message while you were working…").
+7. The model answers Lane-A ("Reply sent."), and the user's question is never
+   answered.
+
+On top of that, the user saw neither half. Live, Lane-A's message was dropped.
+After a reload, it appeared as a `You:` message, and the user's own message was
+gone.
+
+- **The race.** `_pop_queued_prompt`, the single exit for a queued prompt,
+  waits until `TURN_END_SETTLE_S` (1.5 s) has passed since `_turn_ended_at`,
+  which `_end_ghost_turn` and `run_turn`'s `finally` both set. A turn the CLI
+  starts announces itself within milliseconds: its first message begins a
+  ghost turn. The pop then returns None, which every caller treats as "wait for
+  a poke", and `_end_ghost_turn` pokes when that turn is over, so the prompt gets
+  a turn of its own after it.
+
+  A prompt typed at an idle session goes straight to the worker and does not
+  wait. Holding it would mean echoing it twice, and the collision needs both
+  events inside the same instant.
+- **Whose turn it was.** `ResultMessage.origin` is absent (or `human`) for a
+  turn we started, and names the trigger otherwise (`peer`,
+  `task-notification`, …). If `run_turn` ends on a result that isn't ours,
+  `_announce_if_not_our_turn` says so. The wording is hedged on purpose. The CLI
+  folds a waiting prompt in at the running turn's next tool call, but runs it as
+  the next turn if that one ends first, and nothing on the stream says which.
+- **Showing the peer's message.** `_classify_user_text` only knows harness
+  prefixes, and a peer's message has none, so it was taken for the user's own
+  text and skipped as an echo that never existed. It is now recognised by
+  provenance (`origin.kind == "peer"`) and broadcast as `peer_message
+  {name, body}`, using the decoded body the CLI provides. That happens between
+  turns (where it begins the ghost turn) and inside `run_turn` alike.
+  `chat.js` draws it as "✉ From <name>", as text, never markup. It is a
+  boundary for activity collapsing, since it starts a turn.
+- **History.** `render_session_history` reads the same `origin` from the
+  record, so a peer's message is no longer drawn as the user's. It also renders
+  the `queued_command` attachment — the only record the CLI keeps of a prompt it
+  folded into a running turn — as the user's message, marked `mid_turn`, where
+  the model saw it. Only `commandMode == "prompt"` is shown, and one whose
+  `source_uuid` is also a user record is skipped so nothing shows twice.
+
+`--replay-user-messages` would have announced the fold-in on the stream, but it
+echoes every user message and changes batching. That is too broad a change to
+make for this signal.
+
+Tests: `tests/test_cli_queue_race.py`, `tests/peer_message.test.js`; mutation
+targets `cliqueue-bridge`, `cliqueue-history`, `cliqueue-chat`.
+
 ### CLI-native commands are an exchange, not a turn
 
 `/rename` has to reach the running CLI (§8a, *A title is not the name…*), and

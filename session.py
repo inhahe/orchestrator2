@@ -2112,9 +2112,56 @@ def render_session_history(
             "is_history": True,
         })
 
+    # A prompt the CLI passed to a running turn is recorded as a
+    # ``queued_command`` attachment naming it (``source_uuid``) -- and, were it
+    # ever also recorded as a turn of its own, it must not show twice.
+    user_uuids = {r.get("uuid") for r in records
+                  if r.get("type") == "user" and r.get("uuid")}
+
     for rec in records:
         t = rec.get("type")
         msg = rec.get("message")
+
+        # --- A message relayed from another session ---
+        # Recorded as a user record, so by content it reads as the user's own
+        # -- which is how it was drawn: someone else's words in a "You" box.
+        # The CLI stamps its provenance on the record; use that.
+        origin = rec.get("origin") if t == "user" else None
+        if isinstance(origin, dict) and origin.get("kind") == "peer" \
+                and isinstance(msg, dict):
+            body = origin.get("body")
+            if not isinstance(body, str) or not body.strip():
+                body = _extract_text(msg.get("content"))
+            messages.append({
+                "type": "peer_message",
+                "name": origin.get("name") or origin.get("from") or "another session",
+                "body": (body or "").strip(),
+                "is_history": True,
+            })
+            rendered += 1
+            continue
+
+        # --- A prompt the user sent while a turn was running ---
+        # The CLI hands it to that turn instead of giving it one, and records
+        # only this attachment -- no user record.  Skipping it made a message
+        # the user had watched go out disappear on reload.
+        if t == "attachment":
+            att = rec.get("attachment")
+            if isinstance(att, dict) and att.get("type") == "queued_command" \
+                    and att.get("commandMode", "prompt") == "prompt" \
+                    and isinstance(att.get("prompt"), str) \
+                    and not (att.get("source_uuid") in user_uuids):
+                text = att["prompt"].strip()
+                classified = _classify_user_text(text) if text else "drop"
+                if classified != "drop":
+                    messages.append({
+                        "type": classified,
+                        "content": text,
+                        "mid_turn": True,
+                        "is_history": True,
+                    })
+                    rendered += 1
+            continue
 
         # --- User messages ---
         if t == "user" and isinstance(msg, dict):

@@ -106,6 +106,7 @@ const Chat = (() => {
     for (let i = kids.length - 1; i >= 0; i--) {
       const el = kids[i];
       if (el.classList.contains('msg-user') ||
+          el.classList.contains('msg-peer') ||
           el.classList.contains('msg-assistant') ||
           el.classList.contains('msg-turn-end') ||
           el.classList.contains('msg-injected') ||
@@ -589,6 +590,7 @@ const Chat = (() => {
   function _dispatchMessage(msg) {
     switch (msg.type) {
       case 'user_message':    _addUserMessage(msg.content, msg.local === true); break;
+      case 'peer_message':    _addPeerMessage(msg); break;
       case 'injected_prompt': _addInjectedPrompt(msg); break;
       case 'assistant_text':  _addAssistantText(msg); break;
       case 'tool_use':        _addToolUse(msg); break;
@@ -619,12 +621,20 @@ const Chat = (() => {
 
   // --- User messages ---
 
-  function _addUserMessage(content, local) {
+  function _addUserMessage(content, local, midTurn) {
     _flushStreaming();
     _collapseActivity();
     const el = document.createElement('div');
     el.className = 'msg msg-user';
-    el.innerHTML = `<div class="msg-label">You</div>
+    // *midTurn*: history of a prompt the session was handed during a turn
+    // that was already running, rather than given a turn of its own.  Placed
+    // where the model saw it, so the reply around it reads in order.
+    const label = midTurn
+      ? 'You <span class="msg-midturn" title="Sent while the session was '
+        + 'working: it was given to the turn already running, not a turn of '
+        + 'its own.">\u00b7 sent while it was working</span>'
+      : 'You';
+    el.innerHTML = `<div class="msg-label">${label}</div>
                     <div class="msg-content">${_esc(content)}</div>`;
     elMessages.appendChild(el);
     // Force scroll for a prompt the user just sent from *this* tab -- their own
@@ -644,6 +654,28 @@ const Chat = (() => {
       _cancelShortGap();
     }
     if (local) _autoScroll = true;
+    _scrollToBottom();
+  }
+
+  // --- A message relayed from another session ---
+  //
+  // Shown as the sender's, by name.  It starts a turn of its own, and the reply
+  // that follows ("Reply sent.") means nothing without it.  It used to be shown
+  // live not at all -- its text has no harness prefix, so it was taken for the
+  // user's own and skipped as an echo -- and in history as the user's own.
+
+  function _addPeerMessage(msg) {
+    const body = (msg && msg.body) || '';
+    if (!body) return;
+    _flushStreaming();
+    _collapseActivity();
+    const el = document.createElement('div');
+    el.className = 'msg msg-peer';
+    el.innerHTML = '<div class="msg-label"></div><div class="msg-content"></div>';
+    el.querySelector('.msg-label').textContent =
+      '\u2709 From ' + ((msg && msg.name) || 'another session');
+    el.querySelector('.msg-content').textContent = body;
+    elMessages.appendChild(el);
     _scrollToBottom();
   }
 
@@ -1308,7 +1340,9 @@ const Chat = (() => {
   function _renderHistoryMessage(m) {
     const type = m.type || m.role;
     if (type === 'user' || type === 'human') {
-      _addUserMessage(m.content || m.text || '');
+      _addUserMessage(m.content || m.text || '', false, m.mid_turn === true);
+    } else if (type === 'peer_message') {
+      _addPeerMessage(m);
     } else if (type === 'injected_prompt') {
       _addInjectedPrompt({ content: m.content || m.text || '' });
     } else if (type === 'assistant') {

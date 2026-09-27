@@ -1,5 +1,40 @@
 # Known issues / tech debt — orchestrator2
 
+## A message sent as the session started answering a peer went into that turn — FIXED (2026-09-27)
+
+> "in session 'OS D', i interrupted it, sent a message, it showed my message,
+> the ai responded with 'reply sent' and never showed me anything. then just
+> by accident i reloaded the page, and i didn't see my message shown, instead
+> i saw a message sent from another agent that wasn't showing before the
+> reload."
+
+The hub's log and the transcript show a race with the CLI's *own* queue.
+Lane A's message arrived and was queued inside the CLI. The user's prompt was
+held by the hub during a ghost turn. The interrupt ended that turn, and in the
+same instant the CLI started Lane A's turn. The hub sent the prompt 12 ms
+later, and the CLI folded it into Lane A's turn as a `queued_command` ("the
+user sent a new message while you were working"). The model answered Lane A
+("Reply sent.") and moved on.
+
+The user saw neither half. Live, Lane A's message was dropped: it has no
+harness prefix, so it was taken for the user's own text. On reload, it was
+drawn as a "You:" message, and the user's real message was gone, because the
+CLI records a folded-in prompt only as an attachment.
+
+Fixed (design.md §6, *A prompt sent as the CLI starts a turn of its own*):
+- a queued prompt waits 1.5 s after any turn ends, so a turn the CLI starts is
+  seen and waited for;
+- peer messages are recognised by `origin` and shown as "✉ From Lane-A", live
+  and in history;
+- a folded-in prompt shows in history, marked "sent while it was working";
+- if a turn the hub started still ends on someone else's result, the user is
+  told.
+
+Checked against the real transcript: history now reads interrupt → From
+Lane-A → ToolSearch → the user's message (mid-turn) → "Reply sent." Not
+exercised against a live CLI. The model's own thinking shows it took the
+user's point in and still didn't reply, and nothing here can make it.
+
 ## Restarting the hub ended every scheduled loop — FIXED (2026-09-27)
 
 Found while answering *"if i restart the server, the old session will die,

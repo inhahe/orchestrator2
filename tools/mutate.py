@@ -2963,6 +2963,140 @@ MOVESTOP_WAKEUP_MUTATIONS = [
      "    return None\n"),
 ]
 
+# A prompt sent as the CLI starts a turn of its own.  tests/test_cli_queue_race.py
+# and tests/peer_message.test.js.
+CLIQUEUE_BRIDGE_MUTATIONS = [
+    ("a queued prompt goes out the instant a turn ends -- the report",
+     "        if self._turn_ended_at is not None:\n"
+     "            wait = self._turn_ended_at + TURN_END_SETTLE_S - time.monotonic()",
+     "        if False:\n"
+     "            wait = self._turn_ended_at + TURN_END_SETTLE_S - time.monotonic()"),
+
+    ("it waits, but goes into the turn the CLI started anyway",
+     "                if state.busy or self.turn_active.is_set():\n"
+     "                    log.info(\"queued prompt held:",
+     "                if False:\n"
+     "                    log.info(\"queued prompt held:"),
+
+    ("a ghost turn's end does not start the settle",
+     "        self._ghost_settled.set()\n        self._turn_ended_at = time.monotonic()\n",
+     "        self._ghost_settled.set()\n"),
+
+    ("our own turn's end does not start the settle",
+     "            state.turn_started_at = None\n            self._turn_ended_at = time.monotonic()\n",
+     "            state.turn_started_at = None\n"),
+
+    ("a stopped bridge still sends the prompt",
+     "                if self.stop_event.is_set():\n                    return None\n"
+     "                if state.busy or self.turn_active.is_set():",
+     "                if state.busy or self.turn_active.is_set():"),
+
+    ("a head put under edit during the settle is sent half-typed",
+     "                if not state.queued_prompts or state.queue_editing_index == 0:\n"
+     "                    return None\n        prompt = state.queued_prompts.popleft()",
+     "        prompt = state.queued_prompts.popleft()"),
+
+    ("a peer's message is not recognised as one",
+     "        if isinstance(origin, dict) and origin.get(\"kind\") == \"peer\":\n"
+     "            return origin",
+     "        if isinstance(origin, dict) and origin.get(\"kind\") == \"peer-no\":\n"
+     "            return origin"),
+
+    ("between turns, a peer's message is still dropped",
+     "                await self._broadcast_peer_message(peer, msg, during_turn=False)\n",
+     "                pass\n"),
+
+    ("a peer's turn is shown but not marked running, so a prompt goes into it",
+     "            if peer is not None:\n"
+     "                if not await self._begin_ghost_turn_if_needed():\n"
+     "                    return\n",
+     "            if peer is not None:\n"),
+
+    ("inside our turn, a peer's message is still dropped",
+     "                        await self._broadcast_peer_message(peer, msg, during_turn=True)\n",
+     "                        pass\n"),
+
+    ("with no decoded body, an empty message is shown",
+     "            content = getattr(msg, \"content\", None)\n"
+     "            if isinstance(content, str):\n                body = content\n",
+     "            content = getattr(msg, \"content\", None)\n"
+     "            if isinstance(content, str):\n                body = \"\"\n"),
+
+    ("a turn that ended on someone else's result says nothing",
+     "                    await self._announce_if_not_our_turn(msg)\n",
+     ""),
+
+    ("our own turns are reported as someone else's",
+     "        if not kind or kind == \"human\":\n            return\n",
+     "        if not kind:\n            return\n"),
+
+    ("the notice does not say who the turn was for",
+     "            what = \"a message from \" + (origin.get(\"name\") or \"another session\")",
+     "            what = \"a message from another session\""),
+]
+
+CLIQUEUE_HISTORY_MUTATIONS = [
+    ("a peer's message is drawn in history as the user's own",
+     "        if isinstance(origin, dict) and origin.get(\"kind\") == \"peer\" \\\n",
+     "        if False and isinstance(origin, dict) \\\n"),
+
+    ("history shows the raw envelope rather than the peer's words",
+     "            body = origin.get(\"body\")\n            if not isinstance(body, str) or not body.strip():\n"
+     "                body = _extract_text(msg.get(\"content\"))",
+     "            body = None\n            if not isinstance(body, str) or not body.strip():\n"
+     "                body = _extract_text(msg.get(\"content\"))"),
+
+    ("a prompt passed to a running turn vanishes on reload -- the report",
+     "            if isinstance(att, dict) and att.get(\"type\") == \"queued_command\" \\\n",
+     "            if isinstance(att, dict) and att.get(\"type\") == \"queued_command-no\" \\\n"),
+
+    ("one that was also a turn is shown twice",
+     "                    and not (att.get(\"source_uuid\") in user_uuids):",
+     "                    and True:"),
+
+    ("a queued shell command is shown as a prompt",
+     "                    and att.get(\"commandMode\", \"prompt\") == \"prompt\" \\\n",
+     "                    and True \\\n"),
+
+    ("nothing marks it as sent while the session was working",
+     "                        \"mid_turn\": True,\n",
+     ""),
+]
+
+CLIQUEUE_CHAT_MUTATIONS = [
+    ("a live peer_message is not drawn at all",
+     "      case 'peer_message':    _addPeerMessage(msg); break;\n",
+     ""),
+
+    ("a history peer_message is not drawn",
+     "    } else if (type === 'peer_message') {\n      _addPeerMessage(m);\n",
+     ""),
+
+    ("the sender is not named",
+     "      '\\u2709 From ' + ((msg && msg.name) || 'another session');",
+     "      '\\u2709 From another session';"),
+
+    ("a peer's text is rendered as markup",
+     "    el.querySelector('.msg-content').textContent = body;",
+     "    el.querySelector('.msg-content').innerHTML = body;"),
+
+    ("an empty peer message draws an empty box",
+     "    const body = (msg && msg.body) || '';\n    if (!body) return;\n",
+     "    const body = (msg && msg.body) || '';\n"),
+
+    ("activity is folded together across a peer's message",
+     "          el.classList.contains('msg-peer') ||\n",
+     ""),
+
+    ("a mid-turn prompt loses its mark",
+     "      _addUserMessage(m.content || m.text || '', false, m.mid_turn === true);",
+     "      _addUserMessage(m.content || m.text || '', false, false);"),
+
+    ("every prompt in history is marked mid-turn",
+     "    const label = midTurn\n",
+     "    const label = true\n"),
+]
+
 # The tab's icon shows the session's state.  tests/favicon.test.js.
 FAVICON_MUTATIONS = [
     ("working lights the wrong LED",
@@ -3794,6 +3928,12 @@ TARGETS = {
                  MOVESTOP_MUTATIONS, "pytest"),
     "movestop-wakeup": ("wakeup_store.py", "tests/test_move_stops_original.py",
                         MOVESTOP_WAKEUP_MUTATIONS, "pytest"),
+    "cliqueue-bridge": ("sdk_bridge.py", "tests/test_cli_queue_race.py",
+                        CLIQUEUE_BRIDGE_MUTATIONS, "pytest"),
+    "cliqueue-history": ("session.py", "tests/test_cli_queue_race.py",
+                         CLIQUEUE_HISTORY_MUTATIONS, "pytest"),
+    "cliqueue-chat": ("static/chat.js", "tests/peer_message.test.js",
+                      CLIQUEUE_CHAT_MUTATIONS, "node"),
     "favicon": ("static/favicon.js", "tests/favicon.test.js",
                 FAVICON_MUTATIONS, "node"),
     "favicon-status": ("static/status.js", "tests/reconnect_on_show.test.js",
