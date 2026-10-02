@@ -2468,6 +2468,47 @@ The details that make the resume exact:
   for what it has not yet shown. `attached`'s `seq` is also never read as a
   message the tab has shown; a test caught exactly that bug.
 
+**One socket per tab.** Reported 2026-10-02: a session *"is showing a lot of
+things twice"*. Every prompt, tool call, thinking block and "Turn completed"
+line was drawn twice, and streamed text was written twice into one paragraph.
+The hub's log showed the tab resuming twice, a second apart, and from then on
+its sockets always closing in pairs. The page held two live sockets on one
+session, and the hub sent everything to both.
+
+The second socket came from waking. When Chrome wakes a tab it froze, the
+page's socket can already read as not open (`readyState` past OPEN) while its
+close *event* is still queued. `_onVisibilityChange` saw a socket that was not
+open and reconnected at once, as designed. Then the queued close arrived. Its
+handler assumed every close was the current socket's, and scheduled a second
+reconnect a second later. Every wake after that did the same, so the doubling
+never cleared. The log shows the pattern for two tabs that afternoon: a close,
+an unlogged resume within 110 ms (no `why`, because the page had not yet heard
+the close), and a second resume about a second after.
+
+- **A replaced socket has no say.** `_connect` wraps each handler in `own()`,
+  which acts only while that socket is still `ws`. A replaced socket's late
+  close is not news, so it neither reconnects nor shows "disconnected". What
+  it still delivers is ignored, because it is older than the new socket's
+  fresh snapshots and its messages come again in the resume. Its `error` is
+  not logged either.
+- **The replacement ends the old socket's prompt watch.** A `prompt_ack` goes
+  only to the socket that sent the prompt, so it can never come on the new
+  one. The old socket's close used to clear the watchdog. Now that close is
+  ignored, so `_connect` clears it instead. Otherwise the watchdog would close
+  the new, healthy socket for want of an ack.
+- **A numbered message is drawn at most once.** `_dispatch` drops any message
+  whose `seq` is at or before the tab's position. The hub numbers each
+  broadcast once, so a number seen twice is one message delivered twice. This
+  turns any future double delivery into nothing, not a duplicate. `attached`
+  is exempt, as before, and a new stream (another session, or a restarted hub)
+  resets the position, so its lower numbers are news.
+
+A page loaded before this fix keeps its doubled sockets until it is reloaded.
+Static files are served `no-store`, so F5 is enough. Tests: 12 under "one
+socket per tab" in `reconnect_on_show.test.js`. The fake socket's
+`dropUnheard()`/`hearClose()` model Chrome's ordering. Mutation target:
+`onesocket-app` (7, all caught).
+
 **Why it dropped, from now on.** A reconnecting tab adds the close code, how
 long it had been hidden, whether the page was frozen (the `freeze` event), or
 that the browser discarded and reloaded it (`document.wasDiscarded`). The hub

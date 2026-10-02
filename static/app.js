@@ -189,9 +189,29 @@ const App = (() => {
     // Don't flash the landing lobby while we wait for the open/new to attach.
     if (!rid && (openSid || newFlag)) Lobby.expectSession();
 
-    ws = new WebSocket(wsUrl);
+    // A prompt sent on the socket this one replaces is waiting for an ack
+    // that can only come on that socket.  Its close used to end the watch,
+    // but a replaced socket's close is ignored now (below), so the replacing
+    // ends it: left armed, the watchdog would close the new, healthy socket
+    // for want of an ack sent to the old one.
+    _clearPromptWatchdog();
 
-    ws.onopen = () => {
+    const sock = new WebSocket(wsUrl);
+    ws = sock;
+
+    // One socket per tab.  A socket's handlers speak for the tab only while
+    // it *is* the tab's socket, and one that has been replaced can still
+    // fire.  Chrome can wake a tab it froze with its socket's readyState no
+    // longer OPEN and the close event still to come, so `visibilitychange`
+    // reconnects first and the old close arrives after.  Its handler took
+    // that for the tab's socket dropping and reconnected again: two live
+    // sockets on one session, and a tab that drew everything twice
+    // (reported 2026-10-02).  So a replaced socket's close is not news, and
+    // what it still delivers -- older snapshots, messages the new socket's
+    // resume sends again -- is not the session's.
+    const own = (handler) => (e) => { if (sock === ws) handler(e); };
+
+    sock.onopen = own(() => {
       console.log('WebSocket connected');
       reconnectDelay = 1000;
       reconnectAttempt = 0;
@@ -216,9 +236,9 @@ const App = (() => {
           send(cwd ? { type: 'new', cwd } : { type: 'new' });
         }
       }
-    };
+    });
 
-    ws.onclose = (e) => {
+    sock.onclose = own((e) => {
       console.log('WebSocket closed:', e.code, e.reason);
       // Kept from the first close of a run of retries, so the report says
       // how the connection was lost, not how the last retry failed.
@@ -231,13 +251,13 @@ const App = (() => {
       _clearPromptWatchdog();
       _showConnectionStatus('disconnected');
       _scheduleReconnect();
-    };
+    });
 
-    ws.onerror = (e) => {
+    sock.onerror = own((e) => {
       console.error('WebSocket error:', e);
-    };
+    });
 
-    ws.onmessage = (e) => {
+    sock.onmessage = own((e) => {
       let msg;
       try {
         msg = JSON.parse(e.data);
@@ -246,7 +266,7 @@ const App = (() => {
         return;
       }
       _dispatch(msg);
-    };
+    });
   }
 
   function _scheduleReconnect() {
@@ -511,8 +531,13 @@ const App = (() => {
     // How far into its session's stream this tab has got (see _stream).  Not
     // from `attached`: its seq is where the stream stands, not a message this
     // tab has shown -- the attached handler below decides what it means.
-    if (type !== 'attached' && typeof msg.seq === 'number' && _stream
-        && msg.seq > _stream.seq) {
+    // A numbered message at or before that point has been drawn already, so
+    // it is dropped: the stream is numbered once, by the hub, and a number
+    // seen twice is one message delivered twice.  That is what two sockets on
+    // one session did (see _connect), and this keeps any route to it from
+    // drawing anything twice.
+    if (type !== 'attached' && typeof msg.seq === 'number' && _stream) {
+      if (msg.seq <= _stream.seq) return;
       _stream.seq = msg.seq;
     }
     // A broadcast this tab drew itself (its own prompt's echo): only the

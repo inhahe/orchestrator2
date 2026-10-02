@@ -131,6 +131,18 @@ function build(opts) {
       this.readyState = FakeWebSocket.CLOSED;
       if (this.onclose) this.onclose({ code, reason: 'test drop' });
     }
+    // Gone, as far as readyState says, but the page has not been told: the
+    // close event waits behind whatever runs first.  That is how Chrome wakes
+    // a tab it froze (see "one socket per tab").  `hearClose` delivers it.
+    dropUnheard(code = 1006) {
+      this.readyState = FakeWebSocket.CLOSED;
+      this.unheardClose = { code, reason: 'test drop' };
+    }
+    hearClose() {
+      const ev = this.unheardClose;
+      this.unheardClose = null;
+      if (ev && this.onclose) this.onclose(ev);
+    }
     deliver(obj) {
       if (this.onmessage) this.onmessage({ data: JSON.stringify(obj) });
     }
@@ -1329,6 +1341,182 @@ test('a new socket forgets what the last hub understood', (h) => {
   h.live.accept();                        // open, but not yet attached
   h.setHidden(true);
   assert(visibilitySent(h).length === 0, JSON.stringify(visibilitySent(h)));
+});
+
+/* ---- one socket per tab --------------------------------------------------- */
+
+// Reported 2026-10-02: a session "is showing a lot of things twice".  Every
+// prompt, tool call, thinking block and "Turn completed" line was drawn
+// twice, and streamed text was written twice into one paragraph.  The hub's
+// log had the tab resuming twice, a second apart, and from then on its
+// sockets always closing in pairs.  The page held two live sockets on one
+// session and drew what each of them delivered.
+//
+// The second socket came from waking.  Chrome drops the socket of a tab it has
+// frozen, and a page woken by being shown can find `readyState` CLOSED before
+// it is handed the close event.  `visibilitychange` reconnected at once, as it
+// should; then the old socket's close arrived, and its handler, which took any
+// close for the tab's current socket's, scheduled a reconnect of its own.
+
+function shownTimes(h, text) {
+  return h.win.document.getElementById('messages').textContent.split(text).length - 1;
+}
+
+// The tab is shown while Chrome wakes it: its socket is already gone, and the
+// page hears so only afterwards.  Returns the old socket.
+function wakesWithDeadSocket(h) {
+  const old = h.live;
+  h.setHidden(true);
+  old.dropUnheard(1006);
+  h.setHidden(false);
+  return old;
+}
+
+function info(text, seq) {
+  const m = { type: 'system_msg', subtype: 'info', data: { message: text } };
+  if (seq !== undefined) m.seq = seq;
+  return m;
+}
+
+function snapshot(state) {
+  return { type: 'status_update', status: { busy_class: state, busy_label: state } };
+}
+
+test('a close heard only after waking does not open a second socket', (h) => {
+  attachedAt(h, 'e1', 5);
+  const old = wakesWithDeadSocket(h);
+  const fresh = h.live;
+  assert(fresh !== old, 'showing the window did not reconnect');
+  fresh.accept();
+  old.hearClose();
+  h.advance(60000);                       // any backoff it scheduled
+  assert(h.live === fresh,
+         `${h.sockets.length - 2} more socket(s) opened beside the live one`);
+});
+
+test('nor does it report the live connection as down', (h) => {
+  attachedAt(h, 'e1', 5);
+  const old = wakesWithDeadSocket(h);
+  h.live.accept();
+  h.live.deliver(snapshot('idle'));
+  old.hearClose();
+  assert(stateText(h) === 'idle', 'state reads ' + JSON.stringify(stateText(h)));
+});
+
+test('what a replaced socket still delivers is not shown', (h) => {
+  // Anything queued behind its close: snapshots older than the new socket's,
+  // and messages the new socket's resume sends again.
+  attachedAt(h, 'e1', 5);
+  const old = wakesWithDeadSocket(h);
+  const fresh = h.live;
+  fresh.accept();
+  fresh.deliver(snapshot('working'));
+  old.deliver(snapshot('idle'));
+  assert(/working/.test(stateText(h)),
+         'an old snapshot won: ' + JSON.stringify(stateText(h)));
+  old.deliver(info('from the old socket'));
+  assert(shownTimes(h, 'from the old socket') === 0, 'drew a replaced socket\'s message');
+});
+
+test('the resume after waking is drawn once', (h) => {
+  // The report's shape: the same live message on both sockets.
+  attachedAt(h, 'e1', 5);
+  const old = wakesWithDeadSocket(h);
+  const fresh = h.live;
+  fresh.accept();
+  fresh.deliver({ type: 'attached', session: { rid: 's1', cwd: 'D:\\x' },
+                  epoch: 'e1', seq: 9, resumed: true });
+  old.hearClose();
+  h.advance(60000);
+  for (const sock of h.sockets) {
+    if (sock !== old) sock.deliver(info('Turn 21 completed', 6));
+  }
+  old.deliver(info('Turn 21 completed', 6));
+  assert(shownTimes(h, 'Turn 21 completed') === 1,
+         `drawn ${shownTimes(h, 'Turn 21 completed')} times`);
+});
+
+test('a replaced socket\'s failure is not logged as the tab\'s', (h) => {
+  // Chrome fires `error` before `close` on a socket that ended abnormally.
+  // For one already replaced it says nothing about the live connection.
+  attachedAt(h, 'e1', 5);
+  const old = wakesWithDeadSocket(h);
+  h.live.accept();
+  if (old.onerror) old.onerror({});
+  old.hearClose();
+  assert(h.errors.length === 0, 'logged: ' + h.errors.join(' | '));
+});
+
+test('a prompt sent on the replaced socket does not condemn the new one', (h) => {
+  // Its ack can only come on the socket it went out on.  That socket's close
+  // used to clear the watchdog; a close the tab no longer acts on must not
+  // leave it armed to close the new, healthy socket for want of that ack.
+  attachedAt(h, 'e1', 5);
+  typeCommand(h, 'hello there');
+  const old = wakesWithDeadSocket(h);
+  const fresh = h.live;
+  fresh.accept();
+  old.hearClose();
+  h.advance(10000);                       // past the watchdog's 8s
+  assert(fresh.readyState === 1, 'the watchdog closed the new socket');
+  assert(shownTimes(h, 'No response from the server') === 0,
+         'blamed the server for the old socket\'s silence');
+});
+
+test('a socket that closes while handshaking still reconnects', (h) => {
+  // The guard is "replaced", not "not yet open": a reconnect attempt that
+  // fails before it opens is the tab's socket, and its close is news.
+  attachedAt(h, 'e1', 5);
+  h.live.drop(1006);
+  h.advance(1500);
+  const attempt = h.live;
+  attempt.drop(1006);                     // refused before it ever opened
+  h.advance(60000);
+  assert(h.live !== attempt, 'a failed attempt was not retried');
+});
+
+/* A numbered message is drawn at most once.  `seq` was added so a tab can say
+ * how far it got; it says just as well what the tab has already drawn. */
+
+test('a numbered message delivered twice is drawn once', (h) => {
+  attachedAt(h, 'e1', 5);
+  h.live.deliver(info('said once', 6));
+  h.live.deliver(info('said once', 6));
+  assert(shownTimes(h, 'said once') === 1, `drawn ${shownTimes(h, 'said once')} times`);
+});
+
+test('a repeat does not move the tab back', (h) => {
+  attachedAt(h, 'e1', 5);
+  h.live.deliver(info('six', 6));
+  h.live.deliver(info('seven', 7));
+  h.live.deliver(info('six', 6));
+  reconnects(h);
+  assert(asked(h, 'resume') === 'e1.7', asked(h, 'resume'));
+});
+
+test('unnumbered messages are never taken for repeats', (h) => {
+  attachedAt(h, 'e1', 5);
+  h.live.deliver(info('said twice'));
+  h.live.deliver(info('said twice'));
+  assert(shownTimes(h, 'said twice') === 2, `drawn ${shownTimes(h, 'said twice')} times`);
+});
+
+test('a session switched to numbers its own stream', (h) => {
+  // A position belongs to one session's stream.  After a switch a lower
+  // number is the new session's news, not a repeat of the old one's.
+  attachedAt(h, 'e1', 500);
+  h.live.deliver({ type: 'attached', session: { rid: 's2', cwd: 'D:\\y' },
+                   epoch: 'e2', seq: 3 });
+  h.live.deliver(info('news from s2', 4));
+  assert(shownTimes(h, 'news from s2') === 1, 'took another session\'s message for a repeat');
+});
+
+test('as does a restarted hub', (h) => {
+  attachedAt(h, 'e1', 500);
+  reconnects(h);
+  attachedAt(h, 'e2', 3);                 // a full attach: a new stream
+  h.live.deliver(info('after the restart', 4));
+  assert(shownTimes(h, 'after the restart') === 1, 'took the new stream for a repeat');
 });
 
 console.log(`\n${passes}/${passes + failures} passed`);

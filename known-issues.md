@@ -1,5 +1,51 @@
 # Known issues / tech debt — orchestrator2
 
+## A session showed everything twice — FIXED (2026-10-02)
+
+> "session 'Hindsight integration with OS project' is showing a lot of things
+> twice"
+
+The screenshot showed every prompt, tool call, thinking block and "Turn 21
+completed" line twice, and one paragraph of streamed text written twice end to
+end. The tab (s9) had two live sockets on its session, and the hub sent
+everything to both. The log has the moment it started, 13:03:26: a close, a
+resume 50 ms later that carried no `why`, and a second resume 1.04 s after.
+From then on its sockets closed in pairs (13:32:00) and came back in pairs. s4's
+tab went the same way at 14:47:48.
+
+Cause, in `app.js`: when Chrome wakes a tab it froze, the page can find its
+socket no longer open before it is handed the close event. (The log shows it.
+The backoff waits at least a second, so the resume 50 ms after the close came
+from showing the tab. That path reconnects only a socket that is not open, and
+the resume carried no `why`, so the page had not yet heard the close.)
+Showing the tab reconnected at once, as designed. Then the old close arrived.
+Its handler took it for the current socket's and scheduled a reconnect of its
+own, a second later. Each socket's handlers acted for the tab even after the
+tab had replaced that socket.
+
+Fixed: a replaced socket's events are ignored (`own()` in `_connect`). The
+replacement clears the prompt watchdog that the old close used to clear. A
+numbered message at or before the tab's position is dropped, so no route to a
+double delivery can draw anything twice. Tabs loaded before the fix keep their
+doubled sockets until reloaded (F5). design.md §7, *One socket per tab*.
+
+## Hidden tabs reconnect once a minute — OPEN (found 2026-10-02)
+
+The hub's log on 2026-10-02 shows 1,237 tab reconnects by 15:00. Each hidden
+tab cycles once a minute. The hub sees the socket close with 1001 (sent by
+Chrome, not by the page, which closes its socket only from the prompt
+watchdog). About 1.9 s later the page reconnects, reporting 1006 and "page
+frozen meanwhile: yes". s7's tab did this 289 times in a day of being hidden.
+Each cycle is a cheap resume, but it writes four log lines (the log is 168 MB
+and does not rotate), pushes the session list to the lobby, and wakes the
+page. Each cycle is also a chance for the race in the entry above.
+
+The cause looks like Chrome's freezing of background tabs, not anything the
+hub or page does. Worth finding out before changing anything: whether Chrome's
+energy-saver or Memory Saver settings change it, and whether the page could
+stay connected through a freeze. Until then, the cheap mitigation is to log a
+repeat of the same tab's drop at debug level.
+
 ## `--resume` of a name that meant something else, or nothing, "joined" anyway — FIXED (2026-09-27)
 
 > "i tried to --resume "OS F" and it said there were two of that name. so i

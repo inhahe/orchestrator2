@@ -4904,6 +4904,42 @@ LAUNCHRESUME_SESSION_MUTATIONS = [
      "                if not sid:\n"),
 ]
 
+# One socket per tab, and a numbered message drawn at most once (2026-10-02:
+# a session "is showing a lot of things twice").  tests/reconnect_on_show.test.js,
+# "one socket per tab".  There is no mutation for the guard on `onopen`: a
+# socket is replaced only once it is closing or closed, and neither ever opens,
+# so no test can reach it.  It is there because the rule is "a replaced socket
+# has no say", not "no say except", and costs nothing.
+ONESOCKET_APP_MUTATIONS = [
+    ("a replaced socket still speaks for the tab -- the report",
+     "    const own = (handler) => (e) => { if (sock === ws) handler(e); };",
+     "    const own = (handler) => handler;"),
+
+    ("a replaced socket's late close opens another socket",
+     "    sock.onclose = own((e) => {",
+     "    sock.onclose = ((e) => {"),
+
+    ("what a replaced socket still delivers is drawn",
+     "    sock.onmessage = own((e) => {",
+     "    sock.onmessage = ((e) => {"),
+
+    ("a replaced socket's failure is logged as the tab's",
+     "    sock.onerror = own((e) => {",
+     "    sock.onerror = ((e) => {"),
+
+    ("a prompt sent on the replaced socket gets the new one closed",
+     "    _clearPromptWatchdog();\n\n    const sock = new WebSocket(wsUrl);",
+     "\n    const sock = new WebSocket(wsUrl);"),
+
+    ("a numbered message delivered twice is drawn twice",
+     "      if (msg.seq <= _stream.seq) return;\n",
+     ""),
+
+    ("only an older number counts as a repeat, so the latest is drawn twice",
+     "      if (msg.seq <= _stream.seq) return;\n",
+     "      if (msg.seq < _stream.seq) return;\n"),
+]
+
 
 TARGETS = {
     "chat": ("static/chat.js", "tests/hidden_window.test.js",
@@ -5116,6 +5152,8 @@ TARGETS = {
                             LAUNCHRESUME_CONFIG_MUTATIONS, "pytest"),
     "launchresume-session": ("session.py", "tests/test_launch_resume.py",
                              LAUNCHRESUME_SESSION_MUTATIONS, "pytest"),
+    "onesocket-app": ("static/app.js", "tests/reconnect_on_show.test.js",
+                      ONESOCKET_APP_MUTATIONS, "node"),
     "extauth": ("server.py",
                 "tests/test_external_access_policy.py tests/test_external_auth.py",
                 EXTAUTH_MUTATIONS, "pytest"),
