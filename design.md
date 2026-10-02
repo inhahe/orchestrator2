@@ -464,13 +464,39 @@ says so. The page is already dead, so its session stays up until closed from
 the lobby or the hub restarts. That was judged the right side to err on here
 as well.
 
-Known limitation, stated rather than papered over: a **laptop** suspending
-while its tab is in the *foreground* is not covered. Its page never said it was
-hidden, and from the hub that is indistinguishable from a crash.
+*And a page that says when it leaves is asleep unless it said so.* The rule
+above failed within a day. Reported 2026-09-28: *"i never closed my 'Good
+Photons' tab"*, and its session was idled out at 18:08. Chrome had the tab
+frozen, woke it at 18:02, and let it reconnect and resume; its socket went
+again a minute later. Neither signal the rule rests on held:
+
+- A page frozen again moments after reconnecting never gets to say it is
+  hidden, because `visibility` goes out only once `attached` is handled.
+- Real Chrome ends a sleeping tab's socket with **1005** (a Close frame with
+  no code) as well as 1006. The 1001/1006 split above was measured with a
+  test client, not with Chrome. Every drop the hub had spared was a 1005.
+
+So the question is turned round. Instead of recognising sleep, the hub is
+told about leaving. The page sends `{type: "leaving"}` from `pagehide`, which
+fires when a tab is closed, reloaded or navigated away, and never when it is
+frozen or discarded. It declares that it will with `?bye=1` on the connection
+URL, recorded at accept (`_says_bye_ws`) like the phone check, since a page
+may never send anything after connecting. For such a page,
+`_note_how_it_ended` counts any ending without `leaving` as asleep, whatever
+its close code and visibility. That also covers the laptop suspending with its
+tab in the foreground, and a network drop. A page without `bye=1` is from
+before the change, and keeps the rule above.
+
+The cost grows: a tab closed while Chrome has it frozen runs no `pagehide`,
+and neither does a crashed one, so their sessions stay until closed from the
+lobby or the hub restarts. Keeping a session is still the failure that costs
+nothing you cannot undo. Every tab ending is now logged, with its close code
+and the verdict, because nothing said why the Good Photons session went.
 
 Tests: `tests/test_asleep_tab.py` (each close kind hidden and visible, the
-timer, and the real endpoint) and four tests in `reconnect_on_show.test.js`;
-mutation targets `asleep-server` and `asleep-app`.
+timer, the real endpoint, and a page that says bye), plus the visibility and
+leaving tests in `reconnect_on_show.test.js`; mutation targets
+`asleep-server`, `asleep-app`, `bye-server` and `bye-app`.
 
 The runtime remembers whether its countdown is the mobile one (`idle_mobile`),
 so a deferral re-arms with the grace it was armed with rather than quietly
@@ -598,6 +624,47 @@ session still known-dead rather than restarting the budget on the next crash.
 `_is_transport_death()` matches on the message text, not just
 `CLIConnectionError`, so an ordinary turn error never costs a healthy CLI.
 `tests/test_dead_cli_recovery.py`.
+
+**A message too large to read is a death too — so the limit is far above any
+file.** Reported 2026-10-01: *"i got two claude cli errors in a short amount of
+time ... its status says 'working', but it doesn't seem to be doing
+anything."* A lane edited a 10.4 MB `known-issues.md`. An `Edit` result
+carries the whole file it changed (`originalFile` — on the stream, though the
+transcript keeps it only for small files), so the CLI's message describing
+the edit was over the 10 MB `max_buffer_size` the SDK had been given; the SDK's
+reader gave up on the stream, and the CLI had to be replaced. The new CLI
+picked the turn back up, made the same edit (its predecessor had died before
+saving the first one, so the transcript did not show it), and died the same
+way. The limit is now `config.MAX_SDK_MESSAGE_BYTES` (256 MB) for the session
+and its `/btw` forks: one message's worth of memory, held only while it is
+read.
+
+Three things the recovery said or did were wrong, and are fixed with it:
+
+- **The reason shown was the turn's, not the death's.** A death mid-turn
+  reaches `_recover_dead_transport` as `run_turn`'s "SDK dispatcher died
+  mid-turn". `_note_transport_death` now keeps what the first detector saw
+  (`_death_reason`), and `_death_explained` turns the buffer error into
+  words: one message over the limit, usually a tool result carrying a whole
+  file.
+- **A ghost turn outlived its CLI.** The second death came during the turn the
+  CLI had picked back up — a ghost turn, which only its `ResultMessage` ends.
+  The result never came, so the session read "working" with nothing running.
+  `reconnect()` now closes a ghost turn whose CLI it is replacing
+  (`_abandon_ghost_turn`: `_end_ghost_turn`'s state reset, without booking a
+  turn that never finished). A turn of ours is left alone: `run_turn`'s own
+  `finally` unwinds it.
+- **"Re-send your last prompt to continue" was said after every recovery** —
+  including when the CLI was about to finish the turn itself, and when the
+  turn had been one it started, with no prompt of the user's behind it. Now,
+  after a death mid-turn (`_last_reconnect_recovered`, §6e): the new CLI has
+  been asked to pick the turn back up, and says so when it does; if nothing
+  starts, send "continue"; and its last steps may not have been saved, so it
+  may repeat one already done — the report's edit landed twice. After a death
+  between turns: "Reconnected."
+
+Tests: `tests/test_dead_cli_recovery.py`; mutation targets `deadcli-recovery`,
+`deadcli-limit`, `deadcli-btw`.
 
 **The dying CLI's stderr is drained before the transport is closed.** Why
 `claude.exe` aborts is only ever explained on its stderr — the exit code is
@@ -727,6 +794,19 @@ Three things used to make opening a large session take ~42 s to show anything:
   messages are sent as `history` and the remainder as `history_prepend`, which
   `chat.js` renders into a detached container and inserts above, re-anchoring
   `scrollTop` by exactly the height added.
+
+**What arrives before the history waits for it.** A tab is a client of its
+session from the moment it attaches, so live messages reach it while its
+history is still being read -- and a large session's history waits behind its
+CLI's own read of the same file (the queue above), so everything the connect
+says arrives first. Drawn at once, it ended up *above* the history, scrolled
+out of sight: found 2026-09-29 with the notice that a session's last turn was
+cut off and is waiting (§6e), the one thing the user must see on opening it.
+So while "loading session…" shows, `chat.js` holds live chat messages as it
+already did during the batched replay (`_pendingMessages`), and draws them
+after the history -- or when loading ends without one, or the history is
+empty. A `clear_screen` drops what was held for the view it wipes.
+Tests: `history_backfill.test.js`; mutation target `cutoff-chat`.
 
 The cost of that boundedness: a `TodoWrite` further back than the cap is not
 found, so a very stale plan seeds nothing rather than seeding something wrong.
@@ -1188,62 +1268,116 @@ use — not the text.
 
 ---
 
-## 6e. Finishing a turn the CLI reports as interrupted
+## 6e. A turn the CLI reports as interrupted
 
 When the CLI resumes a session whose last turn was cut off mid-flight, its
 conversation-recovery layer appends a **synthetic** user message —
 `"Continue from where you left off."`, flagged `isMeta` — plus an assistant
-sentinel so the transcript stays API-valid if nothing acts on it.
+sentinel, `"No response requested."`, so the transcript stays API-valid if
+nothing acts on it. `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` makes it act: remove
+the pair, run the turn. (Interactively the user is offered the choice;
+non-interactively there is no chooser.) The CLI reads it as a boolean.
 
-Interactively the user is offered the choice, and accepting makes the CLI
-delete that pair and re-enqueue it as a real prompt. **Non-interactively there
-is no chooser**, so without intervention the pair simply stays: a prompt the
-user never typed, answered by a refusal to do anything, with the interrupted
-work quietly abandoned.
+**Who finishes the turn: whoever was watching it run.** From 2026-09-06 the
+variable was set on every connect: without it, history drew the pair as a
+prompt the user never typed answered by a refusal, and the work was abandoned.
+But it meant that *opening* a session set it working with nobody having asked.
+Reported 2026-09-29: *"sessions would often start working automatically when
+i resumed them, when i don't think they had had anything scheduled, and
+without showing me the prompt that caused it"*. The hub log said why: 17
+sessions opened by one hub were sent another launch's `--initial-prompt` (§ *A
+launch's `--initial-prompt`*), and 11 cut-off turns were finished by the CLI,
+none of them announced — the prompt went out first and disarmed the notice
+below. Asked what a resumed session should do: *wait for me*.
 
-`_make_options()` therefore sets **`CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`**,
-the supported opt-in for this path — remove the pair, re-enqueue it once, carry
-on. It defaults on because the alternative is not "do nothing", it is "leave
-the noise *and* drop the work". `--no-resume-interrupted-turn` opts out for
-anyone who wants to open an interrupted session without it acting immediately.
+So `_make_options(resume_id, recovering=)` sets it to `"1"` only for:
 
-**The transcript is left verbatim.** An earlier version of this fix also
-filtered the pair out of the replay; it was reverted on request, and rightly —
-this codebase has burned enough time on failures that were invisible, and
-hiding records makes the next diagnosis harder. The pair stays; the env var
-means it now gets acted on rather than abandoned.
+- a **recovery**: `reconnect()` when a turn was running here as the CLI went —
+  it died under the turn, or a stuck turn is reconnected (`/connect`). The
+  turn is one the user was watching run, and nobody opened anything. A death
+  is recorded when it is noticed (`_note_transport_death` sets
+  `_turn_cut_short`), because the turn has unwound by the time the reconnect
+  runs. `/model`, `/effort` and a CLI recycle reconnect too, but they wait for
+  a quiet moment, so they are not recoveries: a turn left waiting when the
+  session was opened is not finished by a model switch;
+- a **`/move`** (`_create_runtime(resume_interrupted_turn=True)`), which cut
+  the turn itself, and the original reopened when a move fails;
+- an open under **`--resume-interrupted-turn`**, the old behaviour, for a hub
+  or for one launch (it is in the hand-over, `_hub_launch_kwargs`).
+
+Everything else — the runtime's first connect, a `/resume` switch — sets it to
+`"0"`, explicitly, so an inherited `"1"` cannot turn it back on.
+
+**The tab says the turn is waiting.** Before the new CLI starts,
+`connect()` reads the transcript's end (`session.cut_off_turn`), and once the
+connect has worked `_announce_on_open` says what it found through
+`_post_open_notice` (§ *Background work that died with the session*):
+*"This session's last turn was cut off at 2:45 AM, while running Write. It
+began when a background task finished (Sep 28, 7:29 PM). It won't carry on by
+itself: send "continue" to pick it up where it stopped."*
+
+The CLI's own test cannot be asked: it runs inside the CLI and says nothing on
+the stream, and with the variable off it writes its pair only **when the next
+prompt goes out**, stamped with the resume's time (measured on the 2026-08-29
+transcripts). So `cut_off_turn` reads the tail the way the CLI's test does,
+simplified: the last word is a tool call with no result (`phase: "tool"`), a
+tool result or prompt the model never answered (`phase: "reply"`), or a prompt
+queued mid-turn. A finished reply, a turn that ended on an API error (the user
+saw it; the CLI would have re-run it — OS C and OS D on 2026-09-27 re-ran into
+the weekly limit), a meta message (a peer's), a compaction summary, and a
+command's records are not cut off. What an *earlier* resume wrote — its
+placeholder pair, its report of dead tasks — is looked past, so a session
+opened and closed again without a word still says so. The prompt that started
+the turn is found further back when the tail does not hold it (a lane's turn
+can run for hours; `TURN_START_SEARCH_BYTES`, parsing only user records):
+~100 ms on a 160 MB transcript. Run on the report's 11 pickups, it flags the 3
+that were cut off mid-turn, and none of the 8 that had ended on the weekly
+limit -- which the CLI re-ran every time the session was opened, straight into
+the limit again.
+
+**History draws the pair as what it is.** The transcript is left verbatim — an
+earlier fix that filtered the pair out of the replay was reverted on request:
+hiding records makes the next diagnosis harder. But the `isMeta` prompt is
+drawn as the harness's (a collapsed injected prompt), and the `<synthetic>`
+placeholder as a note — *"The session was cut off here, before this was
+answered, and the turn was not picked back up."* — not as the model refusing.
+A prompt the user typed, or a reply the model wrote, that happens to say the
+same is untouched.
 
 **Counter-intuitive when diagnosing:** the pair is the *last* thing in the
-transcript, so it reads as a parting shot from the dying process. It is the
-*first* thing the new one wrote — the recovery layer runs during session load,
-and the pair lands ~0.7 s before connect completes. Confirming that needs the
-transcript's UTC stamps aligned against `orchestrator2.log`'s local ones; the
-four-hour offset is enough to make a resume-time write look like a
-shutdown-time one. See `known-issues.md` for the measured timeline.
+transcript, so it reads as a parting shot from the dying process. It is
+written by the *new* one — as its connect completes when it runs the turn, or
+with the next prompt when it does not — and carries the resume's time either
+way. Aligning the transcript's UTC stamps against `orchestrator2.log`'s local
+ones takes the four-hour offset into account. See `known-issues.md`.
 
-**Recovering the turn is announced.** Acting on the pair means a session can
-start producing output with nobody having typed anything — open it from the
-lobby and it is simply *working*. Reported 2026-09-16 as "it was apparently
-still doing a turn, even though the tab had been closed for a long time". The
-recovery was correct; the silence was not. `_begin_ghost_turn_if_needed()` now
-emits a one-time `system_msg` — *"Continuing a turn that was interrupted before
-this session was last closed. Nothing was sent from here…"* — and names the
-interrupt button, because the work may be days old and no longer wanted.
+**A finished turn is announced.** When the CLI does finish one, a session
+starts producing output with nobody having typed anything. Reported
+2026-09-16 as "it was apparently still doing a turn, even though the tab had
+been closed for a long time". `_begin_ghost_turn_if_needed()` emits a one-time
+`system_msg` — *"Continuing a turn that was interrupted before this session
+was last closed. Nothing was sent from here…"* — and names the interrupt
+button, because the work may be old and no longer wanted.
 
 The signal is `_unprompted_resume_pending`, a single flag with three
-touchpoints: `_make_options()` arms it when the connect carries `resume=`,
-`run_turn()` clears it the moment a prompt goes out, and the ghost-turn path
-consumes it. So it is true in exactly one window — *connected with resume, have
-not asked for anything yet* — and a stream arriving in that window has no other
-possible author. That distinction matters because the **common** ghost turn is
-a background task's `<task-notification>` waking the model mid-session, and
-telling that user their turn had been interrupted would be a lie repeated
-several times a session. A reconnect re-arms it, since transport death
-mid-turn produces the same surprise and owes the same explanation. The
-`ghost turn begin` log line now carries `resumed_interrupted_turn=` so the two
-kinds stay distinguishable in forensics.
+touchpoints: `_make_options()` arms it when the connect carries `resume=` *and
+finishes a cut-off turn*, `run_turn()` clears it the moment a prompt goes out,
+and the ghost-turn path consumes it. So it is true in exactly one window —
+*connected to finish a turn, have not asked for anything yet* — and a stream
+arriving in that window has no other possible author. That distinction matters
+because the **common** ghost turn is a background task's `<task-notification>`
+waking the model mid-session, and telling that user their turn had been
+interrupted would be a lie repeated several times a session; for the same
+reason an opened session, which finishes nothing, never arms it. A reconnect
+re-arms it, since transport death mid-turn produces the same surprise and owes
+the same explanation. The `ghost turn begin` log line carries
+`resumed_interrupted_turn=`, and `connect:` says whether a cut-off turn is
+finished or waits.
 
-Tests: `tests/test_resumed_turn_notice.py`; mutation target `resumenotice`.
+Tests: `tests/test_resume_interrupted_turn.py`, `tests/test_cut_off_turn.py`,
+`tests/test_resumed_turn_notice.py`; mutation targets `resumeturn`,
+`resumenotice`, `cutoff-session`, `cutoff-bridge`, `cutoff-server`,
+`cutoff-config`.
 
 ### Background tasks that never end
 
@@ -1542,22 +1676,20 @@ is the same launch finishing in another process.
 afterwards. So it is on the panel while the session connects, and
 `_pop_queued_prompt` sends it with the echo. Handed over directly, it
 bypassed both echo points, and a tab that attached before the CLI wrote it to
-the transcript never showed it. A lost-work notice goes ahead of it
-(`appendleft`), because the notice is context for what the session does next;
-prompts typed during the connect go after it. It is not queued by a
-restarted worker (`skip_connect`, already delivered), and not when the queue
-restored from disk already holds it (a launch that never finished connecting,
-run again).
+the transcript never showed it. Prompts typed during the connect go after it.
+It is not queued by a restarted worker (`skip_connect`, already delivered),
+and not when the queue restored from disk already holds it (a launch that
+never finished connecting, run again).
 
-**A connect starts the settle.** A fresh CLI starts turns of its own at once:
-it reports the previous process's background tasks as stopped, and it re-runs
-a turn that was cut off (`CLAUDE_CODE_RESUME_INTERRUPTED_TURN`). The lanes'
-prompt went out 30-100 ms after connecting, into that turn. So `connect()`
-sets `_turn_ended_at` exactly as a turn end does. The first queued prompt after
+**A connect starts the settle.** A fresh CLI can start a turn of its own at
+once: it re-runs a turn that was cut off, on a connect that lets it
+(`CLAUDE_CODE_RESUME_INTERRUPTED_TURN`, §6e). The lanes' prompt went out
+30-100 ms after connecting, into that turn. So `connect()` sets
+`_turn_ended_at` exactly as a turn end does. The first queued prompt after
 *any* connect waits `TURN_END_SETTLE_S`, and waits for a turn the CLI starts
-inside it. That includes a reconnect, which orphans running tasks too. This
-also fixes the lost-work notice when there is no initial prompt, since it had
-the same collision.
+inside it. That includes a reconnect, which is where the CLI still finishes a
+cut-off turn. (The lost-work notice that used to collide the same way is gone:
+see *Background work that died with the session*.)
 
 Tests: `tests/test_initial_prompt.py`; mutation targets `initprompt-bridge`,
 `initprompt-server`.
@@ -1649,32 +1781,35 @@ count so a fourth save cannot quietly appear.
 trusted, the log says yes — 50,886 starts against 50,841 completions, ~4
 unexplained — but *"running when we last heard"* is still not *"failed"*: at
 04:01:34,445 on 2026-09-16 a teardown began and two tasks logged **completed**
-1 s and 2 s into it. So `describe_lost_bg_tasks()` names the tasks and how long
-each had been running, says the results are gone and the outcome is unknown,
-and tells the model to check for effects before re-running and not to wait.
-Claiming an outcome we cannot know is the one thing that would make the notice
-worth ignoring.
+1 s and 2 s into it. So the notice names the tasks, says the results are gone
+and whether they finished is unknown. Claiming an outcome we cannot know is the
+one thing that would make it worth ignoring.
 
-**It arrives as a queued prompt, at the front.** Going through
-`state.queued_prompts.appendleft()` buys the whole delivery for free: the
-deque's `on_change` persists it, its listener list pokes the worker (so it is
-sent immediately when nothing is running) and pushes the queue panel, so it is
-visible in the left pane like any other queued prompt. `appendleft` rather than
-`append` because it is *context for whatever the session does next*, not a task
-of its own — appended, a prompt queued earlier would be answered by a model
-still believing its background work was alive. Merging it with your own next
-prompt is deliberately not automatic; `merge all` in the queue pane already
-does that on request.
+**It tells the user; the CLI tells the model.** Until 2026-09-29 the loss also
+went to the model, as a prompt at the head of the queue (`appendleft`). Sent
+as a turn of its own, it set a session that had merely been *opened* working —
+one of the causes of *"sessions would often start working automatically when i
+resumed them"* (§6e). And by then it was a second account: the CLI itself now
+reports, on resume, every background task the previous process left
+unfinished — `<task-notification>` records with `status: stopped`, "didn't
+finish before the previous session ended" — queued with `shouldQuery: false`,
+so they go with the next prompt instead of starting a turn. Both CLIs in use
+do it (2.1.258, bundled with the SDK, and 2.1.280). So `_report_lost_bg_tasks`
+now only tells the tab, through `_post_open_notice` (below), and
+`_orphan_bg_tasks` only the browser, as it always had. `/clear` is covered by
+the same fact: its new CLI starts a new session, so it reports nothing to a
+model that has lost all memory of starting those tasks — the browser is told.
 
-**`/clear` is the one silent orphan path.** It wipes the conversation, so a
-model that has just lost all memory of *starting* those tasks cannot act on
-being told they were lost, and the notice would be the first thing in its
-brand-new context. The browser is still told. Every other caller -- a
-reconnect, a CLI that died for good, a resume -- leaves a model that still
-remembers the work, so all of them tell it.
+**Said to whoever looks, when they look.** An opened session's notices — these,
+and a turn left waiting (§6e) — go into `state.open_notices` as well as out to
+the tabs, and `_send_initial_state` replays them after the history to any tab
+that attaches later: the one that opened the session often is not there yet (a
+`--resume` launch's browser tab, a tab reloading after a hub restart). A new
+connect replaces them, and the next turn — ours or a ghost turn — clears them,
+since from then on they are history.
 
-Tests: `tests/test_lost_bg_tasks.py`; mutation targets `lostbg`,
-`lostbg-session`.
+Tests: `tests/test_lost_bg_tasks.py`, `tests/test_cut_off_turn.py`; mutation
+targets `lostbg`, `lostbg-session`, `cutoff-bridge`, `cutoff-server`.
 
 ## 6y. A resume that cannot happen
 
@@ -2388,6 +2523,26 @@ nobody. Two distinctions make it safe:
   second would race the Lobby reload-poll that is already running. Only our own
   patience running out is reversible. The flag is cleared in `reconnect()`; left
   stale it would make the *next* genuine shutdown look retryable.
+- **Nothing says "working" after the hub has gone.** Reported 2026-09-29: *"i
+  shut down the server, and two of my os sessions still said they were
+  working"*. After `server_shutdown`, the hub stops every session's CLI, which
+  takes seconds, and its status ticker went on sending each session's state
+  until the process exited. The tab applied the last "working" it was sent, and
+  with `_serverShutdown` latched nothing afterwards touched the bar. The input
+  also kept its stop button, because only a status update ever cleared
+  `_isBusy`. Now:
+  - The page ignores `status_update` once the hub has said it is going.
+  - `_nothingRunning()` takes the input and queue out of busy on
+    `server_shutdown` and when retries run out.
+  - On the hub side, `_broadcast_shutdown` stops the ticker (`_hub_going`), and
+    first sends each session's tabs a last full status reading "server
+    stopped". A page loaded before the fix drops its busy state too, and gets
+    every field, so a page older than the connection-only status keeps its
+    title.
+
+  Tests: `tests/test_shutdown_status.py` and three in
+  `reconnect_on_show.test.js`; mutation targets `shutstatus-server`,
+  `shutstatus-app`.
 
 Tested in `tests/hidden_window.test.js` (16 tests) and
 `tests/reconnect_on_show.test.js` (11 tests), which drive the real `chat.js` and
@@ -2681,8 +2836,9 @@ about how it does so matter:
 
 * **The original is stopped before the copy is taken**, so the copy starts from
   its final transcript, not a snapshot it then wrote past. A turn in flight is
-  cut. The copy's CLI picks it back up the way it does after a restart
-  (`CLAUDE_CODE_RESUME_INTERRUPTED_TURN`).
+  cut. The copy's CLI picks it back up (`CLAUDE_CODE_RESUME_INTERRUPTED_TURN`,
+  which the move asks for: `_create_runtime(resume_interrupted_turn=True)`,
+  since an ordinary open leaves a cut-off turn waiting -- §6e).
 * **This tab is detached first** (`_detach_ws`), so the evacuation does not send
   it to the lobby along with the tabs left behind: it follows the conversation.
   Any other tab still on the original is evacuated with a message naming where

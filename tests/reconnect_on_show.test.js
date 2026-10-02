@@ -1343,6 +1343,103 @@ test('a new socket forgets what the last hub understood', (h) => {
   assert(visibilitySent(h).length === 0, JSON.stringify(visibilitySent(h)));
 });
 
+/* ---- a tab says when it really leaves ------------------------------------ */
+
+// Reported 2026-09-28: "i never closed my 'Good Photons' tab", and its session
+// was idled out.  Chrome woke the frozen tab, let it reconnect, and froze it
+// again before it could say it was hidden.  So the tab now says "leaving"
+// when it really goes, having declared on its connection URL that it will,
+// and the hub takes any other ending for a tab asleep (server side:
+// tests/test_asleep_tab.py).
+
+function leavingSent(h, sock) {
+  return (sock || h.live).sent.map((d) => JSON.parse(d))
+    .filter((m) => m.type === 'leaving').length;
+}
+
+test('every socket declares that the tab says when it leaves', (h) => {
+  assert(asked(h, 'bye') === '1', 'first socket: bye=' + asked(h, 'bye'));
+  attachedAt(h, 'e1', 1);
+  reconnects(h, 1006);
+  assert(asked(h, 'bye') === '1', 'reconnect: bye=' + asked(h, 'bye'));
+});
+
+test('closing, reloading or navigating away says "leaving"', (h) => {
+  attachedAt(h, 'e1', 1, { hears: ['visibility', 'leaving'] });
+  h.win.dispatchEvent(new h.win.Event('pagehide'));
+  assert(leavingSent(h) === 1, 'sent ' + leavingSent(h));
+});
+
+test('nothing else does: hiding or freezing is not leaving', (h) => {
+  attachedAt(h, 'e1', 1, { hears: ['visibility', 'leaving'] });
+  h.setHidden(true);
+  h.win.document.dispatchEvent(new h.win.Event('freeze'));
+  h.setHidden(false);
+  assert(leavingSent(h) === 0, 'sent ' + leavingSent(h));
+});
+
+test('a hub that does not hear it is not sent it', (h) => {
+  attachedAt(h, 'e1', 1, { hears: ['visibility'] });
+  h.win.dispatchEvent(new h.win.Event('pagehide'));
+  assert(leavingSent(h) === 0, 'sent ' + leavingSent(h));
+});
+
+test('a socket already gone is not written to', (h) => {
+  attachedAt(h, 'e1', 1, { hears: ['visibility', 'leaving'] });
+  const gone = h.live;
+  gone.drop(1006);
+  h.win.dispatchEvent(new h.win.Event('pagehide'));
+  assert(leavingSent(h, gone) === 0 && h.errors.length === 0,
+         'wrote to a closed socket: ' + h.errors.join(' | '));
+});
+
+/* ---- a hub that has gone leaves nothing saying "working" -------------- */
+
+// Reported 2026-09-29: "i shut down the server, and two of my os sessions
+// still said they were working. and i think the one that said the server may
+// have shut down also said it was still working."
+
+function shows(h) {
+  const d = h.win.document;
+  return {
+    state: d.getElementById('status-state').textContent,
+    indicator: d.getElementById('status-indicator').className,
+    stopButton: !d.getElementById('interrupt-btn').classList.contains('hidden'),
+  };
+}
+
+test('a hub that shut down mid-turn leaves the tab saying so, not "working"', (h) => {
+  statusOf(h, { busy_class: 'working', busy_label: 'working' });
+  h.live.deliver({ type: 'server_shutdown', reason: 'Server shut down from the lobby.' });
+  // Its status ticker runs on while it stops the sessions, until it exits.
+  h.live.deliver({ type: 'status_update',
+                   status: { busy_class: 'working', busy_label: 'working' } });
+  h.live.drop(1006);
+  h.advance(60000);
+  const s = shows(h);
+  assert(s.state === 'server stopped', 'state reads ' + JSON.stringify(s.state));
+  assert(!/working/.test(s.indicator), 'indicator ' + s.indicator);
+  assert(!s.stopButton, 'the stop button is still up: nothing is running');
+});
+
+test('so does one that gave up reconnecting mid-turn', (h) => {
+  statusOf(h, { busy_class: 'working', busy_label: 'working' });
+  h.exhaustRetries();
+  const s = shows(h);
+  assert(/disconnected/.test(s.state), 'state reads ' + JSON.stringify(s.state));
+  assert(!s.stopButton, 'the stop button is still up: nothing is running');
+});
+
+test('and /connect after either lets the next hub say what is running', (h) => {
+  statusOf(h, { busy_class: 'working', busy_label: 'working' });
+  h.live.deliver({ type: 'server_shutdown', reason: 'Server shut down.' });
+  h.live.drop(1006);                      // the hub exits
+  h.win.__mods.App.reconnect();           // /connect, once one is back up
+  statusOf(h, { busy_class: 'working', busy_label: 'working' });
+  const s = shows(h);
+  assert(s.stopButton && /working/.test(s.indicator), JSON.stringify(s));
+});
+
 /* ---- one socket per tab --------------------------------------------------- */
 
 // Reported 2026-10-02: a session "is showing a lot of things twice".  Every

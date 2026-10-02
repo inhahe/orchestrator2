@@ -313,6 +313,9 @@ const Chat = (() => {
     _streamingEl = null;
     _streamingText = '';
     _loadingEl = null;   // was a child of elMessages, just cleared
+    // Held back for the view being wiped; drawn now, they would land in the
+    // next one.
+    _pendingMessages = [];
     _toolBlocks.clear();
     _cancelGap();
     _cancelShortGap();
@@ -575,16 +578,33 @@ const Chat = (() => {
 
   // --- Message dispatch ---
 
+  // What builds the view itself, and so is never held back behind it.
+  const _VIEW_MESSAGES = new Set(
+    ['history', 'history_prepend', 'session_loading', 'clear_screen']);
+
   function handleMessage(msg) {
     // Queue real-time messages while history replay is still rendering
-    // (batched via setTimeout) so they don't get interleaved mid-history.
-    if (_replayInProgress && msg.type !== 'history'
-        && msg.type !== 'history_prepend') {
+    // (batched via setTimeout) so they don't get interleaved mid-history --
+    // and while the history has yet to arrive at all ("loading session..."),
+    // so they don't land above it.  A large session's history waits behind
+    // its CLI's own read of the same file, so what the connect says arrives
+    // first; drawn then, it ended up above the history, scrolled out of sight.
+    // Found 2026-09-29, with the notice that a session's last turn was cut
+    // off and is waiting -- the one thing the user must see on opening it.
+    if ((_replayInProgress || _loadingEl) && !_VIEW_MESSAGES.has(msg.type)) {
       _pendingMessages.push(msg);
       return;
     }
 
     _dispatchMessage(msg);
+  }
+
+  // Draw what was held back, once nothing is being drawn in front of it.
+  function _flushPending() {
+    if (_replayInProgress || _loadingEl) return;
+    const pending = _pendingMessages;
+    _pendingMessages = [];
+    for (const m of pending) _dispatchMessage(m);
   }
 
   function _dispatchMessage(msg) {
@@ -607,7 +627,10 @@ const Chat = (() => {
       case 'bg_started':      _addBgStarted(msg); break;
       case 'bg_complete':     _addBgComplete(msg); break;
       case 'clear_screen':    clear(); break;
-      case 'session_loading': _setSessionLoading(msg.on); break;
+      case 'session_loading':
+        _setSessionLoading(msg.on);
+        if (!msg.on) _flushPending();   // no history is coming after all
+        break;
       case 'command_data':    _addCommandData(msg); break;
       case 'modal':           _openModal(msg); break;
       case 'bell':            _playBell(); break;
@@ -1368,7 +1391,7 @@ const Chat = (() => {
     _historyShown = (messages && messages.length) || 0;
     console.log('[history] _replayHistory called, messages:', messages ? messages.length : 0);
     _setSessionLoading(false);   // history is here — drop the placeholder
-    if (!messages || !messages.length) return;
+    if (!messages || !messages.length) { _flushPending(); return; }
 
     _replayInProgress = true;
 
@@ -1416,11 +1439,7 @@ const Chat = (() => {
 
         // Flush messages that arrived during replay.
         _replayInProgress = false;
-        const pending = _pendingMessages;
-        _pendingMessages = [];
-        for (const m of pending) {
-          _dispatchMessage(m);
-        }
+        _flushPending();
 
         _scrollToBottom();
       }

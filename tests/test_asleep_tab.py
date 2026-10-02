@@ -51,6 +51,8 @@ def clean(monkeypatch):
     monkeypatch.setattr(server, "_hidden_ws", set())
     monkeypatch.setattr(server, "_asleep_ws", set())
     monkeypatch.setattr(server, "_mobile_ws", set())
+    monkeypatch.setattr(server, "_says_bye_ws", set())
+    monkeypatch.setattr(server, "_leaving_ws", set())
     monkeypatch.setattr(server, "config", parse_args([]))     # 300 s / never
     monkeypatch.setattr(server, "_default_runtime", None)
 
@@ -151,9 +153,10 @@ def test_an_asleep_tab_gets_the_sleeping_grace_when_one_is_set(monkeypatch):
 # Through the real endpoint
 # --------------------------------------------------------------------------
 
-def _connect(monkeypatch, rt, frames, code):
+def _connect(monkeypatch, rt, frames, code, query=None):
     """One tab attached to *rt*: it sends *frames*, then its socket ends with
-    *code*.  Returns whether *rt*'s idle countdown was armed."""
+    *code*.  *query* is added to its connection URL's parameters.  Returns
+    whether *rt*'s idle countdown was armed."""
     server.build_app()                      # populates WebSocketDisconnect
     monkeypatch.setattr(server, "runtimes", {rt.rid: rt})
     monkeypatch.setattr(server, "_ws_runtime", {})
@@ -171,7 +174,7 @@ def _connect(monkeypatch, rt, frames, code):
 
     class FakeWS:
         headers: dict = {}
-        query_params = {"rid": rt.rid}
+        query_params = {"rid": rt.rid, **(query or {})}
 
         async def accept(self):
             pass
@@ -238,3 +241,89 @@ def test_the_hub_says_it_hears_visibility(monkeypatch):
     """The page sends it only to a hub that says so: an older one answers an
     unknown type with a line in the chat."""
     assert "visibility" in server.HUB_HEARS
+
+
+# --------------------------------------------------------------------------
+# A page that says when it leaves
+# --------------------------------------------------------------------------
+#
+# Reported 2026-09-28: "i never closed my 'Good Photons' tab, but it now says
+# 'This tab's session (Good Photons) was closed after 5 minutes with no tab
+# connected'".  Chrome had the tab frozen, woke it at 18:02, let it reconnect
+# and resume, and its socket went again a minute later; nothing marked it
+# asleep.  The page is frozen again moments after reconnecting, so it may never
+# get to say it is hidden, and real Chrome ends a sleeping tab's socket with
+# 1005 (every one the hub had spared) as well as 1006.  Now the page says
+# "leaving" when it really goes, having declared at connect (?bye=1) that it
+# will; any other ending is a tab asleep.
+
+BYE = {"bye": "1"}
+LEAVING = {"type": "leaving"}
+
+
+@pytest.mark.parametrize("code", [1000, 1001, 1005, 1006, None])
+def test_a_page_that_says_bye_is_asleep_however_it_ends(monkeypatch, code):
+    """The report: it never got to say it was hidden, and the close code was
+    no guide."""
+    assert _connect(monkeypatch, _rt(), [], code, query=BYE) is False
+
+
+@pytest.mark.parametrize("code", [1000, 1001, 1005, 1006, None])
+def test_unless_it_said_it_was_leaving(monkeypatch, code):
+    """Closed, reloaded or navigated away: its viewer left."""
+    assert _connect(monkeypatch, _rt(), [LEAVING], code, query=BYE) is True
+
+
+def test_what_it_said_about_being_hidden_is_beside_the_point(monkeypatch):
+    assert _connect(monkeypatch, _rt(), [SHOWN], 1006, query=BYE) is False
+    assert _connect(monkeypatch, _rt(), [HIDDEN, LEAVING], 1006, query=BYE) is True
+
+
+def test_a_page_from_before_keeps_the_old_rule(monkeypatch):
+    """No ?bye=1: it says nothing when it goes, so it is judged as before."""
+    assert _connect(monkeypatch, _rt(), [HIDDEN], 1001) is True
+    assert _connect(monkeypatch, _rt(), [HIDDEN], 1005) is False
+    assert _connect(monkeypatch, _rt(), [SHOWN], 1006) is True
+
+
+def test_only_bye_1_declares_it(monkeypatch):
+    assert _connect(monkeypatch, _rt(), [], 1001, query={"bye": "0"}) is True
+
+
+def test_the_hub_hears_a_page_say_it_is_leaving():
+    ws = _Ws()
+
+    assert asyncio.run(server._handle_lobby_message(ws, LEAVING)) is True, \
+        "not consumed: it would reach the chat"
+    assert ws in server._leaving_ws
+
+
+def test_the_hub_says_it_hears_leaving():
+    assert "leaving" in server.HUB_HEARS
+
+
+def test_nothing_is_left_behind_for_a_page_that_said_bye(monkeypatch):
+    _connect(monkeypatch, _rt(), [LEAVING], 1001, query=BYE)
+
+    assert not server._says_bye_ws and not server._leaving_ws
+
+
+@pytest.mark.parametrize("frames, code, says", [
+    ([], 1005, "went without saying it was leaving (close code 1005)"),
+    ([LEAVING], 1001, "left (it said so; close code 1001)"),
+])
+def test_every_ending_is_logged_with_its_close_code(monkeypatch, caplog,
+                                                     frames, code, says):
+    """Nothing said why the Good Photons session went, which is why it took
+    a transcript and a timeline to find out."""
+    with caplog.at_level("INFO", logger="orchestrator2"):
+        _connect(monkeypatch, _rt(), frames, code, query=BYE)
+
+    assert says in caplog.text
+
+
+def test_so_is_a_page_from_before(monkeypatch, caplog):
+    with caplog.at_level("INFO", logger="orchestrator2"):
+        _connect(monkeypatch, _rt(), [SHOWN], 1001)
+
+    assert "left (close code 1001; last said it was visible" in caplog.text

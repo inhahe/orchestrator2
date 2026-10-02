@@ -376,7 +376,7 @@ RECONNECT_MUTATIONS = [
      '                and not state.session_id):'),
 
     ("/clear discards the tasks without saying which",
-     '        await self._orphan_bg_tasks("/clear", tell_model=False)\n',
+     '        await self._orphan_bg_tasks("/clear")\n',
      ""),
 
     ("/clear leaves a deferred switch armed, so it reconnects a second time",
@@ -513,26 +513,70 @@ EXTAUTH_MUTATIONS = [
 ]
 
 RESUMETURN_MUTATIONS = [
-    ("an interrupted turn is abandoned again (the original bug)",
-     '        if getattr(self.config, "resume_interrupted_turn", True):\n'
-     '            kwargs["env"]["CLAUDE_CODE_RESUME_INTERRUPTED_TURN"] = "1"',
-     ""),
+    ("opening a session finishes its cut-off turn again -- the 2026-09-29 report",
+     '        finish = recovering or bool(\n'
+     '            getattr(self.config, "resume_interrupted_turn", False))',
+     "        finish = True"),
 
-    ("the opt-out is ignored, so it always resumes",
-     '        if getattr(self.config, "resume_interrupted_turn", True):',
-     "        if True:"),
+    ("a recovery leaves its own turn waiting, abandoning work the user watched run",
+     '        finish = recovering or bool(\n'
+     '            getattr(self.config, "resume_interrupted_turn", False))',
+     '        finish = bool(\n'
+     '            getattr(self.config, "resume_interrupted_turn", False))'),
 
-    ("it defaults off, so the default install keeps the phantom prompt",
-     '        if getattr(self.config, "resume_interrupted_turn", True):',
-     '        if getattr(self.config, "resume_interrupted_turn", False):'),
+    ("--resume-interrupted-turn is ignored",
+     '        finish = recovering or bool(\n'
+     '            getattr(self.config, "resume_interrupted_turn", False))',
+     "        finish = recovering"),
+
+    ("a config without the field finishes it",
+     '            getattr(self.config, "resume_interrupted_turn", False))',
+     '            getattr(self.config, "resume_interrupted_turn", True))'),
+
+    ("off is left out, so an inherited 1 turns it back on",
+     '        kwargs["env"]["CLAUDE_CODE_RESUME_INTERRUPTED_TURN"] = "1" if finish else "0"',
+     '        if finish:\n'
+     '            kwargs["env"]["CLAUDE_CODE_RESUME_INTERRUPTED_TURN"] = "1"'),
 
     ("the env var name is misspelled, so the CLI ignores it",
-     '            kwargs["env"]["CLAUDE_CODE_RESUME_INTERRUPTED_TURN"] = "1"',
-     '            kwargs["env"]["CLAUDE_CODE_RESUME_INTERRUPTED"] = "1"'),
+     '        kwargs["env"]["CLAUDE_CODE_RESUME_INTERRUPTED_TURN"] = "1" if finish else "0"',
+     '        kwargs["env"]["CLAUDE_CODE_RESUME_INTERRUPTED"] = "1" if finish else "0"'),
 
     ("setting it clobbers the rest of the subprocess environment",
-     '            kwargs["env"]["CLAUDE_CODE_RESUME_INTERRUPTED_TURN"] = "1"',
-     '            kwargs["env"] = {"CLAUDE_CODE_RESUME_INTERRUPTED_TURN": "1"}'),
+     '        kwargs["env"]["CLAUDE_CODE_RESUME_INTERRUPTED_TURN"] = "1" if finish else "0"',
+     '        kwargs["env"] = {"CLAUDE_CODE_RESUME_INTERRUPTED_TURN": "1" if finish else "0"}'),
+
+    ("reconnect is never a recovery, so a CLI that died mid-turn abandons it",
+     "        await self.connect(resume_id=sid, recovering=recovering)",
+     "        await self.connect(resume_id=sid)"),
+
+    ("a death mid-turn is not remembered, so the turn is abandoned",
+     "        self._turn_cut_short = self.turn_active.is_set() or bool(self.state.busy)",
+     "        self._turn_cut_short = False"),
+
+    ("every reconnect is a recovery, so a /model switch finishes a turn left "
+     "waiting when the session was opened",
+     "        recovering = (self._turn_cut_short or self.turn_active.is_set()\n"
+     "                      or bool(self.state.busy))",
+     "        recovering = True"),
+
+    ("reconnecting a stuck turn abandons it",
+     "        recovering = (self._turn_cut_short or self.turn_active.is_set()\n"
+     "                      or bool(self.state.busy))",
+     "        recovering = self._turn_cut_short"),
+
+    ("a death is remembered forever, so every later reconnect finishes turns",
+     "        self._turn_cut_short = False\n        self._last_reconnect_recovered = recovering\n",
+     "        self._last_reconnect_recovered = recovering\n"),
+
+    ("the ghost-turn notice is armed on every resume, calling a peer's message "
+     "a recovered turn",
+     '        self._unprompted_resume_pending = bool(kwargs.get("resume")) and finish',
+     '        self._unprompted_resume_pending = bool(kwargs.get("resume"))'),
+
+    ("the connect is never told whether it finishes one",
+     "        self._finishing_cut_off_turn = finish\n",
+     ""),
 ]
 
 BACKFILL_MUTATIONS = [
@@ -1742,8 +1786,8 @@ RESUMENOTICE_MUTATIONS = [
      "        pass"),
 
     ("a brand-new session with nothing to resume announces a recovery",
-     '        self._unprompted_resume_pending = bool(kwargs.get("resume"))',
-     "        self._unprompted_resume_pending = True"),
+     '        self._unprompted_resume_pending = bool(kwargs.get("resume")) and finish',
+     "        self._unprompted_resume_pending = finish"),
 
     ("sending a prompt no longer disarms it, so the user's own first turn "
      "on a resumed session is labelled a recovery",
@@ -1786,20 +1830,36 @@ RESUMENOTICE_MUTATIONS = [
 
 
 LOSTBG_MUTATIONS = [
-    ("the notice is appended, so a prompt queued earlier is answered by a "
-     "model that still thinks its background work is alive",
-     "        self.state.queued_prompts.appendleft(text)",
-     "        self.state.queued_prompts.append(text)"),
+    ("a resumed session is told nothing -- the 2026-09-16 report, restored",
+     '        await self._post_open_notice("warning", (\n'
+     '            f"{len(labels)} background task{plural} {was} running when this "',
+     '        (lambda *a: None)("warning", (\n'
+     '            f"{len(labels)} background task{plural} {was} running when this "'),
 
-    ("a resumed session is told nothing -- the reported bug, restored",
-     "        self._queue_lost_bg_notice(\n"
-     '            items, "this session was cut off and has just been resumed")',
-     "        pass"),
+    ("the loss is sent to the model as a prompt again, which sets an opened "
+     "session working -- the 2026-09-29 report",
+     '            f"next prompt it gets."\n        ))\n        return len(labels)',
+     '            f"next prompt it gets."\n        ))\n'
+     '        self.state.queued_prompts.appendleft("[orchestrator2] lost tasks")\n'
+     '        return len(labels)'),
 
-    ("a reconnect still tells only the browser, so the model keeps waiting on "
-     "dead TaskOutput handles",
-     '        if tell_model:\n            self._queue_lost_bg_notice(\n                items, f"this session\'s CLI was replaced ({why})")',
-     '        if False:\n            pass'),
+    ("the notice claims the tasks failed, which the log disproves: two "
+     "completed 1 s and 2 s into a teardown",
+     '            f"they finished is unknown. The session is told along with the "',
+     '            f"they were aborted. The session is told along with the "'),
+
+    ("a tab that opens after the resume is not told",
+     "        self.state.open_notices.append(notice)\n",
+     ""),
+
+    ("a reconnect sends the model the loss too, a second account of what the "
+     "new CLI reports",
+     '                f"completion notices are lost. Re-run anything you still need."\n'
+     '            )},\n        })\n        return len(labels)',
+     '                f"completion notices are lost. Re-run anything you still need."\n'
+     '            )},\n        })\n'
+     '        self.state.queued_prompts.appendleft("[orchestrator2] lost tasks")\n'
+     '        return len(labels)'),
 
     ("the record is never written, so a torn-down session comes back knowing "
      "nothing",
@@ -1846,33 +1906,9 @@ LOSTBG_MUTATIONS = [
     #    is an early-out, so the only thing its removal costs is a stat().
     #    The gate that actually matters is covered by the session.py target.
 
-    ('/clear hands a freshly wiped context a notice about work it has just lost all memory of starting',
-     '        await self._orphan_bg_tasks("/clear", tell_model=False)',
-     '        await self._orphan_bg_tasks("/clear", tell_model=True)'),
 ]
 
 LOSTBG_SESSION_MUTATIONS = [
-    ("the notice claims the tasks failed, which the log disproves: two "
-     "completed 1 s and 2 s into a teardown",
-     '        "unknown: a task can complete in the seconds while a session is being "',
-     '        "certain -- they were aborted. No task completes while a session is being "'),
-
-    ("the model is not told to stop waiting, so it parks on a notification "
-     "nobody can send",
-     '        "(files written, commits made, processes still running) before "\n'
-     '        "re-running anything, and do not wait on them."',
-     '        "(files written, commits made, processes still running)."'),
-
-    ("it is told to re-run blindly, losing whatever a finished task committed",
-     '        "torn down. Do not assume either way. Check for their effects "',
-     '        "torn down. Re-run them all now, ignoring their effects "'),
-
-    ("durations are dropped, so \"a task was running\" replaces \"had been "
-     "running for 40 minutes\"",
-     '            mins = max(0, int((now - started) // 60))\n'
-     '            lines.append(f"- {label} (running for {mins} min at that point)")',
-     '            lines.append(f"- {label}")'),
-
     ("monotonic clocks are persisted raw, so every restored duration is "
      "nonsense in the new process",
      "            started_wall = now_wall - max(0.0, now_mono - started)",
@@ -1930,8 +1966,10 @@ GHOSTQUEUE_MUTATIONS = [
 
     ("the ghost turn never reports itself finished, so every later turn waits "
      "out the full timeout",
-     "        state.active_tools.clear()\n        self._ghost_settled.set()",
-     "        state.active_tools.clear()"),
+     "        state.active_tools.clear()\n        self._ghost_settled.set()\n"
+     "        self._turn_ended_at = time.monotonic()\n        # The prompt a parked worker",
+     "        state.active_tools.clear()\n"
+     "        self._turn_ended_at = time.monotonic()\n        # The prompt a parked worker"),
 
     ("a streaming ghost turn is not recorded, so run_turn's guard never fires",
      "        state.turn_started_at = time.monotonic()\n"
@@ -2593,9 +2631,9 @@ RESUMEFAIL_MUTATIONS = [
      "point",
      "            self.state.expected_resume_sid = None\n"
      "\n"
-     "        # A resumed session can start streaming with no prompt from us; arm",
+     "        # A resumed session whose CLI finishes a cut-off turn starts streaming",
      "\n"
-     "        # A resumed session can start streaming with no prompt from us; arm"),
+     "        # A resumed session whose CLI finishes a cut-off turn starts streaming"),
 ]
 
 RESUMELIST_MUTATIONS = [
@@ -2968,8 +3006,8 @@ MOVESTOP_WAKEUP_MUTATIONS = [
 # tests/test_asleep_tab.py and tests/reconnect_on_show.test.js.
 ASLEEP_SERVER_MUTATIONS = [
     ("a tab the browser put to sleep is never marked asleep -- the request",
-     "    _asleep_ws.add(ws)\n    rt = _ws_runtime.get(ws)",
-     "    rt = _ws_runtime.get(ws)"),
+     "    _asleep_ws.add(ws)\n    log.info(\"tab for %s was dropped in the background",
+     "    log.info(\"tab for %s was dropped in the background"),
 
     ("any abnormal close counts: a tab killed as you look at it is kept too",
      "    if code in _DELIBERATE_CLOSES or ws not in _hidden_ws:",
@@ -3008,8 +3046,8 @@ ASLEEP_SERVER_MUTATIONS = [
      ""),
 
     ("the hub never says it hears visibility, so no page sends it",
-     "HUB_HEARS = [\"visibility\"]",
-     "HUB_HEARS = []"),
+     "HUB_HEARS = [\"visibility\", \"leaving\"]",
+     "HUB_HEARS = [\"leaving\"]"),
 ]
 
 ASLEEP_APP_MUTATIONS = [
@@ -3221,8 +3259,9 @@ CLIQUEUE_BRIDGE_MUTATIONS = [
      "                    log.info(\"queued prompt held:"),
 
     ("a ghost turn's end does not start the settle",
-     "        self._ghost_settled.set()\n        self._turn_ended_at = time.monotonic()\n",
-     "        self._ghost_settled.set()\n"),
+     "        self._ghost_settled.set()\n        self._turn_ended_at = time.monotonic()\n"
+     "        # The prompt a parked worker",
+     "        self._ghost_settled.set()\n        # The prompt a parked worker"),
 
     ("our own turn's end does not start the settle",
      "            state.turn_started_at = None\n            self._turn_ended_at = time.monotonic()\n",
@@ -3289,8 +3328,12 @@ CLIQUEUE_HISTORY_MUTATIONS = [
      "                body = _extract_text(msg.get(\"content\"))"),
 
     ("a prompt passed to a running turn vanishes on reload -- the report",
-     "            if isinstance(att, dict) and att.get(\"type\") == \"queued_command\" \\\n",
-     "            if isinstance(att, dict) and att.get(\"type\") == \"queued_command-no\" \\\n"),
+     "            if isinstance(att, dict) and att.get(\"type\") == \"queued_command\" \\\n"
+     "                    and att.get(\"commandMode\", \"prompt\") == \"prompt\" \\\n"
+     "                    and isinstance(att.get(\"prompt\"), str) \\\n",
+     "            if isinstance(att, dict) and att.get(\"type\") == \"queued_command-no\" \\\n"
+     "                    and att.get(\"commandMode\", \"prompt\") == \"prompt\" \\\n"
+     "                    and isinstance(att.get(\"prompt\"), str) \\\n"),
 
     ("one that was also a turn is shown twice",
      "                    and not (att.get(\"source_uuid\") in user_uuids):",
@@ -4692,7 +4735,10 @@ INITPROMPT_SERVER_MUTATIONS = [
      ''),
 
     ("the request leaves it out",
-     '        "initial_prompt": initial_prompt,\n    }).encode("utf-8")',
+     '        "initial_prompt": initial_prompt,\n'
+     '        "resume_interrupted_turn": bool(resume_interrupted_turn),\n'
+     '    }).encode("utf-8")',
+     '        "resume_interrupted_turn": bool(resume_interrupted_turn),\n'
      '    }).encode("utf-8")'),
 
     ("the launch API ignores it",
@@ -4704,8 +4750,8 @@ INITPROMPT_SERVER_MUTATIONS = [
      '    if not initial_prompt:\n'),
 
     ("a new session is not given it",
-     '                                   initial_prompt=initial_prompt)',
-     '                                   initial_prompt=None)'),
+     '                                   initial_prompt=initial_prompt,\n',
+     '                                   initial_prompt=None,\n'),
 
     ("an open session is not sent it",
      '                existing.state.queued_prompts.append(initial_prompt)\n',
@@ -4904,6 +4950,146 @@ LAUNCHRESUME_SESSION_MUTATIONS = [
      "                if not sid:\n"),
 ]
 
+
+# A page that says when it leaves is asleep unless it said so.
+# tests/test_asleep_tab.py and tests/reconnect_on_show.test.js.
+BYE_SERVER_MUTATIONS = [
+    ("a page's bye=1 is not recorded",
+     '    if ws.query_params.get("bye") == "1":\n        _says_bye_ws.add(ws)\n',
+     '    if False:\n        _says_bye_ws.add(ws)\n'),
+
+    ("any bye value declares it",
+     'ws.query_params.get("bye") == "1"',
+     'ws.query_params.get("bye")'),
+
+    ("leaving is heard but not recorded",
+     '    if msg_type == "leaving":\n        _leaving_ws.add(ws)\n        return True\n',
+     '    if msg_type == "leaving":\n        return True\n'),
+
+    ("leaving is passed on to the chat",
+     '    if msg_type == "leaving":\n        _leaving_ws.add(ws)\n        return True\n',
+     ''),
+
+    ("the hub does not say it hears leaving",
+     'HUB_HEARS = ["visibility", "leaving"]',
+     'HUB_HEARS = ["visibility"]'),
+
+    ("a page that says bye is judged by the old rule",
+     '    if ws in _says_bye_ws:\n        if ws in _leaving_ws:\n',
+     '    if False:\n        if ws in _leaving_ws:\n'),
+
+    ("a page that said it was leaving is still asleep",
+     '    if ws in _says_bye_ws:\n        if ws in _leaving_ws:\n',
+     '    if ws in _says_bye_ws:\n        if False:\n'),
+
+    ("a page that went without a word is not asleep",
+     '        _asleep_ws.add(ws)\n        if where:\n            log.info("tab for %s went without saying',
+     '        if where:\n            log.info("tab for %s went without saying'),
+
+    ("the ending of a page that says bye is not explained",
+     'log.info("tab for %s went without saying it was leaving (close "',
+     'log.info("tab for %s went (close "'),
+
+    ("a page that said so is not logged as leaving",
+     'log.info("tab for %s left (it said so; close code %s)", where, shown)',
+     'pass'),
+
+    ("an old page's leaving is not logged",
+     '            log.info("tab for %s left (close code %s%s)", where, shown,\n'
+     '                     "" if ws in _hidden_ws else "; last said it was visible, "\n'
+     '                     "or never said")\n',
+     '            pass\n'),
+
+    ("a gone page's bye is left behind",
+     '    _says_bye_ws.discard(ws)\n    _leaving_ws.discard(ws)\n',
+     ''),
+]
+
+BYE_APP_MUTATIONS = [
+    ("the socket does not declare that the tab says bye",
+     "    q.push('bye=1');\n",
+     ""),
+
+    ("pagehide says nothing",
+     "    window.addEventListener('pagehide', _sayLeaving);\n",
+     ""),
+
+    ("a hub that does not hear it is sent it",
+     "    if (!_hubHears.includes('leaving')) return;\n",
+     ""),
+
+    ("a socket already gone is written to",
+     "    if (!ws || ws.readyState !== WebSocket.OPEN) return;\n"
+     "    try {\n"
+     "      ws.send(JSON.stringify({ type: 'leaving' }));",
+     "    try {\n"
+     "      ws.send(JSON.stringify({ type: 'leaving' }));"),
+]
+
+
+# Nothing says "working" after the hub has gone.
+# tests/test_shutdown_status.py and tests/reconnect_on_show.test.js.
+SHUTSTATUS_SERVER_MUTATIONS = [
+    ("the ticker goes on after the tabs are told",
+     "        if _hub_going:\n"
+     "            # The tabs have been told the hub is going; see _broadcast_shutdown.\n"
+     "            return\n",
+     ""),
+
+    ("telling the tabs does not stop the ticker",
+     "    global _hub_going\n    _hub_going = True\n",
+     "    global _hub_going\n"),
+
+    ("no last status is sent",
+     "        await rt.broadcast({\"type\": \"status_update\", \"status\": status})\n"
+     "    await broadcast({\"type\": \"server_shutdown\", \"reason\": reason})\n",
+     "    await broadcast({\"type\": \"server_shutdown\", \"reason\": reason})\n"),
+
+    ("the last status still says what it was doing",
+     "        status.update(busy_class=\"shutdown\", busy_label=\"server stopped\",\n"
+     "                      busy_prefix=None, busy_since=None)\n",
+     ""),
+
+    ("the last status keeps its clock",
+     "                      busy_prefix=None, busy_since=None)\n",
+     "                      )\n"),
+
+    ("a session nobody is viewing is sent one",
+     "        if rt.state is None or not rt.clients:\n            continue\n"
+     "        try:\n            status = state_to_status_dict(rt.state, rt.config)",
+     "        if rt.state is None:\n            continue\n"
+     "        try:\n            status = state_to_status_dict(rt.state, rt.config)"),
+
+    ("the last status is sent after the notice",
+     "        await rt.broadcast({\"type\": \"status_update\", \"status\": status})\n"
+     "    await broadcast({\"type\": \"server_shutdown\", \"reason\": reason})\n",
+     "        await broadcast({\"type\": \"server_shutdown\", \"reason\": reason})\n"
+     "        await rt.broadcast({\"type\": \"status_update\", \"status\": status})\n"),
+]
+
+SHUTSTATUS_APP_MUTATIONS = [
+    ("status sent after the notice is applied",
+     "      if (_serverShutdown) return;\n      if (msg.status) {\n",
+     "      if (msg.status) {\n"),
+
+    ("the notice leaves the stop button up",
+     "        connection: true,\n      });\n      _nothingRunning();\n",
+     "        connection: true,\n      });\n"),
+
+    ("giving up leaves the stop button up",
+     "      Status.update({ busy_label: 'disconnected', busy_class: 'shutdown', connection: true });\n"
+     "      _nothingRunning();\n",
+     "      Status.update({ busy_label: 'disconnected', busy_class: 'shutdown', connection: true });\n"),
+
+    ("nothing running still leaves the input busy",
+     "    _isBusy = false;\n    Commands.setBusy(false);\n",
+     "    _isBusy = false;\n"),
+
+    ("/connect after a shutdown still ignores the next hub",
+     "    _serverShutdown = false;\n    _retriesExhausted = false;\n    reconnectAttempt = 0;\n",
+     "    _retriesExhausted = false;\n    reconnectAttempt = 0;\n"),
+]
+
 # One socket per tab, and a numbered message drawn at most once (2026-10-02:
 # a session "is showing a lot of things twice").  tests/reconnect_on_show.test.js,
 # "one socket per tab".  There is no mutation for the guard on `onopen`: a
@@ -4938,6 +5124,313 @@ ONESOCKET_APP_MUTATIONS = [
     ("only an older number counts as a repeat, so the latest is drawn twice",
      "      if (msg.seq <= _stream.seq) return;\n",
      "      if (msg.seq < _stream.seq) return;\n"),
+]
+
+
+# An opened session leaves a cut-off turn waiting, and says so (2026-09-29).
+# tests/test_cut_off_turn.py, tests/test_resume_interrupted_turn.py,
+# tests/test_lost_bg_tasks.py, tests/history_backfill.test.js.
+CUTOFF_SESSION_MUTATIONS = [
+    ("a tool call that never came back is not seen",
+     "            if pending:\n                stop, tool = i,",
+     "            if False:\n                stop, tool = i,"),
+
+    ("a turn that ended on an API error is called cut off",
+     "            if rec.get(\"isApiErrorMessage\"):\n                return None",
+     "            if False:\n                return None"),
+
+    ("the model's last word is looked past, so a finished session is called cut off",
+     "            if said:\n                return None",
+     "            if False:\n                return None"),
+
+    ("output that had only begun is taken for the model's last word",
+     "            continue                  # thinking, or nothing yet: keep looking",
+     "            return None"),
+
+    ("a result the model never answered is not seen",
+     "        if _has_tool_result(rec):\n            stop = i                  # a result the model never answered",
+     "        if False:\n            stop = i                  # a result the model never answered"),
+
+    ("a slash command is taken for a prompt owed a reply",
+     "        if _record_text(msg).startswith(_COMMAND_RECORD_PREFIXES):\n"
+     "            continue                  # a command, not a prompt\n",
+     ""),
+
+    ("an earlier resume's bookkeeping is taken for the turn",
+     "        if _is_cli_resume_bookkeeping(rec):\n            continue\n        t = rec.get(\"type\")",
+     "        t = rec.get(\"type\")"),
+
+    ("the CLI's report of dead tasks is not recognised",
+     "_CLI_ORPHAN_REPORT = \"didn't finish before the previous session ended\"",
+     "_CLI_ORPHAN_REPORT = \"didn't finish before the previous session ended-no\""),
+
+    ("the CLI's placeholder is taken for the model's last word",
+     "    if t == \"assistant\" and isinstance(msg, dict) \\\n"
+     "            and msg.get(\"model\") == \"<synthetic>\" \\\n"
+     "            and _record_text(msg) == CLI_NO_RESPONSE:\n        return True\n",
+     ""),
+
+    ("a prompt sent mid-turn is not seen",
+     "                stop = i              # a prompt sent mid-turn, never answered\n                break",
+     "                continue"),
+
+    ("a skill's text behind its command is taken for the prompt",
+     "    elif rec.get(\"isMeta\"):\n        return None\n    else:",
+     "    else:"),
+
+    ("a command's line is shown as its raw record",
+     "            text = _command_line(text) or \"\"",
+     "            text = text"),
+
+    ("the prompt of a turn older than the tail is never looked for",
+     "    if start > 0:\n        found = _turn_start_before(jsonl, start)",
+     "    if False:\n        found = _turn_start_before(jsonl, start)"),
+
+    ("a compaction summary is taken for the prompt",
+     "    if rec.get(\"type\") != \"user\" or rec.get(\"isSidechain\") \\\n"
+     "            or rec.get(\"isCompactSummary\") or _has_tool_result(rec) \\\n",
+     "    if rec.get(\"type\") != \"user\" or rec.get(\"isSidechain\") \\\n"
+     "            or _has_tool_result(rec) \\\n"),
+
+    ("a subagent's record is taken for the session's",
+     "        if not isinstance(rec, dict) or rec.get(\"isSidechain\"):\n            continue",
+     "        if not isinstance(rec, dict):\n            continue"),
+
+    ("the notice does not say what to do",
+     "    return text + (\" It won't carry on by itself: send ",
+     "    return text + (\" send "),
+
+    ("a long prompt is quoted whole",
+     "        if len(line) > 80:",
+     "        if False:"),
+
+    ("a turn that stopped after its tool finished is said to be running it",
+     "    if info.get(\"phase\") == \"tool\" and tool:",
+     "    if tool:"),
+
+    ("another day's time reads as today's",
+     "    if when.date() == now.date():\n        return clock",
+     "    if True:\n        return clock"),
+
+    ("history draws the CLI's prompt as the user's -- the 2026-09-06 report",
+     "                if rec.get(\"isMeta\") and text == CLI_CONTINUE_PROMPT:\n"
+     "                    classified = \"injected_prompt\"\n",
+     ""),
+
+    ("history draws a prompt the user typed as the CLI's",
+     "                if rec.get(\"isMeta\") and text == CLI_CONTINUE_PROMPT:",
+     "                if text == CLI_CONTINUE_PROMPT:"),
+
+    ("history draws the placeholder as the model refusing",
+     "            if msg.get(\"model\") == \"<synthetic>\" \\\n"
+     "                    and _record_text(msg) == CLI_NO_RESPONSE:\n                messages.append({",
+     "            if False:\n                messages.append({"),
+
+    ("history hides a real reply that happens to say the same",
+     "            if msg.get(\"model\") == \"<synthetic>\" \\\n"
+     "                    and _record_text(msg) == CLI_NO_RESPONSE:\n                messages.append({",
+     "            if _record_text(msg) == CLI_NO_RESPONSE:\n                messages.append({"),
+]
+
+CUTOFF_BRIDGE_MUTATIONS = [
+    ("an opened session's cut-off turn is never looked for",
+     "        if resume_sid and not self._finishing_cut_off_turn:\n"
+     "            cut_off = await asyncio.to_thread(self._read_cut_off_turn, resume_sid)",
+     "        if False:\n"
+     "            cut_off = await asyncio.to_thread(self._read_cut_off_turn, resume_sid)"),
+
+    ("a recovery announces a turn its CLI is about to finish",
+     "        if resume_sid and not self._finishing_cut_off_turn:",
+     "        if resume_sid:"),
+
+    ("the cut-off turn is found and never mentioned",
+     "            await self._post_open_notice(\"warning\", describe_cut_off_turn(cut_off))",
+     "            pass"),
+
+    ("a tab that attaches later is not told",
+     "        self.state.open_notices.append(notice)\n",
+     ""),
+
+    ("a new connect keeps what the last one said",
+     "        self.state.open_notices = []\n        await self._report_lost_bg_tasks(resume_sid)",
+     "        await self._report_lost_bg_tasks(resume_sid)"),
+
+    ("the call to action comes before the dead tasks, above them",
+     "        self.state.open_notices = []\n"
+     "        await self._report_lost_bg_tasks(resume_sid)\n"
+     "        if cut_off:\n"
+     "            log.warning(\n"
+     "                \"opened with its last turn cut off at %s (%s %s): left waiting\",\n"
+     "                cut_off.get(\"stopped\"), cut_off.get(\"phase\"),\n"
+     "                cut_off.get(\"tool\") or \"-\")\n"
+     "            await self._post_open_notice(\"warning\", describe_cut_off_turn(cut_off))\n",
+     "        self.state.open_notices = []\n"
+     "        if cut_off:\n"
+     "            await self._post_open_notice(\"warning\", describe_cut_off_turn(cut_off))\n"
+     "        await self._report_lost_bg_tasks(resume_sid)\n"),
+
+    ("a ghost turn leaves the open's notices to be replayed",
+     "        # The session is working again, so what it said when it was opened is\n"
+     "        # history -- as in run_turn.\n"
+     "        state.open_notices = []\n",
+     ""),
+
+    ("a turn of ours leaves the open's notices to be replayed",
+     "        # And what the session had to say when it was opened is now history:\n"
+     "        # a tab attaching from here on is not told it again.\n"
+     "        state.open_notices = []\n",
+     ""),
+]
+
+CUTOFF_SERVER_MUTATIONS = [
+    ("a tab that attaches after the open is not told",
+     "    for notice in list(getattr(state, \"open_notices\", None) or []):\n"
+     "        await send_to(ws, {\"type\": \"system_msg\", **notice})",
+     ""),
+
+    ("a runtime ignores what it was opened for",
+     "    if resume_interrupted_turn is not None:\n"
+     "        overrides[\"resume_interrupted_turn\"] = bool(resume_interrupted_turn)",
+     ""),
+
+    ("a launch that joins a hub drops the flag",
+     "        \"resume_interrupted_turn\": cfg.resume_interrupted_turn,\n    }",
+     "    }"),
+
+    ("the flag is not put on the wire",
+     "        \"resume_interrupted_turn\": bool(resume_interrupted_turn),\n    }).encode(\"utf-8\")",
+     "    }).encode(\"utf-8\")"),
+
+    ("the hub ignores the launch's flag",
+     "    resume_interrupted_turn = body.get(\"resume_interrupted_turn\") is True",
+     "    resume_interrupted_turn = False"),
+
+    ("anything truthy on the wire turns it on",
+     "    resume_interrupted_turn = body.get(\"resume_interrupted_turn\") is True",
+     "    resume_interrupted_turn = bool(body.get(\"resume_interrupted_turn\"))"),
+
+    ("the hub does not pass it to the session it opens",
+     "                                   resume_interrupted_turn=resume_interrupted_turn)",
+     "                                   resume_interrupted_turn=None)"),
+
+    ("a moved session abandons the turn the move cut",
+     "            agent_labels=carry[\"agent_labels\"],\n            resume_interrupted_turn=True)",
+     "            agent_labels=carry[\"agent_labels\"])"),
+
+    ("an original reopened after a failed move abandons it",
+     "                agent_labels=carry[\"agent_labels\"],\n                resume_interrupted_turn=True)",
+     "                agent_labels=carry[\"agent_labels\"])"),
+]
+
+CUTOFF_CONFIG_MUTATIONS = [
+    ("--resume-interrupted-turn is on by default -- the report",
+     "        action=\"store_true\",\n        default=False,\n        help=(\n"
+     "            \"When you open a session whose last turn was cut off",
+     "        action=\"store_true\",\n        default=True,\n        help=(\n"
+     "            \"When you open a session whose last turn was cut off"),
+
+    ("a Config built by hand finishes the turn",
+     "    resume_interrupted_turn: bool = False",
+     "    resume_interrupted_turn: bool = True"),
+]
+
+CUTOFF_CHAT_MUTATIONS = [
+    ("what arrives while a session loads is drawn above its history again",
+     "    if ((_replayInProgress || _loadingEl) && !_VIEW_MESSAGES.has(msg.type)) {",
+     "    if (_replayInProgress && !_VIEW_MESSAGES.has(msg.type)) {"),
+
+    ("the end of loading is held too, so loading never ends",
+     "    ['history', 'history_prepend', 'session_loading', 'clear_screen']);",
+     "    ['history', 'history_prepend', 'clear_screen']);"),
+
+    ("held for a history that is not coming",
+     "        if (!msg.on) _flushPending();   // no history is coming after all\n",
+     ""),
+
+    ("held behind an empty history",
+     "    if (!messages || !messages.length) { _flushPending(); return; }",
+     "    if (!messages || !messages.length) return;"),
+
+    ("what was held for a session left behind is drawn in the next",
+     "    // Held back for the view being wiped; drawn now, they would land in the\n"
+     "    // next one.\n"
+     "    _pendingMessages = [];\n",
+     ""),
+
+    ("a replay that ends while the next session loads draws its messages early",
+     "    if (_replayInProgress || _loadingEl) return;\n    const pending = _pendingMessages;",
+     "    const pending = _pendingMessages;"),
+]
+
+
+# A file too large for the stream, and what the recovery said (2026-10-01).
+# tests/test_dead_cli_recovery.py.
+DEADCLI_LIMIT_MUTATIONS = [
+    ("the limit is back to 10 MB, under the report's 10.4 MB file",
+     "MAX_SDK_MESSAGE_BYTES = 256 * 1024 * 1024",
+     "MAX_SDK_MESSAGE_BYTES = 10 * 1024 * 1024"),
+]
+
+DEADCLI_BTW_MUTATIONS = [
+    ("a /btw fork reads at the old limit",
+     "        \"max_buffer_size\": MAX_SDK_MESSAGE_BYTES,",
+     "        \"max_buffer_size\": 10 * 1024 * 1024,"),
+]
+
+DEADCLI_RECOVERY_MUTATIONS = [
+    ("the session reads at the old limit",
+     "            \"max_buffer_size\": MAX_SDK_MESSAGE_BYTES,",
+     "            \"max_buffer_size\": 10 * 1024 * 1024,"),
+
+    ("what the detector saw kill it is not kept",
+     "        self._transport_dead = True\n        self._death_reason = why\n",
+     "        self._transport_dead = True\n"),
+
+    ("the turn's own failure is shown -- the report",
+     "        shown = _death_explained(self._death_reason or why)",
+     "        shown = _death_explained(why)"),
+
+    ("the reason is carried on to the next death",
+     "        self._death_reason = None\n\n        if not self._may_auto_reconnect():",
+     "\n        if not self._may_auto_reconnect():"),
+
+    ("the buffer error is shown in the SDK's words",
+     "    if \"exceeded maximum buffer size\" in (reason or \"\"):",
+     "    if False:"),
+
+    ("a ghost turn outlives its CLI, reading working for good -- the report",
+     "        if self.state.busy and not self.turn_active.is_set():\n"
+     "            self._abandon_ghost_turn()",
+     "        pass"),
+
+    ("a turn of ours is closed under it",
+     "        if self.state.busy and not self.turn_active.is_set():\n"
+     "            self._abandon_ghost_turn()",
+     "        if self.state.busy:\n"
+     "            self._abandon_ghost_turn()"),
+
+    ("abandoning a ghost turn leaves it busy",
+     "                    \"(elapsed=%.1fs)\", elapsed)\n        state.busy = False\n",
+     "                    \"(elapsed=%.1fs)\", elapsed)\n"),
+
+    ("abandoning a ghost turn leaves a prompt waiting on its end",
+     "        state.active_tools.clear()\n        self._ghost_settled.set()\n"
+     "        self._turn_ended_at = time.monotonic()\n\n    # ----",
+     "        state.active_tools.clear()\n"
+     "        self._turn_ended_at = time.monotonic()\n\n    # ----"),
+
+    ("a death mid-turn is answered with re-send your last prompt -- the report",
+     "        if self._last_reconnect_recovered:\n            text = (",
+     "        if False:\n            text = ("),
+
+    ("whether the reconnect finished a turn is not recorded",
+     "        self._last_reconnect_recovered = recovering\n",
+     ""),
+
+    ("it does not warn that a step may be repeated -- the report's double edit",
+     "                    \"Its last steps may not have been saved before it died, \"\n"
+     "                    \"so it may repeat one that was already done.\")",
+     "                    \"\")"),
 ]
 
 
@@ -5152,8 +5645,33 @@ TARGETS = {
                             LAUNCHRESUME_CONFIG_MUTATIONS, "pytest"),
     "launchresume-session": ("session.py", "tests/test_launch_resume.py",
                              LAUNCHRESUME_SESSION_MUTATIONS, "pytest"),
+    "bye-server": ("server.py", "tests/test_asleep_tab.py",
+                   BYE_SERVER_MUTATIONS, "pytest"),
+    "bye-app": ("static/app.js", "tests/reconnect_on_show.test.js",
+                BYE_APP_MUTATIONS, "node"),
+    "shutstatus-server": ("server.py", "tests/test_shutdown_status.py",
+                          SHUTSTATUS_SERVER_MUTATIONS, "pytest"),
+    "shutstatus-app": ("static/app.js", "tests/reconnect_on_show.test.js",
+                       SHUTSTATUS_APP_MUTATIONS, "node"),
     "onesocket-app": ("static/app.js", "tests/reconnect_on_show.test.js",
                       ONESOCKET_APP_MUTATIONS, "node"),
+    "cutoff-session": ("session.py", "tests/test_cut_off_turn.py",
+                       CUTOFF_SESSION_MUTATIONS, "pytest"),
+    "cutoff-bridge": ("sdk_bridge.py", "tests/test_cut_off_turn.py",
+                      CUTOFF_BRIDGE_MUTATIONS, "pytest"),
+    "cutoff-server": ("server.py",
+                      "tests/test_cut_off_turn.py tests/test_resume_interrupted_turn.py",
+                      CUTOFF_SERVER_MUTATIONS, "pytest"),
+    "cutoff-config": ("config.py", "tests/test_resume_interrupted_turn.py",
+                      CUTOFF_CONFIG_MUTATIONS, "pytest"),
+    "cutoff-chat": ("static/chat.js", "tests/history_backfill.test.js",
+                    CUTOFF_CHAT_MUTATIONS, "node"),
+    "deadcli-recovery": ("sdk_bridge.py", "tests/test_dead_cli_recovery.py",
+                         DEADCLI_RECOVERY_MUTATIONS, "pytest"),
+    "deadcli-limit": ("config.py", "tests/test_dead_cli_recovery.py",
+                      DEADCLI_LIMIT_MUTATIONS, "pytest"),
+    "deadcli-btw": ("btw.py", "tests/test_dead_cli_recovery.py",
+                    DEADCLI_BTW_MUTATIONS, "pytest"),
     "extauth": ("server.py",
                 "tests/test_external_access_policy.py tests/test_external_auth.py",
                 EXTAUTH_MUTATIONS, "pytest"),

@@ -39,6 +39,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from config import MAX_SDK_MESSAGE_BYTES
+
 # Tools the fork may not use.  Everything that can modify the working tree, the
 # session, or spawn something that can.  Read/Grep/Glob stay: answering "which
 # file did you mean?" is the point of the feature.
@@ -88,7 +90,8 @@ def build_btw_options(options_cls: Any, *, config: Any, state: Any,
     kwargs: dict[str, Any] = {
         "cwd": config.cwd,
         "setting_sources": ["user", "project", "local"],
-        "max_buffer_size": 10 * 1024 * 1024,
+        # As the main session's: see config.MAX_SDK_MESSAGE_BYTES.
+        "max_buffer_size": MAX_SDK_MESSAGE_BYTES,
         "resume": state.session_id,
         "fork_session": True,
         "disallowed_tools": list(BTW_DISALLOWED_TOOLS),

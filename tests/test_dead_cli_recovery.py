@@ -813,3 +813,157 @@ def test_a_new_cli_does_not_inherit_the_old_ones_dying_words(monkeypatch):
     asyncio.run(go())
     assert not br._stderr_tail, \
         "the new subprocess inherited the corpse's stderr"
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-01: a file too large for the stream, and what the recovery said
+#
+# "i got two claude cli errors in a short amount of time ... the last message
+# says 're-send your last prompt to continue', but its status says 'working',
+# but it doesn't seem to be doing anything."
+#
+# A lane edited a 10.4 MB known-issues.md.  An Edit result carries the whole
+# file, so the CLI's message describing it was over the 10 MB the SDK was told
+# to read; its reader gave up, and the CLI was replaced.  The new CLI picked
+# the turn back up, made the same edit, and died the same way -- this time in a
+# turn it had started by itself, which nothing then closed.
+# ---------------------------------------------------------------------------
+
+BUFFER_DEATH = ("Failed to decode JSON: JSON message exceeded maximum buffer "
+                "size of 10485760 bytes...")
+
+
+def test_a_message_the_size_of_a_large_file_can_be_read():
+    """Larger than any file the agent edits; the report's was 10.4 MB."""
+    from config import MAX_SDK_MESSAGE_BYTES
+
+    br, _state, _sent = _bridge()
+    opts = br._make_options()
+    got = getattr(opts, "max_buffer_size", None)
+    if got is None and isinstance(opts, dict):
+        got = opts.get("max_buffer_size")
+
+    assert got == MAX_SDK_MESSAGE_BYTES >= 64 * 1024 * 1024
+
+
+def test_so_can_a_btw_fork():
+    from btw import build_btw_options
+    from config import MAX_SDK_MESSAGE_BYTES
+
+    class FakeOptions:
+        def __init__(self, **kw):
+            self.kwargs = kw
+
+    br, state, _sent = _bridge()
+    state.session_id = "sid-1"
+    kw = build_btw_options(FakeOptions, config=br.config, state=state).kwargs
+
+    assert kw["max_buffer_size"] == MAX_SDK_MESSAGE_BYTES
+
+
+def _recover(br, why="SDK dispatcher died mid-turn"):
+    """The real recovery, down to a reconnect whose CLI connects at once."""
+    async def no_disconnect():
+        pass
+
+    async def fake_connect(resume_id=None, *, recovering=False):
+        pass
+
+    br.disconnect = no_disconnect
+    br.connect = fake_connect
+    return asyncio.run(br._recover_dead_transport(why))
+
+
+def test_the_user_is_told_what_killed_it():
+    """The turn's own failure says only that the stream stopped -- "SDK
+    dispatcher died mid-turn" -- which was all the report had to go on."""
+    br, _state, sent = _bridge()
+    br._note_transport_death(BUFFER_DEATH)
+
+    assert _recover(br) is True
+    first = _messages(sent)[0]
+
+    assert "whole file" in first and "very large" in first, first
+    assert "dispatcher died" not in first, first
+
+
+def test_the_reason_is_not_carried_to_the_next_death():
+    br, _state, sent = _bridge()
+    br._note_transport_death(BUFFER_DEATH)
+    _recover(br)
+    br._transport_dead = False             # the new CLI connected
+    sent.clear()
+
+    _recover(br, "exit code 3")
+
+    first = _messages(sent)[0]
+    assert "(exit code 3)" in first and "whole file" not in first, first
+
+
+def test_a_ghost_turn_ends_with_its_cli():
+    """The reported status bar: "working", with nothing running, for good."""
+    br, state, _sent = _bridge()
+    state.busy = True                      # a turn the CLI started itself
+    state.turn_started_at = time.monotonic() - 3
+    br._ghost_settled.clear()
+    br._note_transport_death(BUFFER_DEATH)
+
+    _recover(br)
+
+    assert state.busy is False
+    assert state.turn_started_at is None
+    assert br._ghost_settled.is_set()
+
+
+def test_a_turn_of_ours_is_left_to_unwind_itself():
+    """run_turn's own finally closes it; reaching under it would race that."""
+    br, state, _sent = _bridge()
+    br.turn_active.set()
+    state.busy = True
+
+    async def no_disconnect():
+        pass
+
+    async def fake_connect(resume_id=None, *, recovering=False):
+        pass
+
+    br.disconnect = no_disconnect
+    br.connect = fake_connect
+    asyncio.run(br.reconnect())
+
+    assert state.busy is True
+
+
+def test_after_a_death_mid_turn_it_says_the_turn_is_being_picked_up():
+    """Not "re-send your last prompt": the new CLI is asked to finish the turn,
+    and there may be no prompt of the user's behind it at all."""
+    br, state, sent = _bridge()
+    state.busy = True
+    br._note_transport_death(BUFFER_DEATH)
+
+    _recover(br)
+    last = _messages(sent)[-1]
+
+    assert "Re-send" not in last and "re-send" not in last, last
+    assert "pick it back up" in last and '"continue"' in last, last
+
+
+def test_it_warns_that_a_step_may_be_repeated():
+    """The report's edit was made twice: the CLI died before it saved the
+    first, so the turn it picked up did it again."""
+    br, state, sent = _bridge()
+    state.busy = True
+    br._note_transport_death(BUFFER_DEATH)
+
+    _recover(br)
+
+    assert "already done" in _messages(sent)[-1]
+
+
+def test_after_a_death_between_turns_it_just_says_so():
+    br, _state, sent = _bridge()
+    br._note_transport_death("CLI exited")
+
+    _recover(br, "CLI exited")
+
+    assert _messages(sent)[-1] == "Reconnected."

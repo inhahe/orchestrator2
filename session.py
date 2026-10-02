@@ -220,8 +220,11 @@ def save_persisted_queue(cwd: str, items: Any,
 # **What is on disk means "was running when we last heard", not "failed".** A
 # completion notification can land after teardown has begun -- measured
 # 2026-09-16, two tasks logged completed 1 s and 2 s into one -- so the record
-# is a list of tasks whose outcome is *unknown*. Callers must word it that way;
-# see :func:`describe_lost_bg_tasks`.
+# is a list of tasks whose outcome is *unknown*. Callers must word it that way.
+#
+# It is shown to the *user*, in the tab. The model is told by the CLI itself:
+# on resume it reports every background task the previous process left
+# unfinished, with the next prompt (see SDKBridge._report_lost_bg_tasks).
 # ---------------------------------------------------------------------------
 
 BG_TASKS_MAX_AGE_S = 24 * 3600
@@ -312,9 +315,8 @@ def load_persisted_bg_tasks(cwd: str, session_id: str | None = None, *,
     """Load the background tasks *session_id* had running when it last spoke.
 
     Returns ``[]`` for anything that is not unambiguously this session's own
-    recent record. The gates matter more here than for the queue: this record
-    becomes a *prompt*, so a stale or misattributed one spends a turn telling
-    the model a lie about work it never started.
+    recent record: a stale or misattributed one would tell the user that work
+    died which this session never started.
     """
     if session_id is None:
         return []
@@ -352,42 +354,349 @@ def _bg_task_label(item: dict) -> str:
     return label or f"task {str(item.get('task_id') or '?')[:12]}"
 
 
-def describe_lost_bg_tasks(items: list[dict], *, why: str = "this session was cut off",
-                           now: float | None = None) -> str:
-    """Word the loss for the model, without claiming to know the outcome.
+# ---------------------------------------------------------------------------
+# A turn the last process did not finish
+#
+# Reported 2026-09-29: "sessions would often start working automatically when
+# i resumed them ... and without showing me the prompt that caused it". Opening
+# a session no longer finishes a cut-off turn by itself (see
+# SDKBridge._make_options); the tab says the turn was cut off instead, and this
+# is how it knows.
+#
+# The CLI's own test (conversationRecovery.ts) cannot be asked: it runs inside
+# the CLI, says nothing on the stream, and its placeholder pair is written to
+# the transcript only when the next prompt goes out. So this reads the end of
+# the transcript the way that test does, simplified. It only decides whether
+# to *say* something, never whether anything runs.
+# ---------------------------------------------------------------------------
 
-    The temptation is to say "your background tasks were aborted". That is a
-    guess, and often a wrong one: the CLI's completion notifications can land
-    after teardown has already started. What we actually know is narrower and
-    still actionable -- these were running, we stopped being able to hear about
-    them, so their results are gone whether or not they finished.
-    """
-    if not items:
+#: The CLI's words when it finds a turn cut off on resume: a synthetic prompt
+#: (``isMeta``), and a placeholder reply that keeps the transcript valid when
+#: nothing acts on it.
+CLI_CONTINUE_PROMPT = "Continue from where you left off."
+CLI_NO_RESPONSE = "No response requested."
+
+#: In the CLI's report of background tasks a previous process left unfinished,
+#: which it writes on resume.  Not part of any turn the user had going.
+_CLI_ORPHAN_REPORT = "didn't finish before the previous session ended"
+
+#: What history shows in place of the CLI's placeholder reply.
+CUT_OFF_HISTORY_NOTE = ("The session was cut off here, before this was "
+                        "answered, and the turn was not picked back up.")
+
+#: How much of the transcript's end to read.  A turn's last few records are
+#: all that matters, but one tool result can be large.
+CUT_OFF_TAIL_BYTES = 2 * 1024 * 1024
+
+#: How far back to look for the prompt that started a cut-off turn, when it is
+#: not in the tail.  A lane's autonomous turn can run for hours of tool calls.
+#: Only user records are parsed on the way, so this costs a read, not a parse.
+TURN_START_SEARCH_BYTES = 32 * 1024 * 1024
+
+#: A user record, however the JSON is spaced (the CLI writes it compact).
+_USER_RECORD = re.compile(rb'"type"\s*:\s*"user"')
+
+#: User records the CLI writes for a command rather than a prompt: a slash
+#: command's name and arguments, a local command's output, a ``!`` shell line.
+#: No reply is owed to one.
+_COMMAND_RECORD_PREFIXES = ("<command-name>", "<command-message>",
+                            "<command-args>", "<local-command", "<bash-")
+
+
+def _record_text(msg: Any) -> str:
+    """The plain text of a record's ``message``, tool blocks aside."""
+    if not isinstance(msg, dict):
         return ""
-    now = time.time() if now is None else now
-    lines = []
-    for item in items:
-        label = _bg_task_label(item)
-        started = item.get("started_wall")
-        if isinstance(started, (int, float)) and started > 0:
-            mins = max(0, int((now - started) // 60))
-            lines.append(f"- {label} (running for {mins} min at that point)")
-        else:
-            lines.append(f"- {label}")
-    plural = "" if len(items) == 1 else "s"
-    was = "was" if len(items) == 1 else "were"
-    return (
-        f"[orchestrator2] {why}, and "
-        f"{len(items)} background task{plural} {was} running at the time:\n"
-        + "\n".join(lines) + "\n\n"
-        "Their results and completion notifications are lost -- the CLI that "
-        "owned them is gone, so no <task-notification> is coming and their "
-        "TaskOutput handles are dead. Whether they actually finished is "
-        "unknown: a task can complete in the seconds while a session is being "
-        "torn down. Do not assume either way. Check for their effects "
-        "(files written, commits made, processes still running) before "
-        "re-running anything, and do not wait on them."
-    )
+    return _extract_text(msg.get("content")).strip()
+
+
+def _has_tool_result(rec: dict) -> bool:
+    msg = rec.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    return isinstance(content, list) and any(
+        isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+
+
+def _command_line(text: str) -> str | None:
+    """``/loop do x`` from a slash command's record, or None for any other
+    command record (a local command's output, a shell line)."""
+    name = re.search(r"<command-name>(.*?)</command-name>", text, re.S)
+    if not name:
+        return None
+    args = re.search(r"<command-args>(.*?)</command-args>", text, re.S)
+    return " ".join(p for p in (name.group(1).strip(),
+                                (args.group(1).strip() if args else "")) if p)
+
+
+def _is_cli_resume_bookkeeping(rec: dict) -> bool:
+    """Records the CLI writes on a resume that are no part of the old turn."""
+    t = rec.get("type")
+    msg = rec.get("message")
+    if t == "user":
+        text = _record_text(msg)
+        if rec.get("isMeta") and text == CLI_CONTINUE_PROMPT:
+            return True
+        origin = rec.get("origin")
+        if isinstance(origin, dict) and origin.get("kind") == "task-notification" \
+                and _CLI_ORPHAN_REPORT in text:
+            return True
+    if t == "assistant" and isinstance(msg, dict) \
+            and msg.get("model") == "<synthetic>" \
+            and _record_text(msg) == CLI_NO_RESPONSE:
+        return True
+    return False
+
+
+def cut_off_turn(jsonl: Path, *,
+                 tail_bytes: int = CUT_OFF_TAIL_BYTES) -> dict | None:
+    """Whether *jsonl* ends in the middle of a turn, and which turn.
+
+    None when it ends on a finished turn (the model's last word), on an API
+    error the user was shown at the time, or when it cannot tell.  Otherwise::
+
+        {"stopped": <ISO time of the turn's last record>,
+         "phase": "tool" (a tool call was running) | "reply" (the model had
+                  yet to answer a tool's result, or the prompt),
+         "tool": <that tool's name, or None>,
+         "trigger": "prompt" | "task" | "peer" | None,
+         "prompt": <the prompt's text, for "prompt">,
+         "from": <the peer's name, for "peer">,
+         "started": <ISO time of the record that started the turn>}
+
+    Mid-turn means what the CLI's own test means, simplified: the last word is
+    a tool call that never got its result, a tool result the model never
+    answered, or a prompt it never replied to.  Read before the new CLI starts,
+    so nothing it writes on resume is mistaken for the old turn; what an
+    *earlier* resume wrote (its placeholder pair, its report of unfinished
+    background tasks) is skipped for the same reason.
+    """
+    try:
+        size = jsonl.stat().st_size
+        with open(jsonl, "rb") as f:
+            start = max(0, size - tail_bytes)
+            f.seek(start)
+            raw = f.read()
+    except OSError:
+        return None
+    lines = raw.split(b"\n")
+    if start > 0 and lines:
+        lines = lines[1:]           # the first is cut in half
+    records: list[dict] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get("isSidechain"):
+            continue
+        if rec.get("type") in ("user", "assistant", "attachment"):
+            records.append(rec)
+
+    answered: set[str] = set()
+    tool_names: dict[str, str] = {}
+    for rec in records:
+        content = (rec.get("message") or {}).get("content") \
+            if isinstance(rec.get("message"), dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_result" and block.get("tool_use_id"):
+                answered.add(block["tool_use_id"])
+            elif block.get("type") == "tool_use" and block.get("id"):
+                tool_names[block["id"]] = str(block.get("name") or "")
+
+    stop: int | None = None
+    tool: str | None = None
+    phase = "reply"
+    for i in range(len(records) - 1, -1, -1):
+        rec = records[i]
+        if _is_cli_resume_bookkeeping(rec):
+            continue
+        t = rec.get("type")
+        msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
+        content = msg.get("content")
+        if t == "attachment":
+            att = rec.get("attachment")
+            if isinstance(att, dict) and att.get("type") == "queued_command" \
+                    and att.get("commandMode", "prompt") == "prompt":
+                stop = i              # a prompt sent mid-turn, never answered
+                break
+            continue                  # context for a turn; its prompt decides
+        if t == "assistant":
+            if rec.get("isApiErrorMessage"):
+                return None           # ended on an error, shown when it happened
+            blocks = content if isinstance(content, list) else []
+            pending = [b for b in blocks if isinstance(b, dict)
+                       and b.get("type") == "tool_use" and b.get("id")
+                       and b["id"] not in answered]
+            if pending:
+                stop, tool = i, str(pending[-1].get("name") or "") or None
+                phase = "tool"
+                break
+            said = any(isinstance(b, dict) and b.get("type") == "text"
+                       and str(b.get("text") or "").strip() for b in blocks)
+            if isinstance(content, str) and content.strip():
+                said = True
+            if said:
+                return None           # the model's last word: finished
+            continue                  # thinking, or nothing yet: keep looking
+        # A user record.
+        if rec.get("isMeta") or rec.get("isCompactSummary"):
+            return None
+        if _has_tool_result(rec):
+            stop = i                  # a result the model never answered
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    tool = tool_names.get(str(b.get("tool_use_id") or "")) or tool
+            break
+        if _record_text(msg).startswith(_COMMAND_RECORD_PREFIXES):
+            continue                  # a command, not a prompt
+        stop = i                      # a prompt it never replied to
+        break
+    if stop is None:
+        return None
+
+    info: dict[str, Any] = {
+        "stopped": records[stop].get("timestamp"),
+        "phase": phase,
+        "tool": tool,
+        "trigger": None,
+        "prompt": None,
+        "from": None,
+        "started": None,
+    }
+    # What started it: the nearest user record at or before the stop that is
+    # a prompt, a notification or a peer's message.
+    for j in range(stop, -1, -1):
+        found = _turn_start(records[j])
+        if found is not None:
+            info.update(found)
+            return info
+    # A lane's turn can outlast the tail by hours of tool calls.
+    if start > 0:
+        found = _turn_start_before(jsonl, start)
+        if found is not None:
+            info.update(found)
+    return info
+
+
+def _local_when(iso: Any, now: datetime | None = None) -> str | None:
+    """A transcript timestamp as the user's clock reads it: "2:45 AM", or
+    "Sep 28, 7:29 PM" when it was not today."""
+    if not isinstance(iso, str) or not iso:
+        return None
+    try:
+        when = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return None
+    now = now or datetime.now().astimezone()
+    clock = when.strftime("%I:%M %p").lstrip("0")
+    if when.date() == now.date():
+        return clock
+    return f"{when.strftime('%b')} {when.day}, {clock}"
+
+
+def describe_cut_off_turn(info: dict, *, now: datetime | None = None) -> str:
+    """Tell the user, in the tab, which turn was cut off and that it waits.
+
+    *info* is :func:`cut_off_turn`'s.  Says when it stopped and what it was
+    doing, what started it, and what to do -- because nothing happens next
+    until the user does something.
+    """
+    stopped = _local_when(info.get("stopped"), now)
+    tool = info.get("tool")
+    if info.get("phase") == "tool" and tool:
+        doing = f"while running {tool}"
+    elif tool:
+        doing = f"just after {tool} finished"
+    else:
+        doing = "before it answered"
+    at = f" at {stopped}," if stopped else ""
+    text = f"This session's last turn was cut off{at} {doing}."
+    started = _local_when(info.get("started"), now)
+    since = f" ({started})" if started else ""
+    trigger = info.get("trigger")
+    if trigger == "prompt" and info.get("prompt"):
+        line = str(info["prompt"]).strip().splitlines()[0].strip()
+        if len(line) > 80:
+            line = line[:79].rstrip() + "\u2026"
+        text += f" It began with \u201c{line}\u201d{since}."
+    elif trigger == "task":
+        text += f" It began when a background task finished{since}."
+    elif trigger == "peer":
+        text += (f" It began with a message from "
+                 f"{info.get('from') or 'another session'}{since}.")
+    return text + (" It won't carry on by itself: send \u201ccontinue\u201d to "
+                   "pick it up where it stopped.")
+
+
+def _turn_start(rec: dict) -> dict | None:
+    """What *rec* says about how its turn began, if it began one.
+
+    None for anything that is part of a turn rather than its start: model
+    output, a tool result, context the CLI added (a skill's text, a compaction
+    summary), a local command's output, the CLI's resume bookkeeping.
+    """
+    if rec.get("type") != "user" or rec.get("isSidechain") \
+            or rec.get("isCompactSummary") or _has_tool_result(rec) \
+            or _is_cli_resume_bookkeeping(rec):
+        return None
+    origin = rec.get("origin")
+    kind = origin.get("kind") if isinstance(origin, dict) else None
+    found: dict[str, Any] = {"started": rec.get("timestamp")}
+    if kind == "task-notification":
+        found["trigger"] = "task"
+    elif kind == "peer":
+        found["trigger"] = "peer"
+        found["from"] = origin.get("name") or origin.get("from")
+    elif rec.get("isMeta"):
+        return None
+    else:
+        text = _record_text(rec.get("message"))
+        if text.startswith(_COMMAND_RECORD_PREFIXES):
+            text = _command_line(text) or ""
+            if not text:
+                return None
+        found["trigger"] = "prompt"
+        found["prompt"] = text or None
+    return found
+
+
+def _turn_start_before(jsonl: Path, end: int, *,
+                       limit: int = TURN_START_SEARCH_BYTES) -> dict | None:
+    """:func:`_turn_start` for the nearest record before byte *end*.
+
+    Only user records that are not tool results are parsed; everything else is
+    rejected on a substring, so this is a read of up to *limit* bytes and a
+    handful of ``json.loads``.
+    """
+    begin = max(0, end - limit)
+    try:
+        with open(jsonl, "rb") as f:
+            f.seek(begin)
+            raw = f.read(end - begin)
+    except OSError:
+        return None
+    lines = raw.split(b"\n")
+    if begin > 0 and lines:
+        lines = lines[1:]
+    for line in reversed(lines):
+        if b'"tool_use_id"' in line or not _USER_RECORD.search(line):
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            found = _turn_start(rec)
+            if found is not None:
+                return found
+    return None
 
 
 def normalize_path_for_compare(p: str) -> str:
@@ -2209,6 +2518,10 @@ def render_session_history(
             if isinstance(content, str) and content.strip():
                 text = content.strip()
                 classified = _classify_user_text(text)
+                # The CLI's own prompt for a turn it found cut off: nobody here
+                # typed it.  Drawn as the harness's, like any injected prompt.
+                if rec.get("isMeta") and text == CLI_CONTINUE_PROMPT:
+                    classified = "injected_prompt"
                 if classified == "drop":
                     pass  # XML wrapper / internal — don't render
                 else:
@@ -2256,6 +2569,19 @@ def render_session_history(
         elif t == "assistant" and isinstance(msg, dict):
             content = msg.get("content")
             if not isinstance(content, list):
+                continue
+            # The CLI's placeholder after a turn it found cut off, when nothing
+            # picked the turn back up.  Drawn as the model's reply, it read as
+            # a refusal ("No response requested.") to a prompt nobody typed.
+            if msg.get("model") == "<synthetic>" \
+                    and _record_text(msg) == CLI_NO_RESPONSE:
+                messages.append({
+                    "type": "system",
+                    "subtype": "warning",
+                    "content": CUT_OFF_HISTORY_NOTE,
+                    "is_history": True,
+                })
+                rendered += 1
                 continue
             for block in content:
                 if not isinstance(block, dict):

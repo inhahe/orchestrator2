@@ -935,8 +935,35 @@ async def broadcast(msg: dict[str, Any]) -> None:
                 pass
 
 
+#: Set once the hub has told its tabs it is going (_broadcast_shutdown).  The
+#: status ticker stops then.
+_hub_going = False
+
+
 async def _broadcast_shutdown(reason: str) -> None:
-    """Tell every connected browser tab the server is about to exit."""
+    """Tell every connected browser tab the server is about to exit.
+
+    Reported 2026-09-29: "i shut down the server, and two of my os sessions
+    still said they were working."  After the notice, the hub stops every
+    session's CLI, which takes seconds, and the status ticker went on sending
+    each session's state until the process exited.  A tab applied the last
+    "working" it was sent, and nothing after the socket closed corrected it.
+    So the ticker stops here.  And each session's tabs first get a last full
+    status reading "server stopped", so a page from before that date also
+    drops its busy state (and the stop button) rather than keeping it.
+    """
+    global _hub_going
+    _hub_going = True
+    for rt in list(runtimes.values()):
+        if rt.state is None or not rt.clients:
+            continue
+        try:
+            status = state_to_status_dict(rt.state, rt.config)
+        except Exception:
+            continue
+        status.update(busy_class="shutdown", busy_label="server stopped",
+                      busy_prefix=None, busy_since=None)
+        await rt.broadcast({"type": "status_update", "status": status})
     await broadcast({"type": "server_shutdown", "reason": reason})
     # Give the writer tasks a moment to flush before the process exits.
     await ws_channel.drain_all(1.0)
@@ -1147,6 +1174,9 @@ async def _status_ticker() -> None:
     """
     while True:
         await asyncio.sleep(2.0)
+        if _hub_going:
+            # The tabs have been told the hub is going; see _broadcast_shutdown.
+            return
         for rt in list(runtimes.values()):
             try:
                 await _probe_bg_stalls(rt)
@@ -1430,6 +1460,7 @@ async def _create_runtime(
     agent_name: str | None = None,
     agent_labels: dict[str, str] | None = None,
     initial_prompt: str | None = None,
+    resume_interrupted_turn: bool | None = None,
 ) -> SessionRuntime:
     """Spin up a fresh live session runtime (config clone + state + bridge).
 
@@ -1449,6 +1480,9 @@ async def _create_runtime(
     * ``initial_prompt`` — the ``--initial-prompt`` of the launch that asked
       for this session, queued for it once it connects.  Never inherited from
       the hub either.
+    * ``resume_interrupted_turn`` — whether opening the session finishes a
+      turn its last process cut off.  None keeps the hub's setting.  ``/move``
+      passes True: the move itself cut that turn, and the copy carries on.
     * otherwise — continue the most recent session in *cwd*.
 
     Registers the runtime, starts its bridge, and refreshes the lobby.
@@ -1496,6 +1530,8 @@ async def _create_runtime(
     overrides["session_note"] = session_note or None
     overrides["initial_prompt"] = (
         initial_prompt if initial_prompt and initial_prompt.strip() else None)
+    if resume_interrupted_turn is not None:
+        overrides["resume_interrupted_turn"] = bool(resume_interrupted_turn)
     # Per-session CLI. Lets one session run a newer Claude Code (for a model
     # the bundled one refuses) while everything else stays on the bundled
     # binary -- which matters when the newer CLI is `latest` rather than
@@ -1913,7 +1949,17 @@ _mobile_ws: set[Any] = set()
 #: Messages this hub understands that an older one would answer with
 #: "unknown message type" in the chat; the page sends them only if listed in
 #: ``attached``.
-HUB_HEARS = ["visibility"]
+HUB_HEARS = ["visibility", "leaving"]
+
+#: Sockets whose page says "leaving" when it really goes (closed, reloaded,
+#: navigated away).  Declared by ``?bye=1`` on the connection URL, so it is
+#: known from the moment the socket opens, even when the page is frozen again
+#: before it can send anything.  For these, any other ending is a tab the
+#: browser put to sleep (_note_how_it_ended).
+_says_bye_ws: set[Any] = set()
+
+#: Sockets whose page has said "leaving".
+_leaving_ws: set[Any] = set()
 
 #: Sockets whose page last said it was hidden -- a background tab.
 _hidden_ws: set[Any] = set()
@@ -3078,6 +3124,9 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     initial_prompt = body.get("initial_prompt")
     if not isinstance(initial_prompt, str) or not initial_prompt.strip():
         initial_prompt = None
+    # Only for a session this launch opens: one already open has no cut-off
+    # turn to finish.
+    resume_interrupted_turn = body.get("resume_interrupted_turn") is True
 
     # A title is resolved to its session's id first, as the hub's own startup
     # does -- left as the title, it became this runtime's session id until the
@@ -3185,7 +3234,8 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
                                    config_dir=config_dir, bell_on=bell_on,
                                    cli_path=cli_path, agent_name=agent_name,
                                    agent_labels=agent_labels,
-                                   initial_prompt=initial_prompt)
+                                   initial_prompt=initial_prompt,
+                                   resume_interrupted_turn=resume_interrupted_turn)
     except Exception as exc:
         log.exception("hub session launch failed")
         return {"ok": False, "error": str(exc)}
@@ -3858,6 +3908,8 @@ def _cleanup_ws(ws: WebSocket) -> None:
     _mobile_ws.discard(ws)
     _hidden_ws.discard(ws)
     _asleep_ws.discard(ws)
+    _says_bye_ws.discard(ws)
+    _leaving_ws.discard(ws)
 
 
 #: Close codes a page sends when it goes away on purpose: 1000 its own
@@ -3879,14 +3931,48 @@ def _note_how_it_ended(ws: WebSocket, code: int | None) -> None:
     treats it like a sleeping phone.  (Any abnormal close was rejected as too
     broad -- a crashed or cut-off tab you are looking at still counts as
     leaving; this is only the background ones.)
+
+    **A page that says when it leaves is asleep unless it said so.**  Reported
+    2026-09-28: "i never closed my 'Good Photons' tab", and its session was
+    idled out.  Chrome had frozen the tab, briefly woke it at 18:02, and let
+    it reconnect; its socket then went again a minute later, and the rule
+    above missed it.  The two facts it rests on had failed.  The hub never
+    heard the page was hidden (a page frozen again moments after
+    reconnecting never gets to say so).  And real Chrome ends a sleeping
+    tab's socket with 1005 as well as 1006, not only as measured.  So a page
+    now says "leaving" on ``pagehide``: closed, reloaded or navigated away.
+    It declares that it does with ``?bye=1``, and for such a page any other
+    ending is a tab asleep, whatever the close code and visibility.  A tab
+    you close while Chrome has it frozen says nothing either, so its session
+    stays until closed from the lobby: keeping a session is the failure
+    that costs nothing you can't undo.
     """
+    rt = _ws_runtime.get(ws)
+    where = getattr(rt, "rid", None)
+    shown = code if code is not None else "none"
+    if ws in _says_bye_ws:
+        if ws in _leaving_ws:
+            if where:
+                log.info("tab for %s left (it said so; close code %s)", where, shown)
+            return
+        _asleep_ws.add(ws)
+        if where:
+            log.info("tab for %s went without saying it was leaving (close "
+                     "code %s): asleep, so its session is not idled out",
+                     where, shown)
+        return
+    # A page from before 2026-09-28 says nothing when it goes: judge it, as
+    # before, by what it last said about being hidden, and the close code.
     if code in _DELIBERATE_CLOSES or ws not in _hidden_ws:
+        if where:
+            log.info("tab for %s left (close code %s%s)", where, shown,
+                     "" if ws in _hidden_ws else "; last said it was visible, "
+                     "or never said")
         return
     _asleep_ws.add(ws)
-    rt = _ws_runtime.get(ws)
     log.info("tab for %s was dropped in the background (close code %s): the "
              "browser put it to sleep, so its session is not idled out",
-             getattr(rt, "rid", "lobby"), code if code is not None else "none")
+             where or "lobby", shown)
 
 
 # ---------------------------------------------------------------------------
@@ -3903,6 +3989,10 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     # the case the idle timer must treat differently.
     if _ws_looks_mobile(ws):
         _mobile_ws.add(ws)
+    # Likewise whether the page will say when it leaves: a page frozen again
+    # moments after reconnecting never gets to say anything else.
+    if ws.query_params.get("bye") == "1":
+        _says_bye_ws.add(ws)
 
     global _has_had_clients
     _cancel_shutdown_timer()
@@ -4226,6 +4316,12 @@ async def _send_initial_state(ws: WebSocket) -> None:
             "subtype": "error",
             "data": {"message": _blocked},
         })
+    # Likewise what the session said when it was opened -- its last turn was
+    # cut off and waits, its background tasks died -- until a turn starts.
+    # The tab that opened it is often not attached yet when it is said: a
+    # --resume launch's browser tab, a tab reloading after a hub restart.
+    for notice in list(getattr(state, "open_notices", None) or []):
+        await send_to(ws, {"type": "system_msg", **notice})
 
 
 async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
@@ -4356,7 +4452,8 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
             orig = await _create_runtime(
                 cwd=cwd, resume=sid, config_dir=src_cfg,
                 agent_name=carry["agent_name"],
-                agent_labels=carry["agent_labels"])
+                agent_labels=carry["agent_labels"],
+                resume_interrupted_turn=True)
         except Exception:
             log.exception("move: could not reopen the original session")
             await send_to(ws, {"type": "move_error", "message": (
@@ -4431,10 +4528,13 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
     # Spin up a runtime bound to the target account *and directory*, resuming
     # the copy.  `dest_cwd` is `cwd` unless the move moved it.
     try:
+        # The move cut the original's turn, if it had one going; the copy
+        # finishes it, as the original would have.
         new_rt = await _create_runtime(
             cwd=dest_cwd, resume=new_id, config_dir=target_cfg,
             session_note=note, agent_name=carry["agent_name"],
-            agent_labels=carry["agent_labels"])
+            agent_labels=carry["agent_labels"],
+            resume_interrupted_turn=True)
     except Exception as exc:
         log.exception("move: failed to start runtime for copied session")
         await _move_failed(f"Couldn't start the moved session: {exc}")
@@ -4570,6 +4670,12 @@ async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
             _hidden_ws.add(ws)
         else:
             _hidden_ws.discard(ws)
+        return True
+
+    # The page going for real: closed, reloaded or navigated away.  Sent from
+    # its ``pagehide``; see _note_how_it_ended.
+    if msg_type == "leaving":
+        _leaving_ws.add(ws)
         return True
 
     if msg_type == "list":
@@ -5570,6 +5676,7 @@ def _hub_launch_kwargs(cfg: Config, config_dir: str | None) -> dict[str, Any]:
         "agent_name": cfg.agent_name,
         "agent_labels": dict(cfg.agent_labels or {}),
         "initial_prompt": cfg.initial_prompt,
+        "resume_interrupted_turn": cfg.resume_interrupted_turn,
     }
 
 
@@ -5671,6 +5778,7 @@ def _launch_into_hub(
     cli_path: str | None = None, agent_name: str | None = None,
     agent_labels: dict[str, str] | None = None,
     initial_prompt: str | None = None,
+    resume_interrupted_turn: bool = False,
 ) -> str | None:
     """Ask a running hub to open a session; return its ``rid`` (or None).
 
@@ -5689,6 +5797,8 @@ def _launch_into_hub(
     ``initial_prompt`` too, until 2026-09-27.  A launch that joined a hub lost
     its --initial-prompt, and its session was sent the prompt of whichever
     launch had started the hub instead, because sessions inherited that.
+    And ``resume_interrupted_turn``: whether the session this launch opens
+    finishes a turn that was cut off.
     """
     import urllib.request
 
@@ -5704,6 +5814,7 @@ def _launch_into_hub(
         "agent_name": agent_name,
         "agent_labels": agent_labels or {},
         "initial_prompt": initial_prompt,
+        "resume_interrupted_turn": bool(resume_interrupted_turn),
     }).encode("utf-8")
     try:
         req = urllib.request.Request(

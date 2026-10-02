@@ -46,6 +46,147 @@ energy-saver or Memory Saver settings change it, and whether the page could
 stay connected through a freeze. Until then, the cheap mitigation is to log a
 repeat of the same tab's drop at debug level.
 
+## A lane's CLI died twice in a minute, then the session read "working" with nothing running — FIXED (2026-10-01)
+
+> "i got two claude cli errors in a short amount of time, not sure why, this
+> didn't used to happen ... the last message says 're-send your last prompt to
+> continue', but its status says 'working', but it doesn't seem to be doing
+> anything."
+
+OS C, 2026-09-30 03:04. The log has the cause both times: `Failed to decode
+JSON: JSON message exceeded maximum buffer size of 10485760 bytes`. The lane
+was adding a paragraph to its `known-issues.md`, which had grown to 10.4 MB
+(176,751 lines; the main repo's copy was 9.9 MB on 2026-09-26, which is why
+this "didn't used to happen"). An `Edit` result carries the whole file it
+changed, so the CLI's message describing the edit was over the 10 MB the SDK
+was told to read. The reader gave up, and the CLI was replaced. The new CLI
+picked the turn back up, made the same edit, and died the same way.
+
+The edit landed both times: the first CLI died before it saved the edit to the
+transcript, so the turn it picked back up did not know. The lane's
+`known-issues.md` gained the same status paragraph twice, in two wordings
+(uncommitted in `os-lane-c-wip`).
+
+The second death came in a turn the CLI had started itself, which only its
+result ends. The result never came, so the status read "working" with nothing
+running. And "Re-send your last prompt to continue" was what every recovery
+said, with no prompt of the user's behind this one.
+
+Fixed:
+
+- The limit is 256 MB (`config.MAX_SDK_MESSAGE_BYTES`), for the session and its
+  `/btw` forks.
+- The tab says what killed the CLI, in words: one message was over the limit,
+  usually a tool result carrying a whole file.
+- A reconnect closes a turn the CLI had started by itself.
+- After a death mid-turn, the message says the new CLI was asked to pick the
+  turn back up, that "continue" does it if nothing starts, and that a step may
+  be repeated. After a death between turns, it says "Reconnected."
+
+design.md, *A message too large to read is a death too*.
+
+## Resumed sessions started working by themselves, without showing why — FIXED (2026-09-29)
+
+> "sessions would often start working automatically when i resumed them, when
+> i don't think they had had anything scheduled, and without showing me the
+> prompt that caused it to start working again."
+
+Three causes, from the hub log and the sessions' transcripts:
+
+- **Another launch's prompt.** The hub that ran from 2026-09-27 16:44 to
+  2026-09-29 02:45 had been started for Lane A with `--initial-prompt
+  "Continue. If any background processes were running they may be gone."`.
+  Every session it opened inherited that prompt: 17 sends, to OS C, OS D, OS F
+  and others, this session included. None was shown in the tab. Fixed
+  2026-09-27; see "A launch's `--initial-prompt` went to sessions that never
+  asked for it" below.
+- **The CLI finishing a cut-off turn.** `CLAUDE_CODE_RESUME_INTERRUPTED_TURN`
+  was set on every connect, so a session cut off mid-turn picked the turn back
+  up the moment it was opened. That happened 11 times in the same stretch. The
+  notice meant to explain it never appeared, because the inherited prompt went
+  out first and disarmed it. Only 3 of those 11 were turns cut off mid-flight.
+  The other 8 had ended on the weekly limit, and were re-run straight into it
+  again, every time the session was opened.
+- **orchestrator2's lost-work message.** A session cut off with background
+  tasks running was sent "[orchestrator2] this session was cut off…" as a
+  prompt, which started a turn. It was visible, but it was still the session
+  starting work on its own. It also repeated what the CLI already tells the
+  model.
+
+Asked what a resumed session should do, the answer was "wait for me". Now:
+
+- Opening a session leaves a cut-off turn waiting. The tab says which turn it
+  was (when it stopped, what it was doing, what started it) and that
+  "continue" picks it up. A tab opened later is told too.
+- The model hears about dead background tasks from the CLI, along with the
+  next prompt. Nothing is sent to it just for this.
+- A session whose CLI dies in the middle of a turn still finishes that turn,
+  with the notice, and so does one moved with `/move`. A reconnect between
+  turns (`/model`, a CLI recycle) leaves a waiting turn waiting.
+- `--resume-interrupted-turn` brings the old behaviour back.
+- History shows the CLI's "Continue from where you left off." as the CLI's
+  own, and its "No response requested." as a note, not a refusal.
+
+Found on the way: in a large session, what the connect says arrived before
+the history did, so it was drawn above the history and scrolled out of sight.
+The page now holds live messages until the history is in place.
+design.md §6e.
+
+## Tabs still said "working" after the hub shut down — FIXED (2026-09-29)
+
+> "i shut down the server, and two of my os sessions still said they were
+> working. and i think the one that said the server may have shut down also
+> said it was still working."
+
+- **The status bar.** After telling its tabs it was shutting down, the hub
+  stopped every session's CLI, which takes seconds. Its status ticker went on
+  sending each session's state until the process exited. A tab applied the
+  last "working" it was sent. Once the socket closed nothing touched the bar
+  again, because the page stops reconnecting after a shutdown notice. The
+  local timer kept counting the turn up.
+- **The stop button.** Only a status update ever cleared the page's busy
+  flag. A tab told the hub was going, or one that gave up reconnecting
+  ("Lost connection to server (not running)"), kept ■ in place of send, as
+  if a turn were running.
+
+Now the page ignores status once the hub has said it is going, and takes
+itself out of busy on the notice and when it gives up. The hub stops its
+ticker at the notice, and first sends each session's tabs a last full status
+reading "server stopped", so a page loaded before the fix also drops its
+busy state. design.md §7, *Nothing says "working" after the hub has gone*.
+
+## A tab still open had its session idled out anyway — FIXED (2026-09-28)
+
+> "i never closed my 'Good Photons' tab,, but it now says 'This tab's session
+> (Good Photons) was closed after 5 minutes with no tab connected at
+> 2026-09-28 18:08.'"
+
+The day-old sleeping-tab rule missed it. Chrome had frozen the tab, woke it at
+18:02, and let it reconnect and resume with nothing missed. A minute later its
+socket went again, and the hub took that for the viewer leaving. The rule rests
+on two facts, and neither held:
+
+- **The hub never heard the tab was hidden.** The page says so only after
+  handling `attached`, and a page frozen again moments after reconnecting
+  never gets that far.
+- **The close code was no guide.** Real Chrome ends a sleeping tab's socket
+  with 1005 as well as 1006. The 1001-versus-1006 split was measured with a
+  test client, not with Chrome. Every drop the hub had spared was a 1005.
+
+The same probably closed this orchestrator2 session's own tab at 18:57 the day
+before.
+
+Now the page says "leaving" on `pagehide`, when it is closed, reloaded or
+navigated away. It declares that it will with `?bye=1` when it connects. For
+such a page, any other ending is a tab asleep: frozen, discarded, the
+computer sleeping, the network dropping, even in the foreground. Every tab
+ending is logged with its close code and the verdict. design.md §4, *And a
+page that says when it leaves is asleep unless it said so*.
+
+Cost: a tab closed while Chrome has it frozen, or one that crashes, says
+nothing either. Its session stays until it is closed from the lobby or the
+hub restarts.
+
 ## `--resume` of a name that meant something else, or nothing, "joined" anyway — FIXED (2026-09-27)
 
 > "i tried to --resume "OS F" and it said there were two of that name. so i

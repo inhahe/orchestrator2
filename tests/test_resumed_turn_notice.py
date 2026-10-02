@@ -21,9 +21,16 @@ child, not an orphan).  It came back to life on load because we set
 CLI pick up a turn that was cut off - here, cut off by the idle teardown that
 killed a working runtime (fixed separately; that hub predated the fix).
 
-Recovering the turn is the behaviour we want.  Doing it in total silence is
-not: output appears with nobody having typed anything, and the only trace is a
-server-log WARNING.  These tests pin the notice.
+Recovering the turn was the behaviour wanted then.  Doing it in total silence
+was not: output appears with nobody having typed anything, and the only trace
+is a server-log WARNING.  These tests pin the notice.
+
+Since 2026-09-29 opening a session no longer finishes its cut-off turn at all
+("wait for me" -- see tests/test_resume_interrupted_turn.py); the tab says the
+turn is waiting instead (tests/test_cut_off_turn.py).  This notice is for the
+connects that still finish one: a *recovery* (the CLI died under a running
+turn, or a stuck one is reconnected), a /move, and an open under
+--resume-interrupted-turn.
 
 Offline: a real ``SDKBridge`` with a list broadcaster; no SDK subprocess.
 """
@@ -34,6 +41,8 @@ import asyncio
 import inspect
 import os
 import sys
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -71,16 +80,26 @@ def _notices(sent: list[dict]) -> list[str]:
     return out
 
 
-def _resumed(br, sid: str = "1aa74fb0-ca4e-42cb-80c3-ef7302fee0a4"):
-    """Connect the way a lobby click does: with an explicit session to resume."""
+SID = "1aa74fb0-ca4e-42cb-80c3-ef7302fee0a4"
+
+
+def _resumed(br, sid: str = SID):
+    """Connect the way a recovery does: the CLI died under a running turn, so
+    the new one finishes it."""
+    br._make_options(resume_id=sid, recovering=True)
+
+
+def _opened(br, sid: str = SID):
+    """Connect the way a lobby click does: opening the session, which leaves a
+    cut-off turn waiting."""
     br._make_options(resume_id=sid)
 
 
-def _fresh(br, state):
+def _fresh(br, state, *, recovering=False):
     """Connect the way a brand-new session does: nothing to resume."""
     state.session_id = None
     br._initial_resume_id = None
-    br._make_options()
+    br._make_options(recovering=recovering)
 
 
 # --------------------------------------------------------------------------
@@ -171,10 +190,33 @@ def test_run_turn_is_what_clears_it():
     )
 
 
-def test_a_fresh_session_never_announces():
-    """No resume, nothing to recover."""
+def test_an_opened_session_never_announces_it():
+    """Opening a session leaves its cut-off turn waiting, so whatever streams
+    first has another author -- a peer's message, say.  Calling that a
+    recovered turn would be the lie the notice exists to prevent."""
+    br, _state, sent = _bridge()
+    _opened(br)
+
+    asyncio.run(br._begin_ghost_turn_if_needed())
+
+    assert not _notices(sent), _notices(sent)
+
+
+def test_unless_it_was_opened_to_finish_it():
+    br, _state, sent = _bridge(["--resume-interrupted-turn"])
+    _opened(br)
+
+    asyncio.run(br._begin_ghost_turn_if_needed())
+
+    assert len(_notices(sent)) == 1, _notices(sent)
+
+
+@pytest.mark.parametrize("recovering", [False, True])
+def test_a_fresh_session_never_announces(recovering):
+    """No resume, nothing to recover -- even when its CLI is being replaced,
+    which lets a cut-off turn be finished if there were one."""
     br, state, sent = _bridge(["--no-continue"])
-    _fresh(br, state)
+    _fresh(br, state, recovering=recovering)
 
     asyncio.run(br._begin_ghost_turn_if_needed())
 

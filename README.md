@@ -140,11 +140,16 @@ the same port. Notes:
     use `--mobile-idle-timeout`, which defaults to **0 (never)**; set a
     positive value to reap them too.
     
-    A background tab counts when it had told the hub it was hidden and its
-    connection then ended without a goodbye. A tab you close yourself says
-    goodbye even from the background, and still starts the ordinary clock, as
-    does a tab that crashes while you're looking at it. (An iPad is treated as
-    a desktop — iPadOS Safari reports a desktop User-Agent.)
+    A tab counts as asleep whenever its connection ends without the tab
+    saying it is leaving. Closing, reloading or navigating a tab away says
+    so, and starts the ordinary clock. Chrome freezing or discarding it, the
+    computer sleeping, or the network dropping does not, so the session
+    stays, even if the tab was in front. The one thing that looks the same
+    as sleep: a tab you close while Chrome has it frozen, or one that
+    crashes. Its session stays until you close it from the lobby. (Tabs
+    loaded before this change don't say when they leave, and are judged the
+    old way until they reload. An iPad is treated as a desktop, since iPadOS
+    Safari reports a desktop User-Agent.)
 
 ### A second hub, with several sessions in it
 
@@ -320,8 +325,9 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 - **AskUserQuestion fallback** -- Claude's interactive multiple-choice tool (`AskUserQuestion`) has no picker widget in the web UI, so instead of silently failing, its questions and options are surfaced as a chat message and Claude is told to continue the exchange in plain text — you just type your answer
 - **Session resume** -- automatically continues the most recent session for the working directory
 - **Bring your own Claude Code binary** (`--cli-path`) -- the Agent SDK pins a CLI version and bundles that binary, and the CLI refuses models newer than itself (*"Claude Code 2.1.259 does not support this model; version 2.1.280 or newer is required"*). Upgrading the SDK does not always help: when Opus 5.5 shipped, the newest SDK still pinned 2.1.277. Point `--cli-path` at a newer binary and the model works; it can be set per session, so one session runs the newer CLI while the rest stay on the bundled one — including when the launch joins a hub that is already running. A path that does not exist falls back to the bundled CLI with a warning rather than failing the session
-- **Interrupted turns are picked back up, and announced** -- if a session's last turn was cut off (the tab closed on a working session, the CLI died, the machine rebooted), resuming it makes the CLI finish that turn rather than abandon the work. Because that means output can start appearing with nobody having typed anything, the session says so once in the transcript and points at the interrupt button -- the recovered work may be days old and no longer wanted
-- **Lost background work is reported** -- background tasks die with the CLI process, so a session cut off while they were running used to come back believing they were still out there, waiting for completion notices nobody could send. The live task set is now kept on disk, and a resumed session is handed a queued prompt (at the front of its queue, visible in the queue pane) naming what was running and how long it had been going. It says the results are gone and the outcome is *unknown* rather than claiming the tasks failed -- a task can finish in the seconds while a session is being torn down -- and tells the model to check for effects before re-running
+- **A resumed session waits for you** -- if a session's last turn was cut off (the hub stopped or restarted, the machine rebooted, an idle teardown), opening it again -- from the session list, with `--resume`, or after a restart -- does not make it carry on by itself. The tab says which turn was cut off: when it stopped, what it was doing, and what started it. Send "continue" to pick it up where it stopped, or anything else to do something different. (`--resume-interrupted-turn` has it finish the turn by itself instead, as it did before 2026-09-29.) When a session's CLI dies in the middle of a turn, or you `/connect` a turn that is stuck, the new CLI finishes that turn, and so does the copy of a session cut by `/move`; since output then starts with nobody having typed anything, the session says so once and points at the interrupt button. `/model` and other reconnects between turns leave a waiting turn waiting. In history, the CLI's own "Continue from where you left off." is shown as the CLI's, and its placeholder "No response requested." as a note that the session was cut off there
+- **A CLI that dies is replaced, and says why** -- if the Claude CLI behind a session exits, or sends a single message too large to read (the limit is 256 MB, far above any file it edits -- an edit's result carries the whole file), the hub starts a new one and says what happened. If it died in the middle of a turn, the new one is asked to finish that turn; if nothing starts, send "continue". Its last steps may not have been saved before it died, so it may repeat one that was already done. A session never reads "working" afterwards with nothing running
+- **Lost background work is reported** -- background tasks die with the CLI process. The live task set is kept on disk, so a session cut off while they were running comes back saying, in the tab, which tasks were running, that their results are lost, and that whether they finished is *unknown* rather than claiming they failed -- a task can finish in the seconds while a session is being torn down. The session itself is told by the CLI, along with the next prompt it gets; nothing is sent to it just for this, so opening a session does not set it working. A tab opened after the session came back is told too
 - **Stalled background tasks are called out** -- a background task whose completion the CLI never reports would otherwise sit in the panel forever, and (worse) keep deferring idle teardown, `/model` switches and the context trim. Tasks are probed for output-file movement, CPU time and disk-I/O operations across their whole process tree; one that has done none of the three for five minutes is annotated in the panel ("no output or CPU for 20m") and stops holding those gates open. It is never removed or reported as finished -- usually it is a real process hung on I/O, and the panel is the only thing that can see it. Rows we can identify a process for get a kill button; nothing is killed automatically
 - **Session picker** -- interactive full-screen terminal session selection with `--resume` (no id); `--copy` copies a session in from another account first
 - **Switch projects** -- change working directory and session with `/cwd <path>`
@@ -342,6 +348,7 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 | `--initial-prompt`, `-p` | -- | First message for the session this launch opens. It waits in the queue panel while the session connects, then is sent (and shown) in a turn of its own, after anything the session starts by itself on resuming. It goes only to this launch's session, including when the launch joins a hub that is already running (if that session is already open there, it is queued there). Other sessions the hub opens don't get it, and `/cwd`, `/resume` and restarts don't re-send it. Quote it: an unquoted prompt makes the launch fail with "unrecognized arguments" (see `launch-error.log`) |
 | `--no-continue` | off | Start a fresh session instead of resuming the most recent one |
 | `--no-replay` | off | When resuming, don't replay prior messages into backscroll |
+| `--resume-interrupted-turn` | off | When a session whose last turn was cut off is opened, have it finish that turn by itself (the behaviour before 2026-09-29). Off, it waits, and the tab says which turn was cut off. Applies to every session a hub opens when the hub is started with it, or to the one session a launch opens when the launch joins a running hub. `--no-resume-interrupted-turn` is the default |
 | `--allow-duplicate-session` | off | Connect even when another Claude process is already resuming the same session id. Off by default because two agents sharing one session file and working directory commit over each other — see [Session safety](#session-safety) |
 | `--disable-prompt-cache` | off | Turn off Claude prompt caching in the CLI (sets `DISABLE_PROMPT_CACHING`). Workaround for the bundled CLI's `ttl='1h' cache_control must not come after ttl='5m'` API 400 on long resumed sessions; costs cache savings, so leave off unless you hit that error |
 | `--resume [SESSION_ID\|TITLE]` | -- | Resume a specific session by ID or by its title — the whole title, in any case, of one session in this directory (as `claude --resume` accepts; part of a title does not count, and a title two sessions share opens neither and says so) — or omit it to open a full-screen terminal picker (grouped by project) before the server starts. Works the same whether the launch starts a hub or joins one that is already running. It is checked before anything starts. If this directory has no session by that name but exactly one session elsewhere does, the launch follows it: to its directory (unless you gave `--cwd`) and to its account (unless you chose one with `--config-dir` or `CLAUDE_CONFIG_DIR`), and says so. Otherwise, and for a name several sessions share, the launch stops and lists each candidate's id, last activity, directory and account, so you can pass the right id |
@@ -435,7 +442,7 @@ At runtime, use the `/bell` slash command to view or change the bell events with
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--auto-reconnect` | off | Reconnect and auto-continue on CLI crash |
+| `--auto-reconnect` | off | Also reconnect after a turn fails for any other reason. A CLI that dies is always reconnected, with or without this |
 | `--cli-recycle-at GIB` | 8.0 | Swap `claude.exe` for a fresh one once its committed (private) memory passes this many GiB |
 | `--no-cli-recycle` | off | Never recycle the CLI subprocess, however large it grows |
 | `--cli-recycle-cooldown SECS` | 600 | Minimum seconds between automatic recycles |
@@ -463,7 +470,7 @@ The status bar grows a `cli` field once memory approaches the threshold.
 | `--no-auto-shutdown` | off | Never auto-shut-down when tabs close, even under `--open`/`--detach`; the server runs until stopped explicitly |
 | `--standalone` | off | Start a separate server instead of joining a running hub on the same port/account |
 | `--session-idle-timeout SECS` | 300 | Seconds a session with zero viewers lingers before teardown (`0` disables) |
-| `--mobile-idle-timeout SECONDS` | `0` | Idle teardown when the last viewer was put to sleep by its browser: a phone or tablet, or a background tab whose connection the browser dropped (Chrome discarding it). `0` = never — a sleeping viewer is not one who left |
+| `--mobile-idle-timeout SECONDS` | `0` | Idle teardown when the last viewer was put to sleep by its browser: a phone or tablet, or a tab whose connection ended without it saying it was leaving (Chrome freezing or discarding it, the computer sleeping, the network dropping). `0` = never — a sleeping viewer is not one who left |
 | `--config-dir PATH` | -- | Override `CLAUDE_CONFIG_DIR` (session/credential storage). Use to run under a different Claude account |
 | `--debug` | off | Print extra diagnostic messages |
 

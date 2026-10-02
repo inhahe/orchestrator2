@@ -155,6 +155,16 @@ _PICKER_SENTINEL = "<picker>"
 # Sentinel pushed on turn_msg_queue when the dispatcher crashes.
 DISPATCHER_DEAD = object()
 
+# The largest single message read from the CLI (the SDK's ``max_buffer_size``).
+# An ``Edit`` result carries the whole file it changed (``originalFile``) -- on
+# the stream, not in the transcript, which stores it only for small files -- so
+# this has to be larger than any file the agent edits.  It was 10 MB until
+# 2026-10-01, when a lane editing a 10.4 MB known-issues.md lost its CLI twice
+# in a minute: the message describing the edit was over the limit, the SDK's
+# reader gave up on the stream, and the CLI had to be replaced.  Bounded all the
+# same: it is one message's worth of memory, held only while it is read.
+MAX_SDK_MESSAGE_BYTES = 256 * 1024 * 1024
+
 # Sentinel pushed on turn_msg_queue by ``SDKBridge.interrupt()`` so the
 # run_turn loop's ``await turn_msg_queue.get()`` wakes up immediately
 # even when the SDK isn't streaming.  Without this, an interrupt can
@@ -549,7 +559,11 @@ class Config:
     standalone: bool = False           # don't reuse a running hub; force a separate server
     external_password: str | None = None  # non-LAN password; None = unspecified (→ env var); "" = no password
     external_access: str | None = None    # "on"/"off"; None = unspecified (→ env var, else off)
-    resume_interrupted_turn: bool = True   # finish a turn the CLI reports as interrupted
+    # Opening a session whose last turn was cut off finishes that turn by
+    # itself.  Off: the tab says it was cut off and waits (see
+    # SDKBridge._make_options).  A CLI that dies under a running turn always
+    # has the turn finished by its replacement.
+    resume_interrupted_turn: bool = False
     agent_name: str | None = None          # cross-account agent identity (agent-comms spec §3)
     # One-shot note prepended to the next prompt (see SDKBridge._with_session_note).
     session_note: str | None = None
@@ -1014,9 +1028,10 @@ def parse_args(argv: list[str] | None = None) -> Config:
         metavar="SECONDS",
         help=(
             "Idle teardown for a session whose last viewer was put to sleep "
-            "by its browser: a phone or tablet, or a background tab whose "
-            "connection the browser dropped (Chrome discarding or freezing "
-            "it). Default: 0 (never). Phones suspend their browser within a "
+            "by its browser: a phone or tablet, or a tab whose connection "
+            "ended without it saying it was leaving (Chrome freezing or "
+            "discarding it, the computer sleeping, the network dropping). "
+            "Default: 0 (never). Phones suspend their browser within a "
             "minute or two of the screen locking, and Chrome discards "
             "background tabs to save memory, so the ordinary "
             "--session-idle-timeout reaps a session its viewer is still "
@@ -1079,19 +1094,26 @@ def parse_args(argv: list[str] | None = None) -> Config:
         ),
     )
     ap.add_argument(
+        "--resume-interrupted-turn",
+        dest="resume_interrupted_turn",
+        action="store_true",
+        default=False,
+        help=(
+            "When you open a session whose last turn was cut off (the hub "
+            "stopped, the machine restarted, an idle teardown), have it "
+            "finish that turn by itself, as it did before 2026-09-29.  By "
+            "default it waits: the tab says which turn was cut off, and "
+            "'continue' picks it up.  A session whose CLI dies in the middle "
+            "of a turn always finishes that turn, and so does one moved with "
+            "/move."
+        ),
+    )
+    ap.add_argument(
         "--no-resume-interrupted-turn",
         dest="resume_interrupted_turn",
         action="store_false",
-        help=(
-            "When resuming a session whose last turn was cut off mid-flight, "
-            "do NOT finish it.  By default orchestrator2 sets "
-            "CLAUDE_CODE_RESUME_INTERRUPTED_TURN so the agent picks the turn "
-            "back up; without it the CLI leaves a synthetic 'Continue from "
-            "where you left off.' prompt in the transcript, answers it with "
-            "'No response requested.', and abandons the work.  Turn this off "
-            "if you would rather open an interrupted session without it "
-            "immediately starting to act."
-        ),
+        help="The default: an opened session does not finish a cut-off turn "
+             "by itself.",
     )
     ap.add_argument(
         "--external-access",

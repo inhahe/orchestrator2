@@ -71,6 +71,8 @@ const App = (() => {
     // Chrome freezes a background tab to save power; whether it did so before
     // a socket dropped is the first thing to know about the drop.
     document.addEventListener('freeze', () => { _frozen = true; });
+    // Going for real -- closed, reloaded, navigated away.  See _sayLeaving.
+    window.addEventListener('pagehide', _sayLeaving);
 
     // Focus input.
     Commands.focus();
@@ -183,6 +185,10 @@ const App = (() => {
       _discardReported = true;
       q.push('discarded=1');
     }
+    // This page says "leaving" when it really goes, so the hub can take any
+    // other ending for a tab asleep.  Declared here rather than in a message:
+    // a page frozen again moments after connecting never sends one.
+    q.push('bye=1');
     if (q.length) wsUrl += '?' + q.join('&');
     _hubHears = [];                // until this socket's hub says otherwise
 
@@ -278,6 +284,7 @@ const App = (() => {
       _serverShutdown = true;
       _retriesExhausted = true;
       Status.update({ busy_label: 'disconnected', busy_class: 'shutdown', connection: true });
+      _nothingRunning();
       Chat.handleMessage({
         type: 'system_msg',
         subtype: 'error',
@@ -292,6 +299,15 @@ const App = (() => {
       _connect();
       reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
     }, reconnectDelay);
+  }
+
+  /* Nothing is running any more: the hub has gone, or we gave up on it.  The
+   * bar says so; this takes the input and the queue out of "busy" as well,
+   * so the stop button is not left up for a turn that no longer exists. */
+  function _nothingRunning() {
+    _isBusy = false;
+    Commands.setBusy(false);
+    Panels.setBusy(false);
   }
 
   function _showConnectionStatus(status) {
@@ -434,6 +450,20 @@ const App = (() => {
     try {
       ws.send(JSON.stringify({ type: 'visibility', hidden: !!document.hidden }));
     } catch (e) { /* the socket is going; the next one will say */ }
+  }
+
+  /* Tell the hub this tab is really going: closed, reloaded or navigated
+   * away.  Only then may it idle out the session.  Any other way a socket
+   * ends -- Chrome freezing or discarding the tab, the machine sleeping, the
+   * network dropping -- is a tab asleep, not a viewer gone
+   * (server._note_how_it_ended).  Reported 2026-09-28: "i never closed my
+   * 'Good Photons' tab", and its session was idled out. */
+  function _sayLeaving() {
+    if (!_hubHears.includes('leaving')) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      ws.send(JSON.stringify({ type: 'leaving' }));
+    } catch (e) { /* going anyway */ }
   }
 
   function _onVisibilityChange() {
@@ -654,6 +684,12 @@ const App = (() => {
 
     // Status updates go to the status bar + panels.
     if (type === 'status_update') {
+      // A hub that said it is shutting down has nothing more to say about
+      // what is running.  Its status ticker goes on until the process exits,
+      // and an update from it put "working" back on the bar for good: the
+      // socket closes next, and nothing after that touches the bar.
+      // Reported 2026-09-29.  /connect clears the latch for the next hub.
+      if (_serverShutdown) return;
       if (msg.status) {
         Status.update(msg.status);
         // Track busy state for queue routing and input styling.
@@ -727,6 +763,7 @@ const App = (() => {
         busy_class: 'shutdown',
         connection: true,
       });
+      _nothingRunning();
       Chat.handleMessage({
         type: 'system_msg',
         subtype: 'info',

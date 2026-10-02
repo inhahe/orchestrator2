@@ -80,6 +80,7 @@ AGENT_POLL_INTERVAL = 5.0
 from config import (
     DISPATCHER_DEAD,
     INTERRUPT_SENTINEL,
+    MAX_SDK_MESSAGE_BYTES,
     WAKEUP_DEFAULT_DELAY,
     WAKEUP_MAX_DEFERS,
     WAKEUP_MAX_DELAY,
@@ -126,11 +127,11 @@ from bg_stall import (
 from session import (
     _classify_user_text,
     _bg_task_label,
-    bg_task_items,
+    cut_off_turn,
+    describe_cut_off_turn,
     describe_resumable_sessions,
     read_human_title,
     check_session_integrity,
-    describe_lost_bg_tasks,
     load_persisted_bg_tasks,
     save_persisted_bg_tasks,
     describe_integrity_problem,
@@ -541,6 +542,21 @@ def _exc_reason(exc: BaseException, budget: float = CONNECT_TIMEOUT) -> str:
     return text.splitlines()[0].strip()
 
 
+def _death_explained(reason: str) -> str:
+    """Why a CLI was lost, in words the user can act on.
+
+    The one that needs translating is the SDK's buffer limit: its message names
+    a byte count, and nothing about what makes a message that large -- in
+    practice a tool result carrying a whole file (config.MAX_SDK_MESSAGE_BYTES).
+    """
+    if "exceeded maximum buffer size" in (reason or ""):
+        return (f"one message from it was over the "
+                f"{MAX_SDK_MESSAGE_BYTES // (1024 * 1024)} MB this hub reads at "
+                f"once -- usually a tool result that carries a whole file, after "
+                f"an edit to a very large one")
+    return reason
+
+
 # Broadcaster type: async function that sends a dict to all WS clients.
 Broadcaster = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -863,13 +879,27 @@ class SDKBridge:
         # runtime that already recycles the CLI for leaking.
         self._btw_task: asyncio.Task | None = None
         self._btw_seq: int = 0
-        # True from the moment we connect with ``resume=`` until either we
-        # send a prompt or a ghost turn starts.  A stream that arrives while
-        # this is set was not asked for by anyone here: it is the CLI
-        # continuing a turn that was interrupted before the session was last
-        # closed (CLAUDE_CODE_RESUME_INTERRUPTED_TURN).  See
+        # True from the moment we connect with ``resume=``, on a connect that
+        # lets the CLI finish a cut-off turn, until either we send a prompt or
+        # a ghost turn starts.  A stream that arrives while this is set was not
+        # asked for by anyone here: it is the CLI continuing a turn that was
+        # interrupted (CLAUDE_CODE_RESUME_INTERRUPTED_TURN).  See
         # _begin_ghost_turn_if_needed.
         self._unprompted_resume_pending: bool = False
+        # Whether the connect being made lets the CLI finish a cut-off turn
+        # (see _make_options).  When it does not, the turn is announced as
+        # waiting instead (_announce_on_open).
+        self._finishing_cut_off_turn: bool = False
+        # The CLI died in the middle of a turn (_note_transport_death), so the
+        # reconnect that replaces it finishes that turn (reconnect).
+        self._turn_cut_short: bool = False
+        # What the first detector saw kill it (_note_transport_death), which is
+        # what the user is told -- the turn's own failure only says that the
+        # stream stopped.
+        self._death_reason: str | None = None
+        # Whether the last reconnect let the new CLI finish a cut-off turn,
+        # which decides what _recover_dead_transport says afterwards.
+        self._last_reconnect_recovered: bool = False
         # One-shot note prepended to this session's next prompt; see
         # _with_session_note.  Set from --session-note by /move.
         self._session_note: str | None = (
@@ -1055,13 +1085,23 @@ class SDKBridge:
             return self.state.session_id
         return None
 
-    def _make_options(self, resume_id: str | None = None) -> ClaudeAgentOptions:
-        """Build ``ClaudeAgentOptions`` from config + state."""
+    def _make_options(self, resume_id: str | None = None, *,
+                      recovering: bool = False) -> ClaudeAgentOptions:
+        """Build ``ClaudeAgentOptions`` from config + state.
+
+        *recovering* is True when :meth:`reconnect` replaces the CLI of a
+        session that had a turn running here -- it died under it, or a stuck
+        one is reconnected.  False for opening a session (the runtime's first
+        connect, a switch to another one) and for a reconnect between turns
+        (``/model``, a recycle).  The two differ in what happens to a turn that
+        was cut off; see below.
+        """
         kwargs: dict[str, Any] = {
             "permission_mode": self.config.permission_mode,
             "cwd": self.config.cwd,
             "setting_sources": ["user", "project", "local"],
-            "max_buffer_size": 10 * 1024 * 1024,
+            # Larger than any file the agent edits: see MAX_SDK_MESSAGE_BYTES.
+            "max_buffer_size": MAX_SDK_MESSAGE_BYTES,
             # Pipe the CLI subprocess's stderr into our log so fatal errors
             # ("Check stderr output for details") are actually recoverable.
             "stderr": self._on_sdk_stderr,
@@ -1102,29 +1142,41 @@ class SDKBridge:
         if getattr(self.config, "disable_prompt_cache", False):
             kwargs["env"]["DISABLE_PROMPT_CACHING"] = "1"
 
-        # Finish a turn that was cut off mid-flight.
+        # A turn that was cut off mid-flight: finish it, or wait?
         #
         # When the CLI resumes a session whose last turn was interrupted (the
         # process died, the machine was restarted, a recycle landed badly), its
         # conversationRecovery layer appends a *synthetic* user message,
         # "Continue from where you left off.", flagged ``isMeta``, plus an
         # assistant sentinel "No response requested." so the transcript stays
-        # API-valid if nothing acts on it.
+        # API-valid if nothing acts on it.  ``CLAUDE_CODE_RESUME_INTERRUPTED_TURN``
+        # makes it act on it instead: it removes the pair and runs the turn.
         #
-        # In an interactive terminal the user is offered the choice and, on
-        # accepting, the CLI deletes that pair and re-enqueues it as a real
-        # prompt.  Non-interactively there is no chooser, so **without this env
-        # var the pair simply stays**: the session shows a prompt the user
-        # never typed, answered by a refusal to do anything, and the
-        # interrupted work is silently abandoned.  Reported 2026-09-06 across
-        # three restarted sessions.
+        # From 2026-09-06 that was set on every connect, because without it the
+        # pair was drawn as a prompt nobody typed and a refusal to answer it.
+        # But it meant that **opening** a session made it start working by
+        # itself.  Reported 2026-09-29: "sessions would often start working
+        # automatically when i resumed them, when i don't think they had had
+        # anything scheduled, and without showing me the prompt that caused
+        # it".  Asked what should happen, the answer was "wait for me".
         #
-        # ``CLAUDE_CODE_RESUME_INTERRUPTED_TURN`` is the supported opt-in for
-        # exactly this path (cli/print.ts): remove the synthetic pair and
-        # re-enqueue it once, so the agent actually continues.  Doing neither
-        # is the one option with no upside, which is why this defaults on.
-        if getattr(self.config, "resume_interrupted_turn", True):
-            kwargs["env"]["CLAUDE_CODE_RESUME_INTERRUPTED_TURN"] = "1"
+        # So it is set only for a *recovery*: a turn was running here when the
+        # CLI was replaced (it died under the turn, or a stuck turn is
+        # reconnected).  Nobody opened anything there, and the turn is one the
+        # user was watching run.  Opening a session -- from the lobby,
+        # --resume, after a restart -- waits: the tab says the turn was cut
+        # off (_announce_on_open), and "continue" picks it up.  So does a turn
+        # already waiting when /model or a recycle reconnects between turns.
+        # History draws the pair as what it is (session.render_session_history).
+        # --resume-interrupted-turn restores the old behaviour, and /move
+        # passes it, having cut the turn itself.
+        #
+        # Always set, to "0" when off: the CLI reads it as a boolean, and an
+        # inherited "1" must not turn it back on.
+        finish = recovering or bool(
+            getattr(self.config, "resume_interrupted_turn", False))
+        kwargs["env"]["CLAUDE_CODE_RESUME_INTERRUPTED_TURN"] = "1" if finish else "0"
+        self._finishing_cut_off_turn = finish
 
         # Session resume / continue logic.
         # Always prefer an explicit session id (from cwd lookup or --resume)
@@ -1147,9 +1199,11 @@ class SDKBridge:
             # /clear, which is exactly the one time a new session is the point.
             self.state.expected_resume_sid = None
 
-        # A resumed session can start streaming with no prompt from us; arm
-        # the notice that explains that to whoever opens it.
-        self._unprompted_resume_pending = bool(kwargs.get("resume"))
+        # A resumed session whose CLI finishes a cut-off turn starts streaming
+        # with no prompt from us; arm the notice that explains that.  Only
+        # then: with the turn left waiting, the first stream after an open has
+        # some other author (a peer's message, say).
+        self._unprompted_resume_pending = bool(kwargs.get("resume")) and finish
 
         # A Claude Code binary other than the one the SDK bundles.
         #
@@ -1261,12 +1315,15 @@ class SDKBridge:
         except Exception:
             return 0
 
-    async def connect(self, resume_id: str | None = None) -> None:
+    async def connect(self, resume_id: str | None = None, *,
+                      recovering: bool = False) -> None:
         """Create SDK client, connect, and start the message dispatcher.
 
         **Must run on the worker task** — this is where the SDK transport's
         anyio cancel scope gets *entered*, and the scope's host task is whoever
         is holding it.  See :meth:`_warn_if_foreign_task`.
+
+        *recovering*: see :meth:`_make_options`.  Only :meth:`reconnect` sets it.
         """
         self._warn_if_foreign_task("connect")
         # The name the new CLI starts with is the person-chosen title of the
@@ -1308,12 +1365,15 @@ class SDKBridge:
                 log.info("session %s keeps its name %r", target[:8], remembered)
             if remembered_labels and not self.state.agent_labels:
                 self.state.agent_labels = dict(remembered_labels)
-        options = self._make_options(resume_id)
+        options = self._make_options(resume_id, recovering=recovering)
         resume_sid = getattr(options, "resume", None)
         log.info(
-            "connect: resume=%s, cwd=%s",
+            "connect: resume=%s, cwd=%s%s",
             getattr(options, 'resume', None),
             getattr(options, 'cwd', None),
+            "" if not resume_sid else (
+                ", a cut-off turn is finished" if self._finishing_cut_off_turn
+                else ", a cut-off turn waits"),
         )
         # NOT consumed here.  It used to be cleared right after building the
         # options ("one-time use"), which meant a first connect that *failed*
@@ -1350,6 +1410,14 @@ class SDKBridge:
                 log.error("refusing to resume %s — already running as PID(s) %s",
                           resume_target, [p.pid for p in dupes])
                 raise proc_guard.DuplicateSessionError(resume_target, dupes)
+
+        # Whether the session being opened ends in the middle of a turn, which
+        # this connect will leave waiting (see _make_options).  Read now,
+        # before its new CLI writes anything to the transcript.  Announced
+        # once the connect has worked (_announce_on_open).
+        cut_off: dict | None = None
+        if resume_sid and not self._finishing_cut_off_turn:
+            cut_off = await asyncio.to_thread(self._read_cut_off_turn, resume_sid)
 
         # If a previous dispatcher task is somehow still alive (e.g.
         # connect() was called without disconnect() — should be
@@ -1479,16 +1547,16 @@ class SDKBridge:
         # which is the one case the spec calls unambiguous by definition.
         await self.register_agent()
 
-        # A fresh CLI starts turns of its own the moment it is up.  It reports
-        # the previous process's background tasks as stopped, and it re-runs a
-        # turn that was cut off (CLAUDE_CODE_RESUME_INTERRUPTED_TURN).  A
-        # prompt sent in that instant is folded into the CLI's turn instead
-        # of getting one of its own.  Measured 2026-09-27: every lane that came
-        # back with lost background tasks was sent its --initial-prompt 30-100
-        # ms after connecting, and run_turn ended on the CLI's own result
-        # ("not ours").  So a connect starts the same settle as a turn end
-        # does.  The first queued prompt waits TURN_END_SETTLE_S, and waits for
-        # any turn the CLI starts inside that window (_pop_queued_prompt).
+        # A fresh CLI can start a turn of its own the moment it is up: it
+        # re-runs a turn that was cut off, on a connect that lets it
+        # (CLAUDE_CODE_RESUME_INTERRUPTED_TURN, see _make_options).  A prompt
+        # sent in that instant is folded into the CLI's turn instead of
+        # getting one of its own.  Measured 2026-09-27: every lane that came
+        # back mid-turn was sent its --initial-prompt 30-100 ms after
+        # connecting, and run_turn ended on the CLI's own result ("not ours").
+        # So a connect starts the same settle as a turn end does.  The first
+        # queued prompt waits TURN_END_SETTLE_S, and waits for any turn the CLI
+        # starts inside that window (_pop_queued_prompt).
         self._turn_ended_at = time.monotonic()
 
         # Anything the user typed during the connect went to
@@ -1554,10 +1622,10 @@ class SDKBridge:
         asyncio.create_task(self._report_session_integrity(),
                             name="session-integrity")
 
-        # A session cut off while background work was running comes back with
-        # no idea that the work is gone -- the process that knew died with it.
-        # Read that off disk and put it in front of the model before it acts.
-        await self._report_lost_bg_tasks(resume_sid)
+        # What the session it opened has to tell whoever looks at it: the
+        # background tasks that died with its last process, and a turn left
+        # waiting.  Replaced on every connect.
+        await self._announce_on_open(resume_sid, cut_off)
 
         # The connect worked, so the requested resume has been honoured and is
         # spent.  Later reconnects resume ``state.session_id`` explicitly (see
@@ -1977,6 +2045,11 @@ class SDKBridge:
         if self._transport_dead:
             return  # already known; don't queue a second connect
         self._transport_dead = True
+        self._death_reason = why
+        # Whether it died in the middle of a turn: the reconnect then finishes
+        # that turn (see reconnect).  Read now -- by the time the reconnect
+        # runs, the turn has unwound and cleared both.
+        self._turn_cut_short = self.turn_active.is_set() or bool(self.state.busy)
         log.error("transport dead: %s — requesting reconnect", why)
         if self.stop_event.is_set():
             return
@@ -2076,6 +2149,11 @@ class SDKBridge:
         # close() cancels the SDK's stderr reader mid-stream.
         await self._drain_stderr()
         self._log_stderr_tail(why)
+        # The user is told what the first detector saw, not the turn's own
+        # "SDK dispatcher died mid-turn" -- which is all *why* says when the
+        # death came mid-turn, and was all the 2026-10-01 report had to go on.
+        shown = _death_explained(self._death_reason or why)
+        self._death_reason = None
 
         if not self._may_auto_reconnect():
             log.error(
@@ -2086,7 +2164,7 @@ class SDKBridge:
                 "type": "system_msg",
                 "subtype": "error",
                 "data": {"message": (
-                    f"The Claude CLI keeps dying ({why}). Gave up after "
+                    f"The Claude CLI keeps dying ({shown}). Gave up after "
                     f"{TRANSPORT_DEATH_MAX_RECOVERIES} attempts — this session "
                     f"can't run prompts until it connects. Use /connect to try "
                     f"again."
@@ -2104,7 +2182,7 @@ class SDKBridge:
             "type": "system_msg",
             "subtype": "warning",
             "data": {"message": (
-                f"The Claude CLI exited ({why}). Reconnecting…"
+                f"The Claude CLI exited ({shown}). Reconnecting…"
             )},
         })
         try:
@@ -2121,10 +2199,24 @@ class SDKBridge:
             })
             return False
         log.info("recovered from transport death: %s", why)
+        # Not "re-send your last prompt", which this always said: when the CLI
+        # died in a turn, the new one is asked to finish it (reconnect), and
+        # when it died between turns there is nothing to re-send -- or the
+        # turn was one the CLI had started itself, with no prompt of the
+        # user's behind it.  Reported 2026-10-01, under a status bar that went
+        # on reading "working".
+        if self._last_reconnect_recovered:
+            text = ("Reconnected. The CLI died in the middle of a turn; the "
+                    "new one has been asked to pick it back up, and says so "
+                    'here when it does. If nothing starts, send "continue". '
+                    "Its last steps may not have been saved before it died, "
+                    "so it may repeat one that was already done.")
+        else:
+            text = "Reconnected."
         await self.broadcast({
             "type": "system_msg",
             "subtype": "info",
-            "data": {"message": "Reconnected. Re-send your last prompt to continue."},
+            "data": {"message": text},
         })
         return True
 
@@ -2164,36 +2256,63 @@ class SDKBridge:
         except Exception as exc:
             log.debug("bg task persist failed: %r", exc)
 
-    def _queue_lost_bg_notice(self, items: list[dict], why: str) -> bool:
-        """Put the loss in front of the model, at the head of the queue.
+    async def _post_open_notice(self, subtype: str, text: str) -> None:
+        """Say *text* to the tabs now, and to any that attach before the next
+        turn starts (``state.open_notices``, replayed on attach)."""
+        notice = {"subtype": subtype, "data": {"message": text}}
+        self.state.open_notices.append(notice)
+        try:
+            await self.broadcast({"type": "system_msg", **notice})
+        except Exception as exc:
+            log.warning("open notice broadcast failed: %r", exc)
 
-        ``appendleft`` rather than ``append`` because this is *context for
-        whatever the session does next*, not a task of its own: a prompt the
-        user queued earlier would otherwise be answered by a model still
-        believing its background work was alive, which is the one ordering
-        where knowing late costs the most.
+    def _read_cut_off_turn(self, sid: str) -> dict | None:
+        """:func:`session.cut_off_turn` for *sid*'s transcript, or None."""
+        try:
+            project = find_session_dir(sid, getattr(self.config, "config_dir", None))
+            if project is None:
+                return None
+            return cut_off_turn(project / f"{sid}.jsonl")
+        except Exception:
+            log.debug("could not tell whether %s was cut off", sid[:8],
+                      exc_info=True)
+            return None
 
-        Everything else it needs is already wired to the deque -- ``on_change``
-        persists the queue, and the listener list pokes the worker (so it is
-        sent immediately when nothing is running) and pushes the queue panel,
-        so the notice is visible in the left pane like any other queued prompt.
+    async def _announce_on_open(self, resume_sid: str | None,
+                                cut_off: dict | None) -> None:
+        """What the session this connect opened has to tell whoever looks.
+
+        The background tasks its last process left running, and -- when this
+        connect leaves it waiting -- the turn it was cut off in.  Nothing is
+        sent to the *model* from here: the CLI reports those tasks to it
+        itself, with the next prompt (see _report_lost_bg_tasks), and the turn
+        waits for the user.  Reported 2026-09-29: a resumed session "would
+        often start working automatically", and a message from here, sent as
+        a prompt of its own, was one of the things that started it.
         """
-        text = describe_lost_bg_tasks(items, why=why)
-        if not text:
-            return False
-        self.state.queued_prompts.appendleft(text)
-        log.warning("queued lost-bg-task notice: %d task(s) (%s)",
-                    len(items), why)
-        return True
+        self.state.open_notices = []
+        await self._report_lost_bg_tasks(resume_sid)
+        if cut_off:
+            log.warning(
+                "opened with its last turn cut off at %s (%s %s): left waiting",
+                cut_off.get("stopped"), cut_off.get("phase"),
+                cut_off.get("tool") or "-")
+            await self._post_open_notice("warning", describe_cut_off_turn(cut_off))
 
     async def _report_lost_bg_tasks(self, resume_sid: str | None) -> int:
-        """Tell a freshly resumed session that its background work is gone.
+        """Tell the user that the session being opened lost its background work.
 
         This is the half a reconnect could never cover: the process that knew
         what was running is dead, so the knowledge has to come off disk.  A
         session torn down mid-work (an idle teardown, a hub restart, a reboot)
-        otherwise comes back and waits for notifications that no longer have
-        anyone to send them.
+        otherwise comes back showing nothing of the work it had going.
+
+        The model is not told from here.  Until 2026-09-29 it was, by a prompt
+        at the head of the queue -- which, sent as a turn of its own, set a
+        session that had merely been opened working.  The CLI tells it anyway:
+        on resume it reports every background task the previous process left
+        unfinished (2.1.258 and 2.1.280 both do), queued to go with the next
+        prompt rather than to start a turn.
         """
         if not resume_sid:
             return 0
@@ -2219,21 +2338,12 @@ class SDKBridge:
             shown += f", and {len(labels) - 5} more"
         plural = "" if len(labels) == 1 else "s"
         was = "was" if len(labels) == 1 else "were"
-        try:
-            await self.broadcast({
-                "type": "system_msg",
-                "subtype": "warning",
-                "data": {"message": (
-                    f"{len(labels)} background task{plural} {was} running when "
-                    f"this session was cut off ({shown}). Their results are "
-                    f"lost; whether they finished is unknown. The session has "
-                    f"been told, at the front of its prompt queue."
-                )},
-            })
-        except Exception as exc:
-            log.warning("lost-bg-task broadcast failed: %r", exc)
-        self._queue_lost_bg_notice(
-            items, "this session was cut off and has just been resumed")
+        await self._post_open_notice("warning", (
+            f"{len(labels)} background task{plural} {was} running when this "
+            f"session was cut off ({shown}). Their results are lost; whether "
+            f"they finished is unknown. The session is told along with the "
+            f"next prompt it gets."
+        ))
         return len(labels)
 
     def _active_bg_tasks(self) -> dict:
@@ -2476,8 +2586,7 @@ class SDKBridge:
         except Exception:
             log.debug("btw: could not discard fork transcript", exc_info=True)
 
-    async def _orphan_bg_tasks(self, why: str, *,
-                               tell_model: bool = True) -> int:
+    async def _orphan_bg_tasks(self, why: str) -> int:
         """Drop the background-task registry, and *say so*.
 
         Every reconnect kills the CLI subprocess, and the CLI's task registry
@@ -2495,18 +2604,17 @@ class SDKBridge:
         bookkeeping is sometimes unavoidable (the CLI died; the user asked for
         a reconnect) — losing it *quietly* never is.
 
-        *tell_model* is False only for ``/clear``, which wipes the
-        conversation: a model that has just lost all memory of *starting* those
-        tasks cannot act on being told they were lost, and the notice would be
-        the first thing in its brand-new context. The browser is still told,
-        because the user does need to know.
+        The user is told here.  The model is told by the new CLI, which reports
+        the tasks its predecessor left unfinished when it resumes the session
+        (see _report_lost_bg_tasks) -- and not after ``/clear``, which starts a
+        new one, as it should not be: a model that has lost all memory of
+        starting those tasks cannot act on being told they were lost.
 
         Returns the number of tasks orphaned.
         """
         labels = self._bg_task_labels()
         if not labels:
             return 0
-        items = bg_task_items(self.state.background_tasks)
         self.state.background_tasks.clear()
         self.state.completed_panel_bg.clear()
         # Reported here and now, so the on-disk record must not report the same
@@ -2528,11 +2636,6 @@ class SDKBridge:
                 f"completion notices are lost. Re-run anything you still need."
             )},
         })
-        # The browser has been told since 2026-08; the *model* had not, in any
-        # orphan path, so it kept waiting on handles that were already dead.
-        if tell_model:
-            self._queue_lost_bg_notice(
-                items, f"this session's CLI was replaced ({why})")
         return len(labels)
 
     async def _reconnect_or_defer(self, reason: str) -> bool:
@@ -2618,8 +2721,41 @@ class SDKBridge:
                 "session_id": sid,
             },
         })
+        # A recovery -- the new CLI finishes the turn the old one was in -- only
+        # if a turn was running here when it went: it died under one, or a
+        # stuck one is being reconnected.  /model, /effort, a recycle wait for
+        # a quiet moment, so nothing is running; and a turn left waiting when
+        # the session was opened must not be finished by a model switch.
+        recovering = (self._turn_cut_short or self.turn_active.is_set()
+                      or bool(self.state.busy))
+        self._turn_cut_short = False
+        self._last_reconnect_recovered = recovering
+        # A turn the old CLI had started by itself ends with it: its result
+        # will never come, and nothing else closes one.  Reported 2026-10-01:
+        # the CLI died during the turn it had picked back up, and the session
+        # read "working" ever after with nothing running.  If the new CLI
+        # picks the turn up again, that is a new ghost turn, and says so.
+        if self.state.busy and not self.turn_active.is_set():
+            self._abandon_ghost_turn()
         await self.disconnect()
-        await self.connect(resume_id=sid)
+        await self.connect(resume_id=sid, recovering=recovering)
+
+    def _abandon_ghost_turn(self) -> None:
+        """Close a ghost turn whose CLI is being replaced, without its result.
+
+        What :meth:`_end_ghost_turn` does to the state, minus booking a turn
+        that never finished.  The status reaches the tabs with the connect's
+        own ``status_update``.
+        """
+        state = self.state
+        elapsed = time.monotonic() - (state.turn_started_at or time.monotonic())
+        log.warning("ghost turn abandoned: its CLI is being replaced "
+                    "(elapsed=%.1fs)", elapsed)
+        state.busy = False
+        state.turn_started_at = None
+        state.active_tools.clear()
+        self._ghost_settled.set()
+        self._turn_ended_at = time.monotonic()
 
     # ------------------------------------------------------------------
     # Message dispatcher
@@ -3470,6 +3606,9 @@ class SDKBridge:
         # One notice per connection: a later ghost turn in the same connection
         # has some other cause (a background task waking the model).
         self._unprompted_resume_pending = False
+        # The session is working again, so what it said when it was opened is
+        # history -- as in run_turn.
+        state.open_notices = []
         log.warning(
             "ghost turn begin: SDK streaming without active run_turn "
             "(session_id=%s resumed_interrupted_turn=%s)",
@@ -3490,15 +3629,15 @@ class SDKBridge:
     async def _announce_resumed_interrupted_turn(self) -> None:
         """Say out loud that the CLI is finishing an old turn by itself.
 
-        We set ``CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`` on every connect, so
-        resuming a session whose last turn was cut off makes the CLI pick that
-        turn back up.  That is the behaviour we want -- work is not silently
-        abandoned -- but until this notice existed it was completely
-        unannounced: a session opened from the lobby would start producing
-        output with nobody having typed anything, and the only trace was a
-        WARNING in the server log.  A real report ("it was apparently still
-        doing a turn, even though the tab had been closed for a long time")
-        was exactly this, after an idle teardown killed the turn mid-flight.
+        A connect that sets ``CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`` -- a
+        recovery, a /move, or any open under --resume-interrupted-turn (see
+        _make_options) -- makes the CLI pick a cut-off turn back up.  Until
+        this notice existed that was completely unannounced: a session would
+        start producing output with nobody having typed anything, and the only
+        trace was a WARNING in the server log.  A real report ("it was
+        apparently still doing a turn, even though the tab had been closed for
+        a long time") was exactly this, after an idle teardown killed the turn
+        mid-flight.  (Opening a session no longer does this by default.)
         """
         try:
             await self.broadcast({
@@ -4289,6 +4428,9 @@ class SDKBridge:
 
         # Whatever streams from here on was asked for.
         self._unprompted_resume_pending = False
+        # And what the session had to say when it was opened is now history:
+        # a tab attaching from here on is not told it again.
+        state.open_notices = []
 
         # Diagnostic: log at the *very* top (before queue drain) so we
         # can prove this function actually started, distinct from the
@@ -6157,7 +6299,7 @@ class SDKBridge:
         # Wiping the session discards the running tasks along with everything
         # else.  That is what /clear means, but the user should still be told
         # which tasks went with it — the bulk clear below is silent.
-        await self._orphan_bg_tasks("/clear", tell_model=False)
+        await self._orphan_bg_tasks("/clear")
         await self.disconnect()
         state.session_id = None
         state.session_title = None

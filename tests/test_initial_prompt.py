@@ -280,21 +280,6 @@ def test_a_prompt_typed_during_the_connect_comes_after_it(cli, tmp_path):
     assert asked == [PROMPT, "typed while it connected"]
 
 
-def test_the_lost_work_notice_goes_ahead_of_it(tmp_path):
-    """The notice is context for whatever the session does next."""
-    br, st, _sent = _bridge(tmp_path, ["--initial-prompt", PROMPT])
-    st.queued_prompts.append(PROMPT)
-
-    br._queue_lost_bg_notice(
-        [{"description": "Re-push lane-a to origin",
-          "started_wall": time.time() - 600}],
-        "this session was cut off and has just been resumed")
-
-    queue = list(st.queued_prompts)
-    assert queue[0].startswith("[orchestrator2] this session was cut off")
-    assert queue[1:] == [PROMPT]
-
-
 def test_a_session_without_one_sends_nothing_by_itself(cli, tmp_path):
     br, st, sent = _bridge(tmp_path)
 

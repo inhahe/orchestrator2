@@ -84,7 +84,8 @@ def _bridge(argv=()):
     async def fake_disconnect():
         pass
 
-    async def fake_connect(resume_id=None):
+    async def fake_connect(resume_id=None, *, recovering=False):
+        # recovering: see tests/test_resume_interrupted_turn.py.
         connects.append(resume_id)
 
     br.disconnect = fake_disconnect

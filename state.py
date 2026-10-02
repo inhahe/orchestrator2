@@ -563,6 +563,13 @@ class State:
     # what a typed prompt is rejected with, instead of the misleading generic
     # "worker may be wedged" watchdog.  Cleared on the next successful connect.
     connect_blocked_msg: str | None = None
+    # What a session that has just been opened has to tell whoever looks at it
+    # -- its last turn was cut off and is waiting, its background tasks died --
+    # as ``system_msg`` payloads.  Broadcast when found, and replayed to a tab
+    # that attaches later, since the tab that opened the session is not always
+    # there yet.  Cleared when the next turn starts: from then on it is
+    # history.  See SDKBridge._announce_on_open.
+    open_notices: list = field(default_factory=list)
 
     # What the *CLI* says it is doing, from ``system``/``status`` messages.
     # Today the only value is ``"compacting"`` (set when the CLI starts an

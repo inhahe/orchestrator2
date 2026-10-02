@@ -276,5 +276,79 @@ test('the backfill renders into the real list, not a detached node', () => {
          'the backfilled nodes never made it into the visible list');
 });
 
+// ---------------------------------------------------------------------------
+// What arrives before the history does
+//
+// Found 2026-09-29.  A large session's history waits behind its CLI's own read
+// of the same file, so what the connect says -- that the session's last turn
+// was cut off and is waiting -- arrived first, was drawn at once, and ended up
+// above the history, scrolled out of sight.  While "loading session..." shows,
+// live messages are held and drawn after the history.
+
+function note(text) {
+  return { type: 'system_msg', subtype: 'warning', data: { message: text } };
+}
+
+test('what arrives while the session loads is drawn after its history', () => {
+  const p = makePage();
+  p.Chat.handleMessage({ type: 'session_loading', on: true });
+  p.Chat.handleMessage(note('last turn was cut off'));
+  assert(!p.texts().some(t => t.includes('cut off')),
+         'drawn before the history it belongs below');
+  p.hist(msgs('h', 3));
+  const t = p.texts();
+  assert(t[t.length - 1] === 'last turn was cut off',
+         'not last, under the history: ' + JSON.stringify(t));
+  assert(t.indexOf('h2') < t.indexOf('last turn was cut off'), JSON.stringify(t));
+});
+
+test('...and when no history comes, when the loading ends', () => {
+  const p = makePage();
+  p.Chat.handleMessage({ type: 'session_loading', on: true });
+  p.Chat.handleMessage(note('held'));
+  p.Chat.handleMessage({ type: 'session_loading', on: false });
+  assert(p.texts().includes('held'), JSON.stringify(p.texts()));
+});
+
+test('...and when the history is empty', () => {
+  const p = makePage();
+  p.Chat.handleMessage({ type: 'session_loading', on: true });
+  p.Chat.handleMessage(note('held'));
+  p.hist([]);
+  assert(p.texts().includes('held'), JSON.stringify(p.texts()));
+});
+
+test('what was held for a session left behind is not drawn in the next', () => {
+  const p = makePage();
+  p.Chat.handleMessage({ type: 'session_loading', on: true });
+  p.Chat.handleMessage(note('for the old one'));
+  p.Chat.handleMessage({ type: 'clear_screen' });
+  p.Chat.handleMessage({ type: 'session_loading', on: true });
+  p.hist(msgs('new', 2));
+  assert(!p.texts().includes('for the old one'), JSON.stringify(p.texts()));
+});
+
+test('a replay that ends while the next session loads leaves its messages held', () => {
+  // The old session's replay is still drawing in batches when the tab moves
+  // on; when it ends, the new session's messages must still wait for theirs.
+  const p = makePage();
+  p.Chat.handleMessage({ type: 'history', messages: msgs('old', 120) });
+  p.Chat.handleMessage({ type: 'clear_screen' });
+  p.Chat.handleMessage({ type: 'session_loading', on: true });
+  p.Chat.handleMessage(note('for the new one'));
+  p.flushTimers();                       // the old replay runs to its end
+  assert(!p.texts().includes('for the new one'),
+         'drawn before its own history: ' + JSON.stringify(p.texts().slice(-3)));
+  p.hist(msgs('new', 2));
+  const t = p.texts();
+  assert(t[t.length - 1] === 'for the new one', JSON.stringify(t.slice(-3)));
+});
+
+test('nothing is held when no session is loading', () => {
+  const p = makePage();
+  p.Chat.handleMessage(note('right away'));
+  assert(p.texts().includes('right away'), JSON.stringify(p.texts()));
+});
+
 console.log(`\n${ran - failures}/${ran} passed`);
 process.exit(failures ? 1 : 0);
