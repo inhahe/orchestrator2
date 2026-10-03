@@ -71,13 +71,36 @@ Run from anywhere:
     python tools/mutate.py             # every target
     python tools/mutate.py app         # one target
 
-Exits 0 only when every mutation is caught.  Sources are restored on every exit
-path; if a run is killed hard, a leftover <source>.mutbak holds the original --
-its presence means a sweep is in flight or died mid-mutation.
+Exits 0 only when every mutation is caught.
+
+**The project itself is never modified.**  A run copies it to a scratch
+directory -- every file git tracks, the untracked files it would add, and
+node_modules -- mutates the copy, runs the suites there, and deletes it on the
+way out.  Until 2026-10-02 the mutants were written into the live tree and
+the originals put back afterwards, and that cost a file.  A backup taken
+mid-sweep captured copy_session.py with a mutation in it; when the file was
+later deleted by accident, the backup restored the mutant.  A live tree has
+more readers than the sweep: backups, the hub (which serves static/ fresh to
+every tab that loads, so a tab reloaded during a sweep of app.js ran a mutant),
+and other agents' editors.  The restore was a hazard too: it wrote back the
+file as read at the start, undoing any edit made to it during the sweep.
+
+The copy goes in the system temp directory, or ORCH2_MUTATE_SCRATCH if set,
+named orchestrator2-mutate-<pid>-...  A run killed outright cannot delete its
+own copy, so each run first deletes any whose process has gone.  Python runs
+with PYTHONDONTWRITEBYTECODE and the copy has no __pycache__, so every run
+compiles the source as it stands (see ``run``).  A <source>.mutbak left in the
+project is from the old in-place sweep killed mid-mutation, and the source
+beside it may still be a mutant; a run refuses to start until it is dealt
+with.
 """
+import os
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -5126,6 +5149,91 @@ ONESOCKET_APP_MUTATIONS = [
      "      if (msg.seq < _stream.seq) return;\n"),
 ]
 
+# The sweep works in a copy, never the project (2026-10-02: a backup taken
+# mid-sweep restored copy_session.py as a mutant).  tests/test_mutate_tool.py.
+# Every anchor here contains a real newline, which its own entry below spells
+# as an escape, so no anchor can match the list that names it.
+MUTATE_TOOL_MUTATIONS = [
+    ("the sweep mutates the project, not the copy -- the report",
+     "            survivors += sweep(label, src_rel, test_rel, mutations, runner,\n"
+     "                               root=scratch)\n",
+     "            survivors += sweep(label, src_rel, test_rel, mutations, runner,\n"
+     "                               root=ROOT)\n"),
+
+    ("the copy is never deleted",
+     "    finally:\n        _rmtree(scratch)\n",
+     "    finally:\n        pass\n"),
+
+    ("a copy that fails halfway is left behind",
+     "    except BaseException:\n        _rmtree(scratch)\n        raise\n",
+     "    except BaseException:\n        raise\n"),
+
+    ("a killed run's copy is never deleted",
+     "        if pid is not None and path.is_dir() and not psutil.pid_exists(pid):\n"
+     "            _rmtree(path)\n",
+     "        if False:\n            _rmtree(path)\n"),
+
+    ("a running sweep's copy is deleted from under it",
+     "and not psutil.pid_exists(pid):\n            _rmtree(path)\n",
+     ":\n            _rmtree(path)\n"),
+
+    ("a name with no pid in it is read as having one",
+     "    return int(pid) if pid.isdigit() and sep else None\n",
+     "    return int(pid) if pid.isdigit() else None\n"),
+
+    ("a read-only file strands the copy",
+     "        os.chmod(failed, stat.S_IWRITE)\n        func(failed)\n",
+     "        raise OSError(failed)\n"),
+
+    ("ignored files are copied: logs, caches, a stray nul",
+     '"ls-files", "-z", "--cached", "--others",\n             "--exclude-standard"],\n',
+     '"ls-files", "-z", "--cached", "--others"],\n'),
+
+    ("an untracked new file is left out of the copy",
+     '"ls-files", "-z", "--cached", "--others",\n',
+     '"ls-files", "-z", "--cached",\n'),
+
+    ("node_modules is left out, so the jsdom suites cannot run",
+     '        if (root / "node_modules").is_dir():\n',
+     "        if False:\n"),
+
+    ("without git, logs and bytecode are copied",
+     '            if name.endswith((".log", ".pyc")) or name.lower() == "nul":\n',
+     "            if False:\n"),
+
+    ("without git, .git and the caches are copied",
+     "        dirnames[:] = [d for d in dirnames if d not in _NOT_PROJECT_DIRS]\n",
+     "        dirnames[:] = list(dirnames)\n"),
+
+    ("a scratch directory inside the project is allowed",
+     "    if parent.resolve().is_relative_to(root.resolve()):\n",
+     "    if False:\n"),
+
+    ("bytecode is written, so a same-size mutant can run the old code",
+     '    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")\n',
+     "    env = dict(os.environ)\n"),
+
+    ("a failing baseline does not say why",
+     "    if not run(runner, test_rel, root, show_failure=True):\n",
+     "    if not run(runner, test_rel, root):\n"),
+
+    ("each mutant is built on the one before",
+     "            mutant = original.replace(old, new)\n",
+     "            original = mutant = original.replace(old, new)\n"),
+
+    ("line endings are not kept",
+     "            if crlf:\n                mutant = ",
+     "            if False:\n                mutant = "),
+
+    ("the source is not put back for the next target",
+     "    finally:\n        src.write_bytes(raw)\n",
+     "    finally:\n        pass\n"),
+
+    ("a leftover .mutbak is ignored, and a mutant is copied as the source",
+     "    left = _left_mutated(ROOT)\n    if left:\n",
+     "    left = _left_mutated(ROOT)\n    if False:\n"),
+]
+
 
 # An opened session leaves a cut-off turn waiting, and says so (2026-09-29).
 # tests/test_cut_off_turn.py, tests/test_resume_interrupted_turn.py,
@@ -5655,6 +5763,8 @@ TARGETS = {
                        SHUTSTATUS_APP_MUTATIONS, "node"),
     "onesocket-app": ("static/app.js", "tests/reconnect_on_show.test.js",
                       ONESOCKET_APP_MUTATIONS, "node"),
+    "mutate-tool": ("tools/mutate.py", "tests/test_mutate_tool.py",
+                    MUTATE_TOOL_MUTATIONS, "pytest"),
     "cutoff-session": ("session.py", "tests/test_cut_off_turn.py",
                        CUTOFF_SESSION_MUTATIONS, "pytest"),
     "cutoff-bridge": ("sdk_bridge.py", "tests/test_cut_off_turn.py",
@@ -5678,7 +5788,138 @@ TARGETS = {
 }
 
 
-def _cmds(runner: str, test_rel: str) -> list[list[str]]:
+# --- Running: always in a copy of the project ---------------------------------
+
+#: Every scratch copy is named this, then the pid of the run that owns it.  A
+#: run killed outright cannot delete its own copy; the next run deletes any
+#: whose owner has gone.
+SCRATCH_PREFIX = "orchestrator2-mutate-"
+
+#: What a walk leaves out when git cannot say what the project is.
+_NOT_PROJECT_DIRS = {".git", "node_modules", "__pycache__", ".pytest_cache",
+                     ".claude"}
+
+
+def _project_files(root: Path) -> list[Path]:
+    """The files a copy of *root* needs, relative to it.
+
+    What git tracks, plus the untracked files it would add: a new test not yet
+    committed is part of the project.  Ignored files stay behind -- a log that
+    runs to hundreds of megabytes, caches, and a stray ``nul`` that Windows
+    reads as its null device.  A tracked file deleted from the working tree is
+    not copied either: the copy is the project as it stands.
+    """
+    try:
+        listed = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others",
+             "--exclude-standard"],
+            capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return _walked_files(root)
+    names = {name for name in listed.decode("utf-8").split("\0") if name}
+    return sorted(Path(n) for n in names if (root / n).is_file())
+
+
+def _walked_files(root: Path) -> list[Path]:
+    """``_project_files`` without git: everything but the usual junk."""
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _NOT_PROJECT_DIRS]
+        for name in filenames:
+            if name.endswith((".log", ".pyc")) or name.lower() == "nul":
+                continue
+            found.append(Path(dirpath, name).relative_to(root))
+    return sorted(found)
+
+
+def _scratch_parent() -> Path:
+    """Where copies go: ORCH2_MUTATE_SCRATCH, or else the system temp directory.
+
+    The temp directory rather than beside the project: it is usually on the
+    faster drive, and backups skip it.  The suites do not depend on which
+    drive they run from.
+    """
+    return Path(os.environ.get("ORCH2_MUTATE_SCRATCH") or tempfile.gettempdir())
+
+
+def _owner_pid(name: str) -> int | None:
+    """The pid in a scratch copy's name, or None if *name* is not one."""
+    if not name.startswith(SCRATCH_PREFIX):
+        return None
+    pid, sep, _rest = name[len(SCRATCH_PREFIX):].partition("-")
+    return int(pid) if pid.isdigit() and sep else None
+
+
+def _delete_abandoned(parent: Path) -> None:
+    """Delete copies whose run has gone: one killed outright runs no
+    ``finally``.  A copy whose owner is still running is another sweep's."""
+    try:
+        import psutil
+    except ImportError:   # in requirements.txt; without it, delete them by hand
+        return
+    for path in parent.glob(SCRATCH_PREFIX + "*"):
+        pid = _owner_pid(path.name)
+        if pid is not None and path.is_dir() and not psutil.pid_exists(pid):
+            _rmtree(path)
+
+
+def make_scratch(root: Path) -> Path:
+    """Copy *root* to a new scratch directory and return the copy.
+
+    It holds the project's files (``_project_files``) and node_modules, which
+    the jsdom tests load.  No __pycache__ comes along; see ``run``.
+    """
+    parent = _scratch_parent()
+    if parent.resolve().is_relative_to(root.resolve()):
+        # git would list the copies as untracked project files, and the next
+        # copy would contain the last one.
+        raise SystemExit(f"ORCH2_MUTATE_SCRATCH ({parent}) must be outside "
+                         f"the project ({root})")
+    parent.mkdir(parents=True, exist_ok=True)
+    _delete_abandoned(parent)
+    scratch = Path(tempfile.mkdtemp(prefix=f"{SCRATCH_PREFIX}{os.getpid()}-",
+                                    dir=parent))
+    try:
+        for rel in _project_files(root):
+            (scratch / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(root / rel, scratch / rel)
+        if (root / "node_modules").is_dir():
+            shutil.copytree(root / "node_modules", scratch / "node_modules",
+                            ignore_dangling_symlinks=True)
+    except BaseException:
+        _rmtree(scratch)
+        raise
+    return scratch
+
+
+def _rmtree(path: Path) -> bool:
+    """Delete *path*, and say so if it cannot be done.
+
+    Retries for a few seconds: on Windows a process that has just exited, or a
+    virus scanner reading a file it has just seen written, can hold a handle a
+    moment longer.  A read-only file is made writable and tried again.  Never
+    raises: only the copy is at stake, and the next run tries again.
+    """
+    def writable(func, failed, _exc):
+        os.chmod(failed, stat.S_IWRITE)
+        func(failed)
+
+    for _attempt in range(20):
+        try:
+            if sys.version_info >= (3, 12):
+                shutil.rmtree(path, onexc=writable)
+            else:
+                shutil.rmtree(path, onerror=writable)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            time.sleep(0.25)
+    print(f"could not delete the scratch copy {path}; the next run will")
+    return False
+
+
+def _cmds(runner: str, test_rel: str, root: Path) -> list[list[str]]:
     """The command(s) that run *test_rel*.  All must pass for the suite to pass.
 
     ``node`` takes one script at a time, so several files become several
@@ -5689,15 +5930,16 @@ def _cmds(runner: str, test_rel: str) -> list[list[str]]:
     """
     if runner == "node":
         node = shutil.which("node") or "node"
-        return [[node, str(ROOT / t)] for t in test_rel.split()]
+        return [[node, str(root / t)] for t in test_rel.split()]
     # -p no:cacheprovider: a mutated run must not leave a .pytest_cache
     # describing a source tree that no longer exists by the time it is read.
     return [[sys.executable, "-m", "pytest"]
-            + [str(ROOT / t) for t in test_rel.split()]
+            + [str(root / t) for t in test_rel.split()]
             + ["-q", "-x", "-p", "no:cacheprovider"]]
 
 
-def run(runner: str, test_rel: str, timeout: float = 300.0) -> bool:
+def run(runner: str, test_rel: str, root: Path, timeout: float = 300.0, *,
+        show_failure: bool = False) -> bool:
     """True only if the suite *passed*.  A mutant that makes it hang has not
     survived -- it just failed slowly, so a timeout is a False, not a stall.
 
@@ -5705,29 +5947,58 @@ def run(runner: str, test_rel: str, timeout: float = 300.0) -> bool:
     non-zero on a collection error, which is what a syntax-breaking mutation
     produces.  That is a weaker kill than a failing assertion, so the mutations
     above are written to stay syntactically valid wherever they can be.
+
+    Python runs with PYTHONDONTWRITEBYTECODE.  The copy has no __pycache__ and
+    none is written, so each run compiles the source as it stands.  Python
+    trusts a cached .pyc whose recorded source mtime (whole seconds) and size
+    match, so a mutant the same size as the version before it, written within
+    the same second, would otherwise run the old bytecode.
+
+    *show_failure* prints the end of a failing run's output: a baseline that
+    fails is something someone has to go and read.
     """
-    for cmd in _cmds(runner, test_rel):
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    for cmd in _cmds(runner, test_rel, root):
         try:
-            p = subprocess.run(cmd, cwd=str(ROOT), capture_output=True,
-                               text=True, timeout=timeout)
+            p = subprocess.run(cmd, cwd=str(root), capture_output=True,
+                               timeout=timeout, env=env)
         except subprocess.TimeoutExpired:
+            if show_failure:
+                print(f"timed out after {timeout:.0f}s: {' '.join(cmd)}")
             return False
         if p.returncode != 0:
+            if show_failure:
+                tail = (p.stdout + p.stderr).decode("utf-8", "replace")
+                _print_safely("\n".join(tail.splitlines()[-30:]))
             return False
     return True
 
 
+def _print_safely(text: str) -> None:
+    """Print test output to whatever stdout can encode.  A pipe on Windows is
+    cp1252, and an em dash in a test's output must not end the sweep."""
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    print(text.encode(enc, "replace").decode(enc))
+
+
 def sweep(label: str, src_rel: str, test_rel: str, mutations,
-          runner: str = "node") -> list[str]:
-    src = ROOT / src_rel
-    bak = src.with_suffix(src.suffix + ".mutbak")
-    original = src.read_text(encoding="utf-8")
-    bak.write_text(original, encoding="utf-8")
+          runner: str = "node", *, root: Path) -> list[str]:
+    """Try each mutation of *src_rel* in the copy at *root*.
+
+    Each mutant is written whole from the original, so none carries over into
+    the next, and the file is put back byte for byte at the end: later targets
+    test the same files in the same copy.  Line endings are kept as they were,
+    so a mutant differs from the original only where the mutation says.
+    """
+    src = root / src_rel
+    raw = src.read_bytes()
+    crlf = b"\r\n" in raw
+    # Anchors are written with \n, so match against the text the same way.
+    original = raw.decode("utf-8").replace("\r\n", "\n")
 
     print(f"\n=== {label}: {src_rel} x {test_rel} ===")
-    if not run(runner, test_rel):
+    if not run(runner, test_rel, root, show_failure=True):
         print("BASELINE FAILS -- fix that first")
-        bak.unlink()
         return ["<baseline failure>"]
 
     survivors = []
@@ -5738,17 +6009,26 @@ def sweep(label: str, src_rel: str, test_rel: str, mutations,
                 print(f"{i:2}. SKIP (anchor appears {n}x) {name}")
                 survivors.append(f"{label}: {name}  [anchor not unique]")
                 continue
-            src.write_text(original.replace(old, new), encoding="utf-8")
-            passed = run(runner, test_rel)
+            mutant = original.replace(old, new)
+            if crlf:
+                mutant = mutant.replace("\n", "\r\n")
+            src.write_bytes(mutant.encode("utf-8"))
+            passed = run(runner, test_rel, root)
             print(f"{i:2}. {'SURVIVED' if passed else 'caught  '} {name}")
             if passed:
                 survivors.append(f"{label}: {name}")
     finally:
-        src.write_text(original, encoding="utf-8")
-        bak.unlink()
+        src.write_bytes(raw)
 
-    print(f"{len(mutations) - len([s for s in survivors])}/{len(mutations)} caught")
+    print(f"{len(mutations) - len(survivors)}/{len(mutations)} caught")
     return survivors
+
+
+def _left_mutated(root: Path) -> list[Path]:
+    """Sources the old in-place sweep may have left mutated.  It kept each
+    original beside its source as <source>.mutbak while a mutant was in place,
+    and deleted it once the original was back."""
+    return [p for p in _project_files(root) if p.name.endswith(".mutbak")]
 
 
 def main(argv: list[str]) -> int:
@@ -5758,13 +6038,28 @@ def main(argv: list[str]) -> int:
         print(f"unknown target(s): {', '.join(unknown)}")
         print(f"available: {', '.join(TARGETS)}")
         return 2
+    left = _left_mutated(ROOT)
+    if left:
+        print("A sweep from before 2026-10-02, which mutated files in place, "
+              "was killed mid-mutation and left:")
+        for p in left:
+            print(f"  {p}")
+        print("The file beside each may still be a mutant.  Compare the two, "
+              "keep the real one, delete the .mutbak, and run again.")
+        return 2
 
+    scratch = make_scratch(ROOT)
+    print(f"Working in a copy: {scratch}")
     survivors = []
     total = 0
-    for label in wanted:
-        src_rel, test_rel, mutations, runner = TARGETS[label]
-        total += len(mutations)
-        survivors += sweep(label, src_rel, test_rel, mutations, runner)
+    try:
+        for label in wanted:
+            src_rel, test_rel, mutations, runner = TARGETS[label]
+            total += len(mutations)
+            survivors += sweep(label, src_rel, test_rel, mutations, runner,
+                               root=scratch)
+    finally:
+        _rmtree(scratch)
 
     print(f"\n{total - len(survivors)}/{total} caught overall")
     for s in survivors:
@@ -5773,4 +6068,7 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:   # the copy is already gone: main's finally
+        sys.exit(130)

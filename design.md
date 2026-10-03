@@ -3822,6 +3822,46 @@ disk".
 C:/Users/inhah/AppData/Local/Python/pythoncore-3.14-64/python.exe -m pytest tests/ -q
 ```
 
+**The mutation sweep works in a copy.** `tools/mutate.py` undoes one part of
+a fix at a time and checks that a test notices. Until 2026-10-02 it wrote each
+mutant into the live tree and put the original back afterwards. That cost a
+file: a backup taken during a sweep captured `copy_session.py` with a mutation
+in it, and when the file was later deleted by accident, the backup restored
+the mutant. A live tree has other readers too. The hub serves `static/` fresh
+to every tab that loads, so a tab reloaded during a sweep of `app.js` ran a
+mutant. And the restore wrote back the file as it was read at the start,
+undoing any edit made to it while the sweep ran.
+
+Now a run copies the project and works there:
+
+- **What is copied:** what git tracks, the untracked files it would add, and
+  `node_modules`. Ignored files stay behind, including a 170 MB log and a
+  stray `nul`.
+- **Where it goes:** the system temp directory, or `ORCH2_MUTATE_SCRATCH`.
+  Here that is the NVMe drive, outside what backups cover. A location inside
+  the project is refused.
+- **Cleanup:** the copy is deleted on the way out, interrupted or not. A run
+  killed outright can't delete its own copy, so each run first deletes any
+  copy (`orchestrator2-mutate-<pid>-…`) whose process has gone.
+- **No stale bytecode:** Python runs with `PYTHONDONTWRITEBYTECODE` and the
+  copy has no `__pycache__`. Python trusts a cached `.pyc` whose recorded
+  source mtime (whole seconds) and size match, so a mutant the same size as
+  the version before it, written within the same second, could otherwise run
+  the old code. Compiling every module from source costs under half a second
+  a run.
+- **Each mutant changes one thing:** it is written whole from the original,
+  with the original's line endings. The file is put back byte for byte for the
+  next target in the same copy.
+- **Old leftovers:** a `<source>.mutbak` in the project means the old in-place
+  sweep was killed mid-mutation, so the source beside it may be a mutant. A
+  run refuses to start until that is resolved.
+
+The suite does not depend on which drive it runs from. One test did (it
+expected `D:` in a path Windows resolves against the *current* drive), and was
+fixed so that it could run from the copy. `tests/test_mutate_tool.py` (17)
+drives the tool against small throwaway projects. Its mutation target,
+`mutate-tool` (19), sweeps the tool itself.
+
 ---
 
 ## 10a. Startup failures must be visible

@@ -1,5 +1,30 @@
 # Known issues / tech debt — orchestrator2
 
+## A backup restored copy_session.py as a mutant — FIXED (2026-10-02)
+
+`copy_session.py` was deleted by accident and restored from a backup. The
+backup was 43 bytes short of the deleted file. It had been taken while a
+mutation sweep had the file mutated in place (move-copy's "the plain-copy
+shortcut is keyed on the id again"). The mutant was written at 2026-09-06
+20:16, and the real file was not back until 02:09 the next morning. The
+restored file had `if not rewrite_id:` where the real one has `if not
+rewrite_id and new_cwd is None and new_branch is None:`. With that, `/move`
+to another directory under the same session id copies the transcript without
+rewriting its `cwd` and `gitBranch`. The file was repaired from the cached
+bytecode of the deleted version: the result compiles identically and is the
+same 15,516 bytes.
+
+The cause was `tools/mutate.py` writing mutants into the live tree. Any
+reader in that window could take one: a backup, the hub serving `static/` to
+a tab that reloads, an agent's editor. Its restore also wrote back the file
+as read at the start, undoing any edit made meanwhile. The sweep now copies
+the project to the temp directory and works only there. design.md §10, *The
+mutation sweep works in a copy*.
+
+Found on the way: `test_cwd_namespace.py` expected `D:` in a path that
+Windows resolves against the current drive, so the suite passed only from the
+D: checkout. It now compares against the path Windows actually invents.
+
 ## A session showed everything twice — FIXED (2026-10-02)
 
 > "session 'Hindsight integration with OS project' is showing a lot of things

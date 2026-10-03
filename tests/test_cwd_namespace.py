@@ -213,8 +213,14 @@ def test_the_reported_wsl_path_is_rejected_with_both_forms():
 
     msg = asyncio.run(go())
     assert WSL_CWD in msg, "the path the launcher actually sent is missing"
-    assert "mnt" in msg and ("D:" in msg or "d:" in msg.lower()), \
-        "the resolved path Windows invented is missing"
+    # Windows anchors a rooted path to the *current* drive, so what it invents
+    # depends on where the suite runs.  This assumed D:, where the checkout
+    # lives, and failed anywhere else -- including the copy in the temp
+    # directory that tools/mutate.py runs the suites in.
+    from pathlib import Path
+    invented = str(Path(WSL_CWD).resolve(strict=False))
+    assert repr(invented) in msg or invented in msg, \
+        f"the resolved path Windows invented ({invented!r}) is missing"
 
 
 def test_an_existing_directory_is_accepted(tmp_path, monkeypatch):
