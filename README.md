@@ -91,7 +91,8 @@ orchestrator2 asks it directly — so a session working away in another window
 looks busy here. When the owning hub can't be asked (it didn't answer, or the
 session is held by a bare `claude --resume` in a terminal, which has no API),
 the dot becomes a **hollow ring** meaning *unknown* rather than claiming the
-session is idle; hover it for which of the two it is.
+session is idle; hover it for which of the two it is. A session held by a
+`claude` in a terminal is listed the same way.
 
 On a desktop browser each session gets its **own tab** — picking one focuses
 that tab, or opens a new one. On **mobile** (where a page can't raise another
@@ -193,22 +194,29 @@ it.)
 
 **Resuming a session someone else is already running is refused.** Before
 connecting, the server looks for a `claude` process *outside its own tree*
-running `--resume <the same session id>`. If it finds one, the session doesn't
+that holds the same session: the session it advertises to its peers, or else
+the `--resume` on its command line. That covers another orchestrator2 window,
+a `claude` in a terminal, and an orphan. If it finds one, the session doesn't
 start; you get an error naming the offending PID, when it started, and the exact
 `taskkill` command to clear it. The check only ever blocks on a positive match —
 if the process scan fails for any reason it lets the session through. Pass
 `--allow-duplicate-session` to override it, accepting that both agents will be
-writing to the same session file and the same files on disk.
+writing to the same session file and the same files on disk. (Until 2026-10-09
+the check read only `--resume <id>`, while the SDK passes `--resume=<id>`, so it
+never saw a session another hub had opened, and the lobby listed such a
+session as *recent*.)
 
-**Ending a session cleans up its MCP servers.** Each stdio MCP server runs as a
-process stack underneath that session's `claude` process. Stopping `claude`
-kills only `claude` itself, so those servers used to survive — one abandoned
-stack per session ended, piling up for as long as the hub kept running (idle
-teardown, `/cwd`, reconnects). The server now records a session's child
-processes before shutting it down and cleans up whatever is left afterwards.
-This only ever touches servers started *by* that session, which can't be reused
-by anything else once it's gone; MCP servers you reach over HTTP/SSE aren't
-child processes and are never affected.
+**Ending a session ends everything it started.** Closing a session (its **×**,
+the idle timeout, `/move`, `/clear`) stops its `claude` process and every
+process that process started: its MCP servers, and its background work, such as
+builds and test runs. The same happens when the session's `claude` is replaced,
+by `/connect`, `/model`, a memory recycle or a crash recovery. Each session's
+`claude` runs in a Windows job of its own, so nothing it starts can slip out.
+Before this, a program a background task started with `&` from Git Bash could
+lose its place in the process tree. Git Bash also lets such programs leave the
+server's job, so they outlived the session and even the server. A QEMU
+boot-test ran on after its session was closed. MCP servers you reach over
+HTTP/SSE aren't child processes and are never affected.
 
 ### Accessing the hub from other devices (LAN)
 

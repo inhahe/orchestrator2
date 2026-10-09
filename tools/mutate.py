@@ -2296,13 +2296,15 @@ BTWUI_MUTATIONS = [
 
 
 FORKSKIP_MUTATIONS = [
+    # Both scanners -- the duplicate guard and the lobby's holder map -- read
+    # one walk (_foreign_holders) since 2026-10-09, so one skip serves both.
     ("a /btw fork counts as a foreign holder, so a session looks held "
-     "elsewhere for the seconds an aside takes to answer -- and this scan is "
-     "what stops a session opening",
+     "elsewhere for the seconds an aside takes to answer, the open is refused, "
+     "and the lobby shows it running somewhere it is not",
      "            if _is_session_fork(argv):\n"
      "                continue\n"
-     "            started = \"\"",
-     "            started = \"\""),
+     "            sid = advertised",
+     "            sid = advertised"),
 
     ("the fork skip swallows the real holder as well, so two agents can drive "
      "one session file",
@@ -2312,12 +2314,6 @@ FORKSKIP_MUTATIONS = [
     ("nothing is ever treated as a fork, restoring the false positive",
      '    return "--fork-session" in argv',
      "    return False"),
-
-    ("the holder map still lists forks, so the lobby shows the session "
-     "running somewhere it is not",
-     "            if _is_session_fork(argv):\n"
-     "                continue          # reads it, does not hold it\n",
-     ""),
 
     ("the flag is matched as a substring of the whole line rather than an "
      "argument, so a path or prompt mentioning it disables the guard",
@@ -5149,6 +5145,101 @@ ONESOCKET_APP_MUTATIONS = [
      "      if (msg.seq < _stream.seq) return;\n"),
 ]
 
+# Which session a claude process holds (2026-10-09: "'sessions' was showing
+# 'os b' under 'recent' and not under 'running' even though it was 'working'
+# right then").  tests/test_proc_guard.py.
+HOLDERS_MUTATIONS = [
+    ("--resume=<id>, the form the SDK passes, is not read -- the report",
+     "            if arg.startswith(flag + \"=\"):\n",
+     "            if False:\n"),
+
+    ("--resume <id>, the form typed in a terminal, is not read",
+     "            if arg == flag and i + 1 < len(argv) and not argv[i + 1].startswith(\"-\"):\n",
+     "            if False:\n"),
+
+    ("a dash-leading token after --resume is taken for the session",
+     "and i + 1 < len(argv) and not argv[i + 1].startswith(\"-\"):\n",
+     "and i + 1 < len(argv):\n"),
+
+    ("-r, --resume's short form, is not read",
+     "        for flag in (\"--resume\", \"-r\"):\n",
+     "        for flag in (\"--resume\",):\n"),
+
+    ("advertisements are not read, so a fresh session is never held elsewhere",
+     "            sid = advertised.get(pid) or _resumed_session(argv)\n",
+     "            sid = _resumed_session(argv)\n"),
+
+    ("the command line outranks the advertisement",
+     "            sid = advertised.get(pid) or _resumed_session(argv)\n",
+     "            sid = _resumed_session(argv) or advertised.get(pid)\n"),
+
+    ("an advertisement whose pid now belongs to another process counts",
+     "                if abs(p.create_time() - started) > 1.0:\n",
+     "                if False:\n"),
+
+    ("an advertisement whose pid is not a claude counts",
+     "                if not p.name().lower().startswith(\"claude\"):\n                    continue\n                started",
+     "                if False:\n                    continue\n                started"),
+
+    ("our own CLI is held elsewhere",
+     "            pid = proc.info[\"pid\"]\n            if pid in mine:\n                continue\n",
+     "            pid = proc.info[\"pid\"]\n"),
+    # Skipping forks is the forkskip target's.
+]
+
+# Ending a session ends what it started (2026-10-09: "after closing my os
+# sessions, it didn't stop those sessions' background processes").
+# tests/test_session_job.py.
+SESSIONJOB_MUTATIONS = [
+    ("the session job allows breakaway, so Git Bash lets programs out",
+     "            info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE\n",
+     "            info.BasicLimitInformation.LimitFlags = (\n"
+     "                _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | _JOB_OBJECT_LIMIT_BREAKAWAY_OK)\n"),
+
+    ("the session job is not kill-on-close, so ending it kills nothing",
+     "            info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE\n",
+     "            info.BasicLimitInformation.LimitFlags = 0\n"),
+
+    ("the CLI is never put in the job",
+     "                if not k32.AssignProcessToJobObject(job, proc):\n",
+     "                if False:\n"),
+
+    ("end() lets go of the job without closing it",
+     "        _kernel32().CloseHandle(self._handle)\n        self._handle = None\n",
+     "        self._handle = None\n"),
+]
+
+SESSIONJOB_BRIDGE_MUTATIONS = [
+    ("connect never puts the CLI in a job",
+     "                    self._adopt_session_job()\n                    # Log the handshake",
+     "                    # Log the handshake"),
+
+    ("the job made is not the CLI's",
+     "        self._session_job = proc_guard.SessionJob.adopt(self._cli_pid())\n",
+     "        self._session_job = None\n"),
+
+    ("disconnect never ends the job -- the report",
+     "        # its transcript: whatever the tree walk could not see.\n        self._end_session_job(cli_pid)\n",
+     "        # its transcript: whatever the tree walk could not see.\n"),
+
+    ("the job is ended before the SDK has stopped the CLI",
+     "        try:\n            await self.client.disconnect()\n        except Exception:\n"
+     "            # Not fatal",
+     "        self._end_session_job(cli_pid)\n"
+     "        try:\n            await self.client.disconnect()\n        except Exception:\n"
+     "            # Not fatal"),
+
+    ("a job whose client is already gone is left running",
+     "            # No CLI left to stop, but whatever it started may still run.\n"
+     "            self._end_session_job(None)\n",
+     ""),
+
+    ("a new CLI keeps the last one's job",
+     "        # A job still held belongs to a CLI nothing drives any more.\n"
+     "        self._end_session_job(None)\n",
+     ""),
+]
+
 # The sweep works in a copy, never the project (2026-10-02: a backup taken
 # mid-sweep restored copy_session.py as a mutant).  tests/test_mutate_tool.py.
 # Every anchor here contains a real newline, which its own entry below spells
@@ -5765,6 +5856,12 @@ TARGETS = {
                       ONESOCKET_APP_MUTATIONS, "node"),
     "mutate-tool": ("tools/mutate.py", "tests/test_mutate_tool.py",
                     MUTATE_TOOL_MUTATIONS, "pytest"),
+    "holders": ("proc_guard.py", "tests/test_proc_guard.py",
+                HOLDERS_MUTATIONS, "pytest"),
+    "sessionjob": ("proc_guard.py", "tests/test_session_job.py",
+                   SESSIONJOB_MUTATIONS, "pytest"),
+    "sessionjob-bridge": ("sdk_bridge.py", "tests/test_session_job.py",
+                          SESSIONJOB_BRIDGE_MUTATIONS, "pytest"),
     "cutoff-session": ("session.py", "tests/test_cut_off_turn.py",
                        CUTOFF_SESSION_MUTATIONS, "pytest"),
     "cutoff-bridge": ("sdk_bridge.py", "tests/test_cut_off_turn.py",

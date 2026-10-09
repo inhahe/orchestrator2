@@ -30,13 +30,17 @@ The two nets
 
    The job also sets ``JOB_OBJECT_LIMIT_BREAKAWAY_OK`` so processes that are
    *supposed* to outlive us (notably the ⟳ Restart replacement server) can
-   opt out with :data:`CREATE_BREAKAWAY_FROM_JOB`.
+   opt out with :data:`CREATE_BREAKAWAY_FROM_JOB`.  MSYS takes that as leave
+   to break away every native program Git Bash starts, which is why each
+   session's CLI runs in a job of its own that does not allow it
+   (:class:`SessionJob`): ending the session ends what it started.
 
 2. :func:`find_foreign_claude_for_session` — detect a ``claude`` process that
-   is already resuming a given session id and is **not** part of our own
-   process tree. That catches orphans which already existed before the reaper
-   was installed, and a second hub started behind our back. The caller
-   refuses to connect rather than becoming the second writer.
+   is already holding a given session id and is **not** part of our own
+   process tree: by the session it advertises, else by the ``--resume`` on
+   its command line.  That catches orphans which already existed before the
+   reaper was installed, and a second hub started behind our back.  The
+   caller refuses to connect rather than becoming the second writer.
 
 Non-Windows is a no-op: this is a Windows-specific hazard and orchestrator2
 is a Windows app. On POSIX the equivalent would be a process group plus
@@ -186,6 +190,148 @@ def breakaway_flags() -> int:
     Zero when no reaper is installed, so callers can add it unconditionally.
     """
     return CREATE_BREAKAWAY_FROM_JOB if _reaper_installed else 0
+
+
+# ---------------------------------------------------------------------------
+# One job per session
+# ---------------------------------------------------------------------------
+
+_JobObjectBasicProcessIdList = 3
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_SET_QUOTA = 0x0100
+_k32_cache = None
+
+
+def _kernel32():
+    """kernel32 with the job functions' prototypes declared (Windows only)."""
+    global _k32_cache
+    if _k32_cache is None:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        H, D, B = wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL
+        for name, res, args in (
+            ("CreateJobObjectW", H, [wintypes.LPVOID, wintypes.LPCWSTR]),
+            ("SetInformationJobObject", B, [H, ctypes.c_int, wintypes.LPVOID, D]),
+            ("QueryInformationJobObject", B,
+             [H, ctypes.c_int, wintypes.LPVOID, D, ctypes.POINTER(D)]),
+            ("AssignProcessToJobObject", B, [H, H]),
+            ("OpenProcess", H, [D, B, D]),
+            ("CloseHandle", B, [H]),
+        ):
+            fn = getattr(k32, name)
+            fn.restype, fn.argtypes = res, args
+        _k32_cache = k32
+    return _k32_cache
+
+
+class SessionJob:
+    """A job holding one session's ``claude.exe`` and everything it starts.
+
+    Ending a session (``SDKBridge.disconnect``) used to find what to kill by
+    walking the CLI's process tree, and two things hide from that walk.  Found
+    2026-10-09, after a QEMU started by OS A's fast boot ran on after OS A was
+    closed, until Windows restarted three minutes later:
+
+    * **A program Git Bash backgrounds** (``qemu ... &``) ends up under a bash
+      whose parent has exited, so its parent chain no longer reaches the CLI.
+    * **A native program Git Bash starts breaks away** from any job that
+      allows it -- MSYS asks for ``CREATE_BREAKAWAY_FROM_JOB`` whenever it
+      may -- and the hub's job allows it, so that ⟳ Restart's replacement can
+      outlive the hub.  So such a program survived even the hub's own exit.
+
+    A job is blind to neither: membership is inherited when a process is
+    created and kept whatever happens to its parent, and this job does not
+    allow breakaway, so MSYS does not ask for it.  The CLI joins as soon as it
+    is connected, everything it starts from then on is in the job, and
+    :meth:`end` kills the lot.  What the CLI started before joining -- its MCP
+    servers, during the handshake -- is not in it; the tree walk still covers
+    that.  The job nests inside the hub's, so the hub's exit still takes
+    everything in it.
+    """
+
+    def __init__(self, handle: int, pid: int) -> None:
+        self._handle: int | None = handle
+        self.pid = pid
+
+    @classmethod
+    def adopt(cls, pid: int | None) -> "SessionJob | None":
+        """Put *pid* (a CLI just connected) in a job of its own.
+
+        None when that cannot be done -- not Windows, no pid, or the OS
+        refused -- and the session then runs as before, with only the tree
+        walk to clean up after it.  Logged, never raised: a session must not
+        fail to start for want of this.
+        """
+        if sys.platform != "win32" or not isinstance(pid, int) or pid <= 0:
+            return None
+        try:
+            k32 = _kernel32()
+            job = k32.CreateJobObjectW(None, None)
+            if not job:
+                log.warning("session job: CreateJobObject failed (err=%d)",
+                            ctypes.get_last_error())
+                return None
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            # Kill on close, and deliberately NOT breakaway-ok: see above.
+            info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            proc = None
+            try:
+                if not k32.SetInformationJobObject(
+                        job, _JobObjectExtendedLimitInformation,
+                        ctypes.byref(info), ctypes.sizeof(info)):
+                    raise OSError(ctypes.get_last_error(), "SetInformationJobObject")
+                # A pid that is gone opens as NULL, which the assignment
+                # refuses: one check covers both.
+                proc = k32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE,
+                                       False, pid)
+                if not k32.AssignProcessToJobObject(job, proc):
+                    raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject")
+            except OSError as exc:
+                log.warning("session job: could not put claude.exe pid %d in a "
+                            "job (%s, err=%s) -- its background processes are "
+                            "covered only by the process-tree walk", pid,
+                            exc.strerror, exc.errno)
+                k32.CloseHandle(job)
+                return None
+            finally:
+                if proc:
+                    k32.CloseHandle(proc)
+            return cls(job, pid)
+        except Exception:
+            log.exception("session job: setup failed for pid %s", pid)
+            return None
+
+    def pids(self) -> list[int]:
+        """The processes in the job now; [] if it is ended or unreadable."""
+        if self._handle is None:
+            return []
+
+        class _IdList(ctypes.Structure):
+            _fields_ = [("NumberOfAssignedProcesses", wintypes.DWORD),
+                        ("NumberOfProcessIdsInList", wintypes.DWORD),
+                        ("ProcessIdList", ctypes.c_size_t * 4096)]
+
+        ids = _IdList()
+        ok = _kernel32().QueryInformationJobObject(
+            self._handle, _JobObjectBasicProcessIdList, ctypes.byref(ids),
+            ctypes.sizeof(ids), None)
+        if not ok and ctypes.get_last_error() != 234:     # ERROR_MORE_DATA
+            return []
+        return [int(ids.ProcessIdList[i])
+                for i in range(min(ids.NumberOfProcessIdsInList, 4096))]
+
+    def end(self) -> int:
+        """Kill everything still in the job and release it.  Idempotent.
+
+        Returns how many processes were still in it -- what the tree walk
+        missed, when called after it.  Closing the job's only handle is the
+        kill: the job is kill-on-close, and nothing else holds a handle to it.
+        """
+        if self._handle is None:
+            return 0
+        left = len(self.pids())
+        _kernel32().CloseHandle(self._handle)
+        self._handle = None
+        return left
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +497,101 @@ def reap_descendants(snapshot: list[Descendant]) -> int:
     return killed
 
 
+def _resumed_session(argv: list[str]) -> str | None:
+    """The session a ``claude`` command line resumes, or None.
+
+    The SDK passes ``--resume=<id>``, one argument
+    (``_internal/transport/subprocess_cli.py``: the CLI declares ``--resume``
+    with an *optional* value, so in two tokens a dash-leading value would be
+    read as a flag of its own).  A terminal user types ``--resume <id>`` or
+    ``-r <id>``.  The scan matched only the two-token form, so from the day
+    the SDK switched it saw no session any hub had opened: the lobby listed
+    sessions running in another hub as *recent*, and the duplicate guard let
+    a second agent open on top of one (found 2026-10-09).
+
+    Matched as arguments, never as a substring of the joined line, so an id
+    that merely appears in a prompt or a path is not a match.  In the
+    two-token form a dash-leading next token is a flag, as the CLI reads it.
+    """
+    for i, arg in enumerate(argv):
+        for flag in ("--resume", "-r"):
+            if arg.startswith(flag + "="):
+                return arg[len(flag) + 1:] or None
+            if arg == flag and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                return argv[i + 1]
+    return None
+
+
+#: Seconds between 1601-01-01 (a Windows FILETIME's epoch) and 1970-01-01.
+_FILETIME_EPOCH_OFFSET = 11644473600
+
+
+def _config_dirs() -> list:
+    """Every Claude account directory on this machine, for the advertisements.
+
+    ``copy_session`` is the lobby's own discovery (stdlib only, imported here
+    lazily so this module stays importable on its own); without it, the
+    default account and ``CLAUDE_CONFIG_DIR``.
+    """
+    from pathlib import Path
+    try:
+        from copy_session import discover_claude_dirs
+        return list(discover_claude_dirs())
+    except Exception:
+        dirs = [Path.home() / ".claude"]
+        env = os.environ.get("CLAUDE_CONFIG_DIR")
+        if env:
+            dirs.append(Path(env))
+        return dirs
+
+
+def _advertised_sessions(dirs=None) -> dict[int, str]:
+    """``{pid: session_id}`` for every live CLI advertising itself.
+
+    Each running ``claude`` writes ``<config>/sessions/<pid>.json`` naming its
+    ``sessionId``; that is how peers find each other (``agent_comms`` mirrors
+    them across accounts).  It names the session whatever the command line
+    says -- a fresh session has no ``--resume`` at all, and a session picked
+    from the terminal's menu has none either -- so it catches holders the
+    command line cannot.
+
+    A CLI that crashed leaves its file behind, and Windows reuses pids, so an
+    entry counts only while its pid is a live ``claude`` process created at the
+    advertised ``procStart`` (a FILETIME; measured equal to psutil's creation
+    time to the millisecond).  Best effort: anything unreadable is skipped.
+    """
+    import json
+
+    try:
+        import psutil
+    except ImportError:
+        return {}
+    out: dict[int, str] = {}
+    for d in (dirs if dirs is not None else _config_dirs()):
+        try:
+            files = list((d / "sessions").glob("*.json"))
+        except OSError:
+            continue
+        for f in files:
+            try:
+                ad = json.loads(f.read_text(encoding="utf-8"))
+                pid, sid = ad.get("pid"), ad.get("sessionId")
+                if not isinstance(pid, int) or not isinstance(sid, str) or not sid:
+                    continue
+                if pid in out:
+                    continue          # the same CLI, mirrored into another account
+                p = psutil.Process(pid)
+                if not p.name().lower().startswith("claude"):
+                    continue
+                started = int(ad.get("procStart")) / 1e7 - _FILETIME_EPOCH_OFFSET
+                if abs(p.create_time() - started) > 1.0:
+                    continue          # the pid now belongs to another process
+                out[pid] = sid
+            except (psutil.Error, OSError, ValueError, TypeError, AttributeError):
+                continue
+    return out
+
+
 def _is_session_fork(argv: list[str]) -> bool:
     """Whether this ``claude`` invocation is a throwaway fork, not a holder.
 
@@ -384,52 +625,66 @@ def find_foreign_claude_for_session(session_id: str) -> list[ClaudeProc]:
     """
     if not session_id:
         return []
+    found: list[ClaudeProc] = []
+    for pid, sid, argv, created in _foreign_holders():
+        if sid != session_id:
+            continue
+        found.append(ClaudeProc(pid=pid, started=_started_text(created),
+                                cmdline=" ".join(argv)))
+    return found
+
+
+def _started_text(created) -> str:
+    try:
+        import datetime
+        return datetime.datetime.fromtimestamp(created).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
+def _foreign_holders(dirs=None):
+    """``(pid, session_id, argv, create_time)`` for each ``claude`` process
+    outside our own tree that holds a session.
+
+    One process walk.  The session is the one the process advertises
+    (:func:`_advertised_sessions`), else the one its command line resumes
+    (:func:`_resumed_session`): the advertisement is what it is in *now*, and
+    the only source at all for a session started fresh.  A ``--fork-session``
+    process is skipped whatever it advertises (:func:`_is_session_fork`).
+
+    Best effort throughout: a failure yields fewer holders, never an
+    exception, and a session missing here is treated as not running
+    elsewhere -- what the callers did before this existed.
+    """
     try:
         import psutil
     except ImportError:
-        log.debug("duplicate-session check: psutil not installed — skipped")
-        return []
-
+        log.debug("foreign-holder scan: psutil not installed — skipped")
+        return
     try:
         mine = _own_tree_pids()
+        advertised = _advertised_sessions(dirs)
     except Exception:
-        return []
-
-    found: list[ClaudeProc] = []
+        return
     for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
         try:
-            if proc.info["pid"] in mine:
+            pid = proc.info["pid"]
+            if pid in mine:
                 continue
-            name = (proc.info.get("name") or "").lower()
-            if not name.startswith("claude"):
+            if not (proc.info.get("name") or "").lower().startswith("claude"):
                 continue
             argv = proc.info.get("cmdline") or []
-            # Match the *argument pair* rather than a substring of the whole
-            # line: a bare id could appear in an unrelated --prompt or path.
-            hit = any(
-                a == "--resume" and i + 1 < len(argv) and argv[i + 1] == session_id
-                for i, a in enumerate(argv)
-            )
-            if not hit:
-                continue
             # A fork reads this conversation but writes to a new id, so it is
             # not holding anything.  See _is_session_fork.
             if _is_session_fork(argv):
                 continue
-            started = ""
-            try:
-                import datetime
-                started = datetime.datetime.fromtimestamp(
-                    proc.info["create_time"]).strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                pass
-            found.append(ClaudeProc(pid=proc.info["pid"], started=started,
-                                    cmdline=" ".join(argv)))
+            sid = advertised.get(pid) or _resumed_session(argv)
+            if sid:
+                yield pid, sid, argv, proc.info.get("create_time")
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
         except Exception:
             continue
-    return found
 
 
 def map_foreign_session_holders() -> dict[str, ForeignHolder]:
@@ -454,10 +709,6 @@ def map_foreign_session_holders() -> dict[str, ForeignHolder]:
         import psutil
     except ImportError:
         return {}
-    try:
-        mine = _own_tree_pids()
-    except Exception:
-        return {}
 
     # pid -> (server_pid, port), so two sessions under one hub cost one lookup.
     parent_cache: dict[int, tuple[int | None, int | None]] = {}
@@ -481,35 +732,11 @@ def map_foreign_session_holders() -> dict[str, ForeignHolder]:
         return server_pid, port
 
     out: dict[str, ForeignHolder] = {}
-    for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
-        try:
-            if proc.info["pid"] in mine:
-                continue
-            if not (proc.info.get("name") or "").lower().startswith("claude"):
-                continue
-            argv = proc.info.get("cmdline") or []
-            sid = next(
-                (argv[i + 1] for i, a in enumerate(argv)
-                 if a == "--resume" and i + 1 < len(argv)),
-                None,
-            )
-            if not sid or sid in out:
-                continue          # first holder wins, as elsewhere
-            if _is_session_fork(argv):
-                continue          # reads it, does not hold it
-            started = ""
-            try:
-                import datetime
-                started = datetime.datetime.fromtimestamp(
-                    proc.info["create_time"]).strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                pass
-            server_pid, port = _hub_of(proc.info["pid"])
-            out[sid] = ForeignHolder(proc.info["pid"], started, server_pid, port)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue
-        except Exception:
-            continue
+    for pid, sid, _argv, created in _foreign_holders():
+        if sid in out:
+            continue              # first holder wins, as elsewhere
+        server_pid, port = _hub_of(pid)
+        out[sid] = ForeignHolder(pid, _started_text(created), server_pid, port)
     return out
 
 

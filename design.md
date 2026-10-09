@@ -2028,14 +2028,21 @@ Three nets:
   /F`, where no shutdown code runs. That "no shutdown code runs" case is the
   entire reason this is a job object and not an `atexit` handler.
 - **Duplicate-session guard.** `connect()` refuses (`DuplicateSessionError`)
-  when another `claude` process outside our tree is already resuming the same
+  when another `claude` process outside our tree already holds the same
   session id, since two agents would share one session JSONL and one working
-  tree. Overridable with `--allow-duplicate-session`.
+  tree. Overridable with `--allow-duplicate-session`. Which session a process
+  holds is the one it advertises (`<config>/sessions/<pid>.json`, checked
+  against the live process's creation time), else the `--resume` on its
+  command line, in any of its forms (§8, *A session running in another hub*).
 - **Per-session descendant reap.** `SDKBridge.disconnect()` snapshots the
   CLI's descendants *before* stopping it, then kills any survivors. This
   covers the gap the job object cannot: when only `claude.exe` dies and the
   server lives on, the job object won't collect anything until the server
   itself exits.
+- **Per-session job.** Each CLI runs in a kill-on-close job of its own that
+  allows no breakaway, ended last in `disconnect()`. It catches what the
+  descendant walk cannot see: programs whose parents have exited, and native
+  programs Git Bash lets out of the hub's job (below).
 - **The CLI itself is verified dead.** `snapshot_process(pid)` pins the CLI's
   own pid + `create_time` alongside its descendants, and after
   `client.disconnect()` returns, a survivor is killed directly (and logged at
@@ -2060,10 +2067,77 @@ spawn-then-assign leaves it running). Since the SDK spawns `claude.exe` and
 `claude.exe` spawns its MCP servers during its own init, we could only ever
 assign *after* the processes we care about already exist.
 
-An explicit list is sufficient precisely because of the division of labour:
-the only scenario where no cleanup code can run is the server dying, and the
-job object already covers that. Whenever a *session* is torn down, the server
-is by definition alive and able to run code.
+An explicit list is sufficient *for what the CLI starts during its own init*,
+precisely because of the division of labour: the only scenario where no
+cleanup code can run is the server dying, and the job object already covers
+that. Whenever a *session* is torn down, the server is by definition alive and
+able to run code. It was not sufficient for what the CLI starts *later*, which
+is where the next section comes in.
+
+### Each session's CLI runs in a job of its own anyway
+
+Reported 2026-10-09: *"after closing my os sessions, it didn't stop those
+sessions' background processes, should it have?"* It should have. OS A's close
+killed 16 processes found by the tree walk. But a QEMU its fast boot had
+started (`qemu … 2> file &` from a Git Bash script) kept writing its serial log
+for three more minutes, until Windows restarted. Two things hide such a program
+from the walk, both measured under the real CLI:
+
+- **Its chain of parents breaks.** A native program Git Bash backgrounds can
+  end up under a bash whose parent has exited, so its parents no longer lead
+  back to `claude.exe`. It happened with the task's output going to a file,
+  as the CLI's background tasks do.
+- **It leaves the hub's job.** MSYS starts native programs with
+  `CREATE_BREAKAWAY_FROM_JOB` whenever the job allows it (a workaround for the
+  Program Compatibility Assistant), and the hub's job does allow it, for ⟳
+  Restart. The orphaned program was in no job at all, so it would have
+  outlived the hub too.
+
+A job is blind to neither. Membership is inherited when a process is created
+and kept whatever happens to its parent, and in a job that does not allow
+breakaway, MSYS does not ask for it. Measured both ways, three trials each.
+Git Bash's program left a job that allowed breakaway every time and survived
+the job closing. It stayed in a session job every time and died with it. So
+`proc_guard.SessionJob` puts `claude.exe` in a kill-on-close job, no breakaway,
+on the line after `client.connect()` returns. A turn is what starts background
+work, and none can run before `connect()` returns. `disconnect()` ends the job
+**last**, after the SDK's graceful stop has let the CLI finish its transcript
+and after the tree reap. Anything it still finds is logged as background work
+the tree walk could not see.
+
+That is the nested job dismissed above, and the dismissal was right only for
+the MCP servers. The background tasks that escaped start long after the CLI
+can join a job. So both nets stay: the pid list for what the CLI started during
+its handshake, the job for everything after. The session job nests inside the
+hub's, so the hub's exit still takes everything in it.
+
+Two consequences:
+
+- **The job is ended at every disconnect, not only a close.** `/connect`,
+  `/clear`, a memory recycle, and the reconnect after a crash all end the
+  previous CLI's background processes. §6d already made a reconnect cost the
+  task *registry*. The tree reap already killed the processes it could see on
+  any disconnect. The job only extends that to the ones it could not see, which
+  include a crashed CLI's whole tree, since nothing can walk a dead parent.
+  Reconnects a user can wait on (`/model`, `/effort`, `/thinking`) are already
+  deferred while tasks run. *Decided by: Claude (autonomous).* The alternative,
+  letting a dead CLI's work run on, leaves boots and builds running with nobody
+  waiting on them, which is how this report began.
+- **A program that insists on breaking away cannot start inside a session.**
+  MSYS, Python and Node ask only when the job allows it, so they are
+  unaffected. Something that requests `CREATE_BREAKAWAY_FROM_JOB`
+  unconditionally gets access denied.
+
+Tests: `tests/test_session_job.py` (13) uses real processes, a real Git Bash
+and real jobs: the gap, the job holding and ending what the walk cannot see,
+the job's terms, the bridge's order of events, and connect adopting before
+anything else can run. Mutation targets: `sessionjob` (`proc_guard.py` × 4) and
+`sessionjob-bridge` (`sdk_bridge.py` × 6). The first sweep found a test passing
+for the wrong reason. The stand-in CLI carried the program's marker on its own
+command line, so the search for the program could return the stand-in. A
+process is never its own descendant, and killing the stand-in "killed the
+program". The same mix-up had skewed two of the probes behind this section; the
+measurements quoted above are from ones that could not make it.
 
 Snapshot ordering and pid identity both matter. The snapshot must happen
 while the CLI is alive, because orphaning destroys the parent links needed to
@@ -2992,6 +3066,28 @@ from `runtimes`. It fell through to the on-disk scan and was listed under
 *recent* while actively working (reported 2026-09-03: three sessions, held by
 hubs on ports 63978/51842/51843 while this hub had 8420).
 
+**Which session a process holds** was read from `--resume <id>` on its command
+line, and that stopped working without anyone noticing. The SDK passes
+`--resume=<id>`, one argument, so that a dash-leading value cannot be read as a
+flag. Every test fixture used the two-token form. So the scan saw no session any
+hub had opened. Reported 2026-10-09: *"'sessions' was showing 'os b' under
+'recent' and not under 'running' even though it was 'working' right then."* OS
+B was the primary session of a second hub started alongside this one. Clicked
+from Recent, it opened here as well (s10, then s11), and the duplicate guard,
+reading the same scan, let a second CLI resume it. Pressing × closed those
+copies, while the real OS B worked on in its own tab. Now
+`_resumed_session` reads `--resume=<id>`, `--resume <id>` and `-r`. A test
+builds the SDK's real command line, so a change of form fails a test instead of
+blinding the lobby. Ahead of the command line comes the session the process
+**advertises**: each live CLI names its `sessionId` in
+`<config>/sessions/<pid>.json`, the file peers use to find each other. That is
+the only source for a session started fresh, or picked from a terminal's menu,
+neither of which has `--resume` at all. A crashed CLI leaves its file behind and
+pids are reused, so an advertisement counts only while its pid is a live
+`claude` created at its `procStart`. That FILETIME was measured equal to
+psutil's creation time to the millisecond, and a file without it is not
+trusted. Mutation target `holders` (`proc_guard.py` × 9).
+
 `proc_guard.map_foreign_session_holders()` answers "who else holds a session"
 in **one** `process_iter` walk. The pre-existing `find_foreign_session_holder()`
 scans per session id, which is right for the one-shot open path and hopeless
@@ -3177,6 +3273,11 @@ Three things separate it from the idle teardown it shares plumbing with:
   arms the idle timer of the runtime each tab is *leaving* — during a close
   that is the runtime being torn down, which would leave a live task holding a
   dead runtime.
+
+Closing also ends every process the session started, its background work
+included, wherever that has got to in the process tree (§6b, *Each session's
+CLI runs in a job of its own*). A session another hub holds has no × here: only
+the hub that runs it can stop it.
 
 The session's JSONL is untouched, so a closed session reopens from **Recent**.
 

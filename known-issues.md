@@ -1,5 +1,57 @@
 # Known issues / tech debt — orchestrator2
 
+## A session working in another hub was listed as recent, and opened twice — FIXED (2026-10-09)
+
+> "'sessions' was showing 'os b' under 'recent' and not under 'running' even
+> though it was 'working' right then.  closing a session in the sessions tab
+> didn't stop it working in the session's own tab. should it have?"
+
+Two hubs were running: pid 23824 on port 8420, and pid 15396, started three
+seconds later on another port, whose primary session was OS B (`0b04cedd`).
+The Sessions tab belonged to hub 23824, whose scan for other hubs' sessions
+could not see OS B. It looked for `--resume <id>`, and the SDK passes
+`--resume=<id>`. Every test fixture had the two-token form, so nothing noticed
+that the lobby had stopped listing other hubs' sessions as running.
+
+The duplicate-session guard reads the same scan. So OS B, clicked from Recent,
+opened in hub 23824 as well: s10 at 23:39:15 and s11 at 23:39:56. Each time a
+second CLI resumed a session another CLI was working in. Each was closed with
+× within seconds, and that × closed the copy. The real OS B worked on in its
+own tab, because no × anywhere could reach another hub's session.
+
+Fixed in `proc_guard`. The session a process holds is the one it advertises
+(`<config>/sessions/<pid>.json`, checked against the live process's creation
+time), else the `--resume` on its command line in any form. A test builds the
+SDK's real command line. design.md §8, *A session running in another hub is
+running, not "recent"*.
+
+## Closing a session left its background processes running — FIXED (2026-10-09)
+
+> "after closing my os sessions, it didn't stop those sessions' background
+> processes, should it have?"
+
+It should have. OS A's close at 23:39:54 reaped 16 processes found by walking
+its CLI's process tree. A QEMU its fast boot had started (pid 2288,
+`fastboot.sh` running `qemu … 2> file &`) kept writing its serial log until
+23:43:14, when Windows was restarted. The walk could not see it. Measured under
+the real CLI:
+
+- **Broken chain:** a program Git Bash backgrounds can end up under a bash
+  whose parent has exited, so its parents no longer lead back to the CLI.
+- **Breakaway:** MSYS starts native programs with `CREATE_BREAKAWAY_FROM_JOB`
+  whenever the job allows it, and the hub's job allows it for ⟳ Restart. The
+  orphan was in no job at all, so it would have outlived the hub too.
+
+Fixed: each session's CLI joins a kill-on-close job with no breakaway as soon
+as it connects (`proc_guard.SessionJob`), and `disconnect()` ends the job
+last. That holds at every disconnect, so a crashed CLI's background work no
+longer runs on with nothing waiting for it. design.md §6b, *Each session's CLI
+runs in a job of its own anyway*.
+
+Still not covered: what a CLI starts during its handshake (MCP servers,
+SessionStart hooks) is outside its job. The tree walk still reaps those, but
+one that Git Bash backgrounds could still escape both.
+
 ## A backup restored copy_session.py as a mutant — FIXED (2026-10-02)
 
 `copy_session.py` was deleted by accident and restored from a backup. The

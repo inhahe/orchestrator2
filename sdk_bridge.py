@@ -932,6 +932,10 @@ class SDKBridge:
         # or a write to a terminated process).  Cleared by a successful
         # connect().  See _note_transport_death().
         self._transport_dead = False
+        # The job holding the connected CLI and everything it starts, ended by
+        # disconnect() (proc_guard.SessionJob).  None before the first connect,
+        # after a disconnect, and wherever a job cannot be made.
+        self._session_job: proc_guard.SessionJob | None = None
         # The CLI's own word on whether it is working: the last
         # ``session_state_changed`` it sent ("running" / "idle" /
         # "requires_action"), None until it has said anything on this
@@ -1494,6 +1498,13 @@ class SDKBridge:
                 # ``self.client`` pointing at an unusable client).
                 try:
                     await asyncio.wait_for(self.client.connect(), timeout=budget)
+                    # The CLI, and everything it starts from now on, goes in a
+                    # job of its own, so that ending the session ends its
+                    # background work wherever that has got to -- see
+                    # proc_guard.SessionJob.  Before anything else can await:
+                    # a turn is what starts background work, and none can run
+                    # until this method returns.
+                    self._adopt_session_job()
                     # Log the handshake cost on *success* too.  Only failures
                     # used to log, so the question "is the budget above the real
                     # distribution or inside it?" could only be answered by
@@ -1944,6 +1955,8 @@ class SDKBridge:
         if self._dispatcher_task and not self._dispatcher_task.done():
             await cancel_and_join(self._dispatcher_task, "dispatcher")
         if not self.client:
+            # No CLI left to stop, but whatever it started may still run.
+            self._end_session_job(None)
             return
 
         # Snapshot while the CLI is still alive — once it exits, the parent
@@ -1980,6 +1993,26 @@ class SDKBridge:
             if n:
                 log.info("reaped %d orphaned MCP/tool process(es) left by "
                          "claude.exe pid %s", n, cli_pid)
+        # Last, after the SDK's graceful stop has let the CLI finish writing
+        # its transcript: whatever the tree walk could not see.
+        self._end_session_job(cli_pid)
+
+    def _adopt_session_job(self) -> None:
+        """Put the CLI just connected in a job of its own (SessionJob)."""
+        # A job still held belongs to a CLI nothing drives any more.
+        self._end_session_job(None)
+        self._session_job = proc_guard.SessionJob.adopt(self._cli_pid())
+
+    def _end_session_job(self, cli_pid: int | None) -> None:
+        """Kill whatever the session's CLI started that is still running."""
+        job, self._session_job = getattr(self, "_session_job", None), None
+        if job is None:
+            return
+        left = job.end()
+        if left:
+            log.info("ended %d process(es) claude.exe pid %s left running in "
+                     "its job: background work the process-tree walk cannot "
+                     "see", left, cli_pid if cli_pid is not None else job.pid)
 
     def _warn_if_foreign_task(self, what: str) -> None:
         """Log loudly if an SDK teardown is running off the worker task.

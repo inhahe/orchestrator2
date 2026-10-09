@@ -297,11 +297,15 @@ class _IterProc:
                      "create_time": create_time}
 
 
-def _fake_iter(monkeypatch, procs):
-    """Point the real scanners at *procs* instead of the live process table."""
+def _fake_iter(monkeypatch, procs, advertised=None):
+    """Point the real scanners at *procs* instead of the live process table,
+    and at *advertised* (``{pid: session_id}``) instead of the machine's
+    session advertisements -- a real ``claude.exe`` must never leak in."""
     import psutil
     monkeypatch.setattr(psutil, "process_iter", lambda attrs=None: iter(procs))
     monkeypatch.setattr(proc_guard, "_own_tree_pids", lambda: set())
+    monkeypatch.setattr(proc_guard, "_advertised_sessions",
+                        lambda dirs=None: dict(advertised or {}))
 
 
 SID = "1aa74fb0-ca4e-42cb-80c3-ef7302fee0a4"
@@ -497,3 +501,202 @@ def test_session_holder_hub_port_unreadable_degrades(monkeypatch):
     fh = proc_guard.find_foreign_session_holder("sid")
     assert fh.server_pid == 888
     assert fh.port is None
+
+
+# ---------------------------------------------------------------------------
+# Which session a process holds -- reported 2026-10-09: "'sessions' was
+# showing 'os b' under 'recent' and not under 'running' even though it was
+# 'working' right then."  OS B was the primary session of a second hub; this
+# hub's scan never saw it, because the SDK passes --resume=<id> as one
+# argument and the scan matched only --resume <id>.  Opening it from Recent
+# then started a second CLI on the session: the duplicate guard reads the
+# same scan.
+# ---------------------------------------------------------------------------
+
+def _sdk_command(resume: str) -> list[str]:
+    """The command line the SDK really builds to resume *resume*."""
+    pytest.importorskip("claude_agent_sdk")
+    from claude_agent_sdk import ClaudeAgentOptions
+    from claude_agent_sdk._internal.transport.subprocess_cli import (
+        SubprocessCLITransport)
+    return SubprocessCLITransport(
+        prompt="x", options=ClaudeAgentOptions(resume=resume, cli_path="claude.exe")
+    )._build_command()
+
+
+def test_a_session_the_sdk_resumed_is_held_elsewhere(monkeypatch):
+    """The report: the lobby must list it as running, not recent."""
+    _fake_iter(monkeypatch, [_IterProc(4321, "claude.exe", _sdk_command(SID))])
+
+    assert SID in proc_guard.map_foreign_session_holders()
+
+
+def test_the_duplicate_guard_sees_it_too(monkeypatch):
+    """Opening it from Recent must be refused, not start a second agent."""
+    _fake_iter(monkeypatch, [_IterProc(4321, "claude.exe", _sdk_command(SID))])
+
+    assert [p.pid for p in proc_guard.find_foreign_claude_for_session(SID)] == [4321]
+
+
+def test_every_way_a_command_line_names_its_session():
+    assert proc_guard._resumed_session(["claude.exe", f"--resume={SID}"]) == SID
+    assert proc_guard._resumed_session(["claude.exe", "--resume", SID]) == SID
+    assert proc_guard._resumed_session(["claude.exe", "-r", SID]) == SID
+    assert proc_guard._resumed_session(["claude.exe", f"-r={SID}"]) == SID
+
+
+def test_what_only_looks_like_one_is_not():
+    # The CLI reads a dash-leading token after --resume as a flag, not a value.
+    assert proc_guard._resumed_session(["claude.exe", "--resume", "--verbose"]) is None
+    # A different flag that merely begins the same way.
+    assert proc_guard._resumed_session(
+        ["claude.exe", f"--resume-session-at={SID}"]) is None
+    # The id inside some other argument.
+    assert proc_guard._resumed_session(
+        ["claude.exe", "--prompt", f"resume {SID} please"]) is None
+    assert proc_guard._resumed_session(["claude.exe", "--resume="]) is None
+    assert proc_guard._resumed_session(["claude.exe", "--resume"]) is None
+
+
+# --- the session a process advertises ---------------------------------------
+#
+# A fresh session has no --resume at all, nor does one picked from the
+# terminal's menu; each running CLI names its session in
+# <config>/sessions/<pid>.json, and that is the first thing asked.
+
+
+def test_an_advertised_session_is_held_even_with_nothing_on_the_command_line(
+        monkeypatch):
+    _fake_iter(monkeypatch, [_IterProc(4321, "claude.exe", ["claude.exe"])],
+               advertised={4321: SID})
+
+    assert SID in proc_guard.map_foreign_session_holders()
+    assert [p.pid for p in proc_guard.find_foreign_claude_for_session(SID)] == [4321]
+
+
+def test_the_advertisement_outranks_the_command_line(monkeypatch):
+    """The command line is the session the process started in; the
+    advertisement is the one it is in now."""
+    other = "00000000-0000-0000-0000-000000000000"
+    _fake_iter(monkeypatch, [_IterProc(4321, "claude.exe", _sdk_command(other))],
+               advertised={4321: SID})
+
+    held = proc_guard.map_foreign_session_holders()
+    assert SID in held and other not in held
+
+
+def test_our_own_cli_is_never_held_elsewhere(monkeypatch):
+    """Every session this hub runs is a claude process in its own tree,
+    advertised and resumed like anyone's.  Counting it would refuse to open
+    our own sessions and list them as another window's.  (The test with a
+    real child above spawns python, which the name check stops first.)"""
+    _fake_iter(monkeypatch, [_IterProc(4321, "claude.exe", _sdk_command(SID))],
+               advertised={4321: SID})
+    monkeypatch.setattr(proc_guard, "_own_tree_pids", lambda: {4321})
+
+    assert proc_guard.map_foreign_session_holders() == {}
+    assert proc_guard.find_foreign_claude_for_session(SID) == []
+
+
+def test_a_fork_is_skipped_whatever_it_advertises(monkeypatch):
+    _fake_iter(monkeypatch,
+               [_IterProc(4321, "claude.exe",
+                          ["claude.exe", "--resume", SID, "--fork-session"])],
+               advertised={4321: SID})
+
+    assert proc_guard.map_foreign_session_holders() == {}
+
+
+class _AdProc:
+    """What ``psutil.Process(pid)`` returns, for the advertisement check."""
+
+    def __init__(self, name="claude.exe", created=1_791_522_074.467):
+        self._name, self._created = name, created
+
+    def name(self):
+        return self._name
+
+    def create_time(self):
+        return self._created
+
+
+def _filetime(epoch_seconds: float) -> str:
+    return str(int(round((epoch_seconds + proc_guard._FILETIME_EPOCH_OFFSET) * 1e7)))
+
+
+def _advertise(directory, pid, sid, created=1_791_522_074.467, **extra):
+    import json
+    sessions = directory / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    ad = {"pid": pid, "sessionId": sid, "procStart": _filetime(created)}
+    ad.update(extra)
+    (sessions / f"{pid}.json").write_text(json.dumps(ad), encoding="utf-8")
+
+
+def _live(monkeypatch, procs):
+    """``psutil.Process`` answering from *procs* ({pid: _AdProc})."""
+    def fake(pid):
+        if pid not in procs:
+            raise psutil.NoSuchProcess(pid)
+        return procs[pid]
+    monkeypatch.setattr(psutil, "Process", fake)
+
+
+def test_a_live_cli_s_advertisement_counts(tmp_path, monkeypatch):
+    _advertise(tmp_path, 4321, SID)
+    _live(monkeypatch, {4321: _AdProc()})
+
+    assert proc_guard._advertised_sessions([tmp_path]) == {4321: SID}
+
+
+def test_one_left_by_a_cli_that_has_gone_does_not(tmp_path, monkeypatch):
+    _advertise(tmp_path, 4321, SID)
+    _live(monkeypatch, {})
+
+    assert proc_guard._advertised_sessions([tmp_path]) == {}
+
+
+def test_nor_one_whose_pid_now_belongs_to_another_process(tmp_path, monkeypatch):
+    """Windows reuses pids, and a crashed CLI leaves its file behind.  A file
+    read as current would make a session look held by a stranger -- which
+    refuses to open it."""
+    _advertise(tmp_path, 4321, SID, created=1_791_000_000.0)
+    _live(monkeypatch, {4321: _AdProc(created=1_791_522_074.467)})
+
+    assert proc_guard._advertised_sessions([tmp_path]) == {}
+
+
+def test_nor_one_whose_pid_is_not_a_claude(tmp_path, monkeypatch):
+    _advertise(tmp_path, 4321, SID)
+    _live(monkeypatch, {4321: _AdProc(name="python.exe")})
+
+    assert proc_guard._advertised_sessions([tmp_path]) == {}
+
+
+def test_nor_one_that_cannot_say_when_its_process_started(tmp_path, monkeypatch):
+    import json
+    (tmp_path / "sessions").mkdir()
+    (tmp_path / "sessions" / "4321.json").write_text(
+        json.dumps({"pid": 4321, "sessionId": SID}), encoding="utf-8")
+    _live(monkeypatch, {4321: _AdProc()})
+
+    assert proc_guard._advertised_sessions([tmp_path]) == {}
+
+
+def test_a_cli_mirrored_into_every_account_counts_once(tmp_path, monkeypatch):
+    # agent_comms copies each live advertisement into every account.
+    for account in ("a", "b", "c"):
+        _advertise(tmp_path / account, 4321, SID)
+    _live(monkeypatch, {4321: _AdProc()})
+
+    dirs = [tmp_path / a for a in ("a", "b", "c")]
+    assert proc_guard._advertised_sessions(dirs) == {4321: SID}
+
+
+def test_an_unreadable_advertisement_is_skipped(tmp_path, monkeypatch):
+    (tmp_path / "sessions").mkdir()
+    (tmp_path / "sessions" / "1.json").write_text("{not json", encoding="utf-8")
+    _advertise(tmp_path, 4321, SID)
+    _live(monkeypatch, {4321: _AdProc()})
+
+    assert proc_guard._advertised_sessions([tmp_path]) == {4321: SID}
