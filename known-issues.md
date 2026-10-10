@@ -1,5 +1,42 @@
 # Known issues / tech debt — orchestrator2
 
+## A tab woken from a freeze still drew what it missed slowly — FIXED (2026-10-10)
+
+> "sometimes clicking on a tab again that's working still replays the recent
+> history fairly slowly, usaully it's instant. i don't know why or what makes
+> the difference. it just played it slowly on my "OS F" session that's
+> currently running. i think it was a bit scrolled up when i clicked on it,
+> which is the only difference i know of."
+
+OS F's tab had been hidden for 25 minutes, and frozen by Chrome, while the
+session worked. On waking, the resume sent it 1,294 messages. The 2026-09-26 fix (below) made the
+scroll once per frame. But each message was still drawn in a task of its own,
+with the browser free to paint between, and each still forced a layout or
+more: collapsing a run of activity measured the list, and so did each one-line
+thinking summary. Replayed in headless Chrome, that backlog took about 1 s
+with tool runs collapsed, and 10 to 16 s without. "Usually instant" is the size
+of the backlog. Most hidden tabs are woken and resumed about once a minute
+(*Hidden tabs reconnect once a minute*, below), so they catch up a little at a
+time. OS F's tab stayed frozen instead, and resumed with 1,066 missed messages
+at 05:06 and 1,294 at 05:32.
+
+"A bit scrolled up" was the effect, not the cause. The scroll check judged
+following by position alone. A burst adds content below between a scroll and
+the check 60 ms later, so the view, exactly where following had left it, read
+as one the user had scrolled away from. In eight replays, following stopped
+within the first two-fifths of the backlog, and the rest was drawn below the
+view.
+
+Fixed: `app.js` knows where a resume's backlog ends, because the resumed
+`attached` carries the hub's position. `chat.js` holds the backlog until then
+and draws it in one go, measuring nothing per message. The same backlog draws
+in 0.15 to 0.3 s and ends at the bottom, and a reader scrolled up stays put.
+The scroll check now stops following only when the view has moved up from
+where following left it. design.md §7, *A resumed backlog is drawn in one go*.
+
+Not verified in a real frozen tab, as before. The benchmark replays the
+backlog into a visible page.
+
 ## A session working in another hub was listed as recent, and opened twice — FIXED (2026-10-09)
 
 > "'sessions' was showing 'os b' under 'recent' and not under 'running' even

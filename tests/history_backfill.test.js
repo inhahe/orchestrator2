@@ -350,5 +350,264 @@ test('nothing is held when no session is loading', () => {
   assert(p.texts().includes('right away'), JSON.stringify(p.texts()));
 });
 
+// ---------------------------------------------------------------------------
+// Following through a burst, and a catch-up drawn in one go (2026-10-10)
+//
+// Coming back to a tab Chrome had frozen "replays the recent history fairly
+// slowly".  The backlog came a message at a time with a repaint between, and
+// a view following the bottom stopped following partway: the scroll check
+// read what a burst had added below as the user scrolling away.
+
+function say(text) {
+  return { type: 'assistant_text', content: text, delta: false };
+}
+
+function note(text) {
+  return { type: 'system_msg', subtype: 'info', data: { message: text } };
+}
+
+function atTheBottom(p) {
+  return p.scrollTop >= p.el.scrollHeight - p.el.clientHeight;
+}
+
+test('a burst does not stop a following view from following', () => {
+  const p = makePage();
+  p.hist(msgs('h', 20));
+  p.flushFrames();
+  // Messages land between one frame's scroll and the next...
+  for (let i = 0; i < 10; i++) p.Chat.handleMessage(say('b' + i));
+  // ...and the scroll check runs on the scroll our own write made.
+  p.el.dispatchEvent(new p.win.Event('scroll'));
+  p.flushTimers();
+  p.flushFrames();
+  assert(atTheBottom(p),
+         `left ${p.el.scrollHeight - p.el.clientHeight - p.scrollTop}px above the bottom`);
+});
+
+test('a view moved up stops following, though nothing said why', () => {
+  // Find in page, a link to an anchor: no wheel and no key, the view moves.
+  const p = makePage();
+  p.hist(msgs('h', 20));
+  p.flushFrames();
+  p.scrollTop = p.scrollTop - 300;
+  p.el.dispatchEvent(new p.win.Event('scroll'));
+  p.flushTimers();
+  p.Chat.handleMessage(say('new'));
+  p.flushFrames();
+  assert(!atTheBottom(p), 'pulled back down to the bottom');
+});
+
+test('trimming what is above a following view does not stop it following', () => {
+  // Removing it lowers scrollTop by as much, the browser keeping what is on
+  // screen in place.  Modelled here: the harness has no layout to do it.
+  const p = makePage();
+  const deleteContents = p.win.Range.prototype.deleteContents;
+  p.win.Range.prototype.deleteContents = function () {
+    const before = p.el.scrollHeight;
+    deleteContents.call(this);
+    p.scrollTop = p.scrollTop - (before - p.el.scrollHeight);
+  };
+  p.Chat.setMaxDomMessages(10);
+  p.hist(msgs('h', 5));
+  p.flushFrames();
+  for (let i = 0; i < 20; i++) p.Chat.handleMessage(say('b' + i));
+  p.flushFrames();                          // follows, then trims
+  for (let i = 0; i < 10; i++) p.Chat.handleMessage(say('c' + i));
+  p.el.dispatchEvent(new p.win.Event('scroll'));
+  p.flushTimers();
+  p.flushFrames();
+  assert(atTheBottom(p),
+         `left ${p.el.scrollHeight - p.el.clientHeight - p.scrollTop}px above the bottom`);
+});
+
+test('a catch-up is held, then drawn in one go and in order', () => {
+  const p = makePage();
+  p.hist(msgs('h', 5));
+  p.flushFrames();
+  const before = p.children;
+  p.Chat.beginCatchUp();
+  for (let i = 0; i < 6; i++) p.Chat.handleMessage(say('c' + i));
+  assert(p.children === before, 'drawn while held');
+  p.Chat.endCatchUp();
+  const t = p.texts();
+  const at = [0, 1, 2, 3, 4, 5].map(i => t.findIndex(x => x.includes('c' + i)));
+  assert(at.every((x, i) => x >= 0 && (i === 0 || x > at[i - 1])), JSON.stringify(at));
+});
+
+test('...and stays held whatever else draws what is waiting', () => {
+  const p = makePage();
+  p.Chat.beginCatchUp();
+  p.Chat.handleMessage(say('held'));
+  p.Chat.handleMessage({ type: 'session_loading', on: false });   // draws what waits
+  assert(!p.texts().some(x => x.includes('held')), 'drawn before the catch-up ended');
+  p.Chat.endCatchUp();
+  assert(p.texts().some(x => x.includes('held')), 'never drawn');
+});
+
+test('...and one message that fails to draw does not lose the rest', () => {
+  // Drawn one per task, each failed alone.  Drawn together, the same.
+  const p = makePage();
+  p.win.App = { openModal() { throw new Error('a renderer bug'); } };
+  const reported = [];
+  p.win.console.error = (...a) => reported.push(a.join(' '));
+  p.Chat.beginCatchUp();
+  p.Chat.handleMessage({ type: 'modal', title: 'x', content: 'y' });
+  p.Chat.handleMessage(say('after it'));
+  p.Chat.endCatchUp();
+  assert(p.texts().some(x => x.includes('after it')), JSON.stringify(p.texts()));
+  assert(reported.length === 1, `reported ${reported.length} times`);
+});
+
+test('...and followed to the bottom at once, not a frame later', () => {
+  // Collapsing the runs a catch-up ends can move the view up.  A scroll check
+  // due before the next frame would take that for the user leaving.
+  const p = makePage();
+  p.hist(msgs('h', 5));
+  p.flushFrames();
+  p.Chat.beginCatchUp();
+  for (let i = 0; i < 6; i++) p.Chat.handleMessage(say('c' + i));
+  p.Chat.endCatchUp();
+  assert(atTheBottom(p),
+         `${p.el.scrollHeight - p.el.clientHeight - p.scrollTop}px above the bottom`);
+});
+
+test('a catch-up is drawn without reading the layout once per message', () => {
+  // Each read forces a layout of the whole list, and collapsing read it
+  // several times over for every run of activity a message ended.
+  const p = makePage();
+  p.hist(msgs('h', 5));
+  p.flushFrames();
+  let reads = 0;
+  for (const name of ['scrollHeight', 'scrollTop']) {
+    const own = Object.getOwnPropertyDescriptor(p.el, name);
+    Object.defineProperty(p.el, name, { configurable: true,
+      get() { reads++; return own.get.call(this); }, set: own.set });
+  }
+  const rect = p.win.Element.prototype.getBoundingClientRect;
+  p.win.Element.prototype.getBoundingClientRect = function () {
+    reads++;
+    return rect.call(this);
+  };
+  p.Chat.beginCatchUp();
+  for (let i = 0; i < 10; i++) {
+    p.Chat.handleMessage(note('s' + i));
+    p.Chat.handleMessage(note('t' + i));
+    p.Chat.handleMessage(say('a' + i));     // collapses the two before it
+  }
+  p.Chat.endCatchUp();
+  // Two are the scroll to the bottom at the end.
+  assert(reads <= 2, reads + ' layout reads drawing 30 messages');
+});
+
+test('clearing the screen drops a held catch-up', () => {
+  const p = makePage();
+  p.Chat.beginCatchUp();
+  p.Chat.handleMessage(say('for the old view'));
+  p.Chat.handleMessage({ type: 'clear_screen' });
+  p.Chat.endCatchUp();
+  p.hist(msgs('new', 2));
+  assert(!p.texts().some(x => x.includes('for the old view')), JSON.stringify(p.texts()));
+});
+
+test('...and what comes after the clear is not held for the view it wiped', () => {
+  const p = makePage();
+  p.hist(msgs('h', 2));
+  p.Chat.beginCatchUp();
+  p.Chat.handleMessage({ type: 'clear_screen' });
+  p.Chat.handleMessage(say('after the clear'));
+  assert(p.texts().some(x => x.includes('after the clear')), JSON.stringify(p.texts()));
+});
+
+// Layout, as far as fitting a thinking summary needs it: 7 px a character,
+// *available* px of room, and nothing measurable inside a collapsed group.
+function measuring(p, available) {
+  const proto = p.win.HTMLElement.prototype;
+  Object.defineProperty(proto, 'offsetParent', { configurable: true,
+    get() { return this.isConnected && !this.closest('.collapsed') ? p.doc.body : null; } });
+  Object.defineProperty(proto, 'scrollWidth', { configurable: true,
+    get() { return (this.textContent || '').length * 7; } });
+  Object.defineProperty(proto, 'clientWidth', { configurable: true,
+    get() { return available; } });
+}
+
+function summaries(p) {
+  return Array.from(p.doc.querySelectorAll('.thinking-summary')).map(e => e.textContent);
+}
+
+test('a catch-up fits its thinking summaries once it is in', () => {
+  const p = makePage();
+  measuring(p, 140);                        // 20 characters fit
+  p.Chat.beginCatchUp();
+  p.Chat.handleMessage({ type: 'thinking', content: 'short and sweet' });
+  p.Chat.handleMessage({ type: 'thinking', content: 'x'.repeat(60) });
+  p.Chat.handleMessage({ type: 'thinking', content: 'two\nlines' });
+  p.Chat.endCatchUp();
+  const s = summaries(p);
+  assert(s[0] === 'short and sweet' && s[1] === '(60 chars)' && s[2] === '(9 chars, 2 lines)',
+         JSON.stringify(s));
+});
+
+// For each measurement a summary takes, how many thinking blocks were drawn
+// by then.  One at a time, each forces a layout of the whole list.
+function measurements(p) {
+  const drawn = [];
+  const proto = p.win.HTMLElement.prototype;
+  for (const name of ['offsetParent', 'scrollWidth']) {
+    const was = Object.getOwnPropertyDescriptor(proto, name);
+    Object.defineProperty(proto, name, { configurable: true, get() {
+      drawn.push(p.doc.querySelectorAll('.msg-thinking').length);
+      return was.get.call(this);
+    } });
+  }
+  return drawn;
+}
+
+const THREE_THOUGHTS = [{ type: 'thinking', content: 'one line' },
+                        { type: 'thinking', content: 'two\nlines' },
+                        { type: 'thinking', content: 'one more' }];
+
+test('...measuring them together, once the last of them is drawn', () => {
+  const p = makePage();
+  measuring(p, 140);
+  const drawn = measurements(p);
+  p.Chat.beginCatchUp();
+  THREE_THOUGHTS.forEach(m => p.Chat.handleMessage(m));
+  p.Chat.endCatchUp();
+  assert(drawn.length && drawn.every(n => n === 3),
+         'measured with ' + JSON.stringify(drawn) + ' of 3 drawn');
+});
+
+test('...and one a collapsed group hid, when the group is opened', () => {
+  const p = makePage();
+  measuring(p, 140);
+  p.Chat.beginCatchUp();
+  p.Chat.handleMessage({ type: 'thinking', content: 'short and sweet' });
+  p.Chat.handleMessage({ type: 'thinking', content: 'also short' });
+  p.Chat.handleMessage(say('done'));        // collapses the two above
+  p.Chat.endCatchUp();
+  assert(summaries(p)[0] === '(15 chars)', 'fitted while hidden: ' + summaries(p)[0]);
+  p.win.Element.prototype.scrollIntoView = () => {};   // jsdom has none
+  p.doc.querySelector('.activity-group-toggle').click();
+  assert(summaries(p)[0] === 'short and sweet', summaries(p)[0]);
+});
+
+test('a history fits its thinking summaries once it is drawn', () => {
+  const p = makePage();
+  measuring(p, 140);
+  p.hist([{ type: 'thinking', content: 'short and sweet' },
+          { type: 'thinking', content: 'x'.repeat(60) }]);
+  const s = summaries(p);
+  assert(s[0] === 'short and sweet' && s[1] === '(60 chars)', JSON.stringify(s));
+});
+
+test('...measuring them together too', () => {
+  const p = makePage();
+  measuring(p, 140);
+  const drawn = measurements(p);
+  p.hist(THREE_THOUGHTS);
+  assert(drawn.length && drawn.every(n => n === 3),
+         'measured with ' + JSON.stringify(drawn) + ' of 3 drawn');
+});
+
 console.log(`\n${ran - failures}/${ran} passed`);
 process.exit(failures ? 1 : 0);

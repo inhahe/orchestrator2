@@ -26,6 +26,13 @@ const App = (() => {
   // Sent back on reconnect, so the hub sends only what was missed instead of
   // clearing the tab and re-sending the whole history (server._resume_ws).
   let _stream = null;
+  // Where a reconnect's backlog ends: until that message is in, chat.js holds
+  // what arrives, then draws it in one go (Chat.beginCatchUp).
+  let _catchUpTo = null;
+  let _catchUpTimer = null;
+  // Longest a catch-up is held waiting for its last message.  The hub sends
+  // the whole backlog at once, so this only bounds one that stalls.
+  const CATCH_UP_MAX_MS = 5000;
   // Why the last socket went away, for the hub's log: { code, hiddenAt }.
   let _lastClose = null;
   let _frozen = false;             // the browser froze this page since then
@@ -153,6 +160,15 @@ const App = (() => {
 
   // --- WebSocket ---
 
+  // Draw a held catch-up: its last message is in, or will not come -- the
+  // socket went, or it took too long.
+  function _endCatchUp() {
+    if (_catchUpTimer) { clearTimeout(_catchUpTimer); _catchUpTimer = null; }
+    if (_catchUpTo === null) return;
+    _catchUpTo = null;
+    Chat.endCatchUp();
+  }
+
   function _connect() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const params = new URLSearchParams(location.search);
@@ -201,6 +217,9 @@ const App = (() => {
     // ends it: left armed, the watchdog would close the new, healthy socket
     // for want of an ack sent to the old one.
     _clearPromptWatchdog();
+    // Likewise a catch-up that socket was delivering: drawn as far as it got.
+    // The resume position has already moved past it, so it must be on screen.
+    _endCatchUp();
 
     const sock = new WebSocket(wsUrl);
     ws = sock;
@@ -255,6 +274,7 @@ const App = (() => {
       // reconnect banner says it better than "no response from the server".
       // Leaving it armed would also have it close an already-closed socket.
       _clearPromptWatchdog();
+      _endCatchUp();
       _showConnectionStatus('disconnected');
       _scheduleReconnect();
     });
@@ -272,6 +292,7 @@ const App = (() => {
         return;
       }
       _dispatch(msg);
+      if (_catchUpTo !== null && _stream && _stream.seq >= _catchUpTo) _endCatchUp();
     });
   }
 
@@ -642,6 +663,18 @@ const App = (() => {
           ? { rid: s.rid, epoch: msg.epoch, seq: msg.seq || 0 }
           : null;
       }
+      // A resumed attach is followed by everything this tab missed, back to
+      // back, up to the hub's position now (msg.seq).  Drawn a message at a
+      // time, a tab Chrome had frozen took seconds to catch up, repainting
+      // all the way (2026-10-10).  chat.js holds it instead, and draws it in
+      // one go when the last of it is in (onmessage), the socket goes
+      // (_connect, onclose), or the timer runs out.  The hub resumes only a
+      // socket's first attach, so no catch-up is under way here already.
+      if (resumedHere && msg.seq > _stream.seq) {
+        _catchUpTo = msg.seq;
+        Chat.beginCatchUp();
+        _catchUpTimer = setTimeout(_endCatchUp, CATCH_UP_MAX_MS);
+      }
       // What this hub understands; then where this tab stands now -- it may
       // be attaching in the background.
       _hubHears = Array.isArray(msg.hears) ? msg.hears : [];
@@ -826,6 +859,8 @@ const App = (() => {
     const group = el.closest('.activity-group.collapsed');
     if (group) {
       group.classList.remove('collapsed');
+      // Thinking summaries cannot be measured while their group is shut.
+      Chat.fitThinking(group);
       const toggle = group.querySelector('.activity-group-toggle');
       if (toggle) toggle.textContent = toggle.textContent.replace(/^\u25B6/, '\u25BC');
     }

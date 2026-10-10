@@ -2557,7 +2557,9 @@ between: the drip, and the view pinned to the bottom throughout. Now:
   PageUp/ArrowUp/Home, a press on the scrollbar. The throttled scroll check
   decided 60 ms after the fact, and a message landing inside those 60 ms had
   already scrolled back to the bottom, so it saw "at the bottom" and kept
-  following. Coming back down re-arms it through that check, as before.
+  following. Coming back down re-arms it through that check, as before. The
+  check itself no longer reads a burst as the user leaving (§7, *A resumed
+  backlog is drawn in one go*).
 - **Only a prompt typed in this tab forces the view down.** `app.js` marks its
   echo `local`; every other `user_message` — a queued prompt starting, a
   loop wakeup, a peer's message, another tab's prompt, any of them from a
@@ -2737,6 +2739,62 @@ Static files are served `no-store`, so F5 is enough. Tests: 12 under "one
 socket per tab" in `reconnect_on_show.test.js`. The fake socket's
 `dropUnheard()`/`hearClose()` model Chrome's ordering. Mutation target:
 `onesocket-app` (7, all caught).
+
+**A resumed backlog is drawn in one go.** Reported 2026-10-10: *"sometimes
+clicking on a tab again that's working still replays the recent history fairly
+slowly, usaully it's instant ... i think it was a bit scrolled up when i
+clicked on it"*. That tab had been hidden for 25 minutes, and frozen by
+Chrome, while its session worked. The resume sent it 1,294 messages, each its
+own WebSocket message. The page drew them one per task, and the browser may
+paint between tasks. Each also forced a layout or more: `_collapseActivity`
+measured the list for every run of activity a message ended, and
+`_addThinking` measured one-line summaries. Replayed in headless Chrome, a
+backlog that size took about 1 s with tool runs collapsed, and 10 to 16 s
+without, where the page is bigger and every paint costs more. "Usually
+instant" is the size of the backlog: most hidden tabs are woken and resumed
+about once a minute (known-issues.md, *Hidden tabs reconnect once a minute*),
+so they catch up a little at a time, and that tab had stayed frozen
+throughout.
+
+- **The backlog is held, then drawn at once.** A resumed `attached` carries
+  the hub's position, so `app.js` knows which message ends the backlog. It
+  calls `Chat.beginCatchUp()`, and `Chat.endCatchUp()` once that message is
+  in. In between, `chat.js` holds what arrives, as it already did behind a
+  history replay or "loading session…". A catch-up also ends when its socket
+  closes or is replaced, since the resume position has already moved past what
+  that socket delivered, and after `CATCH_UP_MAX_MS` (5 s) if its end never
+  comes. A resume with nothing missed holds nothing. Status snapshots are not
+  chat messages, so they show at once. Drawn together, each held message
+  still fails alone (`_flushPending`), as it did in a task of its own, so one
+  that throws does not lose the rest.
+- **Drawn in bulk, nothing is measured per message.** `endCatchUp` draws with
+  `_drawingInBulk` set. `_collapseActivity` then skips its collapse gap, which
+  exists for a reader watching at the bottom and was the only reason for its
+  layout reads. One-line thinking summaries get their size hint and are fitted
+  together afterwards (`_fitThinking`): a couple of layouts in all, not one
+  each. A history replay fits its summaries the same way. A summary inside a
+  collapsed group cannot be measured, so it keeps its hint until the group is
+  opened, by its toggle or when `app.js` reveals a tool inside it
+  (`Chat.fitThinking`). Then the view follows to the bottom at once, not on
+  the next frame, so a scroll check due before that frame cannot find it out
+  of place.
+- **A burst is not the user scrolling away.** "A bit scrolled up" was the
+  effect, not the cause. The scroll check, 60 ms after a scroll, set
+  `_autoScroll = atBottom`. A burst adds content below between a scroll and
+  that check, so a view exactly where following had left it read as one the
+  user had left. In eight replays, following stopped within the first
+  two-fifths of the backlog. Now the check stops following only when the
+  view has moved *up* from where following last put it (`_followedTop`,
+  recorded by `_followToBottom`, and after a trim, which lowers `scrollTop`
+  by what it removes). Wheel, touch, keys and the scrollbar still stop
+  following at once; anything else that moves the view up, such as find in
+  page or a link, stops it through the check.
+
+The same backlog now draws in 0.15 to 0.3 s, over three to five frames, and
+ends at the bottom; a reader scrolled up stays where they were. Tests: 15 in
+`history_backfill.test.js` under "following through a burst", and 10 in
+`reconnect_on_show.test.js` under "a resumed tab's backlog is drawn in one
+go". Mutation targets: `catchup-chat` (22) and `catchup-app` (7), all caught.
 
 **Why it dropped, from now on.** A reconnecting tab adds the close code, how
 long it had been hidden, whether the page was frozen (the `freeze` event), or

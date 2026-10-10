@@ -214,7 +214,7 @@ CHAT_MUTATIONS = [
      ""),
 
     ("becoming visible does not catch up the deferred scroll",
-     "    if (_scrollPendingOnShow) {\n      _scrollPendingOnShow = false;\n      if (_autoScroll) elMessages.scrollTop = elMessages.scrollHeight;\n    }",
+     "    if (_scrollPendingOnShow) {\n      _scrollPendingOnShow = false;\n      if (_autoScroll) _followToBottom();\n    }",
      ""),
 
     ("the catch-up latch is never cleared, so it fires spuriously",
@@ -5133,8 +5133,8 @@ ONESOCKET_APP_MUTATIONS = [
      "    sock.onerror = ((e) => {"),
 
     ("a prompt sent on the replaced socket gets the new one closed",
-     "    _clearPromptWatchdog();\n\n    const sock = new WebSocket(wsUrl);",
-     "\n    const sock = new WebSocket(wsUrl);"),
+     "    _clearPromptWatchdog();\n    // Likewise a catch-up that socket was delivering",
+     "    // Likewise a catch-up that socket was delivering"),
 
     ("a numbered message delivered twice is drawn twice",
      "      if (msg.seq <= _stream.seq) return;\n",
@@ -5535,8 +5535,8 @@ CUTOFF_CONFIG_MUTATIONS = [
 
 CUTOFF_CHAT_MUTATIONS = [
     ("what arrives while a session loads is drawn above its history again",
-     "    if ((_replayInProgress || _loadingEl) && !_VIEW_MESSAGES.has(msg.type)) {",
-     "    if (_replayInProgress && !_VIEW_MESSAGES.has(msg.type)) {"),
+     "    if ((_replayInProgress || _loadingEl || _catchingUp)\n",
+     "    if ((_replayInProgress || _catchingUp)\n"),
 
     ("the end of loading is held too, so loading never ends",
      "    ['history', 'history_prepend', 'session_loading', 'clear_screen']);",
@@ -5557,7 +5557,9 @@ CUTOFF_CHAT_MUTATIONS = [
      ""),
 
     ("a replay that ends while the next session loads draws its messages early",
-     "    if (_replayInProgress || _loadingEl) return;\n    const pending = _pendingMessages;",
+     "    if (_replayInProgress || _loadingEl || _catchingUp) return;\n"
+     "    const pending = _pendingMessages;",
+     "    if (_replayInProgress || _catchingUp) return;\n"
      "    const pending = _pendingMessages;"),
 ]
 
@@ -5630,6 +5632,143 @@ DEADCLI_RECOVERY_MUTATIONS = [
      "                    \"Its last steps may not have been saved before it died, \"\n"
      "                    \"so it may repeat one that was already done.\")",
      "                    \"\")"),
+]
+
+
+# A tab Chrome had frozen "replays the recent history fairly slowly" when it is
+# shown again (2026-10-10): its backlog was drawn a message at a time, with a
+# repaint and a layout or more between, and a view following the bottom
+# stopped following partway.  tests/history_backfill.test.js, "following
+# through a burst".  No mutation for endCatchUp's `if (!_catchingUp) return;`
+# or for clear() emptying _thinkingToFit: one spares a flush that would draw
+# nothing, the other frees the summaries of a view already gone, and no test
+# can tell either from its absence.
+CATCHUP_CHAT_MUTATIONS = [
+    ("a burst stops a following view following -- the report",
+     "        } else if (elMessages.scrollTop < _followedTop - 2) {\n",
+     "        } else {\n"),
+
+    ("a view moved up by anything but wheel or keys keeps following",
+     "        } else if (elMessages.scrollTop < _followedTop - 2) {\n",
+     "        } else if (false) {\n"),
+
+    ("following does not note where it left the view",
+     "    elMessages.scrollTop = elMessages.scrollHeight;\n"
+     "    _followedTop = elMessages.scrollTop;\n",
+     "    elMessages.scrollTop = elMessages.scrollHeight;\n"),
+
+    ("a trim reads as the user scrolling away",
+     "    if (_autoScroll) _followedTop = elMessages.scrollTop;\n",
+     ""),
+
+    ("a catch-up is drawn a message at a time -- the report",
+     "    if ((_replayInProgress || _loadingEl || _catchingUp)\n",
+     "    if ((_replayInProgress || _loadingEl)\n"),
+
+    ("a catch-up is drawn early by whatever else draws what waits",
+     "    if (_replayInProgress || _loadingEl || _catchingUp) return;\n",
+     "    if (_replayInProgress || _loadingEl) return;\n"),
+
+    ("a catch-up is never drawn",
+     "      _flushPending();\n    } finally {\n",
+     "    } finally {\n"),
+
+    ("one message that fails to draw loses the rest of a catch-up",
+     "      try {\n        _dispatchMessage(m);\n      } catch (e) {\n",
+     "      {\n        _dispatchMessage(m);\n      } if (false) {\n"),
+
+    ("a catch-up reads the layout for every run it collapses",
+     "    const _wasPinned = _autoScroll && !_replayInProgress && !_drawingInBulk;\n",
+     "    const _wasPinned = _autoScroll && !_replayInProgress;\n"),
+
+    ("a collapse reads the view's top when nothing will use it",
+     "    const _beforeTop = _wasPinned ? elMessages.scrollTop : 0;\n",
+     "    const _beforeTop = elMessages.scrollTop;\n"),
+
+    ("a collapse reads the list's height when nothing will use it",
+     "    const _beforeH = _wasPinned ? elMessages.scrollHeight : 0;\n",
+     "    const _beforeH = elMessages.scrollHeight;\n"),
+
+    ("a collapse measures the content when nothing will use it",
+     "    const _beforeContentH = _wasPinned ? _contentHeight() : 0;\n",
+     "    const _beforeContentH = _contentHeight();\n"),
+
+    ("a catch-up is followed a frame late, after a scroll check may have run",
+     "    if (_hidden()) _scrollToBottom(); else _scrollNow();\n",
+     "    _scrollToBottom();\n"),
+
+    ("clearing holds what comes next for the view it wiped",
+     "    _pendingMessages = [];\n    _catchingUp = false;\n",
+     "    _pendingMessages = [];\n"),
+
+    ("a catch-up measures each thinking summary as it is drawn",
+     "    if (isSingleLine && nChars > 0 && (_drawingInBulk || _replayInProgress)) {\n",
+     "    if (isSingleLine && nChars > 0 && _replayInProgress) {\n"),
+
+    ("a history measures each thinking summary as it is drawn",
+     "    if (isSingleLine && nChars > 0 && (_drawingInBulk || _replayInProgress)) {\n",
+     "    if (isSingleLine && nChars > 0 && _drawingInBulk) {\n"),
+
+    ("every thinking block asks whether it is visible, a layout each",
+     "    } else if (isSingleLine && nChars > 0 && el.offsetParent !== null) {\n",
+     "    } else if (el.offsetParent !== null && isSingleLine && nChars > 0) {\n"),
+
+    ("a catch-up's thinking summaries are never fitted",
+     "    _fitThinking(_takeThinkingToFit());\n    // Followed now",
+     "    // Followed now"),
+
+    ("a history's thinking summaries are never fitted",
+     "        _fitThinking(_takeThinkingToFit());\n        _replayInProgress = false;\n",
+     "        _replayInProgress = false;\n"),
+
+    ("a summary too wide for its line shows its text anyway",
+     "      if (tooWide[i]) s.textContent = hints[i];\n",
+     ""),
+
+    ("a summary in a shut group is fitted where nothing can be measured",
+     "    const visible = summaries.filter(s => s.offsetParent !== null);\n",
+     "    const visible = summaries;\n"),
+
+    ("opening a group leaves the summaries it hid unfitted",
+     "        fitThinking(content);\n",
+     ""),
+]
+
+# The same, from app.js: where a backlog ends, and what else ends one.
+# tests/reconnect_on_show.test.js, "a resumed tab's backlog is drawn in one
+# go".  No mutation for the `msg.seq > _stream.seq` that starts one: with
+# nothing missed, the check after each message ends a catch-up straight after
+# the attach that began it, so the guard only spares a begin and an end that
+# draw nothing.  (`>=` there survived a sweep, as it must.)
+CATCHUP_APP_MUTATIONS = [
+    ("a resumed tab draws its backlog a message at a time -- the report",
+     "        Chat.beginCatchUp();\n",
+     ""),
+
+    ("a backlog is held until the timer, not until its last message",
+     "      if (_catchUpTo !== null && _stream && _stream.seq >= _catchUpTo) _endCatchUp();\n",
+     ""),
+
+    ("a backlog's last message does not end it",
+     "_stream.seq >= _catchUpTo) _endCatchUp();",
+     "_stream.seq > _catchUpTo) _endCatchUp();"),
+
+    ("a backlog cut off by a dropped socket stays held",
+     "      _clearPromptWatchdog();\n      _endCatchUp();\n",
+     "      _clearPromptWatchdog();\n"),
+
+    ("a backlog cut off by a replaced socket stays held",
+     "    // The resume position has already moved past it, so it must be on screen.\n"
+     "    _endCatchUp();\n",
+     "    // The resume position has already moved past it, so it must be on screen.\n"),
+
+    ("a backlog whose end never comes is held for good",
+     "        _catchUpTimer = setTimeout(_endCatchUp, CATCH_UP_MAX_MS);\n",
+     ""),
+
+    ("a group opened to show a tool leaves the thinking it hid unfitted",
+     "      Chat.fitThinking(group);\n",
+     ""),
 ]
 
 
@@ -5882,6 +6021,10 @@ TARGETS = {
     "extauth": ("server.py",
                 "tests/test_external_access_policy.py tests/test_external_auth.py",
                 EXTAUTH_MUTATIONS, "pytest"),
+    "catchup-chat": ("static/chat.js", "tests/history_backfill.test.js",
+                     CATCHUP_CHAT_MUTATIONS, "node"),
+    "catchup-app": ("static/app.js", "tests/reconnect_on_show.test.js",
+                    CATCHUP_APP_MUTATIONS, "node"),
 }
 
 

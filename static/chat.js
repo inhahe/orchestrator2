@@ -21,6 +21,16 @@ const Chat = (() => {
   // backfill writes can report the true total.
   let _historyShown = 0;
   let _autoScroll = true;
+  // Where following last put the view.  The scroll check in init() turns
+  // following off only when the view has moved up from there.
+  let _followedTop = Infinity;
+  // A reconnecting tab's catch-up: what it missed while its socket was down,
+  // held while _catchingUp and drawn in one go by endCatchUp(), during which
+  // _drawingInBulk is true.
+  let _catchingUp = false;
+  let _drawingInBulk = false;
+  // One-line thinking summaries waiting to be fitted together (_fitThinking).
+  let _thinkingToFit = [];
 
   // --- Collapse gap (scroll-anchored collapse) ---
   // When a run of tools collapses into one line, the document suddenly
@@ -151,10 +161,12 @@ const Chat = (() => {
     // Snapshot scroll state *before* the DOM shrinks so we can anchor it.
     // Only engage the gap when the user is following at the bottom and we're
     // not bulk-replaying history (where a live gap would just churn).
-    const _wasPinned = _autoScroll && !_replayInProgress;
-    const _beforeTop = elMessages.scrollTop;
-    const _beforeH = elMessages.scrollHeight;
-    const _beforeContentH = _contentHeight();
+    const _wasPinned = _autoScroll && !_replayInProgress && !_drawingInBulk;
+    // Read only for that gap: each read forces a layout of the whole list, and
+    // a catch-up or a history collapses hundreds of times in a row.
+    const _beforeTop = _wasPinned ? elMessages.scrollTop : 0;
+    const _beforeH = _wasPinned ? elMessages.scrollHeight : 0;
+    const _beforeContentH = _wasPinned ? _contentHeight() : 0;
 
     // Create collapsible group.
     const group = document.createElement('div');
@@ -182,6 +194,7 @@ const Chat = (() => {
         _scrollToBottom();
       } else {
         toggle.textContent = '\u25BC ' + summary;
+        fitThinking(content);
         toggle.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }
     });
@@ -299,7 +312,17 @@ const Chat = (() => {
         }
         const threshold = 80;
         const atBottom = (elMessages.scrollHeight - elMessages.scrollTop - elMessages.clientHeight) < threshold;
-        _autoScroll = atBottom;
+        if (atBottom) {
+          _autoScroll = true;
+        } else if (elMessages.scrollTop < _followedTop - 2) {
+          // The view moved up from where following put it: reading.
+          _autoScroll = false;
+        }
+        // Otherwise the view is where following left it, and what lies below
+        // arrived since: a burst of messages, not the user leaving.  Judged by
+        // position alone, what a burst adds between a scroll and this check
+        // read as the user scrolling away, and a tab following a catch-up
+        // stopped following partway through it (measured 2026-10-10).
       }, 60);
     });
   }
@@ -316,6 +339,8 @@ const Chat = (() => {
     // Held back for the view being wiped; drawn now, they would land in the
     // next one.
     _pendingMessages = [];
+    _catchingUp = false;
+    _thinkingToFit = [];
     _toolBlocks.clear();
     _cancelGap();
     _cancelShortGap();
@@ -388,9 +413,13 @@ const Chat = (() => {
       _maintainShortGap();
       return;
     }
-    if (_autoScroll) {
-      elMessages.scrollTop = elMessages.scrollHeight;
-    }
+    if (_autoScroll) _followToBottom();
+  }
+
+  // Scroll to the bottom for following, and remember where that put the view.
+  function _followToBottom() {
+    elMessages.scrollTop = elMessages.scrollHeight;
+    _followedTop = elMessages.scrollTop;
   }
 
   // Re-size the bottom gap so the frozen viewport top stays put while new
@@ -404,7 +433,7 @@ const Chat = (() => {
       // Content now fills past the frozen viewport — hand back to normal
       // bottom-following.
       _cancelGap();
-      if (_autoScroll) elMessages.scrollTop = elMessages.scrollHeight;
+      if (_autoScroll) _followToBottom();
       return;
     }
     _gapPad = needed;
@@ -434,7 +463,7 @@ const Chat = (() => {
     const remaining = _shortGapFreed - growth;
     if (remaining <= 0) {
       _cancelShortGap();
-      if (_autoScroll) elMessages.scrollTop = elMessages.scrollHeight;
+      if (_autoScroll) _followToBottom();
       return;
     }
     _shortGapFreed = remaining;
@@ -517,7 +546,7 @@ const Chat = (() => {
     // the hidden path skipped.
     if (_scrollPendingOnShow) {
       _scrollPendingOnShow = false;
-      if (_autoScroll) elMessages.scrollTop = elMessages.scrollHeight;
+      if (_autoScroll) _followToBottom();
     }
   }
 
@@ -549,6 +578,9 @@ const Chat = (() => {
     range.setStartBefore(elMessages.firstChild);
     range.setEndBefore(elMessages.children[remove]);
     range.deleteContents();
+    // Removing what is above the view lowers scrollTop by as much: the browser
+    // keeps what is on screen in place.  That is not the user scrolling away.
+    if (_autoScroll) _followedTop = elMessages.scrollTop;
   }
 
   function _maybeTrimOldMessages() {
@@ -591,7 +623,8 @@ const Chat = (() => {
     // first; drawn then, it ended up above the history, scrolled out of sight.
     // Found 2026-09-29, with the notice that a session's last turn was cut
     // off and is waiting -- the one thing the user must see on opening it.
-    if ((_replayInProgress || _loadingEl) && !_VIEW_MESSAGES.has(msg.type)) {
+    if ((_replayInProgress || _loadingEl || _catchingUp)
+        && !_VIEW_MESSAGES.has(msg.type)) {
       _pendingMessages.push(msg);
       return;
     }
@@ -601,10 +634,72 @@ const Chat = (() => {
 
   // Draw what was held back, once nothing is being drawn in front of it.
   function _flushPending() {
-    if (_replayInProgress || _loadingEl) return;
+    if (_replayInProgress || _loadingEl || _catchingUp) return;
     const pending = _pendingMessages;
     _pendingMessages = [];
-    for (const m of pending) _dispatchMessage(m);
+    // Each fails alone, as it did when it was drawn in a task of its own: one
+    // that throws must not lose the rest of a catch-up, which the resume
+    // position has already moved past.
+    for (const m of pending) {
+      try {
+        _dispatchMessage(m);
+      } catch (e) {
+        console.error('[chat] a held', m && m.type, 'message failed to draw:', e);
+      }
+    }
+  }
+
+  // A tab that reconnects is sent what it missed back to back, and app.js
+  // knows where that ends.  Drawn as it came, a message per task, the browser
+  // repainted between messages, and each message forced a layout or two:
+  // 1,294 messages for a tab hidden for 25 minutes, and frozen, took 1 s with
+  // tool runs collapsed and up to 16 s without (measured 2026-10-10).  So it
+  // is held, and drawn in one go without the layout reads (_drawingInBulk).
+  function beginCatchUp() { _catchingUp = true; }
+
+  function endCatchUp() {
+    if (!_catchingUp) return;
+    _catchingUp = false;
+    _drawingInBulk = true;
+    try {
+      _flushPending();
+    } finally {
+      _drawingInBulk = false;
+    }
+    _fitThinking(_takeThinkingToFit());
+    // Followed now, not at the next frame.  Collapsing the runs it ended can
+    // move the view up, and a scroll check that came due before that frame
+    // would read the move as the user scrolling away.
+    if (_hidden()) _scrollToBottom(); else _scrollNow();
+  }
+
+  function _takeThinkingToFit() {
+    const waiting = _thinkingToFit;
+    _thinkingToFit = [];
+    return waiting;
+  }
+
+  // Show each waiting summary's text where it fits, else its size hint.
+  // Measured all together rather than one at a time, so it forces a couple of
+  // layouts however many there are.  One hidden in a collapsed group keeps its
+  // hint and its data-fit, and is fitted when the group is opened.
+  function _fitThinking(summaries) {
+    const visible = summaries.filter(s => s.offsetParent !== null);
+    if (!visible.length) return;
+    const hints = visible.map(s => s.textContent);
+    visible.forEach((s) => { s.textContent = s.dataset.fit; });
+    const tooWide = visible.map(s => s.scrollWidth > s.clientWidth);
+    visible.forEach((s, i) => {
+      if (tooWide[i]) s.textContent = hints[i];
+      delete s.dataset.fit;
+    });
+  }
+
+  // Fit the summaries inside *root* that were hidden when the rest were
+  // fitted: a collapsed group, on being opened (app.js opens one to show a
+  // tool the panel was asked for).
+  function fitThinking(root) {
+    _fitThinking(Array.from(root.querySelectorAll('.thinking-summary[data-fit]')));
   }
 
   function _dispatchMessage(msg) {
@@ -1017,8 +1112,15 @@ const Chat = (() => {
     // Decide summary text after insertion so we can measure width.
     // If the element is hidden (inside a collapsed group), skip
     // measurement and use the size-hint fallback directly.
-    const isVisible = el.offsetParent !== null;
-    if (isSingleLine && nChars > 0 && isVisible) {
+    // Asking whether it is visible is itself a layout, so only a summary that
+    // might show its text asks.
+    if (isSingleLine && nChars > 0 && (_drawingInBulk || _replayInProgress)) {
+      // Many arriving at once (a catch-up, a history): measured together once
+      // they are all in, in one layout rather than one each (_fitThinking).
+      summaryEl.textContent = `(${nChars} chars)`;
+      summaryEl.dataset.fit = text;
+      _thinkingToFit.push(summaryEl);
+    } else if (isSingleLine && nChars > 0 && el.offsetParent !== null) {
       // Try fitting the full text; measure against the header's available space.
       summaryEl.textContent = text;
       if (summaryEl.scrollWidth > summaryEl.clientWidth) {
@@ -1437,7 +1539,9 @@ const Chat = (() => {
         endSep.textContent = '--- End of history ---';
         elMessages.appendChild(endSep);
 
-        // Flush messages that arrived during replay.
+        // The thinking summaries the history held back, then the messages that
+        // arrived during replay.
+        _fitThinking(_takeThinkingToFit());
         _replayInProgress = false;
         _flushPending();
 
@@ -1931,9 +2035,10 @@ const Chat = (() => {
 
   function forceScrollToBottom() {
     _autoScroll = true;
-    elMessages.scrollTop = elMessages.scrollHeight;
+    _followToBottom();
   }
 
   return { init, clear, handleMessage, setCollapseTools, getCollapseTools,
-           setShowThinking, getShowThinking, setMaxDomMessages, forceScrollToBottom };
+           setShowThinking, getShowThinking, setMaxDomMessages, forceScrollToBottom,
+           beginCatchUp, endCatchUp, fitThinking };
 })();

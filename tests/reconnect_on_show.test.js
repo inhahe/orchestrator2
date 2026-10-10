@@ -1616,5 +1616,113 @@ test('as does a restarted hub', (h) => {
   assert(shownTimes(h, 'after the restart') === 1, 'took the new stream for a repeat');
 });
 
+/* ---- a resumed tab's backlog is drawn in one go -------------------------- */
+//
+// Reported 2026-10-10: coming back to a tab Chrome had frozen "replays the
+// recent history fairly slowly".  The hub sends what the tab missed back to
+// back -- 1,294 messages for one tab that morning -- and the page drew
+// them a message at a time, the browser repainting in between.  Now chat.js
+// holds them until the last is in (the attach says which), then draws them
+// at once.
+
+function backlog(h, from, to) {
+  for (let s = from; s <= to; s++) h.live.deliver(info('missed ' + s, s));
+}
+
+function resumedAt(h, seqBefore, seqNow) {
+  attachedAt(h, 'e1', seqBefore);
+  reconnects(h);
+  attachedAt(h, 'e1', seqNow, { resumed: true });
+}
+
+test('a resumed tab holds its backlog until the last of it is in', (h) => {
+  resumedAt(h, 5, 9);
+  backlog(h, 6, 8);
+  assert(shownTimes(h, 'missed') === 0,
+         `drew ${shownTimes(h, 'missed')} before the backlog was in`);
+  backlog(h, 9, 9);
+  assert(shownTimes(h, 'missed') === 4, 'drew ' + shownTimes(h, 'missed'));
+});
+
+test('...and draws it in the order it came', (h) => {
+  resumedAt(h, 5, 8);
+  backlog(h, 6, 8);
+  const text = h.win.document.getElementById('messages').textContent;
+  const at = [6, 7, 8].map(s => text.indexOf('missed ' + s));
+  assert(at.every(i => i >= 0) && at[0] < at[1] && at[1] < at[2], JSON.stringify(at));
+});
+
+test('what comes after the backlog is drawn as it arrives', (h) => {
+  resumedAt(h, 5, 7);
+  backlog(h, 6, 7);
+  h.live.deliver(info('live 8', 8));
+  assert(shownTimes(h, 'live 8') === 1, 'the next message waited');
+});
+
+test('a backlog cut off by a dropped socket is drawn as far as it got', (h) => {
+  // The resume position has already moved past it, so it has to be on screen.
+  resumedAt(h, 5, 9);
+  backlog(h, 6, 7);
+  h.live.drop(1006);
+  assert(shownTimes(h, 'missed') === 2, 'drew ' + shownTimes(h, 'missed'));
+});
+
+test('...and so is one whose socket is replaced before it is heard to close', (h) => {
+  // A replaced socket's close is ignored (one socket per tab), so the
+  // replacing has to end it.
+  resumedAt(h, 5, 9);
+  backlog(h, 6, 7);
+  wakesWithDeadSocket(h);
+  assert(shownTimes(h, 'missed') === 2, 'drew ' + shownTimes(h, 'missed'));
+});
+
+test('a backlog whose end never comes is drawn after a while', (h) => {
+  resumedAt(h, 5, 9);
+  backlog(h, 6, 7);
+  h.advance(6000);
+  assert(shownTimes(h, 'missed') === 2, 'drew ' + shownTimes(h, 'missed'));
+});
+
+// A prompt typed here is drawn by the page itself, at once.  Held, it would
+// wait for the hub's next message, or for the timer.
+test('a fresh attach holds nothing', (h) => {
+  attachedAt(h, 'e1', 5);
+  h.win.__mods.App.send({ type: 'message', text: 'typed at once' });
+  assert(shownTimes(h, 'typed at once') === 1, 'held');
+});
+
+test('nor does a resume with nothing missed', (h) => {
+  resumedAt(h, 5, 5);
+  h.win.__mods.App.send({ type: 'message', text: 'typed at once' });
+  assert(shownTimes(h, 'typed at once') === 1, 'held');
+});
+
+test('the status sent with a resume is shown while the backlog comes', (h) => {
+  resumedAt(h, 5, 9);
+  h.live.deliver(snapshot('working'));
+  assert(/working/.test(stateText(h)), 'state reads ' + JSON.stringify(stateText(h)));
+});
+
+test('a group opened to show a tool fits the thinking it hid', (h) => {
+  // A backlog's one-line thinking is measured once it is all in, but not
+  // inside a collapsed group, where nothing can be measured.
+  const proto = h.win.HTMLElement.prototype;
+  Object.defineProperty(proto, 'offsetParent', { configurable: true,
+    get() { return this.isConnected && !this.closest('.collapsed') ? this.ownerDocument.body : null; } });
+  Object.defineProperty(proto, 'scrollWidth', { configurable: true,
+    get() { return (this.textContent || '').length * 7; } });
+  Object.defineProperty(proto, 'clientWidth', { configurable: true, get() { return 140; } });
+  h.win.Element.prototype.scrollIntoView = () => {};   // jsdom has none
+  resumedAt(h, 5, 9);
+  h.live.deliver({ type: 'thinking', content: 'short and sweet', seq: 6 });
+  h.live.deliver({ type: 'tool_use', tool_use_id: 't1', name: 'Read', input: {}, seq: 7 });
+  h.live.deliver({ type: 'thinking', content: 'also short', seq: 8 });
+  h.live.deliver({ type: 'assistant_text', content: 'done', delta: false, seq: 9 });
+  const summary = () => h.win.document.querySelector('.thinking-summary').textContent;
+  assert(summary() === '(15 chars)', 'measured while shut: ' + summary());
+  h.win.__mods.App.showToolDetail('t1');
+  assert(summary() === 'short and sweet', summary());
+});
+
 console.log(`\n${passes}/${passes + failures} passed`);
 process.exit(failures ? 1 : 0);
