@@ -238,7 +238,13 @@ environment at startup (the SDK can only add to a CLI's environment, never
 remove), every "the hub's account" lookup asks `account.hub_account()`, and a
 CLI is given the variable only for an account that is not the default. See
 design.md, "A CLI on the default account runs with `CLAUDE_CONFIG_DIR` unset".
-`~/.claude/.claude.json` is now unused; it was left in place.
+`~/.claude/.claude.json` is now unused; it was left in place, not merged.
+Checked on this machine before deciding: it held no MCP servers and no
+`primaryApiKey`, and its only project setting missing from `~/.claude.json`
+was trust for `D:/youtube/philosophy/images/avatar`, which the SDK's CLI does
+not ask about. On another machine, `claude mcp add` run from such a session,
+or a `/login console` key, would have to be redone, or the entries copied
+across by hand.
 
 ## Hidden tabs reconnect once a minute — OPEN (found 2026-10-02)
 

@@ -42,7 +42,8 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable
 
-from state import api_key_source_name, config_dir_path, detect_account_info
+from account import credentials_path
+from state import api_key_source_name, detect_account_info
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 # The subscription API answers an OAuth token only with this beta, as for
@@ -62,7 +63,7 @@ class UsageError(Exception):
 
 def read_oauth(config_dir: str | None) -> dict[str, Any] | None:
     """The account's ``claudeAiOauth`` record, or None when it has none."""
-    path = config_dir_path(config_dir) / ".credentials.json"
+    path = credentials_path(config_dir)
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)

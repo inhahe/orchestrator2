@@ -18,7 +18,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from account import account_dir
+from account import account_dir, credentials_path
 
 log = logging.getLogger(__name__)
 
@@ -245,9 +245,10 @@ _model_cache_at: float = 0.0
 MODEL_CACHE_TTL = 3600.0
 
 
-def _read_oauth_token() -> str | None:
-    """Read the Claude Code OAuth access token from credentials, if present."""
-    path = account_dir() / ".credentials.json"
+def _read_oauth_token(config_dir: str | None = None) -> str | None:
+    """The OAuth access token of account *config_dir* (None: the hub's), if
+    it has a subscription login."""
+    path = credentials_path(config_dir)
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -270,7 +271,9 @@ def _fmt_window(n: int) -> str:
 
 
 def fetch_available_models(timeout: float = 6.0,
-                           api_key: str | None = None) -> list[tuple[str, str]] | None:
+                           api_key: str | None = None,
+                           config_dir: str | None = None,
+                           ) -> list[tuple[str, str]] | None:
     """Fetch the live model list from the Anthropic API (blocking).
 
     Returns a list of ``(model_id, description)`` tuples in the order the API
@@ -280,8 +283,9 @@ def fetch_available_models(timeout: float = 6.0,
 
     Auth uses *api_key* when given -- the hub passes its primary session's
     own key, which it keeps out of its environment -- else
-    ``ANTHROPIC_API_KEY`` when set, otherwise the Claude Code OAuth token
-    (with the oauth beta header the subscription API expects).
+    ``ANTHROPIC_API_KEY`` when set, otherwise the OAuth token of account
+    *config_dir* (None: the hub's), with the oauth beta header the
+    subscription API expects.
 
     This blocks on the network, so off the event loop only (startup warm or
     the synchronous --list-models path).
@@ -292,11 +296,11 @@ def fetch_available_models(timeout: float = 6.0,
     if api_key:
         headers["x-api-key"] = api_key
     else:
-        token = _read_oauth_token()
+        token = _read_oauth_token(config_dir)
         if not token:
             log.warning("model list: no credentials (no ANTHROPIC_API_KEY and "
                         "no OAuth token in %s) — using the fallback list",
-                        account_dir())
+                        account_dir(config_dir))
             return None
         headers["Authorization"] = f"Bearer {token}"
         headers["anthropic-beta"] = "oauth-2025-04-20"
@@ -1165,7 +1169,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
     # --list-models: print available models and exit.  Prefer the live list
     # from the API; fall back to the hardcoded set if it can't be fetched.
     if args.list_models:
-        models = fetch_available_models() or KNOWN_MODELS
+        # Before main() adopts the account: --config-dir is passed explicitly.
+        models = fetch_available_models(config_dir=args.config_dir) or KNOWN_MODELS
         print("Available models:")
         for model_id, desc in models:
             print(f"  {model_id:28s} {desc}")

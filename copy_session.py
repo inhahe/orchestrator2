@@ -38,7 +38,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from account import account_dir, hub_account
+from account import hub_account
 
 # Title prefix that tells tray_minimizer to leave this window visible (never
 # minimize it to the tray).  Must match tray_minimizer.NO_HIDE_TITLE_PREFIX.
@@ -378,12 +378,6 @@ def _fmt_time(mtime: float) -> str:
 # ---------------------------------------------------------------------------
 # Launch-time picker — used by server.py for `--resume` / `--copy`
 # ---------------------------------------------------------------------------
-
-
-def current_claude_dir() -> Path:
-    """The .claude directory of this process's account
-    (``account.account_dir``): ``CLAUDE_CONFIG_DIR``'s, else ``~/.claude``."""
-    return account_dir()
 
 
 

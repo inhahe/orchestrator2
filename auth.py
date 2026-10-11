@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
-from account import account_dir, child_env
+from account import child_env, credentials_path
 from state import global_config_path
 
 log = logging.getLogger("orchestrator2.auth")
@@ -82,9 +82,9 @@ def _has_credentials_file(config_dir: str | None = None) -> bool:
 
     An expired token is fine — the CLI refreshes it via the stored refresh
     token — so a present token means "effectively signed in".  ``config_dir``
-    (a cross-account runtime's dir) overrides the process env.
+    (a cross-account runtime's dir) overrides the hub's account.
     """
-    path = account_dir(config_dir) / ".credentials.json"
+    path = credentials_path(config_dir)
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -165,7 +165,7 @@ def credentials_mtime(config_dir: str | None = None) -> float | None:
     reliable than ``claude auth status``, which reports ``loggedIn:true`` even
     for a dead session.
     """
-    path = account_dir(config_dir) / ".credentials.json"
+    path = credentials_path(config_dir)
     try:
         return path.stat().st_mtime
     except OSError:

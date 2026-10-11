@@ -45,17 +45,20 @@ def _same_path(a: Path, b: Path) -> bool:
 
 
 def normalize(config_dir: str | None) -> str | None:
-    """Account *config_dir* as a CLI should be given it: its resolved path,
-    or None for the default account -- unset, or ``~/.claude`` by name."""
+    """Account *config_dir* as a CLI should be given it: as given, or None
+    for the default account -- unset, or ``~/.claude`` by name."""
     if not config_dir or not str(config_dir).strip():
         return None
     path = Path(config_dir).expanduser()
     if _same_path(path, default_dir()):
         return None
-    try:
-        return str(path.resolve())
-    except OSError:
-        return str(path.absolute())
+    return str(path)
+
+
+def same_account(a: str | None, b: str | None) -> bool:
+    """Whether accounts *a* and *b* (None: the hub's) are one: the default
+    by name and unset are."""
+    return _same_path(account_dir(a), account_dir(b))
 
 
 def adopt_from_environment(given: str | None = None) -> str | None:
@@ -101,9 +104,16 @@ def account_dir(config_dir: str | None = None) -> Path:
     return Path(base) if base else default_dir()
 
 
+def credentials_path(config_dir: str | None = None) -> Path:
+    """Account *config_dir*'s (None: the hub's) subscription login file."""
+    return account_dir(config_dir) / ".credentials.json"
+
+
 def cli_config_dir(config_dir: str | None = None) -> str | None:
     """``CLAUDE_CONFIG_DIR`` for a CLI on account *config_dir* (None: the
     hub's); None means the CLI must not be given one."""
+    if not config_dir and _adopted:
+        return _hub             # normalized when adopted
     return normalize(config_dir or hub_account())
 
 

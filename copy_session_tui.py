@@ -21,6 +21,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from account import account_dir
 from copy_session import (
     NO_HIDE_TITLE_PREFIX,
     _find_recent_for_cwd,
@@ -30,7 +31,6 @@ from copy_session import (
     _same_dir,
     copy_session_file,
     count_sessions,
-    current_claude_dir,
     discover_claude_dirs,
     scan_sessions,
     sessions_with_id,
@@ -711,7 +711,7 @@ def pick_session_for_launch(
     the default in the "what to open?" fallback.  Requires an interactive
     terminal.
     """
-    app = LaunchPickerApp(mode, current_claude_dir(), launch_cwd)
+    app = LaunchPickerApp(mode, account_dir(), launch_cwd)
     app.run()
     if app.status_message:
         print(app.status_message)

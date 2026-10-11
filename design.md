@@ -100,6 +100,7 @@ Three layers, deliberately separated:
 | `sdk_bridge.py` | `SDKBridge`: SDK connection, `worker_loop`, `_message_dispatcher`, turn management, auto-continue |
 | `state.py` | `State` dataclass + `state_to_status_dict()` / `state_to_panels_dict()` serialisers, rate-limit helpers |
 | `config.py` | `Config` dataclass, `parse_args()`, constants (`CONTINUE_PROMPT`, `MARKERS`, …) |
+| `account.py` | Which Claude account (config dir) the hub and each CLI use: the hub's, adopted out of its environment at startup; where an account's files are; and what `CLAUDE_CONFIG_DIR` a child is given — none for the default ("Central-hub reuse": "A CLI on the default account runs with `CLAUDE_CONFIG_DIR` unset"). Stdlib only |
 | `commands.py` | `classify(line)` → `(kind, payload)`, immediate-command dispatch, completions |
 | `plan_usage.py` | `/usage`: fetches the account's plan limits from the usage endpoint (§6f), or says why a session billed to an API key has none (§6g) |
 | `session.py` | Session discovery, JSONL parsing, `render_session_history`, titles, trim, export |

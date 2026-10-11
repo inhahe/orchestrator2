@@ -717,7 +717,7 @@ def normalize_path_for_compare(p: str) -> str:
 
 def project_dir_for_cwd(cwd: str, config_dir: str | None = None) -> Path:
     """Return the on-disk project directory for *cwd* in *config_dir*'s
-    account (the process environment's without one)."""
+    account (the hub's without one)."""
     try:
         resolved = str(Path(cwd).resolve(strict=False))
     except OSError:
@@ -728,7 +728,7 @@ def project_dir_for_cwd(cwd: str, config_dir: str | None = None) -> Path:
 def find_most_recent_session_for_cwd(cwd: str,
                                      config_dir: str | None = None) -> Path | None:
     """Return the most-recently-modified ``.jsonl`` in the project for *cwd*,
-    in *config_dir*'s account (the process environment's without one)."""
+    in *config_dir*'s account (the hub's without one)."""
     project = project_dir_for_cwd(cwd, config_dir)
     if not project.exists():
         return None

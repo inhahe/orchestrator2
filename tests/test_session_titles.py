@@ -191,37 +191,6 @@ def test_read_write_scoped_to_account(tmp_path: Path, monkeypatch) -> None:
     assert session_mod.read_session_title(sid, str(acct_a)) == "A auto"
 
 
-def test_write_to_other_account_skips_sdk(tmp_path: Path, monkeypatch) -> None:
-    """When config_dir names a non-env account, the SDK rename helper (which is
-    env-scoped and would misfire) must be bypassed in favour of a direct
-    account-correct append."""
-    acct_a = _make_account(tmp_path, "account-a")
-    acct_b = _make_account(tmp_path, "account-b")
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(acct_a))
-
-    sid = "22222222-2222-2222-2222-222222222222"
-    _write_session(acct_b, "slug", sid, [
-        {"type": "ai-title", "aiTitle": "B auto"},
-    ])
-
-    called = {"sdk": False}
-
-    def _boom(*_a, **_k):
-        called["sdk"] = True
-        raise AssertionError("SDK rename_session must not run for other account")
-
-    monkeypatch.setattr(session_mod, "rename_session", _boom, raising=False)
-    # Also guard the import site: inject a fake module attr the function imports.
-    import types
-    fake_sdk = types.ModuleType("claude_agent_sdk")
-    fake_sdk.rename_session = _boom  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake_sdk)
-
-    session_mod.write_session_title(sid, "B renamed", str(acct_b))
-    assert called["sdk"] is False
-    assert session_mod.read_session_title(sid, str(acct_b)) == "B renamed"
-
-
 # ---------------------------------------------------------------------------
 # _parse_session_info (lobby list) reads the file it parses
 # ---------------------------------------------------------------------------

@@ -44,7 +44,7 @@ def home(monkeypatch, tmp_path):
 def test_the_default_account_named_outright_is_given_as_none(home):
     assert account.normalize(str(home / ".claude")) is None
     assert account.normalize(None) is None
-    assert account.normalize(str(home / "acct-b")) == str((home / "acct-b").resolve())
+    assert account.normalize(str(home / "acct-b")) == str(home / "acct-b")
 
 
 def test_a_cli_on_the_default_account_finds_the_variable_unset(home):
@@ -55,13 +55,20 @@ def test_a_cli_on_the_default_account_finds_the_variable_unset(home):
 
 def test_a_cli_on_another_account_is_given_it(home):
     env = account.child_env(str(home / "acct-b"), base={})
-    assert env["CLAUDE_CONFIG_DIR"] == str((home / "acct-b").resolve())
+    assert env["CLAUDE_CONFIG_DIR"] == str(home / "acct-b")
+
+
+def test_before_adoption_the_environment_is_the_account(home, monkeypatch):
+    # A tool, or copy_session run on its own.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / "acct-b"))
+    assert account.cli_config_dir(None) == str(home / "acct-b")
+    assert account.account_dir() == home / "acct-b"
 
 
 def test_a_session_without_its_own_account_has_the_hubs(home, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / "acct-b"))
     account.adopt_from_environment()
-    assert account.cli_config_dir(None) == str((home / "acct-b").resolve())
+    assert account.cli_config_dir(None) == str(home / "acct-b")
     assert account.child_env(None, base={})["CLAUDE_CONFIG_DIR"] == account.cli_config_dir(None)
 
 
@@ -73,7 +80,7 @@ def test_the_hub_takes_its_account_out_of_its_environment(home, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / "acct-b"))
     given = account.adopt_from_environment()
     assert "CLAUDE_CONFIG_DIR" not in os.environ
-    assert given == str((home / "acct-b").resolve())
+    assert given == str(home / "acct-b")
     assert account.hub_account() == given
     assert account.account_dir() == Path(given)
 
@@ -115,14 +122,13 @@ def test_a_sessions_cli_on_the_default_account_named_outright(home):
 
 def test_a_sessions_cli_on_another_account(home):
     account.adopt_from_environment()
-    assert _bridge_env(str(home / "acct-b"))["CLAUDE_CONFIG_DIR"] == str(
-        (home / "acct-b").resolve())
+    assert _bridge_env(str(home / "acct-b"))["CLAUDE_CONFIG_DIR"] == str(home / "acct-b")
 
 
 def test_a_sessions_cli_on_the_hubs_account(home, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / "acct-b"))
     account.adopt_from_environment()
-    assert _bridge_env(None)["CLAUDE_CONFIG_DIR"] == str((home / "acct-b").resolve())
+    assert _bridge_env(None)["CLAUDE_CONFIG_DIR"] == str(home / "acct-b")
 
 
 def test_a_side_questions_cli_like_its_sessions(home):
@@ -133,20 +139,19 @@ def test_a_side_questions_cli_like_its_sessions(home):
     assert "CLAUDE_CONFIG_DIR" not in opts.env
     cfg = dataclasses.replace(cfg, config_dir=str(home / "acct-b"))
     opts = build_btw_options(ClaudeAgentOptions, config=cfg, state=State())
-    assert opts.env["CLAUDE_CONFIG_DIR"] == str((home / "acct-b").resolve())
+    assert opts.env["CLAUDE_CONFIG_DIR"] == str(home / "acct-b")
 
 
 def test_a_sign_in_on_the_default_account_named_outright(home):
     account.adopt_from_environment()
     assert "CLAUDE_CONFIG_DIR" not in auth._auth_env(str(home / ".claude"))
-    assert auth._auth_env(str(home / "acct-b"))["CLAUDE_CONFIG_DIR"] == str(
-        (home / "acct-b").resolve())
+    assert auth._auth_env(str(home / "acct-b"))["CLAUDE_CONFIG_DIR"] == str(home / "acct-b")
 
 
 def test_a_sign_in_on_the_hubs_account(home, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / "acct-b"))
     account.adopt_from_environment()
-    assert auth._auth_env(None)["CLAUDE_CONFIG_DIR"] == str((home / "acct-b").resolve())
+    assert auth._auth_env(None)["CLAUDE_CONFIG_DIR"] == str(home / "acct-b")
 
 
 # --------------------------------------------------------------------------
@@ -168,6 +173,82 @@ def test_a_detached_child_on_the_default_account_is_handed_none(home):
     assert "CLAUDE_CONFIG_DIR" not in server._detach_child_env(cfg)
 
 
+def _picker_env(monkeypatch):
+    import subprocess
+    import server
+    seen = {}
+
+    class _Proc:
+        def wait(self):
+            return 0
+
+    def fake_popen(args, **kw):
+        seen["env"] = kw.get("env")
+        return _Proc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server, "_console_is_visible", lambda: True)
+    monkeypatch.setattr(sys, "platform", "win32")
+    server._run_launch_picker("resume")
+    return seen["env"]
+
+
+def test_the_launch_picker_is_handed_the_account(home, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / "acct-b"))
+    given = account.adopt_from_environment()
+    assert _picker_env(monkeypatch)["CLAUDE_CONFIG_DIR"] == given
+
+
+def _restart_env(monkeypatch, cfg):
+    import asyncio
+    import subprocess
+    import server
+    seen = {}
+
+    def fake_popen(args, **kw):
+        seen["env"] = kw.get("env")
+        raise OSError("not really")
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(sys, "argv", ["server.py"])
+    monkeypatch.setattr(server, "config", cfg)
+    st = State()
+    st.session_id = "sid-1"
+    monkeypatch.setattr(server, "state", st)
+    monkeypatch.setattr(server, "_picker_mode", False)
+    asyncio.run(server.api_restart())
+    return seen["env"]
+
+
+def test_the_restart_replacement_is_handed_the_account(home, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / "acct-b"))
+    given = account.adopt_from_environment()
+    cfg = dataclasses.replace(parse_args([]), config_dir=given)
+    assert _restart_env(monkeypatch, cfg)["CLAUDE_CONFIG_DIR"] == given
+
+
+def test_move_knows_the_default_account_by_either_name(home, monkeypatch):
+    """A hub started plainly has no config_dir; /move lists ~/.claude by
+    name.  They are one account."""
+    import copy_session
+    import server
+    monkeypatch.setattr(copy_session, "discover_claude_dirs",
+                        lambda: [home / ".claude", home / "acct-b"])
+    monkeypatch.setattr(server, "_account_email_for", lambda _d: None)
+    account.adopt_from_environment()
+    current = {a["name"]: a["is_current"] for a in server._move_accounts_payload(None)}
+    assert current == {".claude": True, "acct-b": False}
+    assert account.same_account(None, str(home / ".claude"))
+    assert not account.same_account(None, str(home / "acct-b"))
+
+
+def test_a_restart_on_the_default_account_hands_over_none(home, monkeypatch):
+    given = account.adopt_from_environment(str(home / ".claude"))
+    cfg = dataclasses.replace(parse_args([]), config_dir=given)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
+    assert "CLAUDE_CONFIG_DIR" not in _restart_env(monkeypatch, cfg)
+
+
 # --------------------------------------------------------------------------
 # Where the default account's details are read
 # --------------------------------------------------------------------------
@@ -184,4 +265,4 @@ def test_the_default_account_named_outright_is_read_where_its_cli_keeps_it(home)
 
 
 def test_another_account_is_read_inside_its_dir(home):
-    assert global_config_path(str(home / "acct-b")) == (home / "acct-b").resolve() / ".claude.json"
+    assert global_config_path(str(home / "acct-b")) == home / "acct-b" / ".claude.json"

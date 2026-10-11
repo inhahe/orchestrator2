@@ -15,8 +15,9 @@ default rather than something each file has to remember.
 session running this suite from its Bash tool carries the second.
 
 **No test inherits another's account.**  ``account.adopt_from_environment``
-makes the process's account module state; each test starts un-adopted, so
-the environment is the account, as for a tool.
+makes the process's account module state and takes ``CLAUDE_CONFIG_DIR`` out
+of the environment; each test starts un-adopted, with the variable as the
+suite found it, so the environment is the account, as for a tool.
 """
 
 from __future__ import annotations
@@ -40,7 +41,17 @@ def _private_agent_registry(monkeypatch, tmp_path_factory):
     monkeypatch.delenv("CLAUDE_CODE_SESSION_NAME", raising=False)
 
 
+_SUITE_ACCOUNT = os.environ.get("CLAUDE_CONFIG_DIR")
+
+
 @pytest.fixture(autouse=True)
 def _unadopted_account(monkeypatch):
     monkeypatch.setattr(account, "_adopted", False)
     monkeypatch.setattr(account, "_hub", None)
+    # Registered with monkeypatch either way, so it is put back after a test
+    # whose main() popped it.
+    if _SUITE_ACCOUNT is None:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "placeholder")
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    else:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", _SUITE_ACCOUNT)

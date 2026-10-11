@@ -77,6 +77,7 @@ from account import (
     child_env,
     default_dir,
     hub_account,
+    same_account,
     set_hub_account,
 )
 from config import (
@@ -97,7 +98,6 @@ from state import (
     State,
     apply_api_key_source,
     billed_to_api_key,
-    config_dir_path,
     detect_account_info,
     init_state_from_config,
     reset_rate_limit,
@@ -822,14 +822,6 @@ def _account_email_for(claude_dir: Path) -> str | None:
     return detect_account_info(str(claude_dir)).get("email")
 
 
-def _same_config_dir(a: str | None, b: str | None) -> bool:
-    """True when two runtime config dirs resolve to the same account store."""
-    try:
-        return config_dir_path(a).resolve() == config_dir_path(b).resolve()
-    except OSError:
-        return (a or "") == (b or "")
-
-
 async def _propagate_login_to_siblings(
     origin: "SessionRuntime", cfg_dir: str | None, info: dict,
 ) -> None:
@@ -844,7 +836,7 @@ async def _propagate_login_to_siblings(
     for other in list(runtimes.values()):
         if other is origin or other.state is None or other.config is None:
             continue
-        if not _same_config_dir(getattr(other.config, "config_dir", None), cfg_dir):
+        if not same_account(getattr(other.config, "config_dir", None), cfg_dir):
             continue
         other.state.account = info
         other.state.auth_error = False
@@ -936,15 +928,13 @@ def _move_accounts_payload(current_cfg: str | None) -> list[dict[str, Any]]:
     ``copy_session.discover_claude_dirs``.
     """
     from copy_session import discover_claude_dirs
-    cur_norm = os.path.normpath(current_cfg) if current_cfg else None
     accounts: list[dict[str, Any]] = []
     for d in discover_claude_dirs():
         accounts.append({
             "config_dir": str(d),
             "name": d.name,
             "email": _account_email_for(d),
-            "is_current": cur_norm is not None
-            and os.path.normpath(str(d)) == cur_norm,
+            "is_current": same_account(str(d), current_cfg),
         })
     return accounts
 
@@ -4682,8 +4672,7 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
     new_branch = (await asyncio.to_thread(git_branch_for, dest_cwd)
                   if dir_changed else None)
 
-    account_changed = normalize_path_for_compare(target_cfg or "") != \
-        normalize_path_for_compare(src_cfg or "")
+    account_changed = not same_account(target_cfg, src_cfg)
     where = _move_where(dest_cwd if dir_changed else None,
                         target_cfg if account_changed else None)
 
@@ -5863,7 +5852,9 @@ def _settle_launch_resume(cfg: Config) -> tuple[Config, str | None, str | None]:
     ref = (cfg.resume or "").strip()
     if not ref or ref == _PICKER_SENTINEL:
         return cfg, None, None
-    account_given = bool(cfg.config_dir or hub_account())
+    # main() has adopted an inherited CLAUDE_CONFIG_DIR into cfg.config_dir,
+    # so an account from the environment counts as chosen too.
+    account_given = bool(cfg.config_dir)
     account = str(account_dir(cfg.config_dir))
     everything: list[dict[str, Any]] | None = None
 
@@ -6641,8 +6632,8 @@ def main() -> None:
 
     # --resume (no id) / --copy: show the full-screen terminal picker so the
     # user can choose a project + session to resume (or copy in from another
-    # account) before the server starts.  The account is the one selected by
-    # CLAUDE_CONFIG_DIR (set just above).  _run_launch_picker draws the TUI in
+    # account) before the server starts, in the account adopted just above.
+    # _run_launch_picker draws the TUI in
     # this terminal when we have one, or pops a fresh console window when we
     # don't (IDE run / hidden launcher).  In --detach the *parent* runs here
     # and passes the resolved id to the child via argv below.  The headless

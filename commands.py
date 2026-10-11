@@ -408,7 +408,7 @@ def _cmd_login(payload: str, state: State, config: Config) -> CommandResult:
 
     All the auth checks are scoped to *this* runtime's account
     (``config.config_dir``) — a cross-account hub session must be checked and
-    re-authed against its own ``CLAUDE_CONFIG_DIR``, not the hub process's.
+    re-authed against its own account, not the hub's.
     """
     cfg_dir = getattr(config, "config_dir", None)
     words = set(payload.strip().lower().split())
@@ -627,7 +627,7 @@ def _cmd_export(payload: str, state: State, config: Config) -> CommandResult:
     if not sid:
         return CommandResult(messages=[_msg("No active session yet.", level="warning")])
     # Scope the lookup to *this* session's account — a cross-account hub runtime
-    # stores its session under its own CLAUDE_CONFIG_DIR, not the hub process's.
+    # stores its session under its own account, not the hub's.
     project_dir = find_session_dir(sid, getattr(config, "config_dir", None))
     if project_dir is None:
         return CommandResult(messages=[_msg(f"Session {sid[:8]} not found on disk.", level="error")])

@@ -188,13 +188,17 @@ def test_not_when_the_account_was_chosen(machine):
     assert f'Resume it with --config-dir "{machine.other}".' in err
 
 
-def test_nor_when_the_account_came_from_the_environment(machine, monkeypatch):
+def test_nor_when_the_account_came_from_the_environment(machine, monkeypatch, tmp_path,
+                                                        capsys):
+    """main() adopts the inherited account into the launch's Config, so it
+    counts as chosen, as --config-dir does."""
     _session(machine.other, machine.os, MOVED, "OS F old")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(machine.default))
 
-    _cfg_, _note, err = _settle(_cfg(machine, machine.os, "OS F old"))
+    stopped, _log = _main(monkeypatch, _cfg(machine, machine.os, "OS F old"), tmp_path)
 
-    assert err is not None and MOVED in err
+    assert isinstance(stopped, SystemExit) and stopped.code == 2
+    assert MOVED in capsys.readouterr().err
 
 
 def test_one_session_under_two_accounts_is_still_one(machine):

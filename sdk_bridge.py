@@ -78,7 +78,7 @@ except Exception:  # pragma: no cover - defensive
 #: several accounts write to.
 AGENT_POLL_INTERVAL = 5.0
 
-from account import cli_config_dir
+from account import account_dir, cli_config_dir
 from config import (
     DISPATCHER_DEAD,
     INTERRUPT_SENTINEL,
@@ -98,7 +98,6 @@ from state import (
     apply_api_key_source,
     apply_rate_limit_info,
     carry_cost,
-    config_dir_path,
     detect_account_info,
     extract_context_tokens,
     fmt_duration,
@@ -1812,7 +1811,7 @@ class SDKBridge:
         if pid is None:
             self.state.cli_name = None
             return
-        path = (config_dir_path(getattr(self.config, "config_dir", None))
+        path = (account_dir(getattr(self.config, "config_dir", None))
                 / "sessions" / f"{pid}.json")
 
         def read() -> str | None:

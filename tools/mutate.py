@@ -3770,8 +3770,8 @@ STATUSAGENT_MUTATIONS = [
      "            pass\n"),
 
     ("the hub's account is read for a session in another account",
-     '        path = (config_dir_path(getattr(self.config, "config_dir", None))\n',
-     "        path = (config_dir_path(None)\n"),
+     '        path = (account_dir(getattr(self.config, "config_dir", None))\n',
+     "        path = (account_dir(None)\n"),
 
     ("the file is re-read on every tick",
      "        if now - self._cli_name_read_at < self.CLI_NAME_REFRESH_S:\n"
@@ -4255,8 +4255,8 @@ USAGE_PY_MUTATIONS = [
      '        with opener(req) as resp:'),
 
     ("the credentials are read from the hub's account",
-     '    path = config_dir_path(config_dir) / ".credentials.json"',
-     '    path = config_dir_path(None) / ".credentials.json"'),
+     '    path = credentials_path(config_dir)\n    try:',
+     '    path = credentials_path(None)\n    try:'),
 
     ("an unreadable credentials file escapes",
      '    except (OSError, ValueError):\n        return None\n    oauth =',
@@ -4857,8 +4857,9 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
      "              ]"),
 
     ("the environment's account is not a choice",
-     "    account_given = bool(cfg.config_dir or hub_account())",
-     "    account_given = bool(cfg.config_dir)"),
+     "        config, config_dir=adopt_from_environment(config.config_dir))\n",
+     "        config, config_dir=(adopt_from_environment(config.config_dir) and None)"
+     " or config.config_dir)\n"),
 
     ("the title elsewhere must match its case",
      "             if s[\"title\"] and s[\"title\"].strip().casefold() == want]",
@@ -4913,8 +4914,8 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
      "            lines.append(\"Resume it by its id (--resume <id>).\" if need else\n"),
 
     ("the picker is settled as a title",
-     "    if not ref or ref == _PICKER_SENTINEL:\n        return cfg, None, None\n    account_given = bool(",
-     "    if not ref:\n        return cfg, None, None\n    account_given = bool("),
+     "    if not ref or ref == _PICKER_SENTINEL:\n        return cfg, None, None\n",
+     "    if not ref:\n        return cfg, None, None\n"),
 
     ("an unsettled launch goes on to the hub",
      "    if _err:\n        print(_err, file=sys.stderr)\n",
@@ -6000,6 +6001,12 @@ ACCTENV_MODULE_MUTATIONS = [
     ("the hub's own files are looked for in the default account",
      "    base = config_dir or hub_account()\n",
      "    base = config_dir\n"),
+    ("an adopted hub's account is not given to its sessions' CLIs",
+     "        return _hub             # normalized when adopted\n",
+     "        return None\n"),
+    ("accounts are compared as named",
+     "    return _same_path(account_dir(a), account_dir(b))\n",
+     "    return a == b\n"),
 ]
 
 ACCTENV_STATE_MUTATIONS = [
@@ -6030,6 +6037,16 @@ ACCTENV_SERVER_MUTATIONS = [
     ("a detached child is not handed the account",
      "    env = child_env(cfg.config_dir)\n",
      "    env = dict(os.environ)\n"),
+    ("the launch picker is not handed the account",
+     "            env=child_env(),\n",
+     ""),
+    ("the restart replacement is not handed the account",
+     "    env = child_env(\n"
+     '        getattr(config, "config_dir", None) if config is not None else None)\n',
+     "    env = dict(os.environ)\n"),
+    ("/move takes the default account by name for another",
+     '            "is_current": same_account(str(d), current_cfg),\n',
+     '            "is_current": str(d) == current_cfg,\n'),
 ]
 
 APIKEY_RESOLVER_SERVER_MUTATIONS = [

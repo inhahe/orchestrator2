@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from account import account_dir, cli_config_dir
+from account import account_dir, cli_config_dir, credentials_path
 from config import (
     MARKERS,
     RL_TYPE_LABEL,
@@ -194,7 +194,7 @@ def check_authentication() -> tuple[bool, str]:
         val = os.environ.get(v, "").strip().lower()
         if val and val not in ("0", "false", "no"):
             return True, f"{v} set"
-    path = account_dir() / ".credentials.json"
+    path = credentials_path()
     if path.exists():
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -214,9 +214,9 @@ def check_authentication() -> tuple[bool, str]:
 def detect_subscription_plan(config_dir: str | None = None) -> str | None:
     """Read the plan name from OAuth credentials, distinguishing Max 5x/20x.
 
-    ``config_dir`` is the account to read; without it, the process env's.
+    ``config_dir`` is the account to read; without it, the hub's.
     """
-    path = config_dir_path(config_dir) / ".credentials.json"
+    path = credentials_path(config_dir)
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -234,13 +234,6 @@ def detect_subscription_plan(config_dir: str | None = None) -> str | None:
         if m:
             return f"{plan} {m.group(1)}"
     return plan
-
-
-def config_dir_path(config_dir: str | None = None) -> Path:
-    """Where account *config_dir* keeps its files: it, if given (a
-    cross-account runtime's), else the hub's account (``account.account_dir``).
-    """
-    return account_dir(config_dir)
 
 
 def global_config_path(config_dir: str | None = None) -> Path:
@@ -273,7 +266,7 @@ def detect_account_info(config_dir: str | None = None) -> dict[str, Any]:
     runtime's dir); without it the hub's account is used.  Where the file is:
     ``global_config_path``.
     """
-    cfg = config_dir_path(config_dir)
+    cfg = account_dir(config_dir)
     info: dict[str, Any] = {"config_dir": str(cfg)}
     try:
         with open(global_config_path(config_dir), "r", encoding="utf-8") as f:
@@ -782,7 +775,8 @@ class State:
     # or a cloud provider.  None until the CLI has said.
     api_key_source: str | None = None
 
-    # Signed-in account (read once from <config-dir>/.claude.json).  Keys:
+    # Signed-in account (read from the CLI's config file for the account,
+    # ``global_config_path``).  Keys:
     # email, display_name, org_name, org_type, org_role, config_dir.
     account: dict[str, Any] = field(default_factory=dict)
 
@@ -1086,7 +1080,7 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         "turns": state.turns,
         "plan_field": plan_field,
         "plan_title": plan_title,
-        "config_dir": str(config_dir_path(getattr(config, "config_dir", None))),
+        "config_dir": str(account_dir(getattr(config, "config_dir", None))),
         "account": state.account,
         "is_subscription": state.is_subscription,
         "rate_field": rate_field,
