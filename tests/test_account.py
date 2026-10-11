@@ -142,16 +142,49 @@ def test_a_side_questions_cli_like_its_sessions(home):
     assert opts.env["CLAUDE_CONFIG_DIR"] == str(home / "acct-b")
 
 
-def test_a_sign_in_on_the_default_account_named_outright(home):
+def _sign_in_env(monkeypatch, config_dir):
+    """The environment ``claude auth status`` is run with for *config_dir*."""
+    import subprocess
+    seen = {}
+
+    def fake_run(args, **kw):
+        seen["env"] = kw.get("env")
+        return subprocess.CompletedProcess(args, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(auth, "find_claude_cli", lambda: "claude")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    auth.auth_status(config_dir)
+    return seen["env"]
+
+
+def test_a_sign_in_on_the_default_account_named_outright(home, monkeypatch):
     account.adopt_from_environment()
-    assert "CLAUDE_CONFIG_DIR" not in auth._auth_env(str(home / ".claude"))
-    assert auth._auth_env(str(home / "acct-b"))["CLAUDE_CONFIG_DIR"] == str(home / "acct-b")
+    assert "CLAUDE_CONFIG_DIR" not in _sign_in_env(monkeypatch, str(home / ".claude"))
+    assert _sign_in_env(monkeypatch, str(home / "acct-b"))["CLAUDE_CONFIG_DIR"] == str(
+        home / "acct-b")
 
 
 def test_a_sign_in_on_the_hubs_account(home, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / "acct-b"))
     account.adopt_from_environment()
-    assert auth._auth_env(None)["CLAUDE_CONFIG_DIR"] == str(home / "acct-b")
+    assert _sign_in_env(monkeypatch, None)["CLAUDE_CONFIG_DIR"] == str(home / "acct-b")
+
+
+def test_a_relative_account_reaches_a_child_whole(home, monkeypatch):
+    """A child runs in another directory: a relative --config-dir is made
+    absolute before it is handed on."""
+    monkeypatch.chdir(home)
+    given = account.adopt_from_environment("acct-b")
+    assert given == str((home / "acct-b").resolve())
+    assert account.child_env(None, base={})["CLAUDE_CONFIG_DIR"] == given
+    assert account.normalize("acct-b") == str((home / "acct-b").absolute())
+
+
+def test_an_account_written_with_a_tilde_is_the_home_one(home, monkeypatch):
+    # expanduser reads the environment, not Path.home.
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    assert account.account_dir("~/acct-b") == home / "acct-b"
 
 
 # --------------------------------------------------------------------------

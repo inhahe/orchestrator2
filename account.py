@@ -45,14 +45,15 @@ def _same_path(a: Path, b: Path) -> bool:
 
 
 def normalize(config_dir: str | None) -> str | None:
-    """Account *config_dir* as a CLI should be given it: as given, or None
-    for the default account -- unset, or ``~/.claude`` by name."""
+    """Account *config_dir* as a CLI should be given it: as given, made
+    absolute (a child may run elsewhere), or None for the default account --
+    unset, or ``~/.claude`` by name."""
     if not config_dir or not str(config_dir).strip():
         return None
     path = Path(config_dir).expanduser()
     if _same_path(path, default_dir()):
         return None
-    return str(path)
+    return str(path if path.is_absolute() else path.absolute())
 
 
 def same_account(a: str | None, b: str | None) -> bool:
@@ -72,13 +73,13 @@ def adopt_from_environment(given: str | None = None) -> str | None:
     """
     inherited = (os.environ.pop("CLAUDE_CONFIG_DIR", None) or "").strip() or None
     chosen = given or inherited
+    if chosen:
+        try:
+            chosen = str(Path(chosen).expanduser().resolve())
+        except OSError:
+            chosen = str(Path(chosen).expanduser().absolute())
     set_hub_account(chosen)
-    if not chosen:
-        return None
-    try:
-        return str(Path(chosen).expanduser().resolve())
-    except OSError:
-        return str(Path(chosen).expanduser().absolute())
+    return chosen
 
 
 def set_hub_account(config_dir: str | None) -> None:
@@ -101,7 +102,7 @@ def hub_account() -> str | None:
 def account_dir(config_dir: str | None = None) -> Path:
     """Where account *config_dir* (None: the hub's) keeps its files."""
     base = config_dir or hub_account()
-    return Path(base) if base else default_dir()
+    return Path(base).expanduser() if base else default_dir()
 
 
 def credentials_path(config_dir: str | None = None) -> Path:

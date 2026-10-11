@@ -182,35 +182,6 @@ def detect_subscription() -> bool:
     return True
 
 
-def check_authentication() -> tuple[bool, str]:
-    """Check whether Claude Code has credentials available.
-
-    Returns ``(ok, reason)`` — ``ok=False`` means the CLI can't
-    authenticate.
-    """
-    if os.environ.get("ANTHROPIC_API_KEY", "").strip():
-        return True, "ANTHROPIC_API_KEY set"
-    for v in ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"):
-        val = os.environ.get(v, "").strip().lower()
-        if val and val not in ("0", "false", "no"):
-            return True, f"{v} set"
-    path = credentials_path()
-    if path.exists():
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
-            if isinstance(oauth, dict) and oauth.get("accessToken"):
-                return True, f"OAuth credentials at {path}"
-        except (OSError, ValueError) as e:
-            return False, f"credentials file {path} exists but is unreadable: {e}"
-    return False, (
-        "no Claude Code credentials found — neither ANTHROPIC_API_KEY "
-        "nor cloud-routing env vars are set, and there's no OAuth "
-        f"token at {path}"
-    )
-
-
 def detect_subscription_plan(config_dir: str | None = None) -> str | None:
     """Read the plan name from OAuth credentials, distinguishing Max 5x/20x.
 

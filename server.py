@@ -6681,6 +6681,9 @@ def main() -> None:
         print(_note)
     # The session may be on another account: the hub works in it, as above.
     set_hub_account(config.config_dir)
+    # What a launch that joins a hub sends as its account: by name, the
+    # default as ~/.claude, since the hub may work in another one.
+    join_account = config.config_dir or str(default_dir())
 
     # --- Central-hub reuse -------------------------------------------------
     # If an orchestrator2 hub is already serving on our port, join it — open
@@ -6702,7 +6705,7 @@ def main() -> None:
             and _probe_hub(config.port) is not None):
         rid = _launch_into_hub(
             config.port,
-            **_hub_launch_kwargs(config, config.config_dir or str(default_dir())),
+            **_hub_launch_kwargs(config, join_account),
         )
         if rid:
             _announce_joined(config.port, rid, config.open_browser)
@@ -6838,14 +6841,13 @@ def main() -> None:
         if not config.standalone and not config.wait_port \
                 and config.resume != _PICKER_SENTINEL:
             sock.close()  # release the useless fallback port
-            join_cfg_dir = config.config_dir or str(default_dir())
             import time as _time
             deadline = _time.monotonic() + 30.0
             rid = None
             while _time.monotonic() < deadline:
                 if _probe_hub(config.port) is not None:
                     rid = _launch_into_hub(
-                        config.port, **_hub_launch_kwargs(config, join_cfg_dir))
+                        config.port, **_hub_launch_kwargs(config, join_account))
                     if rid:
                         break
                 _time.sleep(0.5)

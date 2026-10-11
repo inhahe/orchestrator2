@@ -39,6 +39,7 @@ from session import (
     write_session_title,
 )
 import auth
+from account import child_env
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +469,7 @@ def _cmd_logout(_payload: str, _state: State, config: Config) -> CommandResult:
             "data": {"message": "could not find the `claude` CLI to log out."},
         }])
     import subprocess
-    env = auth._auth_env(getattr(config, "config_dir", None))
+    env = child_env(getattr(config, "config_dir", None))
     try:
         subprocess.run([cli, "auth", "logout"], capture_output=True,
                        text=True, timeout=20, env=env)

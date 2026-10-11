@@ -84,10 +84,8 @@ def machine(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.setattr(copy_session, "discover_claude_dirs",
                         lambda: [default, other])
-    # Set, then delete: so the variable is put back as it was even when
-    # main() assigns it directly, which monkeypatch does not see.
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "placeholder")
-    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    # conftest puts the variable back after a main() pops it.
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     return types.SimpleNamespace(default=default, other=other,
                                  os=str(os_dir), orch=str(orch))
 

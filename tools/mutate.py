@@ -6004,6 +6004,12 @@ ACCTENV_MODULE_MUTATIONS = [
     ("an adopted hub's account is not given to its sessions' CLIs",
      "        return _hub             # normalized when adopted\n",
      "        return None\n"),
+    ("a relative account is handed to a child as relative",
+     "    return str(path if path.is_absolute() else path.absolute())\n",
+     "    return str(path)\n"),
+    ("an account written with ~ is used literally",
+     "    return Path(base).expanduser() if base else default_dir()\n",
+     "    return Path(base) if base else default_dir()\n"),
     ("accounts are compared as named",
      "    return _same_path(account_dir(a), account_dir(b))\n",
      "    return a == b\n"),
@@ -6028,9 +6034,9 @@ ACCTENV_BTW_MUTATIONS = [
 ]
 
 ACCTENV_AUTH_MUTATIONS = [
-    ("a sign-in is given its account as named",
-     "    return child_env(config_dir)\n",
-     '    return {"CLAUDE_CONFIG_DIR": str(config_dir)} if config_dir else {}\n'),
+    ("a sign-in check inherits whatever account the hub's environment has",
+     "            env=child_env(config_dir),\n",
+     "            env=None,\n"),
 ]
 
 ACCTENV_SERVER_MUTATIONS = [

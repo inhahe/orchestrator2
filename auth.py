@@ -41,13 +41,6 @@ def find_claude_cli() -> str | None:
     return None
 
 
-def _auth_env(config_dir: str | None) -> dict:
-    """The environment for a ``claude auth`` process on account *config_dir*
-    (None: the hub's), so a cross-account runtime checks and signs in to the
-    right account (``account.child_env``)."""
-    return child_env(config_dir)
-
-
 def auth_status(config_dir: str | None = None) -> dict:
     """Return ``claude auth status --json`` as a dict (empty on failure).
 
@@ -62,7 +55,7 @@ def auth_status(config_dir: str | None = None) -> dict:
         out = subprocess.run(
             [cli, "auth", "status", "--json"],
             capture_output=True, text=True, timeout=20,
-            env=_auth_env(config_dir),
+            env=child_env(config_dir),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         log.warning("auth status failed: %s", exc)
@@ -220,7 +213,7 @@ def launch_login(*, method: str = "claudeai", new_window: bool = True,
             "manually."
         )
     args = [cli, "auth", "login", f"--{method}"]
-    kwargs: dict = {"env": _auth_env(config_dir)}
+    kwargs: dict = {"env": child_env(config_dir)}
     try:
         if sys.platform == "win32" and new_window:
             # New visible console so the interactive login is usable even when
