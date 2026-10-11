@@ -352,12 +352,6 @@ def load_persisted_bg_tasks(cwd: str, session_id: str | None = None, *,
     return [x for x in items if isinstance(x, dict) and x.get("task_id")]
 
 
-def clear_persisted_bg_tasks(cwd: str, session_id: str | None = None,
-                             config_dir: str | None = None) -> None:
-    """Drop the record, so it is reported exactly once."""
-    save_persisted_bg_tasks(cwd, {}, session_id, config_dir)
-
-
 def _bg_task_label(item: dict) -> str:
     """Name a task the way its owner would recognise it."""
     label = (item.get("name") or item.get("command")
@@ -731,35 +725,6 @@ def project_dir_for_cwd(cwd: str, config_dir: str | None = None) -> Path:
     except OSError:
         resolved = cwd
     return claude_projects_dir(config_dir) / _sanitize_cwd(resolved)
-
-
-def find_project_for_cwd(cwd: str) -> Path | None:
-    """Locate an existing project directory for *cwd*.
-
-    Tries the direct sanitise-and-check path first; falls back to
-    scanning every project dir for one whose first-record ``cwd``
-    matches (case-insensitive on Windows).
-    """
-    direct = project_dir_for_cwd(cwd)
-    if direct.exists():
-        return direct
-    try:
-        target = str(Path(cwd).resolve(strict=False))
-    except OSError:
-        target = cwd
-    target_norm = normalize_path_for_compare(target)
-    projects = claude_projects_dir()
-    if not projects.exists():
-        return None
-    for project in projects.iterdir():
-        if not project.is_dir():
-            continue
-        for jsonl in project.glob("*.jsonl"):
-            stored = sniff_session_cwd(jsonl)
-            if stored and normalize_path_for_compare(stored) == target_norm:
-                return project
-            break  # only check one jsonl per project
-    return None
 
 
 def find_most_recent_session_for_cwd(cwd: str,

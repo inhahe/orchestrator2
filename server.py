@@ -4655,10 +4655,8 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
             await _enter_lobby(ws)
             return
         _rearm_carried_wakeup(orig, carry["wakeup"])
-        # Its queue normally comes back from its own file, as on any reopen --
-        # but that read looks in the session's account and the saves land in
-        # the hub's, so for another account's session it finds nothing.  Put
-        # it back by hand when the reopen did not.
+        # Its queue normally comes back from its own file, as on any reopen.
+        # Should that restore find nothing, put it back by hand.
         q = getattr(orig.state, "queued_prompts", None)
         if carry["queue"] and q is not None and not q:
             q.extend(carry["queue"])
