@@ -5727,8 +5727,12 @@ CATCHUP_CHAT_MUTATIONS = [
      ""),
 
     ("a summary in a shut group is fitted where nothing can be measured",
-     "    const visible = summaries.filter(s => s.offsetParent !== null);\n",
-     "    const visible = summaries;\n"),
+     "    const visible = summaries.filter(s => 'fit' in s.dataset && s.offsetParent !== null);\n",
+     "    const visible = summaries.filter(s => 'fit' in s.dataset);\n"),
+
+    ("a summary fitted already is fitted again, and emptied",
+     "    const visible = summaries.filter(s => 'fit' in s.dataset && s.offsetParent !== null);\n",
+     "    const visible = summaries.filter(s => s.offsetParent !== null);\n"),
 
     ("opening a group leaves the summaries it hid unfitted",
      "        fitThinking(content);\n",

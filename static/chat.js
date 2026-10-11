@@ -682,9 +682,11 @@ const Chat = (() => {
   // Show each waiting summary's text where it fits, else its size hint.
   // Measured all together rather than one at a time, so it forces a couple of
   // layouts however many there are.  One hidden in a collapsed group keeps its
-  // hint and its data-fit, and is fitted when the group is opened.
+  // hint and its data-fit, and is fitted when the group is opened.  One
+  // without data-fit was fitted already, by a group opened before the rest
+  // were drawn, and has no text left to try.
   function _fitThinking(summaries) {
-    const visible = summaries.filter(s => s.offsetParent !== null);
+    const visible = summaries.filter(s => 'fit' in s.dataset && s.offsetParent !== null);
     if (!visible.length) return;
     const hints = visible.map(s => s.textContent);
     visible.forEach((s) => { s.textContent = s.dataset.fit; });

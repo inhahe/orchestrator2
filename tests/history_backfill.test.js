@@ -609,5 +609,23 @@ test('...measuring them together too', () => {
          'measured with ' + JSON.stringify(drawn) + ' of 3 drawn');
 });
 
+test('a summary fitted while the history is still drawing is not emptied at its end', () => {
+  const p = makePage();
+  measuring(p, 140);
+  // More than one batch, so the user can open a group between batches.
+  p.Chat.handleMessage({ type: 'history', messages: [
+    { type: 'thinking', content: 'short and sweet' },
+    { type: 'thinking', content: 'also short' },
+    ...msgs('h', 80)] });
+  p.win.Element.prototype.scrollIntoView = () => {};   // jsdom has none
+  const toggle = p.doc.querySelector('.activity-group-toggle');
+  assert(toggle, 'the first batch drew no group to open');
+  toggle.click();
+  assert(summaries(p)[0] === 'short and sweet', 'not fitted on opening: ' + summaries(p)[0]);
+  p.flushTimers();                          // the rest of the history
+  assert(summaries(p)[0] === 'short and sweet', 'emptied at the end: '
+         + JSON.stringify(summaries(p)[0]));
+});
+
 console.log(`\n${ran - failures}/${ran} passed`);
 process.exit(failures ? 1 : 0);
