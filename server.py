@@ -86,6 +86,7 @@ from config import (
 )
 from state import (
     State,
+    billed_to_api_key,
     config_dir_path,
     detect_account_info,
     init_state_from_config,
@@ -672,27 +673,33 @@ async def _propagate_login_to_siblings(
             log.warning("sibling login-propagate broadcast failed: %r", exc)
 
 
-async def _watch_login(rt: "SessionRuntime") -> None:
+# How long /login's browser sign-in may take, and how often to look.
+LOGIN_WATCH_S = 300.0
+LOGIN_POLL_S = 2.0
+
+
+async def _watch_login(rt: "SessionRuntime", method: str = "claudeai") -> None:
     """After ``/login`` launches the browser OAuth, wait for it to finish.
 
-    The interactive login runs in a separate console and rewrites
-    ``<config-dir>/.credentials.json`` when it completes.  We poll for that
-    file's mtime advancing (reliable, unlike ``claude auth status``), then
-    refresh ``state.account`` from the freshly-written ``.claude.json``, clear
-    any sticky auth error, and broadcast: a confirmation naming the account plus
-    a ``status_update`` so the toolbar's *account* field updates immediately.
+    The interactive login runs in a separate console.  A subscription sign-in
+    rewrites ``<config-dir>/.credentials.json`` when it completes; a Console
+    sign-in (``method == "console"``) stores a new API key in ``.claude.json``
+    instead.  We poll for either (``auth.login_completed``; reliable, unlike
+    ``claude auth status``), then refresh ``state.account`` from the
+    freshly-written ``.claude.json``, clear any sticky auth error, and
+    broadcast: a confirmation naming the account plus a ``status_update`` so
+    the toolbar's *account* field updates immediately.
     """
     state = rt.state
     config = rt.config
     cfg_dir = getattr(config, "config_dir", None)
 
-    start_mtime = await asyncio.to_thread(auth.credentials_mtime, cfg_dir)
-    deadline = time.monotonic() + 300.0  # 5 min to complete the browser flow
+    before = await asyncio.to_thread(auth.login_fingerprint, cfg_dir)
+    deadline = time.monotonic() + LOGIN_WATCH_S
     while time.monotonic() < deadline:
-        await asyncio.sleep(2.0)
-        mtime = await asyncio.to_thread(auth.credentials_mtime, cfg_dir)
-        # Completed when the credentials file is (re)written after we started.
-        if mtime is not None and (start_mtime is None or mtime > start_mtime):
+        await asyncio.sleep(LOGIN_POLL_S)
+        now = await asyncio.to_thread(auth.login_fingerprint, cfg_dir)
+        if auth.login_completed(before, now):
             info = await asyncio.to_thread(detect_account_info, cfg_dir)
             state.account = info
             state.auth_error = False
@@ -704,9 +711,12 @@ async def _watch_login(rt: "SessionRuntime") -> None:
             reset_rate_limit(state)
             email = info.get("email")
             who = f" as {email}" if email else ""
+            billed = (" This account's sessions are now billed per token to "
+                      "its Anthropic Console API key."
+                      if method == "console" else "")
             await rt.broadcast({
                 "type": "system_msg", "subtype": "info",
-                "data": {"message": f"Signed in to Claude{who}. "
+                "data": {"message": f"Signed in to Claude{who}.{billed} "
                                     f"Run /connect to reconnect this session."},
             })
             await rt.broadcast({
@@ -5038,7 +5048,7 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             if result.login_launched:
                 # Browser OAuth completes asynchronously; watch for it, then
                 # refresh the account field / status bar for this runtime.
-                asyncio.create_task(_watch_login(rt))
+                asyncio.create_task(_watch_login(rt, result.login_launched))
             return
 
         # /graphify explain|path|diagnose — read-only queries against the
@@ -5228,13 +5238,19 @@ async def _handle_usage(ws: WebSocket, rt: "SessionRuntime") -> None:
     network answers.  The second carries the limits or an ``error``
     (``plan_usage.usage_report``).  The fetch blocks, so it runs in a thread.
     It uses the *runtime's* account: a session on another account shows that
-    account's limits.  static/usage.js draws them.
+    account's limits.  A session billed to an API key has none, even on an
+    account with a subscription, and is told so instead.  static/usage.js
+    draws them.
     """
     config_dir = getattr(rt.config, "config_dir", None)
     await send_to(ws, {"type": "command_data", "label": "usage",
                        "data": {"loading": True}})
     try:
-        data = await asyncio.to_thread(plan_usage.usage_report, config_dir)
+        if billed_to_api_key(rt.state):
+            data = await asyncio.to_thread(
+                plan_usage.api_key_report, config_dir, rt.state.api_key_source)
+        else:
+            data = await asyncio.to_thread(plan_usage.usage_report, config_dir)
     except Exception:  # noqa: BLE001 -- a bug; say so rather than hang "Loading"
         log.exception("/usage: building the report failed")
         data = {"error": "Failed to load usage data (see the hub log)."}

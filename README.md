@@ -24,6 +24,8 @@ claude auth login          # from a terminal, or
 /login                     # from inside orchestrator2 (then /connect)
 ```
 
+To pay per token with an Anthropic API key instead of a Claude subscription, see [Using an Anthropic API key](#using-an-anthropic-api-key).
+
 **4. Run it**
 
 From the project directory you want Claude to work in:
@@ -306,6 +308,30 @@ orch --config-dir "C:\Users\me\.claude-alt"
 
 Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reconnect). The active account is shown in the status bar's **account** field (hover for the config dir).
 
+### Using an Anthropic API key
+
+A session can be billed per token to an Anthropic API key instead of a Claude subscription. The key belongs to an **account** (a config dir), so every session on that account uses it; give a key an account of its own to keep your subscriptions for everything else. A key wins over a subscription login on the same account, so an account with both is billed to the key.
+
+There are three ways to give an account a key:
+
+- **`/login console`** in a session on that account. It opens the Anthropic Console sign-in; the Claude CLI then creates an API key and keeps it in the account's config. This replaces the account's current login, a subscription included, once you finish signing in (close the window instead and nothing changes). `/login force` signs it back in to a subscription.
+- **Your own key, in the account's `settings.json`.** Add an `env` entry to `<config-dir>\settings.json` (keep whatever else the file holds):
+
+  ```json
+  {
+    "env": {
+      "ANTHROPIC_API_KEY": "sk-ant-api03-..."
+    }
+  }
+  ```
+
+  Or have a command print the key, so it isn't stored in the file: `"apiKeyHelper": "<command>"`. Remove the entry to go back to the account's subscription.
+- **`ANTHROPIC_API_KEY` in the hub's environment.** Every session the hub runs, on every account, is then billed to it. Set it where the hub starts: a launch that joins a running hub opens its session in the hub's environment, not the launching shell's.
+
+A session picks up a new key when its CLI starts: run `/connect` in one that was already open. To start sessions on a new account, launch with `--config-dir <dir>`; once it has sessions, `/move` can move others there.
+
+You can see which a session uses. The status bar's plan field reads **`API $0.1234`** instead of the plan name (hover for the key's source). `/status` says what the session is billed to, and `/usage` explains that plan limits don't apply to a session billed to a key.
+
 ## Features
 
 - **Live WebSocket UI** -- real-time streaming of assistant messages, tool calls, and results
@@ -498,7 +524,7 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/move` | Move this session to another Claude account **and/or another project directory**, and continue it in the same window. The conversation is copied under a new session id and **the original is stopped**. Its queued prompts, scheduled loop and agent name come along. Background tasks it was running cannot, and you are told which ones died. The original's transcript is left on disk. If the move fails after the original has stopped, the original is reopened. Opens a picker: choose the account (the current one included, if you only want to change directory), then the destination directory and a name for the copy. Leave either as-is to change only the other. Directories Claude already knows about are offered as one-click fills, but any existing directory works |
 | `/move <path>` | Same, with the destination directory prefilled |
 | `/export [path]` | Save conversation as markdown |
-| `/login [force]` | Show sign-in status, or launch the Claude login flow. Automatically re-authenticates when the last turn failed with a 401; `/login force` re-authenticates even when it thinks you're already signed in (use this if you hit auth errors but it insists you're logged in). After you finish signing in the browser, it confirms the signed-in account by email and updates the status bar's **account** field, then prompts you to `/connect`. |
+| `/login [force\|console]` | Show sign-in status, or launch the Claude login flow. Automatically re-authenticates when the last turn failed with a 401; `/login force` re-authenticates even when it thinks you're already signed in (use this if you hit auth errors but it insists you're logged in). `/login console` signs the session's account in to an Anthropic Console account instead, billed per token to an API key the Claude CLI creates for it; see [Using an Anthropic API key](#using-an-anthropic-api-key). After you finish signing in the browser, it confirms the signed-in account by email and updates the status bar's **account** field, then prompts you to `/connect`. |
 | `/logout` | Sign the active account out |
 | `/connect` | Reconnect. If the browser↔server WebSocket has dropped (e.g. server restart), revives it client-side even after auto-reconnect has given up; if the socket is alive, reconnects the SDK bridge. Prompts typed while disconnected are queued and sent once reconnected. |
 | `/resume [id\|title]` | Resume a specific session, or open the session picker |

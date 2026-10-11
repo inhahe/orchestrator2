@@ -93,6 +93,7 @@ from config import (
 )
 from state import (
     State,
+    apply_api_key_source,
     apply_rate_limit_info,
     config_dir_path,
     detect_account_info,
@@ -4056,6 +4057,12 @@ class SDKBridge:
             sid = getattr(msg, "session_id", None)
             if not sid and isinstance(data_dict, dict):
                 sid = data_dict.get("session_id")
+            # Every init, not just the first: it comes each turn, and what it
+            # says can change -- a key added to the account's settings.json is
+            # in use from the next CLI.
+            if isinstance(data_dict, dict):
+                apply_api_key_source(state, data_dict.get("apiKeySource"),
+                                     getattr(self.config, "config_dir", None))
             old_sid = state.session_id
             if sid:
                 state.session_id = sid

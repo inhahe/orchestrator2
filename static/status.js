@@ -252,6 +252,8 @@ const Status = (() => {
     // Plan / cost.
     const plan = status.plan_field || '--';
     _set(elPlan, 'textContent', plan);
+    // What it is billed to, and what the cost figure means.
+    _set(elPlan, 'title', status.plan_title || 'Plan');
 
     // Model.
     if (status.model) {

@@ -513,6 +513,13 @@ test('an error with no account is just the error', () => {
      'Error: Failed to load usage data (see the hub log).', 'bare');
 });
 
+test('a session billed to an API key gets its note, not an error', () => {
+  // Plan limits do not apply to it; nothing went wrong.
+  eq(U.render({ note: 'This session is billed per token to an API key.',
+                account: { email: 'someone@example.com' } }, AT),
+     'someone@example.com\n\nThis session is billed per token to an API key.', 'note');
+});
+
 test('an empty reply says there is nothing to show', () => {
   eq(U.render({ usage: {} }, AT), 'No plan limits reported for this account.', 'empty');
   eq(U.render({}, AT), 'No plan limits reported for this account.', 'no usage at all');

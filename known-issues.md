@@ -1,5 +1,23 @@
 # Known issues / tech debt — orchestrator2
 
+## A session billed to an API key was shown as a subscription — FIXED (2026-10-10)
+
+Found while answering *"Does orchestrator2 support using API keys?"*. The CLI
+the SDK runs uses an API key without asking, even on an account signed in to
+a subscription: a key in the hub's environment, in the account's
+`settings.json` (`env`), or from an `apiKeyHelper` all beat the login. Measured
+against CLI 2.1.280 with fake credentials. The hub judged billing from its own
+environment alone. So a session on an account whose `settings.json` held a key
+showed the subscription's plan and limits in the status bar, and `/usage`
+fetched limits that did not apply to it. `/login` could only start a
+subscription sign-in.
+
+Fixed: the hub takes the CLI's own word, the `apiKeySource` in each turn's
+`init`. A key-billed session's plan field reads `API $<cost>`, and `/usage`
+says plan limits don't apply. `/status` says what the session is billed to.
+`/login console` signs an account in to an Anthropic Console account, billed
+per token. design.md §6g.
+
 ## A tab woken from a freeze still drew what it missed slowly — FIXED (2026-10-10)
 
 > "sometimes clicking on a tab again that's working still replays the recent

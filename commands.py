@@ -25,6 +25,8 @@ from config import (
 )
 from state import (
     State,
+    api_key_source_name,
+    billed_to_api_key,
     fmt_duration,
     fmt_tok,
     state_to_status_dict,
@@ -57,10 +59,11 @@ class CommandResult:
     forward_to_sdk: bool = False
     forward_payload: str | None = None
 
-    # If True, an interactive login flow (browser OAuth) was just launched, so
-    # the caller should watch for its async completion and then refresh the
-    # account info / status bar.  Set by ``_cmd_login``.
-    login_launched: bool = False
+    # Set when an interactive login flow (browser OAuth) was just launched: its
+    # method, "claudeai" or "console" (``auth.LOGIN_METHODS``).  The caller
+    # watches for its async completion, then refreshes the account info /
+    # status bar.  Set by ``_cmd_login``.
+    login_launched: str | None = None
 
 
 def _msg(text: str, *, level: str = "info") -> dict[str, Any]:
@@ -279,7 +282,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         ("/thinking [on|off|toggle]",    "enable/disable extended thinking"),
         ("/show-thinking [on|off]",      "expand thinking blocks by default"),
         ("/model [name]",                "show/set model; no arg lists available"),
-        ("/login [force]",               "sign in to your Claude account (force = re-auth even if it thinks you're signed in)"),
+        ("/login [force|console]",       "sign in to your Claude account (force = re-auth even if it thinks you're signed in; console = an Anthropic Console account, billed per token to an API key)"),
         ("/logout",                      "sign out of your Claude account"),
         ("/connect",                     "reconnect (revives a dropped browser socket, or the SDK)"),
         ("/resume [id|title]",           "resume a session (or open picker)"),
@@ -331,6 +334,7 @@ def _cmd_status(_payload: str, state: State, config: Config) -> CommandResult:
         "turns": state.turns,
         "context_tokens": state.context_tokens,
         "cost": f"${state.total_cost_usd:.4f}",
+        "billing": _billing_summary(state),
         "effort": state.effort or "auto",
         "model": state.model or state.active_model or "(auto)",
         "thinking": "on" if state.thinking_enabled else "off",
@@ -343,6 +347,18 @@ def _cmd_status(_payload: str, state: State, config: Config) -> CommandResult:
         "status": status,
     }
     return CommandResult(messages=[_data_msg(info, label="status")])
+
+
+def _billing_summary(state: State) -> str:
+    """What the session's turns are billed to, in one line."""
+    if billed_to_api_key(state):
+        return (f"an API key ({api_key_source_name(state.api_key_source)}), "
+                f"per token")
+    if state.is_subscription:
+        return f"a Claude subscription ({state.subscription_plan or 'plan unknown'})"
+    if state.api_key_source is None:
+        return "not known until the session's CLI has started"
+    return "neither an API key nor a subscription: a cloud provider, or a token"
 
 
 def _external_access_summary(config: Config) -> str:
@@ -361,8 +377,17 @@ def _external_access_summary(config: Config) -> str:
             "--external-password \"<pw>\"")
 
 
+_LOGIN_FORCE_WORDS = frozenset({"force", "relogin", "-f", "--force"})
+_LOGIN_CONSOLE_WORDS = frozenset({"console", "--console", "api"})
+
+
 def _cmd_login(payload: str, state: State, config: Config) -> CommandResult:
-    """Show login status, and start the Claude login flow when needed.
+    """Show login status, and start a Claude login flow when needed.
+
+    ``/login`` signs this session's account in to a Claude subscription.
+    ``/login console`` signs it in to an Anthropic Console account instead:
+    the CLI creates an API key for it, and every session on the account is
+    billed per token to that key.  Asked for by name, it always starts.
 
     ``is_logged_in()`` only checks that a credential file exists — it can't tell
     a still-valid session from one whose OAuth tokens (access *and* refresh) have
@@ -372,13 +397,23 @@ def _cmd_login(payload: str, state: State, config: Config) -> CommandResult:
     forced it with ``/login force``.  Either way we launch the OAuth flow instead
     of stonewalling.
 
+    An argument it does not know is refused rather than ignored: a mistyped
+    ``console`` would otherwise start a subscription sign-in, the opposite.
+
     All the auth checks are scoped to *this* runtime's account
     (``config.config_dir``) — a cross-account hub session must be checked and
     re-authed against its own ``CLAUDE_CONFIG_DIR``, not the hub process's.
     """
     cfg_dir = getattr(config, "config_dir", None)
-    force = payload.strip().lower() in ("force", "relogin", "-f", "--force")
-    needs_reauth = force or state.auth_error
+    words = set(payload.strip().lower().split())
+    unknown = words - _LOGIN_FORCE_WORDS - _LOGIN_CONSOLE_WORDS
+    if unknown:
+        return CommandResult(messages=[_msg(
+            f"/login doesn't know {', '.join(sorted(unknown))}. Use /login, "
+            f"/login force, or /login console.", level="error")])
+    method = "console" if words & _LOGIN_CONSOLE_WORDS else "claudeai"
+    force = bool(words & _LOGIN_FORCE_WORDS)
+    needs_reauth = force or state.auth_error or method == "console"
 
     if auth.is_logged_in(cfg_dir) and not needs_reauth:
         email = auth.account_email(cfg_dir)
@@ -391,22 +426,29 @@ def _cmd_login(payload: str, state: State, config: Config) -> CommandResult:
                                 f"to re-authenticate if you're seeing auth errors."},
         }])
 
-    ok, msg = auth.launch_login(config_dir=cfg_dir)
+    ok, msg = auth.launch_login(method=method, config_dir=cfg_dir)
     hint = ("The current session's login has expired — "
-            if state.auth_error else "")
+            if state.auth_error and method == "claudeai" else "")
     if ok and state.auth_error:
         # Optimistically clear the sticky flag; a fresh 401 will re-set it.
         state.auth_error = False
+    what = ""
+    if ok and method == "console":
+        what = (" Signing in replaces this account's current login, a Claude "
+                "subscription included: every session on the account is then "
+                "billed per token to an API key the Claude CLI creates for it. "
+                "Close the window without signing in and nothing changes.")
     return CommandResult(
         messages=[{
             "type": "system_msg",
             "subtype": "info" if ok else "error",
-            "data": {"message": f"{hint}{msg} Waiting for sign-in to complete — "
-                                f"I'll confirm the account here, then run /connect."},
+            "data": {"message": f"{hint}{msg}{what}" + (
+                " Waiting for sign-in to complete — I'll confirm the account "
+                "here, then run /connect." if ok else "")},
         }],
         # Tell the caller to watch for the async browser-OAuth completion and
         # then refresh the account info / status bar.
-        login_launched=ok,
+        login_launched=method if ok else None,
     )
 
 

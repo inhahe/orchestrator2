@@ -4327,8 +4327,8 @@ USAGE_PY_MUTATIONS = [
      '    return value if isinstance(value, str) else None'),
 
     ("the report does not say whose email",
-     'account = {"email": info.get("email"), "config_dir": info.get("config_dir")}',
-     'account = {"email": None, "config_dir": info.get("config_dir")}'),
+     'return {"email": info.get("email"), "config_dir": info.get("config_dir")}',
+     'return {"email": None, "config_dir": info.get("config_dir")}'),
 
     ("a failed report does not say whose",
      '        return {"error": str(exc), "account": account}',
@@ -5772,6 +5772,161 @@ CATCHUP_APP_MUTATIONS = [
 ]
 
 
+# Sessions billed to an API key (2026-10-10: "Does orchestrator2 support using
+# API keys?").  The CLI's init names the key, and that decides what the status
+# bar, /status and /usage say; the cost is the CLI's running total.
+# tests/test_api_key_billing.py and tests/test_api_key_hub.py; design.md §6g.
+APIKEY_STATE_MUTATIONS = [
+    ("a key the CLI names leaves the session a subscription -- the gap",
+     "        state.is_subscription = False\n        state.subscription_plan = None\n"
+     "    elif had_key:",
+     "        state.subscription_plan = None\n    elif had_key:"),
+
+    ("a key session keeps its subscription's plan name",
+     "        state.is_subscription = False\n        state.subscription_plan = None\n"
+     "    elif had_key:",
+     "        state.is_subscription = False\n    elif had_key:"),
+
+    ("the subscription's limits linger on a key session",
+     "            reset_rate_limit(state)\n        state.is_subscription = False",
+     "            pass\n        state.is_subscription = False"),
+
+    ("a key that goes away leaves the session without its plan",
+     "    elif had_key:\n        state.is_subscription = detect_subscription()",
+     "    elif False:\n        state.is_subscription = detect_subscription()"),
+
+    ("the plan comes back from the hub's account, not the session's",
+     "detect_subscription_plan(config_dir)\n",
+     "detect_subscription_plan()\n"),
+
+    ("an init without a usable source is taken as one",
+     "    if not isinstance(source, str) or not source:\n        return\n    had_key",
+     "    had_key"),
+
+    ("a source of none counts as a key",
+     'return state.api_key_source not in (None, "none")',
+     'return state.api_key_source is not None'),
+
+    ("a subscription rate limit makes a key session a subscription again",
+     "    if rl_type in SUBSCRIPTION_RL_TYPES and not billed_to_api_key(state):\n",
+     "    if rl_type in SUBSCRIPTION_RL_TYPES:\n"),
+
+    ("a key session's plan field shows a bare cost",
+     '    elif billed_to_api_key(state):\n        plan_field = f"API {cost}"',
+     '    elif False:\n        plan_field = f"API {cost}"'),
+
+    ("the plan field's explanation is not sent",
+     '        "plan_title": plan_title,\n',
+     ""),
+]
+
+APIKEY_BRIDGE_MUTATIONS = [
+    ("the init message's apiKeySource is not read -- the gap",
+     "            if isinstance(data_dict, dict):\n                apply_api_key_source(",
+     "            if False:\n                apply_api_key_source("),
+
+    ("only the first init is read",
+     "            if isinstance(data_dict, dict):\n                apply_api_key_source(",
+     "            if isinstance(data_dict, dict) and first_init:\n"
+     "                apply_api_key_source("),
+]
+
+APIKEY_AUTH_MUTATIONS = [
+    ("/login console starts a subscription sign-in",
+     'args = [cli, "auth", "login", f"--{method}"]',
+     'args = [cli, "auth", "login", "--claudeai"]'),
+
+    ("a flow it does not know is handed to the CLI",
+     "    if method not in LOGIN_METHODS:\n"
+     "        raise ValueError(f\"unknown login method {method!r}\")\n",
+     ""),
+
+    ("the fingerprint leaves out the Console key",
+     "    return credentials_mtime(config_dir), digest\n",
+     "    return credentials_mtime(config_dir), None\n"),
+
+    ("a Console sign-in is never seen to finish",
+     "    return key_now is not None and key_now != key_before\n",
+     "    return False\n"),
+
+    ("a key removed on the way counts as finishing",
+     "    return key_now is not None and key_now != key_before\n",
+     "    return key_now != key_before\n"),
+
+    ("the same token file counts as finishing",
+     "if cred_now is not None and (cred_before is None or cred_now > cred_before):",
+     "if cred_now is not None:"),
+
+    ("without CLAUDE_CONFIG_DIR, .claude.json is looked for inside ~/.claude",
+     'return Path(base) / ".claude.json" if base else Path.home() / ".claude.json"',
+     'return Path(base or Path.home() / ".claude") / ".claude.json"'),
+]
+
+APIKEY_CMD_MUTATIONS = [
+    ("/login console does nothing when signed in -- the gap",
+     '    needs_reauth = force or state.auth_error or method == "console"\n',
+     '    needs_reauth = force or state.auth_error\n'),
+
+    ("/login console starts a subscription sign-in",
+     '    method = "console" if words & _LOGIN_CONSOLE_WORDS else "claudeai"\n',
+     '    method = "claudeai"\n'),
+
+    ("a mistyped argument starts a subscription sign-in",
+     "    if unknown:\n        return CommandResult(messages=[_msg(\n",
+     "    if False:\n        return CommandResult(messages=[_msg(\n"),
+
+    ("/login console does not say it replaces the subscription",
+     '    if ok and method == "console":\n        what = (',
+     '    if False:\n        what = ('),
+
+    ("the watcher is told every sign-in is a subscription's",
+     "        login_launched=method if ok else None,\n",
+     "        login_launched=\"claudeai\" if ok else None,\n"),
+
+    ("/status does not say what the session is billed to",
+     '        "billing": _billing_summary(state),\n',
+     ""),
+
+    ("/status calls a key session a subscription",
+     '    if billed_to_api_key(state):\n        return (f"an API key (',
+     '    if False:\n        return (f"an API key ('),
+]
+
+APIKEY_SERVER_MUTATIONS = [
+    ("/usage fetches subscription limits for a key session -- the gap",
+     "        if billed_to_api_key(rt.state):\n"
+     "            data = await asyncio.to_thread(\n"
+     "                plan_usage.api_key_report",
+     "        if False:\n"
+     "            data = await asyncio.to_thread(\n"
+     "                plan_usage.api_key_report"),
+
+    ("a Console sign-in is never seen to finish",
+     "        if auth.login_completed(before, now):\n",
+     "        if now[0] is not None and (before[0] is None or now[0] > before[0]):\n"),
+
+    ("a finished Console sign-in does not say it bills per token",
+     '                      if method == "console" else "")\n',
+     '                      if False else "")\n'),
+
+    ("the watcher is not told which sign-in it watches",
+     "asyncio.create_task(_watch_login(rt, result.login_launched))",
+     "asyncio.create_task(_watch_login(rt))"),
+
+]
+
+APIKEY_USAGEJS_MUTATIONS = [
+    ("a key session's note is drawn as an empty report",
+     "    if (typeof data.note === 'string' && data.note) {\n",
+     "    if (false) {\n"),
+]
+
+APIKEY_STATUSJS_MUTATIONS = [
+    ("the plan field's explanation is not shown on hover",
+     "    _set(elPlan, 'title', status.plan_title || 'Plan');\n",
+     ""),
+]
+
 TARGETS = {
     "chat": ("static/chat.js", "tests/hidden_window.test.js",
              CHAT_MUTATIONS, "node"),
@@ -6025,6 +6180,20 @@ TARGETS = {
                      CATCHUP_CHAT_MUTATIONS, "node"),
     "catchup-app": ("static/app.js", "tests/reconnect_on_show.test.js",
                     CATCHUP_APP_MUTATIONS, "node"),
+    "apikey-state": ("state.py", "tests/test_api_key_billing.py",
+                     APIKEY_STATE_MUTATIONS, "pytest"),
+    "apikey-bridge": ("sdk_bridge.py", "tests/test_api_key_billing.py",
+                      APIKEY_BRIDGE_MUTATIONS, "pytest"),
+    "apikey-auth": ("auth.py", "tests/test_api_key_billing.py",
+                    APIKEY_AUTH_MUTATIONS, "pytest"),
+    "apikey-cmd": ("commands.py", "tests/test_api_key_billing.py",
+                   APIKEY_CMD_MUTATIONS, "pytest"),
+    "apikey-server": ("server.py", "tests/test_api_key_hub.py",
+                      APIKEY_SERVER_MUTATIONS, "pytest"),
+    "apikey-usagejs": ("static/usage.js", "tests/usage.test.js",
+                       APIKEY_USAGEJS_MUTATIONS, "node"),
+    "apikey-statusjs": ("static/status.js", "tests/reconnect_on_show.test.js",
+                        APIKEY_STATUSJS_MUTATIONS, "node"),
 }
 
 

@@ -1703,6 +1703,17 @@ test('the status sent with a resume is shown while the backlog comes', (h) => {
   assert(/working/.test(stateText(h)), 'state reads ' + JSON.stringify(stateText(h)));
 });
 
+test('the plan field says on hover what the session is billed to', (h) => {
+  attachedAt(h, 'e1', 5);
+  const s = snapshot('idle');
+  s.status.plan_field = 'API $0.0123';
+  s.status.plan_title = 'Billed per token to an API key (ANTHROPIC_API_KEY).';
+  h.live.deliver(s);
+  const el = h.win.document.getElementById('status-plan');
+  assert(el.textContent === 'API $0.0123', JSON.stringify(el.textContent));
+  assert(el.title === s.status.plan_title, JSON.stringify(el.title));
+});
+
 test('a group opened to show a tool fits the thinking it hid', (h) => {
   // A backlog's one-line thinking is measured once it is all in, but not
   // inside a collapsed group, where nothing can be measured.

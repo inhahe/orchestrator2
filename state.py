@@ -211,10 +211,12 @@ def check_authentication() -> tuple[bool, str]:
     )
 
 
-def detect_subscription_plan() -> str | None:
-    """Read the plan name from OAuth credentials, distinguishing Max 5x/20x."""
-    base = os.environ.get("CLAUDE_CONFIG_DIR")
-    path = Path(base if base else Path.home() / ".claude") / ".credentials.json"
+def detect_subscription_plan(config_dir: str | None = None) -> str | None:
+    """Read the plan name from OAuth credentials, distinguishing Max 5x/20x.
+
+    ``config_dir`` is the account to read; without it, the process env's.
+    """
+    path = config_dir_path(config_dir) / ".credentials.json"
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -282,6 +284,49 @@ def detect_account_info(config_dir: str | None = None) -> dict[str, Any]:
     return info
 
 
+# How each ``apiKeySource`` is named to the user.
+_API_KEY_SOURCE_NAMES = {
+    "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY",
+    "apiKeyHelper": "apiKeyHelper",
+    "/login managed key": "Anthropic Console sign-in",
+}
+
+
+def billed_to_api_key(state: State) -> bool:
+    """True when the session's CLI says it calls the API with an API key."""
+    return state.api_key_source not in (None, "none")
+
+
+def api_key_source_name(source: str | None) -> str:
+    """What to call ``source`` (an ``apiKeySource``) in the UI."""
+    return _API_KEY_SOURCE_NAMES.get(source or "", source or "unknown")
+
+
+def apply_api_key_source(state: State, source: Any, config_dir: str | None) -> None:
+    """Record what the session's CLI calls the API with: init's ``apiKeySource``.
+
+    Only the CLI can say.  An API key outranks a subscription login: where the
+    SDK runs it, the CLI uses a key from its environment or from the account's
+    settings.json even while the account is signed in to a subscription, and
+    it never asks.  ``config_dir`` is the session's account, whose plan is read
+    back when a key the session had is gone.
+    """
+    if not isinstance(source, str) or not source:
+        return
+    had_key = billed_to_api_key(state)
+    state.api_key_source = source
+    if source != "none":
+        if not had_key:
+            # The subscription's limits no longer describe this session.
+            reset_rate_limit(state)
+        state.is_subscription = False
+        state.subscription_plan = None
+    elif had_key:
+        state.is_subscription = detect_subscription()
+        state.subscription_plan = (detect_subscription_plan(config_dir)
+                                   if state.is_subscription else None)
+
+
 # ---------------------------------------------------------------------------
 # Rate-limit helpers
 # ---------------------------------------------------------------------------
@@ -300,7 +345,7 @@ def apply_rate_limit_info(state: State, info: Any) -> None:
         util = getattr(info, "utilization", None)
         status = getattr(info, "status", None)
         resets_at = getattr(info, "resets_at", None)
-    if rl_type in SUBSCRIPTION_RL_TYPES:
+    if rl_type in SUBSCRIPTION_RL_TYPES and not billed_to_api_key(state):
         state.is_subscription = True
     if isinstance(util, (int, float)) and isinstance(rl_type, str):
         state.rate_limit_utils[rl_type] = float(util)
@@ -649,6 +694,11 @@ class State:
     # Subscription / plan
     is_subscription: bool = False
     subscription_plan: str | None = None
+    # The API key the session's CLI calls the API with, as its init message
+    # names the source (``apiKeySource``): "ANTHROPIC_API_KEY", "apiKeyHelper"
+    # or "/login managed key".  "none" means no key -- a subscription login,
+    # or a cloud provider.  None until the CLI has said.
+    api_key_source: str | None = None
 
     # Signed-in account (read once from <config-dir>/.claude.json).  Keys:
     # email, display_name, org_name, org_type, org_role, config_dir.
@@ -842,8 +892,11 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
     # --- Plan / cost ---
     rate_field: str | None = None
     rate_limits: dict[str, Any] = {}
+    cost = f"${state.total_cost_usd:.4f}"
+    cost_note = "what this session's turns have cost, as Claude Code reports it."
     if state.is_subscription:
         plan_field = f"{state.subscription_plan or 'sub'}"
+        plan_title = "Claude subscription plan"
         is_hit = (
             state.rate_limit_status == "rejected"
             and state.rate_limit_resets_at
@@ -877,8 +930,14 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
                     delta = max(0, state.rate_limit_resets_at - now_ts)
                     entry["reset_in"] = fmt_countdown(float(delta))
                 rate_limits[label] = entry
+    elif billed_to_api_key(state):
+        plan_field = f"API {cost}"
+        plan_title = (f"Billed per token to an API key "
+                      f"({api_key_source_name(state.api_key_source)}). "
+                      f"{cost}: {cost_note}")
     else:
-        plan_field = f"${state.total_cost_usd:.4f}"
+        plan_field = cost
+        plan_title = f"Cost: {cost_note}"
 
     # --- Model ---
     effective_model = state.model or state.active_model or ""
@@ -937,6 +996,7 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         "busy_since": busy_since,
         "turns": state.turns,
         "plan_field": plan_field,
+        "plan_title": plan_title,
         "config_dir": str(config_dir_path(getattr(config, "config_dir", None))),
         "account": state.account,
         "is_subscription": state.is_subscription,

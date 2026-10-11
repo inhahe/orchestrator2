@@ -101,11 +101,11 @@ Three layers, deliberately separated:
 | `state.py` | `State` dataclass + `state_to_status_dict()` / `state_to_panels_dict()` serialisers, rate-limit helpers |
 | `config.py` | `Config` dataclass, `parse_args()`, constants (`CONTINUE_PROMPT`, `MARKERS`, …) |
 | `commands.py` | `classify(line)` → `(kind, payload)`, immediate-command dispatch, completions |
-| `plan_usage.py` | `/usage`: fetches the account's plan limits from the usage endpoint (§6f) |
+| `plan_usage.py` | `/usage`: fetches the account's plan limits from the usage endpoint (§6f), or says why a session billed to an API key has none (§6g) |
 | `session.py` | Session discovery, JSONL parsing, `render_session_history`, titles, trim, export |
 | `tool_manager.py` | Tool-use / tool-result / thinking rendering helpers, registries |
 | `theme.py` | CSS-variable theme system, `load_theme()` |
-| `auth.py` | LAN-vs-external classification, external password, HTTP Basic + WS auth |
+| `auth.py` | Claude sign-in through the `claude auth` CLI: status, `/login`'s subscription or Console flow, and what its watcher compares to see it finish (§6g). The LAN-vs-external classification and the external password are in `server.py` (§9) |
 | `proc_guard.py` | Job object tying `claude.exe` children to the server's lifetime; duplicate-session detection |
 | `copy_session.py` | Account/session discovery + the JSONL copy-and-rewrite. Imports nothing heavier than the stdlib on purpose — see §8 |
 | `copy_session_tui.py` | The full-screen `textual` wizards (`--resume` / `--copy` picker, standalone copy wizard). The only module that needs `textual` |
@@ -2011,6 +2011,77 @@ Tests: `tests/test_usage.py` (the fetch, what it says instead, the token),
 harness loads the same scripts as `index.html`). Mutation targets:
 `usage-py`, `usage-server`, `usage-cmd`, `usage-config`, `usage-js`,
 `usage-page`, `usage-chat`, `usage-index`.
+
+## 6g. Billing: a subscription or an API key
+
+Asked 2026-10-10: *"Does orchestrator2 support using API keys? if so, tell me
+how to use them. if not, implement it?"*. The CLI always could; the hub could
+not tell which a session was using.
+
+**The CLI decides, and a key wins.** The SDK starts each session's CLI with
+the hub's environment plus the session's `CLAUDE_CONFIG_DIR`, and runs it
+non-interactively, where the CLI uses an API key without asking and turns its
+subscription login off. Measured against CLI 2.1.280 with fake credentials (a
+401 names the credential that was sent):
+
+| The account has | A turn uses |
+|---|---|
+| a subscription login | the subscription |
+| `ANTHROPIC_API_KEY` in the environment | the key |
+| a subscription login, and the key in the environment | the key |
+| a subscription login, and the key in `settings.json`'s `env` | the key |
+| a subscription login, and an `apiKeyHelper` | the key |
+
+So a key belongs to an account, as a login does: the hub's environment gives
+it to every account, an account's `settings.json` to that account's sessions.
+`claude auth login --console` is the CLI's own way to get one: it signs the
+account out, signs in to an Anthropic Console account, creates an API key, and
+keeps it in `.claude.json` as `primaryApiKey` (not on macOS, where it goes to
+the keychain). That file is in the config dir when `CLAUDE_CONFIG_DIR` is set,
+and in the home directory, beside `~/.claude`, when it is not.
+
+**What the session is billed to comes from its `init` message.** Each turn's
+`init` carries `apiKeySource`: `ANTHROPIC_API_KEY` (the environment or
+`settings.json`), `apiKeyHelper`, `/login managed key` (a Console sign-in), or
+`none` (a subscription, a cloud provider, or a token). It is the CLI's own
+answer, from the same resolver that picks the credential, so the hub reads it
+instead of guessing. `state.apply_api_key_source` records it on every init, not
+only the first: a key can appear between turns. While a key is in use the
+session is not a subscription (`is_subscription` False, whatever the account
+also has), so:
+
+- the status bar's plan field reads `API $<cost>`, its tooltip naming the
+  key's source (`plan_title`);
+- `/usage` sends a `note` that plan limits do not apply, instead of fetching
+  the account's subscription limits (`plan_usage.api_key_report`);
+- `/status` has a `billing` line;
+- a subscription-type rate-limit event does not mark it a subscription again.
+
+When the key goes, the account's plan is read back from the session's own
+config dir.
+
+`detect_subscription()`, from the hub's environment, is still the guess until
+the first `init`, and the only judge of a cloud provider, which `apiKeySource`
+does not name.
+
+**`/login console`** launches `claude auth login --console` for the session's
+account. It always starts, signed in or not, and says first that it replaces
+the account's login, a subscription included, once the browser sign-in
+completes. Words `/login` does not know are refused, because a mistyped
+`console`, ignored, would start the subscription sign-in instead. Completion
+can't be seen as a new `.credentials.json`, because the Console flow writes no
+subscription token. So `_watch_login` compares `auth.login_fingerprint`
+readings: that file's mtime, and a digest of `primaryApiKey`. The key is read
+only to be digested. A newer token file, or a key that differs from before,
+counts as completion. A file or key removed on the way, when the sign-in signs
+out the old login, does not.
+
+Tests: `tests/test_api_key_billing.py` (state, the bridge, `/status`, the
+report, `auth`, `/login`), `tests/test_api_key_hub.py` (`/usage`, the
+watcher), `tests/usage.test.js` (the note) and
+`tests/reconnect_on_show.test.js` (the tooltip). Mutation targets:
+`apikey-state`, `apikey-bridge`, `apikey-auth`, `apikey-cmd`,
+`apikey-server`, `apikey-usagejs`, `apikey-statusjs`.
 
 ## 6b. Subprocess ownership (`proc_guard.py`)
 

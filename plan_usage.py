@@ -42,7 +42,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable
 
-from state import config_dir_path, detect_account_info
+from state import api_key_source_name, config_dir_path, detect_account_info
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 # The subscription API answers an OAuth token only with this beta, as for
@@ -147,14 +147,36 @@ def usage_report(config_dir: str | None) -> dict[str, Any]:
     ``UsageError`` becomes an ``error`` here; anything else is a bug, and it
     propagates for the caller to log.
     """
-    info = detect_account_info(config_dir)
-    account = {"email": info.get("email"), "config_dir": info.get("config_dir")}
+    account = _account(config_dir)
     try:
         report = fetch_usage(config_dir)
     except UsageError as exc:
         return {"error": str(exc), "account": account}
     report["account"] = account
     return report
+
+
+def api_key_report(config_dir: str | None, source: str | None) -> dict[str, Any]:
+    """What ``/usage`` sends for a session billed to an API key.
+
+    Plan limits do not apply to it, even when its account also has a
+    subscription login: the key is what its CLI spends.  ``source`` is the
+    session's ``apiKeySource``.  The result carries a ``note``, not an
+    ``error``: nothing went wrong.
+    """
+    return {
+        "note": (f"This session is billed per token to an API key "
+                 f"({api_key_source_name(source)}), not to a Claude "
+                 f"subscription, so plan limits do not apply to it. The status "
+                 f"bar shows what it has cost."),
+        "account": _account(config_dir),
+    }
+
+
+def _account(config_dir: str | None) -> dict[str, Any]:
+    """Which account a report is for."""
+    info = detect_account_info(config_dir)
+    return {"email": info.get("email"), "config_dir": info.get("config_dir")}
 
 
 def _http_error_text(exc: urllib.error.HTTPError) -> str:

@@ -266,6 +266,11 @@ const Usage = (() => {
       out.push('Error: ' + data.error);
       return out.join('\n\n');
     }
+    // No limits to show, and nothing wrong: a session billed to an API key.
+    if (typeof data.note === 'string' && data.note) {
+      out.push(data.note);
+      return out.join('\n\n');
+    }
     const u = data.usage && typeof data.usage === 'object' ? data.usage : {};
     const plan = typeof data.subscription_type === 'string' ? data.subscription_type : null;
     const weekly = Object.assign({}, o, { alwaysDate: true });
