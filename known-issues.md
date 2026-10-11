@@ -24,22 +24,24 @@ launch opens (*"can you make ANTHROPIC_API_KEY only work for the session that
 was loaded with that key set?"*). The hub keeps it with that session in
 memory, and `/apikey off` drops it. design.md §6g.
 
-## Four timing tests fail under heavy load — OPEN (found 2026-10-10)
+## Five timing tests failed under heavy load — FIXED (2026-10-10)
 
-A full `pytest tests/` run, made while a mutation sweep ran on a machine
-already at 100% CPU, failed four tests that pass alone and as whole files:
+Full `pytest tests/` runs, made while a mutation sweep or a CLI probe ran on
+a machine already at 100% CPU, failed five tests that pass alone and as whole
+files:
 
 - `test_bridge_shutdown.py::test_disconnect_kills_the_cli_even_when_the_sdk_raises`
   and `::test_stop_finishes_the_shutdown_even_if_the_caller_is_cancelled`
   waited for a child process to die within their time limit, and it hadn't.
-- `test_initial_prompt.py::test_it_waits_out_a_turn_the_cli_starts_as_it_connects`
-  and `::test_a_prompt_left_from_an_earlier_run_goes_before_it` found no
-  prompt sent yet when they looked.
+- `test_initial_prompt.py::test_it_waits_out_a_turn_the_cli_starts_as_it_connects`,
+  `::test_a_prompt_left_from_an_earlier_run_goes_before_it` and
+  `::test_a_queue_restored_from_disk_does_not_get_it_twice` found no prompt
+  sent yet when they looked.
 
-Each waits a fixed time for something another process or task does. Under
-that load the wait was not enough. The fix is to wait on the event itself,
-with a much longer outer limit, rather than a fixed time. Until then, rerun a
-failure alone before believing it.
+Each waited a fixed few seconds for something another process or task does.
+Each already polled, so the limit is now an outer one of 60 s, which a
+passing run never reaches (`died`, `_run_worker`). The tests that check a
+prompt goes out only once wait for the first, then 3 s more for a second.
 
 ## The session's cost counted every earlier turn again — FIXED (2026-10-10)
 

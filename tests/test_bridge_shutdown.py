@@ -122,12 +122,14 @@ def victim():
         proc.wait(timeout=10)
 
 
-async def died(pid: int, timeout: float = 5.0) -> bool:
+async def died(pid: int, timeout: float = 60.0) -> bool:
     """Did *pid* go away within *timeout*?
 
     A kill is not instantaneous — on Windows ``TerminateProcess`` returns before
     the process object is gone — so asserting on ``pid_exists`` the instant
-    ``disconnect()`` returns tests the scheduler, not the shutdown.
+    ``disconnect()`` returns tests the scheduler, not the shutdown.  Returns as
+    soon as it is gone, so the limit is only an outer one: generous, for a
+    machine under load, where a few seconds were not enough.
     """
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
@@ -202,7 +204,7 @@ def test_stop_finishes_the_shutdown_even_if_the_caller_is_cancelled(victim):
             with pytest.raises(asyncio.CancelledError):
                 await stopper              # the caller still sees it
 
-            gone = await died(victim.pid, timeout=10.0)
+            gone = await died(victim.pid)
         finally:
             sdk_bridge.CANCEL_JOIN_TIMEOUT = original
             await worker.release()
@@ -257,7 +259,7 @@ def test_stop_survives_a_caller_that_keeps_cancelling(victim):
             with pytest.raises(asyncio.CancelledError):
                 await stopper
 
-            gone = await died(victim.pid, timeout=10.0)
+            gone = await died(victim.pid)
         finally:
             sdk_bridge.CANCEL_JOIN_TIMEOUT = original
             await worker.release()

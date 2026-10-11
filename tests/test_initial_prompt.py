@@ -110,10 +110,14 @@ def _bridge(tmp_path, argv=()):
     return SDKBridge(config=cfg, state=st, broadcaster=bc), st, sent
 
 
-def _run_worker(br, *, until, timeout=5.0, skip_connect=False):
+def _run_worker(br, *, until, timeout=60.0, then_for=0.0, skip_connect=False):
     """Run the real worker_loop and the real connect() against the fake CLI
     until ``until(asked)``; run_turn records what it is asked, and when
-    (``time.monotonic()``)."""
+    (``time.monotonic()``).
+
+    *timeout* is an outer limit only, as the wait ends the moment ``until``
+    holds: generous, for a machine under load.  *then_for* keeps the worker
+    running that much longer, to see whether anything more is sent."""
     asked: list[str] = []
     at: list[float] = []
 
@@ -130,6 +134,8 @@ def _run_worker(br, *, until, timeout=5.0, skip_connect=False):
         try:
             while not until(asked) and time.monotonic() < deadline:
                 await asyncio.sleep(0.01)
+            if then_for:
+                await asyncio.sleep(then_for)
         finally:
             br.stop_event.set()
             br.event_queue.put_nowait(("quit", ""))
@@ -224,7 +230,7 @@ def test_a_connect_starts_the_settle(cli, tmp_path):
 def test_it_is_sent_once(cli, tmp_path):
     br, _st, _sent = _bridge(tmp_path, ["--initial-prompt", PROMPT])
 
-    asked, _ = _run_worker(br, until=lambda a: len(a) >= 2, timeout=3.0)
+    asked, _ = _run_worker(br, until=lambda a: a, then_for=3.0)
 
     assert asked == [PROMPT]
 
@@ -235,7 +241,7 @@ def test_a_queue_restored_from_disk_does_not_get_it_twice(cli, tmp_path):
     br, st, _sent = _bridge(tmp_path, ["--initial-prompt", PROMPT])
     st.queued_prompts.append(PROMPT)
 
-    asked, _ = _run_worker(br, until=lambda a: len(a) >= 2, timeout=3.0)
+    asked, _ = _run_worker(br, until=lambda a: a, then_for=3.0)
 
     assert asked == [PROMPT]
 
@@ -266,7 +272,7 @@ def test_a_restarted_worker_still_sends_what_is_queued(cli, tmp_path):
     while not br.event_queue.empty():
         br.event_queue.get_nowait()
 
-    asked, _ = _run_worker(br, until=lambda a: a, timeout=5.0, skip_connect=True)
+    asked, _ = _run_worker(br, until=lambda a: a, skip_connect=True)
 
     assert asked == ["typed while the worker was down"]
 
