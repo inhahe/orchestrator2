@@ -1177,19 +1177,25 @@ def save_session_cost(session_id: str, record: dict[str, Any],
                       config_dir: str | None = None) -> None:
     """Keep *record* as what the hub knows of *session_id*'s cost.
 
-    Written whole and replaced atomically.  Failures are swallowed: keeping
-    the figure must never break a turn.
+    Written whole and replaced atomically, through a temporary file of the
+    writer's own: two writes at once (threads, or two hubs on one session)
+    must not write into one file, or one can rename the other's half-written
+    one into place.  Failures are swallowed: keeping the figure must never
+    break a turn.
     """
     path = session_cost_file(session_id, config_dir)
+    tmp = path.with_name(f"{path.name}.{uuid_mod.uuid4().hex}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({**record, "session_id": session_id,
                        "saved_at": time.time()}, f)
         os.replace(tmp, path)
     except OSError:
-        pass
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def sessions_titled(title: str, cwd: str, config_dir: str | None = None

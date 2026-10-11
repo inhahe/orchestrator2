@@ -487,6 +487,58 @@ def test_each_id_the_cli_gives_keeps_the_key(monkeypatch):
     assert server._session_api_keys == {"sid-asked": KEY, "sid-started": KEY}
 
 
+def test_a_seeded_session_the_cli_replaced_keeps_its_key(monkeypatch):
+    """The hub seeded sid-seeded with the key; the CLI's first init names
+    another.  The seeded one ran with the key too."""
+    import sdk_bridge
+    monkeypatch.setattr(sdk_bridge, "read_session_title", lambda _s, _d=None: None)
+
+    async def bcast(_msg):
+        pass
+
+    st = State()
+    st.session_id = "sid-seeded"
+    br = server._new_bridge(dataclasses.replace(parse_args([]), api_key=KEY), st, bcast)
+    asyncio.run(br._handle_system_message(_init("sid-started"), during_turn=True))
+    assert server._session_api_keys == {"sid-seeded": KEY, "sid-started": KEY}
+
+
+def test_clear_before_the_cli_names_a_seeded_session_keeps_its_key(monkeypatch):
+    import sdk_bridge
+
+    class _CLI:
+        def __init__(self, options=None):
+            pass
+
+        async def connect(self):
+            pass
+
+        async def disconnect(self):
+            pass
+
+        async def receive_messages(self):
+            while True:
+                await asyncio.sleep(3600)
+                yield None      # pragma: no cover
+
+    monkeypatch.setattr(sdk_bridge, "ClaudeSDKClient", _CLI)
+
+    async def bcast(_msg):
+        pass
+
+    st = State()
+    st.session_id = "sid-seeded"
+    br = server._new_bridge(dataclasses.replace(parse_args([]), api_key=KEY), st, bcast)
+
+    async def go():
+        await br._clear_context()
+        if br._dispatcher_task is not None:
+            br._dispatcher_task.cancel()
+            await asyncio.gather(br._dispatcher_task, return_exceptions=True)
+    asyncio.run(go())
+    assert server._session_api_keys == {"sid-seeded": KEY}
+
+
 def test_a_session_without_a_key_is_named_with_none(monkeypatch):
     _named_by_the_cli(monkeypatch, None, _init("sid-new"))
     assert server._session_api_keys == {}
@@ -559,6 +611,19 @@ def test_a_tab_yet_to_start_a_session_takes_its_key_along(monkeypatch, tmp_path)
                         lambda _c, _d=None: None)
     cfg = _switch(monkeypatch, tmp_path, key=KEY, sid=None, cwd=str(tmp_path))
     assert cfg.api_key == KEY
+
+
+def test_a_tab_yet_to_start_a_session_gives_a_session_it_resumes_that_ones_key(
+        monkeypatch, tmp_path):
+    server._session_api_keys["sid-b"] = OTHER
+    cfg = _switch(monkeypatch, tmp_path, key=KEY, sid=None, resume="sid-b")
+    assert cfg.api_key == OTHER
+
+
+def test_nor_its_own_to_one_that_ran_without(monkeypatch, tmp_path):
+    # A cleared tab, say: its key was the session it cleared.
+    cfg = _switch(monkeypatch, tmp_path, key=KEY, sid=None, resume="sid-b")
+    assert cfg.api_key is None
 
 
 def test_the_session_picked_in_the_picker_gets_the_launchs_key(monkeypatch, tmp_path):

@@ -98,6 +98,57 @@ def test_a_refusal_of_an_older_level_leaves_the_new_one():
     assert len(errors) == 1 and "now auto" not in errors[0]
 
 
+def test_a_refused_level_leaves_the_config_the_session_is_rebuilt_from(monkeypatch):
+    """/cwd, /resume and ⟳ Restart build from the Config: the launch's
+    --effort xhihg must not come back with them."""
+    import server
+    from session_runtime import SessionRuntime
+    cfg = parse_args(["--effort", "xhihg"])
+    state = init_state_from_config(cfg)
+
+    async def run():
+        async def bcast(_m):
+            pass
+        br = server._new_bridge(cfg, state, bcast)
+        rt = SessionRuntime(config=cfg, state=state, rid="R-eff")
+        rt.bridge = br
+        monkeypatch.setitem(server.runtimes, rt.rid, rt)
+        br._on_sdk_stderr(WARNING)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        return rt, br
+
+    rt, br = asyncio.run(run())
+    assert rt.config.effort is None and br.config.effort is None
+
+
+def _launched_into_an_open_session(monkeypatch, effort, had="high"):
+    """A launch with *effort* for a session the hub has open at *had*."""
+    import types
+    import server
+    from state import State
+    st = State()
+    st.session_id = "sid-live"
+    st.effort = had
+
+    class _Live:
+        def __init__(self):
+            self.event_queue = asyncio.Queue()
+            self.config = parse_args([])
+
+    rt = types.SimpleNamespace(rid="R1", state=st, config=parse_args([]), bridge=_Live())
+    monkeypatch.setattr(server, "runtimes", {"R1": rt})
+    monkeypatch.setattr(server, "config", parse_args([]))
+    asyncio.run(server.api_session_launch(
+        {"cwd": "C:/w", "resume": "sid-live", "effort": effort}))
+    return st
+
+
+def test_a_launch_into_an_open_session_folds_the_levels_case(monkeypatch):
+    assert _launched_into_an_open_session(monkeypatch, "XHigh").effort == "xhigh"
+    assert _launched_into_an_open_session(monkeypatch, "Auto").effort is None
+
+
 def test_other_stderr_leaves_the_level_alone():
     async def run():
         br, state, sent = _bridge(["--effort", "xhigh"])

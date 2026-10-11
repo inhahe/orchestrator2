@@ -714,9 +714,12 @@ the CLI does not know it ignores, warning on stderr ("Unknown --effort value
 'x' … Valid values: …"); `_on_sdk_stderr` spots that line
 (`_EFFORT_UNKNOWN_RE`), shows it in the tab, and sets the session back to
 `auto` — what the CLI is running at — unless the user has since picked another
-level, which a warning from the CLI started before it does not undo. Tests:
+level, which a warning from the CLI started before it does not undo. Through
+`on_effort_refused` the hub drops the level from the session's Config too
+(`server._drop_refused_effort`), so a bad `--effort` does not come back with
+`/cwd`, `/resume` or ⟳ Restart, which build from it. Tests:
 `tests/test_effort_levels.py`; mutation targets `effort-config`, `effort-cmd`,
-`effort-bridge`.
+`effort-bridge`, `effort-server`.
 
 **`run_turn`'s `try` opens *before* the session is marked working.** Everything
 that claims the session — `state.busy = True`, `state.turn_started_at`,
@@ -2151,7 +2154,9 @@ transcript to read restores nothing, so everything before it is carried. The
 context trim replaces the transcript, so it drops the mark (the new one is
 read from its start) but keeps the figure. A CLI that started another session
 than the one asked for starts the figure over (`state.forget_cost`, as
-`/clear` does); the settle runs only once the init's id is the state's, so
+`/clear` does) -- a new CLI's, not an id that changes inside one running CLI,
+whose next result is that process's running total; the settle runs only once
+the init's id is the state's, so
 what is kept goes under the session it describes. That look-back reads the
 whole transcript in a thread while the turn's dispatcher waits: once per
 session at most, and just after the CLI has itself parsed that file to resume
@@ -2160,7 +2165,8 @@ result for `cost_reported`.
 
 The hub keeps what it knows per session (`session.save_session_cost`, beside
 the session's queue, after every result and settle; written in a thread, in
-order, by `_keep_cost`), and a state made from scratch -- reopened from the
+order, by `_keep_cost`, each write through a temporary file of its own), and a
+state made from scratch -- reopened from the
 lobby, or after a restart -- starts from it, so the figure survives both.
 Spend a hub saw only after its last kept result is lost if the hub itself is
 killed.
@@ -2205,13 +2211,19 @@ every account, so:
   one leaves an open session's key alone.
 - **The key is the session's, not the tab's, and the hub remembers it while
   it runs.** A session's key is recorded by its id in `_session_api_keys` the
-  moment the session has one: every id a CLI gives its bridge (an init, a
-  result, a trim's new transcript) goes through `SDKBridge._take_session_id`
-  to `on_session_id`, which every hub bridge (`_new_bridge`) points at
-  `_note_session_key`. The hub's own departures (teardown, `/cwd`, `/resume`)
-  also record it (`_remember_session_key`), for a session it seeded whose CLI
-  has not named it yet. So an id a runtime leaves keeps the key it ran with:
-  a session closed, or left by `/clear` or `/resume`, however soon. Every path that opens a session asks `_session_key`:
+  moment the session has one, and again as it leaves: every id a CLI gives
+  its bridge (an init, a result, a trim's new transcript) goes through
+  `SDKBridge._take_session_id`, which reports it and the id it replaces to
+  `on_session_id`, and `/clear` reports the id it drops. Every hub bridge
+  (`_new_bridge`) points `on_session_id` at `_note_session_key`. The hub's own
+  departures (teardown, `/cwd`, `/resume`) also record it
+  (`_remember_session_key`). So an id a runtime leaves keeps the key it ran
+  with, a session the hub seeded and its CLI never named included: a session
+  closed, or left by `/clear` or `/resume`, however soon. A tab that has not
+  started a session (the picker, or a new conversation before its first
+  turn) has no id to leave its key with: the picker gives it to the session
+  it picks, and a new conversation keeps it if `/cwd` leaves it a new
+  conversation; a session it switches to otherwise runs with its own. Every path that opens a session asks `_session_key`:
   the opening launch's own key if it brought one, else the one the session
   ran with. So a session reopened from the lobby, resumed with `/resume`,
   continued by `/cwd`, picked in the picker, or brought back by ⟳ Restart

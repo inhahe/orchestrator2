@@ -229,7 +229,17 @@ def _new_bridge(cfg: Config, st: State, broadcaster: Any) -> "SDKBridge":
     from sdk_bridge import SDKBridge
     br = SDKBridge(config=cfg, state=st, broadcaster=broadcaster)
     br.on_session_id = _note_session_key
+    br.on_effort_refused = lambda level: _drop_refused_effort(br, level)
     return br
+
+
+def _drop_refused_effort(br: "SDKBridge", level: str) -> None:
+    """Bridge *br*'s CLI ignored effort *level*: drop it from the session's
+    Config too, so nothing built from it -- /cwd, /resume, ⟳ Restart --
+    passes it again.  A level the Config does not hold is left alone."""
+    rt = next((r for r in runtimes.values() if r.bridge is br), None)
+    if rt is not None and getattr(rt.config, "effort", None) == level:
+        _replace_runtime_config(rt, effort=None)
 
 
 def _remember_session_key(rt: "SessionRuntime") -> None:
@@ -2934,13 +2944,17 @@ async def _reconfigure(
         overrides["session_note"] = None
     # Its API key likewise: a key is its session's, so the session switched
     # to runs with its own, if it ran with one, and never with the one left.
-    # A tab that has not started a session yet -- the picker, or a new
-    # conversation before its first turn -- has nothing to leave the key
-    # with, so the key goes with the tab.
-    overrides["api_key"] = _session_key(
-        target,
-        config.api_key if _picker_mode or not getattr(state, "session_id", None)
-        else None)
+    # The picker's key is for the session it picks.  A new conversation
+    # that has not started yet has no id to leave its key with, so if it
+    # stays a new conversation (/cwd that continues nothing) the key goes
+    # with it; a session it switches to has its own.
+    if _picker_mode:
+        launch_key = config.api_key
+    elif target is None and not getattr(state, "session_id", None):
+        launch_key = config.api_key
+    else:
+        launch_key = None
+    overrides["api_key"] = _session_key(target, launch_key)
     config = dataclasses.replace(config, **overrides)
 
     # --- Reinitialise state + bridge ---
@@ -2957,21 +2971,13 @@ async def _reconfigure(
         _default_runtime.state = state
         _default_runtime.bridge = bridge
 
-    if new_resume:
-        state.session_id = new_resume
-        title = read_session_title(new_resume, config.config_dir)
-        if title:
-            state.session_title = title
-        bridge._initial_resume_id = new_resume
-    elif cwd:
-        # Seed session from the new cwd (continue most recent, found above).
-        if target is not None:
-            state.session_id = target
-            state.session_title = read_session_title(target, config.config_dir)
-            bridge._initial_resume_id = target
+    if target is not None:
+        state.session_id = target
+        state.session_title = read_session_title(target, config.config_dir)
+        bridge._initial_resume_id = target
 
     # Same rule as startup: the queue follows the session, so this has to run
-    # after the two branches above have decided which one (if any) we are on.
+    # once the session (if any) is decided.
     _attach_queue_persistence(state, config.cwd, config.config_dir)
 
     _picker_mode = False
@@ -3355,7 +3361,7 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     resume = (body.get("resume") or "").strip() or None
     no_continue = bool(body.get("no_continue"))
     model = (body.get("model") or "").strip() or None
-    effort = (body.get("effort") or "").strip() or None
+    effort = (body.get("effort") or "").strip().lower() or None
     config_dir = (body.get("config_dir") or "").strip() or None
     bell_on = (body.get("bell_on") or "").strip() or None
     cli_path = (body.get("cli_path") or "").strip() or None

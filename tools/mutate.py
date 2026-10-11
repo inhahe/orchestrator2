@@ -6126,23 +6126,24 @@ SESSIONKEY_SERVER_MUTATIONS = [
      "    if False:\n        key = _session_key(resume_id)\n"),
 
     ("/resume carries the tab's key to the session it switches to",
-     '    overrides["api_key"] = _session_key(\n'
-     "        target,\n"
-     '        config.api_key if _picker_mode or not getattr(state, "session_id", None)\n'
-     "        else None)\n",
+     '    overrides["api_key"] = _session_key(target, launch_key)\n',
      ""),
 
     ("/resume gives the session it switches to no key of its own",
-     "        target,\n        config.api_key if _picker_mode or not",
-     "        None,\n        config.api_key if _picker_mode or not"),
+     '    overrides["api_key"] = _session_key(target, launch_key)\n',
+     '    overrides["api_key"] = _session_key(None, launch_key)\n'),
 
     ("the session picked in the picker loses the launch's key",
-     "        config.api_key if _picker_mode or not getattr(",
-     "        config.api_key if not getattr("),
+     "    if _picker_mode:\n        launch_key = config.api_key\n",
+     "    if False:\n        launch_key = config.api_key\n"),
 
     ("a tab yet to start a session loses the launch's key on /cwd",
-     '        config.api_key if _picker_mode or not getattr(state, "session_id", None)\n',
-     "        config.api_key if _picker_mode\n"),
+     '    elif target is None and not getattr(state, "session_id", None):\n',
+     "    elif False:\n"),
+
+    ("a tab yet to start a session forces its key on a session it switches to",
+     "    elif target is None and not getattr(",
+     "    elif not getattr("),
 
     ("/resume forgets the key of the session it leaves",
      "    if _default_runtime is not None:\n"
@@ -6307,6 +6308,14 @@ SESSIONKEY_BRIDGE_MUTATIONS = [
      "            self.on_session_id(sid, self.config)\n",
      ""),
 
+    ("the id a new one replaces is not reported",
+     "        if old and old != sid:\n            self._report_session_id(old)\n",
+     ""),
+
+    ("/clear does not report the id it drops",
+     "        if state.session_id:\n            self._report_session_id(state.session_id)\n",
+     ""),
+
     ("an init's session id is not reported",
      "            if sid:\n                self._take_session_id(sid)\n",
      "            if sid:\n                self.state.session_id = sid\n"),
@@ -6394,13 +6403,33 @@ EFFORT_BRIDGE_MUTATIONS = [
      '            "data": {"message": message},\n',
      '            "data": {"message": ""},\n'),
     ("the status bar keeps showing the refused level",
-     '        loop.create_task(self._broadcast_status(), name="effort-refused-status")\n',
+     '        self._spawn_side_task(self._broadcast_status(), "effort-refused-status")\n',
      ""),
+    ("a refused level stays in the Config the session is rebuilt from",
+     "        if self.on_effort_refused is not None:\n"
+     "            self.on_effort_refused(level)\n",
+     ""),
+]
+
+EFFORT_SERVER_MUTATIONS = [
+    ("a hub bridge does not report a refused level",
+     "    br.on_effort_refused = lambda level: _drop_refused_effort(br, level)\n",
+     ""),
+    ("a refused level is left in the session's Config",
+     '    if rt is not None and getattr(rt.config, "effort", None) == level:\n',
+     "    if False:\n"),
+    ("a launch's level is passed on in the case it came in",
+     '    effort = (body.get("effort") or "").strip().lower() or None\n',
+     '    effort = (body.get("effort") or "").strip() or None\n'),
 ]
 
 # What each CLI spent counts once across the session's CLIs and hubs, by
 # what each version restores.  tests/test_session_cost.py.
 COST_SESSION_MUTATIONS = [
+    ("two writes at once share one temporary file",
+     '    tmp = path.with_name(f"{path.name}.{uuid_mod.uuid4().hex}.tmp")\n',
+     '    tmp = path.with_name(path.name + ".tmp")\n'),
+
     ("another session's saved total is taken for this one's",
      '            or rec.get("sessionId") != session_id:\n',
      "            or False:\n"),
@@ -6483,8 +6512,12 @@ COST_BRIDGE_MUTATIONS = [
      "                carry_cost(st, final, last_saved if restores else 0.0)\n"),
 
     ("a CLI that started another session keeps the one asked for's figure",
-     "            if sid and old_sid and sid != old_sid:\n",
+     "            if self._cost_settle_due and sid and old_sid and sid != old_sid:\n",
      "            if False:\n"),
+
+    ("an id that changes inside one CLI starts the figure over",
+     "            if self._cost_settle_due and sid and old_sid and sid != old_sid:\n",
+     "            if sid and old_sid and sid != old_sid:\n"),
 
     ("the session's cost is written on the event loop",
      "            await asyncio.to_thread(save_session_cost, st.session_id, {\n",
@@ -6905,6 +6938,8 @@ TARGETS = {
                    EFFORT_CMD_MUTATIONS, "pytest"),
     "effort-bridge": ("sdk_bridge.py", "tests/test_effort_levels.py",
                       EFFORT_BRIDGE_MUTATIONS, "pytest"),
+    "effort-server": ("server.py", "tests/test_effort_levels.py",
+                      EFFORT_SERVER_MUTATIONS, "pytest"),
 }
 
 

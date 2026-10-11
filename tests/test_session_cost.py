@@ -385,6 +385,30 @@ def test_a_cli_that_started_another_session_starts_its_cost_afresh(tmp_path, mon
     assert load_session_cost(other, s.cfg_dir) is not None
 
 
+def test_an_id_that_changes_inside_one_cli_keeps_the_figure(tmp_path, monkeypatch):
+    # No new CLI (nothing to settle): its running total goes on.
+    monkeypatch.setattr(sdk_bridge, "read_session_title", lambda _s, _d=None: None)
+    s = _bridge(tmp_path)
+    take_cost(s.st, _result(0.04))
+    init = types.SimpleNamespace(subtype="init", data={
+        "session_id": "c0570000-0000-0000-0000-000000000003",
+        "claude_code_version": NEW, "apiKeySource": "none"})
+    asyncio.run(s.br._handle_system_message(init, during_turn=True))
+    assert s.st.total_cost_usd == pytest.approx(0.04)
+
+
+def test_two_writes_at_once_never_share_a_file(tmp_path, monkeypatch):
+    sources = []
+    real = os.replace
+    monkeypatch.setattr(os, "replace", lambda src, dst: (sources.append(str(src)),
+                                                         real(src, dst)))
+    save_session_cost(SID, {"reported": 0.1}, str(tmp_path))
+    save_session_cost(SID, {"reported": 0.2}, str(tmp_path))
+    assert len(set(sources)) == 2
+    assert load_session_cost(SID, str(tmp_path))["reported"] == 0.2
+    assert not list(Path(sources[0]).parent.glob("*.tmp"))
+
+
 class _CLI:
     def __init__(self, options=None):
         self.options = options

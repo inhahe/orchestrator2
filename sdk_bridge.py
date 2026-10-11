@@ -890,6 +890,11 @@ class SDKBridge:
         # runs on: the hub remembers the session's API key under the id from
         # that moment (see _take_session_id).
         self.on_session_id: Callable[[str, Config], None] | None = None
+        # Told an effort level the CLI refused (_effort_refused), so the hub
+        # can drop it from the Config the session is rebuilt from.
+        self.on_effort_refused: Callable[[str], None] | None = None
+        # Fire-and-forget tasks, held so they are not collected mid-run.
+        self._side_tasks: set[asyncio.Task] = set()
         # Set by connect(), consumed by the new CLI's first init.
         self._cost_settle_due = False
         self._keep_cost_lock = asyncio.Lock()
@@ -1065,39 +1070,63 @@ class SDKBridge:
                 self._effort_refused(unknown.group(1), line)
 
     def _take_session_id(self, sid: str) -> None:
-        """Make *sid* the session this bridge runs, and tell ``on_session_id``.
+        """Make *sid* the session this bridge runs.
 
         Every id the CLI gives (an init, a result, a trim's new transcript)
-        comes through here, so whatever must hold for a session from the
-        moment it has an id -- the hub's record of its key -- holds before
-        any ``/clear`` or switch can take the id away again.
+        comes through here.  ``on_session_id`` hears of it, and of the id it
+        replaces (see ``_report_session_id``).
         """
+        old = self.state.session_id
+        if old and old != sid:
+            self._report_session_id(old)
         self.state.session_id = sid
+        self._report_session_id(sid)
+
+    def _report_session_id(self, sid: str) -> None:
+        """Tell ``on_session_id`` that session *sid* runs on this Config.
+
+        For a session's id as it arrives and again as it leaves (``/clear``,
+        a CLI that started another): what must hold for a session -- the
+        hub's record of its key -- then holds however briefly the bridge ran
+        it, a session the hub seeded and its CLI never named included.
+        """
         if self.on_session_id is not None:
             self.on_session_id(sid, self.config)
+
+    def _spawn_side_task(self, coro: Any, name: str) -> None:
+        """Run *coro* on the running loop without waiting for it, held until
+        done.  Nothing happens off a loop."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            coro.close()
+            return
+        task = loop.create_task(coro, name=name)
+        self._side_tasks.add(task)
+        task.add_done_callback(self._side_tasks.discard)
 
     def _effort_refused(self, level: str, line: str) -> None:
         """The CLI ignored effort *level*; *line* is its warning saying so.
 
         The session falls back to ``auto``, which is what the CLI now runs at,
         so the status bar stops showing a level that is not in effect and the
-        next reconnect does not pass it again.  A different level set since
-        (the warning came from a CLI started with an older one) is left alone.
-        The warning goes to the tab: it names the levels the CLI does know.
+        next reconnect does not pass it again; ``on_effort_refused`` drops it
+        from the Config the session is rebuilt from.  A different level set
+        since (the warning came from a CLI started with an older one) is left
+        alone.  The warning goes to the tab: it names the levels the CLI does
+        know.
         """
         message = f"CLI: {line}"
         if self.state.effort == level:
             self.state.effort = None
             message += " This session's effort is now auto."
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        loop.create_task(self.broadcast({
+        if self.on_effort_refused is not None:
+            self.on_effort_refused(level)
+        self._spawn_side_task(self.broadcast({
             "type": "system_msg", "subtype": "error",
             "data": {"message": message},
-        }), name="effort-refused")
-        loop.create_task(self._broadcast_status(), name="effort-refused-status")
+        }), "effort-refused")
+        self._spawn_side_task(self._broadcast_status(), "effort-refused-status")
 
     def _addressable_name(self) -> str | None:
         """The name other Claude sessions should address this one by.
@@ -4232,10 +4261,12 @@ class SDKBridge:
                 apply_api_key_source(state, data_dict.get("apiKeySource"),
                                      getattr(self.config, "config_dir", None))
             old_sid = state.session_id
-            if sid and old_sid and sid != old_sid:
-                # Another session than the one this state ran (the SDK
-                # started a new one): its figure, kept under its own id, is
-                # not this one's.
+            if self._cost_settle_due and sid and old_sid and sid != old_sid:
+                # A new CLI on another session than the one this state ran
+                # (the SDK started a new one): that figure, kept under its own
+                # id, is not this one's.  An id that changes inside one running
+                # CLI is left alone: the CLI's next result reports the running
+                # total of that same process, which the figure already holds.
                 forget_cost(state)
             if sid:
                 self._take_session_id(sid)
@@ -6527,6 +6558,8 @@ class SDKBridge:
         # which tasks went with it — the bulk clear below is silent.
         await self._orphan_bg_tasks("/clear")
         await self.disconnect()
+        if state.session_id:
+            self._report_session_id(state.session_id)
         state.session_id = None
         state.session_title = None
         state.context_tokens = 0
