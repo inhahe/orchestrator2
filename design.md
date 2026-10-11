@@ -2082,7 +2082,8 @@ one.
 account. It always starts, signed in or not, and says first that it replaces
 the account's login, a subscription included, once the browser sign-in
 completes. Words `/login` does not know are refused, because a mistyped
-`console`, ignored, would start the subscription sign-in instead. Completion
+`console`, ignored, would start the subscription sign-in instead, and they
+are not repeated back, since one may be a key pasted in hope. Completion
 can't be seen as a new `.credentials.json`, because the Console flow writes no
 subscription token. So `_watch_login` compares `auth.login_fingerprint`
 readings: that file's mtime, and a digest of `primaryApiKey`. The key is read
@@ -2130,7 +2131,10 @@ every account, so:
   the hub's own `config` share one, and `/cwd` rebuilds from the last: a key
   dropped from fewer would come back. A key is never typed: anything after
   `/apikey` but `off` is refused without being repeated, since it may be a
-  key pasted in hope.
+  key pasted in hope. The browser keeps such a line out of its prompt
+  history, which `localStorage` writes to disk, and any line holding text
+  shaped like an Anthropic key (`commands.js`, `_mayHoldKey`); the line is
+  still sent, for the hub to refuse.
 
 An account's own key wins over a session's: the CLI applies `settings.json`'s
 `env` over the environment it was started with. Measured by pointing the CLI
@@ -2142,8 +2146,9 @@ report, `auth`, `/login`), `tests/test_api_key_hub.py` (`/usage`, the
 watcher), `tests/test_session_api_key.py` (a key for one session),
 `tests/test_move_stops_original.py` (the key going with `/move`),
 `tests/usage.test.js` (the note) and `tests/reconnect_on_show.test.js` (the
-tooltip). Mutation targets: `apikey-state`, `apikey-bridge`, `apikey-auth`,
-`apikey-cmd`, `apikey-server`, `apikey-usagejs`, `apikey-statusjs`,
+tooltip, the prompt history). Mutation targets: `apikey-state`,
+`apikey-bridge`, `apikey-auth`, `apikey-cmd`, `apikey-server`,
+`apikey-usagejs`, `apikey-statusjs`, `apikey-history`,
 `sessionkey-server`, `sessionkey-move`, `sessionkey-bridge`, `sessionkey-btw`,
 `sessionkey-config`, `sessionkey-state`, `sessionkey-cmd`.
 

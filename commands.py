@@ -404,6 +404,7 @@ def _cmd_login(payload: str, state: State, config: Config) -> CommandResult:
 
     An argument it does not know is refused rather than ignored: a mistyped
     ``console`` would otherwise start a subscription sign-in, the opposite.
+    It is not repeated back, since it may be an API key pasted in hope.
 
     All the auth checks are scoped to *this* runtime's account
     (``config.config_dir``) — a cross-account hub session must be checked and
@@ -414,8 +415,9 @@ def _cmd_login(payload: str, state: State, config: Config) -> CommandResult:
     unknown = words - _LOGIN_FORCE_WORDS - _LOGIN_CONSOLE_WORDS
     if unknown:
         return CommandResult(messages=[_msg(
-            f"/login doesn't know {', '.join(sorted(unknown))}. Use /login, "
-            f"/login force, or /login console.", level="error")])
+            "/login takes only force or console: use /login, /login force, or "
+            "/login console. An API key is never typed here; /apikey says "
+            "where one goes.", level="error")])
     method = "console" if words & _LOGIN_CONSOLE_WORDS else "claudeai"
     force = bool(words & _LOGIN_FORCE_WORDS)
     needs_reauth = force or state.auth_error or method == "console"

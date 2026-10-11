@@ -5914,6 +5914,31 @@ APIKEY_CMD_MUTATIONS = [
     ("/status calls a key session a subscription",
      '    if billed_to_api_key(state):\n        return (f"an API key (',
      '    if False:\n        return (f"an API key ('),
+
+    ("a refused argument is repeated back, a pasted key with it",
+     '            "/login takes only force or console: use /login, /login force, or "\n',
+     '            f"/login doesn\'t know {sorted(unknown)}: use /login, /login force, or "\n'),
+]
+
+# A line typed with a key in it is kept out of the browser's prompt history.
+# tests/reconnect_on_show.test.js, "a line that may hold an API key is kept
+# out of the prompt history" and the two after it.
+APIKEY_HISTORY_MUTATIONS = [
+    ("a line that may hold a key goes into the history -- the gap",
+     "    if (_mayHoldKey(text)) return;\n",
+     ""),
+
+    ("/apikey with something not shaped like a key goes into the history",
+     "    return /^\\/apikey\\s+(?!off$)/i.test(text) || /sk-ant-/i.test(text);\n",
+     "    return /sk-ant-/i.test(text);\n"),
+
+    ("a key typed after another command goes into the history",
+     "    return /^\\/apikey\\s+(?!off$)/i.test(text) || /sk-ant-/i.test(text);\n",
+     "    return /^\\/apikey\\s+(?!off$)/i.test(text);\n"),
+
+    ("/apikey off is kept out of the history too",
+     "    return /^\\/apikey\\s+(?!off$)/i.test(text) || /sk-ant-/i.test(text);\n",
+     "    return /^\\/apikey\\s+/i.test(text) || /sk-ant-/i.test(text);\n"),
 ]
 
 APIKEY_SERVER_MUTATIONS = [
@@ -6388,6 +6413,8 @@ TARGETS = {
                        APIKEY_USAGEJS_MUTATIONS, "node"),
     "apikey-statusjs": ("static/status.js", "tests/reconnect_on_show.test.js",
                         APIKEY_STATUSJS_MUTATIONS, "node"),
+    "apikey-history": ("static/commands.js", "tests/reconnect_on_show.test.js",
+                       APIKEY_HISTORY_MUTATIONS, "node"),
     "sessionkey-server": ("server.py", "tests/test_session_api_key.py",
                           SESSIONKEY_SERVER_MUTATIONS, "pytest"),
     "sessionkey-move": ("server.py", "tests/test_move_stops_original.py",

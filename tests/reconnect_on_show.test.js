@@ -609,6 +609,42 @@ function typeCommand(h, text) {
     'keydown', { key: 'Enter', bubbles: true, cancelable: true }));
 }
 
+/* ---- prompt history ----------------------------------------------------- */
+
+function savedHistory(h) {
+  return JSON.parse(h.win.localStorage.getItem('prompt-history') || '[]');
+}
+
+const PASTED = 'sk-ant-api03-pasted-in-hope';
+
+test('a line that may hold an API key is kept out of the prompt history', (h) => {
+  h.live.accept();
+  typeCommand(h, '/apikey ' + PASTED);
+  typeCommand(h, '/apikey not-shaped-like-one');
+  typeCommand(h, '/login ' + PASTED);
+  typeCommand(h, 'my key is ' + PASTED);
+  const saved = savedHistory(h);
+  assert(!saved.some(x => x.includes(PASTED) || x.includes('not-shaped')),
+         JSON.stringify(saved));
+});
+
+test('...but is still sent, for the hub to refuse', (h) => {
+  h.live.accept();
+  typeCommand(h, '/apikey ' + PASTED);
+  const sent = h.live.sent.map(s => JSON.parse(s)).filter(m => m.type === 'message');
+  assert(sent.length === 1 && sent[0].text === '/apikey ' + PASTED, JSON.stringify(sent));
+});
+
+test('...and the rest is kept, /apikey off included', (h) => {
+  h.live.accept();
+  typeCommand(h, '/apikey off');
+  typeCommand(h, '/apikey');
+  typeCommand(h, 'an ordinary prompt');
+  const saved = savedHistory(h);
+  assert(['/apikey off', '/apikey', 'an ordinary prompt'].every(x => saved.includes(x)),
+         JSON.stringify(saved));
+});
+
 test('/move opens the move overlay', (h) => {
   h.live.accept();
   const opens = [];

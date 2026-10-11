@@ -414,4 +414,11 @@ def test_a_mistyped_argument_starts_nothing(monkeypatch):
     res, launched, text = _login(monkeypatch, "consol")
     assert launched == []
     assert res.login_launched is None
-    assert "consol" in text
+    assert "/login console" in text
+
+
+def test_a_refused_argument_is_not_repeated(monkeypatch):
+    # It may be an API key, pasted in hope, and the refusal is drawn in the tab.
+    _res, launched, text = _login(monkeypatch, "sk-ant-api03-pasted-in-hope")
+    assert launched == []
+    assert "sk-ant" not in text

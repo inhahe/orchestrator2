@@ -226,7 +226,16 @@ const Commands = (() => {
     _autoResize();
   }
 
+  // A line that may hold an API key: /apikey with anything but "off" (a key
+  // is never typed there, but may be pasted in hope), or text shaped like an
+  // Anthropic key.  Such a line is still sent, for the hub to refuse, but
+  // never goes into the history, which localStorage keeps on disk.
+  function _mayHoldKey(text) {
+    return /^\/apikey\s+(?!off$)/i.test(text) || /sk-ant-/i.test(text);
+  }
+
   function _pushHistory(text) {
+    if (_mayHoldKey(text)) return;
     // Don't duplicate the last entry.
     if (_promptHistory.length > 0 && _promptHistory[_promptHistory.length - 1] === text) return;
     _promptHistory.push(text);
