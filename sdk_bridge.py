@@ -626,6 +626,13 @@ _AUTH_FAIL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The CLI's stderr warning for an effort level it does not know, e.g.
+#   Warning: Unknown --effort value 'xhihg' — ignoring it and using the default
+#   effort. Valid values: low, medium, high, xhigh, max.
+# The level is passed through unchecked (see config.EFFORT_LEVELS), so this
+# line is the only word that it was not applied.  Group 1 is the level.
+_EFFORT_UNKNOWN_RE = re.compile(r"Unknown --effort value '([^']*)'")
+
 # Matches a codeless auth-refusal banner the CLI emits as a turn's assistant
 # text (no "API Error: NNN") when the stored session is unusable, e.g.
 #   "Not logged in · Please run /login"
@@ -1047,6 +1054,32 @@ class SDKBridge:
             # `/login` forces a re-auth instead of reporting "already signed in".
             if _AUTH_FAIL_RE.search(line):
                 self.state.auth_error = True
+            unknown = _EFFORT_UNKNOWN_RE.search(line)
+            if unknown is not None:
+                self._effort_refused(unknown.group(1), line)
+
+    def _effort_refused(self, level: str, line: str) -> None:
+        """The CLI ignored effort *level*; *line* is its warning saying so.
+
+        The session falls back to ``auto``, which is what the CLI now runs at,
+        so the status bar stops showing a level that is not in effect and the
+        next reconnect does not pass it again.  A different level set since
+        (the warning came from a CLI started with an older one) is left alone.
+        The warning goes to the tab: it names the levels the CLI does know.
+        """
+        message = f"CLI: {line}"
+        if self.state.effort == level:
+            self.state.effort = None
+            message += " This session's effort is now auto."
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self.broadcast({
+            "type": "system_msg", "subtype": "error",
+            "data": {"message": message},
+        }), name="effort-refused")
+        loop.create_task(self._broadcast_status(), name="effort-refused-status")
 
     def _addressable_name(self) -> str | None:
         """The name other Claude sessions should address this one by.

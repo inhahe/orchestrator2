@@ -24,9 +24,12 @@ log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-EFFORT_LEVELS = ("low", "medium", "high", "max")
-# "auto" means "don't pass effort — let the model pick its default"
-# (typically 'high' for Opus/Sonnet 4.6).
+# The effort levels offered by /effort's list.  They are suggestions, not a
+# limit: any level is passed to the CLI as given, because which levels exist
+# depends on the CLI and the model, and the CLI is the one that knows.  One it
+# does not know it ignores with a warning on stderr, which the bridge shows.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+# "auto" means "don't pass effort — let the model pick its default".
 EFFORT_CHOICES = ("auto",) + EFFORT_LEVELS
 
 DEFAULT_COMPACT_THRESHOLD = 160_000
@@ -695,11 +698,13 @@ def parse_args(argv: list[str] | None = None) -> Config:
     # -- Model & effort --
     ap.add_argument(
         "--effort",
-        choices=list(EFFORT_CHOICES),
+        type=str.lower,
         default=None,
+        metavar="LEVEL",
         help=(
-            "Thinking effort level. 'auto' (or omit) means don't pass an "
-            "effort parameter; the model uses its own default."
+            f"Thinking effort level, e.g. {', '.join(EFFORT_LEVELS)}; any "
+            "level the CLI knows is accepted. 'auto' (or omit) means don't "
+            "pass an effort parameter; the model uses its own default."
         ),
     )
     ap.add_argument(

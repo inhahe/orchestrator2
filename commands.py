@@ -126,9 +126,9 @@ def classify(line: str) -> tuple[str, str]:
         if not arg:
             return "effort-show", ""
         val = arg.lower()
-        if val in EFFORT_CHOICES:
+        if len(val.split()) == 1:
             return "effort", val
-        return "error", f"effort must be one of {', '.join(EFFORT_CHOICES)}"
+        return "error", "effort takes one level, e.g. " + ", ".join(EFFORT_CHOICES)
 
     if cmd in ("model", "models"):
         return ("model", arg) if arg else ("model-show", "")
@@ -282,7 +282,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         ("/cls",                         "clear the output area"),
         ("/history [N]",                 "replay session history (last N records)"),
         ("/interrupt, /i",               "stop the current turn"),
-        ("/effort <level>",              f"one of {', '.join(EFFORT_CHOICES)}"),
+        ("/effort <level>",              f"e.g. {', '.join(EFFORT_CHOICES)}"),
         ("/thinking [on|off|toggle]",    "enable/disable extended thinking"),
         ("/show-thinking [on|off]",      "expand thinking blocks by default"),
         ("/model [name]",                "show/set model; no arg lists available"),
@@ -1142,10 +1142,14 @@ def _cmd_effort_show(_payload: str, state: State, _config: Config) -> CommandRes
         "low": "minimal thinking budget",
         "medium": "moderate thinking budget",
         "high": "generous thinking budget",
+        "xhigh": "more than high, short of max",
         "max": "maximum thinking budget",
     }
+    names = list(EFFORT_CHOICES)
+    if current not in names:
+        names.append(current)
     levels = [{"name": lv, "description": descs.get(lv, ""), "current": lv == current}
-              for lv in EFFORT_CHOICES]
+              for lv in names]
     data = {"current": current, "levels": levels}
     return CommandResult(messages=[_data_msg(data, label="effort")])
 

@@ -706,6 +706,18 @@ itself (the dump sitting unread in the pipe), not proof of a silent CLI.
 `connect()` clears the buffer so a fresh subprocess is never logged with its
 predecessor's dying words.
 
+**Effort levels are the CLI's to judge.** `--effort` and `/effort` pass any
+level through (lowercased), because which levels exist depends on the CLI and
+the model — `xhigh` came with Opus 5.5 — and a list kept here only falls behind.
+`config.EFFORT_LEVELS` is what `/effort`'s list offers, not a limit. A level
+the CLI does not know it ignores, warning on stderr ("Unknown --effort value
+'x' … Valid values: …"); `_on_sdk_stderr` spots that line
+(`_EFFORT_UNKNOWN_RE`), shows it in the tab, and sets the session back to
+`auto` — what the CLI is running at — unless the user has since picked another
+level, which a warning from the CLI started before it does not undo. Tests:
+`tests/test_effort_levels.py`; mutation targets `effort-config`, `effort-cmd`,
+`effort-bridge`.
+
 **`run_turn`'s `try` opens *before* the session is marked working.** Everything
 that claims the session — `state.busy = True`, `state.turn_started_at`,
 `turn_active.set()`, the `turn_start` broadcast — and the `client.query()` that

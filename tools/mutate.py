@@ -6312,6 +6312,51 @@ APIKEY_STATUSJS_MUTATIONS = [
      ""),
 ]
 
+# Any effort level goes to the CLI, which says when it does not know one.
+# tests/test_effort_levels.py.
+EFFORT_CONFIG_MUTATIONS = [
+    ("the command line keeps a list of its own",
+     "        type=str.lower,\n",
+     '        type=str.lower, choices=["auto", "low", "medium", "high", "max"],\n'),
+    ("the command line does not fold case",
+     "        type=str.lower,\n",
+     "        type=str,\n"),
+    ("the list does not offer xhigh",
+     'EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")\n',
+     'EFFORT_LEVELS = ("low", "medium", "high", "max")\n'),
+]
+
+EFFORT_CMD_MUTATIONS = [
+    ("/effort keeps a list of its own",
+     "        if len(val.split()) == 1:\n",
+     "        if val in EFFORT_CHOICES:\n"),
+    ("/effort takes several words as a level",
+     "        if len(val.split()) == 1:\n",
+     "        if True:\n"),
+    ("the list does not mark a level it does not offer",
+     "        names.append(current)\n",
+     "        pass\n"),
+]
+
+EFFORT_BRIDGE_MUTATIONS = [
+    ("the CLI's refusal is not looked for",
+     "            if unknown is not None:\n",
+     "            if False:\n"),
+    ("a refused level stays the session's",
+     "            self.state.effort = None\n"
+     "            message += \" This session's effort is now auto.\"\n",
+     "            message += \" This session's effort is now auto.\"\n"),
+    ("a refusal of an older level drops the new one",
+     "        if self.state.effort == level:\n",
+     "        if True:\n"),
+    ("the refusal is not shown",
+     '            "data": {"message": message},\n',
+     '            "data": {"message": ""},\n'),
+    ("the status bar keeps showing the refused level",
+     '        loop.create_task(self._broadcast_status(), name="effort-refused-status")\n',
+     ""),
+]
+
 # What each CLI spent counts once across the session's CLIs and hubs, by
 # what each version restores.  tests/test_session_cost.py.
 COST_SESSION_MUTATIONS = [
@@ -6787,6 +6832,12 @@ TARGETS = {
                    COST_STATE_MUTATIONS, "pytest"),
     "cost-bridge": ("sdk_bridge.py", "tests/test_session_cost.py",
                     COST_BRIDGE_MUTATIONS, "pytest"),
+    "effort-config": ("config.py", "tests/test_effort_levels.py",
+                      EFFORT_CONFIG_MUTATIONS, "pytest"),
+    "effort-cmd": ("commands.py", "tests/test_effort_levels.py",
+                   EFFORT_CMD_MUTATIONS, "pytest"),
+    "effort-bridge": ("sdk_bridge.py", "tests/test_effort_levels.py",
+                      EFFORT_BRIDGE_MUTATIONS, "pytest"),
 }
 
 

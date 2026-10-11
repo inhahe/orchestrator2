@@ -403,7 +403,7 @@ You can see which a session uses. The status bar's plan field reads **`API $0.12
 |------|---------|-------------|
 | `--model NAME` | auto | Model to use (see `--list-models` for available models) |
 | `--list-models` | -- | List available models and exit |
-| `--effort LEVEL` | auto | Thinking effort: `auto`, `low`, `medium`, `high`, `max` |
+| `--effort LEVEL` | auto | Thinking effort: `auto`, `low`, `medium`, `high`, `xhigh`, `max`, or any other level the CLI knows (see `/effort`) |
 | `--no-thinking` | off | Disable extended thinking entirely |
 
 ### Context & Compaction
@@ -557,7 +557,7 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/model` | List available models and show current. The list is fetched live from the Anthropic API and refreshed hourly; if it can't be reached, a built-in fallback list is shown and labelled as such |
 | `/model <name>` | Switch to a different model. Any model id works, whether or not it appears in the list |
 | `/models` | Alias for `/model` |
-| `/effort [level]` | Show or set effort (`auto`/`low`/`medium`/`high`/`max`) |
+| `/effort [level]` | Show or set effort (`auto`/`low`/`medium`/`high`/`xhigh`/`max`). Any level is passed to the CLI as given; one it does not know it ignores, and the tab shows its warning, which lists the levels it does know, and the session goes back to `auto` |
 | `/thinking [on\|off]` | Toggle extended thinking (API-level — reconnects) |
 
 `/model`, `/effort` and `/thinking` take effect by reconnecting the CLI, and a
