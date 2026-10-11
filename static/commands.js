@@ -31,10 +31,17 @@ const Commands = (() => {
     elInputWrap.style.position = 'relative';
     elInputWrap.appendChild(acDropdown);
 
-    // Load prompt history from localStorage.
+    // Load prompt history from localStorage, less any line that may hold a
+    // key (_mayHoldKey), which is taken off disk too.
     try {
       const saved = localStorage.getItem('prompt-history');
-      if (saved) _promptHistory = JSON.parse(saved);
+      if (saved) {
+        const all = JSON.parse(saved);
+        _promptHistory = all.filter(x => !_mayHoldKey(x));
+        if (_promptHistory.length !== all.length) {
+          localStorage.setItem('prompt-history', JSON.stringify(_promptHistory));
+        }
+      }
     } catch (_) {}
 
     // Event listeners.

@@ -2184,7 +2184,8 @@ every account, so:
   key pasted in hope. The browser keeps such a line out of its prompt
   history, which `localStorage` writes to disk, and any line holding text
   shaped like an Anthropic key (`commands.js`, `_mayHoldKey`); the line is
-  still sent, for the hub to refuse.
+  still sent, for the hub to refuse. Such lines already in the stored history
+  are dropped from it when the page loads.
 
 An account's own key wins over a session's: the CLI applies `settings.json`'s
 `env` over the environment it was started with. Measured by pointing the CLI

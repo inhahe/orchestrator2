@@ -5994,6 +5994,14 @@ APIKEY_HISTORY_MUTATIONS = [
     ("/apikey off is kept out of the history too",
      "    return /^\\/apikey\\s+(?!off$)/i.test(text) || /sk-ant-/i.test(text);\n",
      "    return /^\\/apikey\\s+/i.test(text) || /sk-ant-/i.test(text);\n"),
+
+    ("a key stored before the filter is still recalled",
+     "        _promptHistory = all.filter(x => !_mayHoldKey(x));\n",
+     "        _promptHistory = all;\n"),
+
+    ("a key stored before the filter stays on disk",
+     "        if (_promptHistory.length !== all.length) {\n",
+     "        if (false) {\n"),
 ]
 
 APIKEY_SERVER_MUTATIONS = [

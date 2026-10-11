@@ -48,7 +48,8 @@ function test(name, fn, opts) {
 
 // *opts*: `url` for the page (default the hub's root), `session` for
 // sessionStorage entries present before the page's scripts run -- a tab the
-// browser reloaded keeps its sessionStorage.
+// browser reloaded keeps its sessionStorage -- and `local` for localStorage
+// ones, which outlive every tab.
 function build(opts) {
   const o = opts || {};
   const html = fs.readFileSync(path.join(STATIC, 'index.html'), 'utf8');
@@ -56,6 +57,7 @@ function build(opts) {
                                 runScripts: 'outside-only' });
   const win = dom.window;
   for (const [k, v] of Object.entries(o.session || {})) win.sessionStorage.setItem(k, v);
+  for (const [k, v] of Object.entries(o.local || {})) win.localStorage.setItem(k, v);
 
   // --- manual clock.  app.js's reconnect backoff is the thing under test, so
   // it must be steppable rather than real.
@@ -634,6 +636,13 @@ test('...but is still sent, for the hub to refuse', (h) => {
   const sent = h.live.sent.map(s => JSON.parse(s)).filter(m => m.type === 'message');
   assert(sent.length === 1 && sent[0].text === '/apikey ' + PASTED, JSON.stringify(sent));
 });
+
+test('a key already in the stored history is taken out of it', (h) => {
+  const saved = savedHistory(h);
+  assert(!saved.some(x => x.includes(PASTED)), JSON.stringify(saved));
+  assert(saved.includes('an older prompt'), JSON.stringify(saved));
+}, { local: { 'prompt-history': JSON.stringify(
+  ['an older prompt', '/apikey ' + PASTED, 'my key is ' + PASTED]) } });
 
 test('...and the rest is kept, /apikey off included', (h) => {
   h.live.accept();
