@@ -2080,9 +2080,10 @@ config dir.
 Until the first `init`, a session given its own key (below) is taken at its
 word: `init_state_from_config` records `apiKeySource` as `ANTHROPIC_API_KEY`
 (`OWN_KEY_SOURCE`, what its CLI will call it), so the status bar and `/usage`
-treat it as billed to the key from the start. An open session a launch hands
-a key to is billed to it at once the same way, and `/apikey off` gives one its
-account's login back at once; each `init` confirms or corrects these. For
+treat it as billed to the key from the start. A live session whose key
+changes -- handed one by a launch, given its own by the picker, `/apikey off`
+-- is billed accordingly at once by `_replace_runtime_config`, through which
+every such change goes; each `init` confirms or corrects these. For
 every other session, `detect_subscription()`, from the hub's environment, is
 the guess until the first `init`, and it is the only judge of a cloud
 provider, which `apiKeySource` does not name.

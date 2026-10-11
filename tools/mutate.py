@@ -6071,13 +6071,8 @@ SESSIONKEY_SERVER_MUTATIONS = [
      "    st, cfg = rt.state, rt.config\n"),
 
     ("a restart's replacement opens a session without the key it ran with",
-     "    if not cfg.api_key:\n        key = _session_key(st.session_id)\n",
-     "    if False:\n        key = _session_key(st.session_id)\n"),
-
-    ("a session opened at startup with a remembered key is not billed to it",
-     "            cfg = dataclasses.replace(cfg, api_key=key)\n"
-     "            apply_api_key_source(st, OWN_KEY_SOURCE, cfg.config_dir)\n",
-     "            cfg = dataclasses.replace(cfg, api_key=key)\n"),
+     "    if not cfg.api_key:\n        key = _session_key(resume_id)\n",
+     "    if False:\n        key = _session_key(resume_id)\n"),
 
     ("/resume carries the tab's key to the session it switches to",
      '    overrides["api_key"] = _session_key(\n'
@@ -6128,21 +6123,17 @@ SESSIONKEY_SERVER_MUTATIONS = [
      '            if getattr(existing.config, "api_key", None) != api_key:\n'),
 
     ("a launch's key for an open session waits for a reconnect that never comes",
-     "                                         getattr(existing.config, \"config_dir\", None))\n"
+     "                _replace_runtime_config(existing, api_key=api_key)\n"
      "                need_reconnect = True\n",
-     "                                         getattr(existing.config, \"config_dir\", None))\n"),
+     "                _replace_runtime_config(existing, api_key=api_key)\n"),
 
-    ("a key given to an open session is not billed until its next turn",
-     "                if existing.state is not None:\n"
-     "                    apply_api_key_source(existing.state, OWN_KEY_SOURCE,\n",
-     "                if False:\n"
-     "                    apply_api_key_source(existing.state, OWN_KEY_SOURCE,\n"),
+    ("a key a live session is given is not billed until its next turn",
+     '    if "api_key" in changes and rt.state is not None:\n',
+     "    if False:\n"),
 
-    ("/apikey off leaves the session billed to a key until its next turn",
-     "        if rt.state is not None:\n"
-     "            apply_api_key_source(rt.state, \"none\",\n",
-     "        if False:\n"
-     "            apply_api_key_source(rt.state, \"none\",\n"),
+    ("a key a live session drops leaves it billed to one until its next turn",
+     '        apply_api_key_source(rt.state, OWN_KEY_SOURCE if new_cfg.api_key else "none",\n',
+     "        apply_api_key_source(rt.state, OWN_KEY_SOURCE,\n"),
 
     ("closing a session forgets its key",
      "    _remember_session_key(rt)\n    runtimes.pop(rt.rid, None)",

@@ -384,11 +384,13 @@ def test_a_restart_gives_no_launch_key_to_a_primary_without_one(monkeypatch):
 
 
 def _seeded(monkeypatch, *args):
-    """The config and state the hub's own launch opens its session with."""
+    """The config and state the hub's own launch opens its session with, made
+    as lifespan makes them."""
     monkeypatch.setattr(server, "resolve_session_ref", lambda ref, _c, _d: ref)
     monkeypatch.setattr(server, "read_session_title", lambda _s, _d=None: None)
-    st = init_state_from_config(parse_args(list(args)))
-    cfg, resume_id = server._seed_primary_session(parse_args(list(args)), st)
+    cfg, resume_id, _title = server._seed_primary_session(parse_args(list(args)))
+    st = init_state_from_config(cfg)
+    st.session_id = resume_id
     return cfg, st, resume_id
 
 
@@ -405,7 +407,7 @@ def test_a_session_the_launch_brought_a_key_for_keeps_that_one(monkeypatch):
     monkeypatch.setattr(server, "resolve_session_ref", lambda ref, _c, _d: ref)
     monkeypatch.setattr(server, "read_session_title", lambda _s, _d=None: None)
     launched = dataclasses.replace(parse_args(["--resume", "sid-p"]), api_key=KEY)
-    cfg, _ = server._seed_primary_session(launched, init_state_from_config(launched))
+    cfg, _id, _title = server._seed_primary_session(launched)
     assert cfg.api_key == KEY
 
 

@@ -245,7 +245,10 @@ def _replace_runtime_config(rt: "SessionRuntime", **changes: Any) -> None:
 
     The runtime and its bridge share one, and the primary session's is also
     the hub's own ``config``, which /cwd and /resume rebuild from.  Changing
-    only some of them would let the old value come back.
+    only some of them would let the old value come back.  A changed API key
+    changes what the session is billed to at once, as one in its Config from
+    the start does (``init_state_from_config``); its CLI's next init confirms
+    or corrects it.
     """
     global config
     new_cfg = dataclasses.replace(rt.config, **changes)
@@ -254,6 +257,9 @@ def _replace_runtime_config(rt: "SessionRuntime", **changes: Any) -> None:
     rt.config = new_cfg
     if rt.bridge is not None:
         rt.bridge.config = new_cfg
+    if "api_key" in changes and rt.state is not None:
+        apply_api_key_source(rt.state, OWN_KEY_SOURCE if new_cfg.api_key else "none",
+                             new_cfg.config_dir)
 
 
 def _ensure_logged_in(*, block: bool, api_key: str | None = None) -> bool:
@@ -1406,17 +1412,19 @@ def _launch_picker_mode(cfg: Config) -> str | None:
     return None
 
 
-def _seed_primary_session(cfg: Config, st: State) -> tuple[Config, str | None]:
-    """Which session the hub's own launch opens, seeded into *st* early.
+def _seed_primary_session(cfg: Config) -> tuple[Config, str | None, str | None]:
+    """Which session the hub's own launch opens, decided before its state.
 
     Cheap disk reads, so a tab gets the session's history on its first
     connect, before the bridge is up.  Returns the config to run the session
-    with, and the id its bridge is to resume (None for a new session):
+    with -- its API key included -- the id its bridge is to resume, and that
+    session's title (None, None for a new session).  The session is
     ``--resume``'s, or the most recent in the directory -- unless
     ``--no-continue``, a picker still to choose (``--resume`` with no id), or
     a restart replacing a new conversation (``--start-fresh``).
     """
     resume_id: str | None = None
+    title: str | None = None
     if cfg.resume and cfg.resume != _PICKER_SENTINEL:
         # Resolve the resume value to a real session UUID — it might be a
         # title rather than an ID (e.g. ``--resume fastpyb``).  The same rule
@@ -1426,23 +1434,20 @@ def _seed_primary_session(cfg: Config, st: State) -> tuple[Config, str | None]:
         resolved = resolve_session_ref(cfg.resume, cfg.cwd, cfg.config_dir)
         if resolved != cfg.resume:
             cfg = dataclasses.replace(cfg, resume=resolved)
-        st.session_id = resolved
-        st.session_title = read_session_title(resolved, cfg.config_dir)
         resume_id = resolved
     elif cfg.resume is None and not cfg.no_continue and not cfg.start_fresh:
         recent = find_most_recent_session_for_cwd(cfg.cwd)
         if recent is not None:
-            st.session_id = recent.stem
-            st.session_title = read_session_title(recent.stem, cfg.config_dir)
             resume_id = recent.stem
+    if resume_id:
+        title = read_session_title(resume_id, cfg.config_dir)
     # A session this launch brought no key for keeps the one it ran with: the
     # replacement ⟳ Restart starts is handed the old hub's keys (main()).
     if not cfg.api_key:
-        key = _session_key(st.session_id)
+        key = _session_key(resume_id)
         if key:
             cfg = dataclasses.replace(cfg, api_key=key)
-            apply_api_key_source(st, OWN_KEY_SOURCE, cfg.config_dir)
-    return cfg, resume_id
+    return cfg, resume_id, title
 
 
 @asynccontextmanager
@@ -1467,7 +1472,14 @@ async def lifespan(app: FastAPI):
 
     if config is None:
         config = parse_args()
+    # The session the hub's own launch opens, before its state is made: the
+    # key it runs with comes with it.  The resume id is stashed for
+    # _deferred_bridge_startup to apply once the bridge exists.
+    global _pending_resume_id
+    config, _pending_resume_id, seeded_title = _seed_primary_session(config)
     state = init_state_from_config(config)
+    state.session_id = _pending_resume_id
+    state.session_title = seeded_title
     theme = load_theme()
 
     # The default session runtime wraps the process-wide globals and is the
@@ -1498,21 +1510,9 @@ async def lifespan(app: FastAPI):
         asyncio.to_thread(_recent_disk_sessions), name="warm-disk-sessions",
     )
 
-    # Seed session_id early (cheap disk reads) so the browser gets history on
-    # first connect, even before the deferred bridge is up.  The resume id is
-    # stashed for _deferred_bridge_startup to apply once the bridge exists.
-    global _pending_resume_id
-    config, _pending_resume_id = _seed_primary_session(config, state)
-
-    # The seeding block above may have rebound ``config`` (e.g. resolving a
-    # --resume title to a real UUID via dataclasses.replace).  Re-point the
-    # default runtime at the finalized config so its ``config`` isn't stale.
-    _default_runtime.config = config
-
-    # Only *now* is it known which session this process is continuing, and that
-    # is what selects the queue to restore.  Wiring this before the block above
-    # is what let a --no-continue session inherit (and immediately send) a
-    # prompt left by an older session in the same directory.
+    # After the session is decided, never before: it is what selects the queue
+    # to restore, and a restored prompt is sent at once -- to a --no-continue
+    # session too, were it wired before that one had no id.
     _attach_queue_persistence(state, config.cwd, config.config_dir)
 
     # If --resume was passed without an argument, defer SDK start until the
@@ -3381,13 +3381,9 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
                 _replace_runtime_config(existing, cli_path=cli_path)
                 need_reconnect = True
             # And its API key, likewise fixed at connect time.  A launch
-            # without one leaves the key the session has.  Billed to it from
-            # now, as a session opened with one is (init_state_from_config).
+            # without one leaves the key the session has.
             if api_key and getattr(existing.config, "api_key", None) != api_key:
                 _replace_runtime_config(existing, api_key=api_key)
-                if existing.state is not None:
-                    apply_api_key_source(existing.state, OWN_KEY_SOURCE,
-                                         getattr(existing.config, "config_dir", None))
                 need_reconnect = True
             # And its labels and name: the launch described this session,
             # which happens to be open already.  Applied live, without the
@@ -3560,7 +3556,6 @@ async def api_resume(body: dict[str, Any]) -> dict[str, Any]:
         key = _session_key(session_id)
         if key:
             _replace_runtime_config(_default_runtime, api_key=key)
-            apply_api_key_source(state, OWN_KEY_SOURCE, config.config_dir)
 
     # Optionally switch cwd to match the session's recorded cwd.
     session_cwd = find_session_cwd(session_id)
@@ -5468,11 +5463,6 @@ async def _handle_apikey(ws: WebSocket, rt: "SessionRuntime", payload: str) -> N
         text = "This session has no API key of its own."
     else:
         _replace_runtime_config(rt, api_key=None)
-        # Back on its account's login from now, as if the CLI had said so;
-        # the next init confirms or corrects it.
-        if rt.state is not None:
-            apply_api_key_source(rt.state, "none",
-                                 getattr(rt.config, "config_dir", None))
         sid = getattr(rt.state, "session_id", None)
         if sid:
             _session_api_keys.pop(sid, None)
