@@ -346,16 +346,22 @@ def test_a_new_conversation_keeps_its_key_across_a_restart(monkeypatch):
     rt.config = dataclasses.replace(rt.config, cwd="D:\\now-here")
     seen = _restart(monkeypatch, rt, primary=True)
     assert seen["env"]["ANTHROPIC_API_KEY"] == KEY
-    assert "--no-continue" in seen["argv"] and "--resume" not in seen["argv"]
+    assert "--start-fresh" in seen["argv"] and "--resume" not in seen["argv"]
+    assert "--no-continue" not in seen["argv"], "a lasting flag for a one-off"
     assert seen["argv"][seen["argv"].index("--cwd") + 1] == "D:\\now-here"
 
 
-def test_a_picker_still_to_choose_keeps_the_launchs_key_across_a_restart(monkeypatch):
+def test_a_picker_still_to_choose_is_a_picker_again_after_a_restart(monkeypatch):
+    # With the launch's key, for the session it is still to pick -- not the
+    # directory's most recent, which nobody chose.
     rt = _open_session(monkeypatch, key=KEY, sid=None)
     monkeypatch.setattr(server, "_picker_mode", True)
     seen = _restart(monkeypatch, rt, primary=True)
     assert seen["env"]["ANTHROPIC_API_KEY"] == KEY
-    assert "--no-continue" not in seen["argv"]
+    argv = seen["argv"]
+    assert "--resume" in argv and "--start-fresh" not in argv
+    after = argv[argv.index("--resume") + 1:]
+    assert not after or after[0].startswith("--"), "--resume took an id"
 
 
 def test_a_closed_primarys_key_goes_only_by_its_id(monkeypatch):
@@ -408,6 +414,36 @@ def test_a_new_session_at_startup_gets_no_remembered_key(monkeypatch):
     cfg, st, resume_id = _seeded(monkeypatch, "--no-continue")
     assert resume_id is None and cfg.api_key is None
     assert not billed_to_api_key(st)
+
+
+def _recent_is(monkeypatch, sid):
+    monkeypatch.setattr(server, "find_most_recent_session_for_cwd",
+                        lambda _c, _d=None: types.SimpleNamespace(stem=sid))
+
+
+def test_a_picker_still_to_choose_opens_no_session(monkeypatch):
+    # Not the directory's most recent: nobody chose it, and seeded, it would
+    # be remembered as running with the launch's key.
+    server._session_api_keys["sid-recent"] = OTHER
+    _recent_is(monkeypatch, "sid-recent")
+    cfg, st, resume_id = _seeded(monkeypatch, "--resume")
+    assert resume_id is None and st.session_id is None
+    assert cfg.api_key is None
+
+
+def test_a_restart_replacing_a_new_conversation_opens_a_new_one(monkeypatch):
+    _recent_is(monkeypatch, "sid-recent")
+    cfg, st, resume_id = _seeded(monkeypatch, "--start-fresh")
+    assert resume_id is None and st.session_id is None
+    # Only at startup: /cwd and a worker's own connect still continue.
+    assert cfg.no_continue is False
+
+
+def test_a_restarts_replacement_still_to_choose_shows_no_console_picker():
+    # It goes straight to the picker in the tabs it takes over.
+    assert server._launch_picker_mode(parse_args(["--resume"])) == "resume"
+    assert server._launch_picker_mode(parse_args(["--resume", "--wait-port"])) is None
+    assert server._launch_picker_mode(parse_args(["--copy", "--wait-port"])) == "copy"
 
 
 # --------------------------------------------------------------------------

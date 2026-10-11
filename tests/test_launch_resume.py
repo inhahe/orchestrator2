@@ -480,13 +480,22 @@ def test_a_restart_with_no_session_keeps_the_directory(monkeypatch):
     assert "--no-continue" not in argv
 
 
+def test_a_replacement_does_not_pass_its_own_fresh_start_on(monkeypatch):
+    # It was for that replacement's startup; the next restart decides anew.
+    argv = _restart_argv(monkeypatch, ["server.py", "--start-fresh"], IDLE)
+
+    assert "--start-fresh" not in argv
+    assert argv[argv.index("--resume") + 1] == IDLE
+
+
 def test_a_restart_of_a_new_conversation_starts_a_new_one_where_it_is(monkeypatch):
     """Not the most recent session there, which would swap the conversation
     for another, and not the launch's directory after /cwd moved it."""
     argv = _restart_argv(monkeypatch, ["server.py", "--cwd", r"D:\a"], None,
                          cwd=r"D:\b")
 
-    assert "--no-continue" in argv and "--resume" not in argv
+    assert "--start-fresh" in argv and "--resume" not in argv
+    assert "--no-continue" not in argv
     assert argv.count("--cwd") == 1 and argv[argv.index("--cwd") + 1] == r"D:\b"
 
 

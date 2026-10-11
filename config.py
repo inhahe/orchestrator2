@@ -581,6 +581,7 @@ class Config:
     api_key: str | None = field(default=None, repr=False)
     skip_auto_login: bool = False      # internal: child skips the login check
     wait_port: bool = False            # internal: retry binding --port while an old instance releases it (restart)
+    start_fresh: bool = False          # internal: open a new conversation, as --no-continue does, but only at startup (restart)
 
 
 # ---------------------------------------------------------------------------
@@ -1147,6 +1148,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
         action="store_true",
         help=argparse.SUPPRESS,  # internal: restart child waits for the old instance to free the port
     )
+    ap.add_argument(
+        "--start-fresh",
+        action="store_true",
+        help=argparse.SUPPRESS,  # internal: restart child replacing a new conversation
+    )
 
     args = ap.parse_args(argv)
 
@@ -1237,4 +1243,5 @@ def parse_args(argv: list[str] | None = None) -> Config:
         cli_path=os.path.abspath(args.cli_path) if args.cli_path else None,
         skip_auto_login=args.skip_auto_login,
         wait_port=args.wait_port,
+        start_fresh=args.start_fresh,
     )

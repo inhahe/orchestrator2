@@ -2165,11 +2165,17 @@ every account, so:
   (`_take_handed_over_keys`) and looks up when it seeds the session it opens
   (`_seed_primary_session`). A primary with no session id yet is a new
   conversation, which no id can carry: its key goes as the replacement's
-  launch key, the replacement being that launch again, with `--no-continue`
+  launch key, the replacement being that launch again, with `--start-fresh`
   and the primary's current directory, so it starts a new conversation there
-  rather than continuing whatever is most recent. A picker still to choose
-  passes the key the same way. After the hub shuts down, nothing is left:
-  nothing was written to disk.
+  rather than continuing whatever is most recent. `--start-fresh` acts only at
+  startup, where `--no-continue` would stay in the replacement's `Config` and
+  make every later `/cwd` and connect start new conversations too. A picker
+  still to choose stays one: the replacement gets a bare `--resume` and the
+  key, and shows its picker in the tabs it takes over rather than in a console
+  window (`_launch_picker_mode`). Picker mode seeds no session at all: the
+  directory's most recent one, which nobody chose, would otherwise be
+  remembered as running with the launch's key. After the hub shuts down,
+  nothing is left: nothing was written to disk.
 - **The rest of the launch knows it.** A launch with a key needs no
   subscription sign-in, so `_ensure_logged_in` skips it. A `--detach` child is
   given the key in its environment (`_detach_child_env`), being the same

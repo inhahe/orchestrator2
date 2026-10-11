@@ -4963,12 +4963,20 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
      "        if a == \"--cwd\":\n"),
 
     ("a restart of a new conversation continues another session",
-     '        child.extend(["--no-continue", "--cwd", config.cwd])\n',
+     '        child.extend(["--start-fresh", "--cwd", config.cwd])\n',
      '        child.extend(["--cwd", config.cwd])\n'),
+
+    ("a restart of a new conversation stops later ones continuing for good",
+     '        child.extend(["--start-fresh", "--cwd", config.cwd])\n',
+     '        child.extend(["--no-continue", "--cwd", config.cwd])\n'),
 
     ("a restart of a new conversation starts in the launch's directory",
      "    fresh = state is not None and not sid and not _picker_mode\n",
      "    fresh = False\n"),
+
+    ("a replacement passes its own fresh start on to the next restart",
+     '        if a in ("--detach", "--open", "--copy", "--wait-port", "--start-fresh",\n',
+     '        if a in ("--detach", "--open", "--copy", "--wait-port",\n'),
 
     ("/resume in a session says a shared title is not found",
      "            if len(several) > 1:\n",
@@ -6167,6 +6175,24 @@ SESSIONKEY_SERVER_MUTATIONS = [
     ("a picker still to choose is restarted as a new conversation",
      "    fresh = state is not None and not sid and not _picker_mode\n",
      "    fresh = state is not None and not sid\n"),
+
+    ("a restart while the picker chooses continues a session nobody chose",
+     "    elif _picker_mode:\n"
+     "        # Still to choose: the replacement is a picker again.\n"
+     '        child.append("--resume")\n',
+     ""),
+
+    ("a picker still to choose opens the directory's most recent session",
+     "    elif cfg.resume is None and not cfg.no_continue and not cfg.start_fresh:\n",
+     "    elif not cfg.no_continue and not cfg.start_fresh:\n"),
+
+    ("a restart's fresh start continues the most recent session after all",
+     "    elif cfg.resume is None and not cfg.no_continue and not cfg.start_fresh:\n",
+     "    elif cfg.resume is None and not cfg.no_continue:\n"),
+
+    ("a restart's replacement still to choose shows a console picker",
+     "    if cfg.resume == _PICKER_SENTINEL and not cfg.wait_port:\n",
+     "    if cfg.resume == _PICKER_SENTINEL:\n"),
 
     ("the new hub leaves the handed-over keys in its environment",
      "    raw = os.environ.pop(HANDOVER_KEYS_ENV, None)",

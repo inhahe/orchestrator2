@@ -1392,14 +1392,29 @@ import contextlib
 from contextlib import asynccontextmanager
 
 
+def _launch_picker_mode(cfg: Config) -> str | None:
+    """Which picker a launch shows before its hub starts: "copy" for
+    ``--copy``, "resume" for ``--resume`` with no id, else None.
+
+    A restart's replacement (``--wait-port``) still to choose shows none: it
+    goes straight to the picker in the tabs it takes over.
+    """
+    if cfg.copy:
+        return "copy"
+    if cfg.resume == _PICKER_SENTINEL and not cfg.wait_port:
+        return "resume"
+    return None
+
+
 def _seed_primary_session(cfg: Config, st: State) -> tuple[Config, str | None]:
     """Which session the hub's own launch opens, seeded into *st* early.
 
     Cheap disk reads, so a tab gets the session's history on its first
     connect, before the bridge is up.  Returns the config to run the session
     with, and the id its bridge is to resume (None for a new session):
-    ``--resume``'s, or the most recent in the directory unless
-    ``--no-continue``.
+    ``--resume``'s, or the most recent in the directory -- unless
+    ``--no-continue``, a picker still to choose (``--resume`` with no id), or
+    a restart replacing a new conversation (``--start-fresh``).
     """
     resume_id: str | None = None
     if cfg.resume and cfg.resume != _PICKER_SENTINEL:
@@ -1414,7 +1429,7 @@ def _seed_primary_session(cfg: Config, st: State) -> tuple[Config, str | None]:
         st.session_id = resolved
         st.session_title = read_session_title(resolved, cfg.config_dir)
         resume_id = resolved
-    elif not cfg.no_continue:
+    elif cfg.resume is None and not cfg.no_continue and not cfg.start_fresh:
         recent = find_most_recent_session_for_cwd(cfg.cwd)
         if recent is not None:
             st.session_id = recent.stem
@@ -3019,7 +3034,7 @@ async def api_restart() -> dict[str, Any]:
         if (sid or fresh) and a.startswith("--cwd="):
             i += 1
             continue
-        if a in ("--detach", "--open", "--copy", "--wait-port",
+        if a in ("--detach", "--open", "--copy", "--wait-port", "--start-fresh",
                  "--skip-auto-login", "--no-continue", "--continue"):
             i += 1
             continue
@@ -3060,7 +3075,10 @@ async def api_restart() -> dict[str, Any]:
     if sid:
         child.extend(["--resume", sid])
     elif fresh:
-        child.extend(["--no-continue", "--cwd", config.cwd])
+        child.extend(["--start-fresh", "--cwd", config.cwd])
+    elif _picker_mode:
+        # Still to choose: the replacement is a picker again.
+        child.append("--resume")
     # ...under the name it has *now*, rather than whatever the launch command
     # said: one that came from ORCH2_AGENT_NAME is no longer in the
     # environment (config.py consumes it), and the command line's is stale if
@@ -6576,8 +6594,8 @@ def main() -> None:
     # don't (IDE run / hidden launcher).  In --detach the *parent* runs here
     # and passes the resolved id to the child via argv below.  The headless
     # --detach child skips this (its resume id is already concrete).
-    if config.copy or config.resume == _PICKER_SENTINEL:
-        picker_mode = "copy" if config.copy else "resume"
+    picker_mode = _launch_picker_mode(config)
+    if picker_mode:
         result = _run_launch_picker(picker_mode, config.cwd)
         chosen = result.get("session_id") if isinstance(result, dict) else None
         chosen_cwd = result.get("cwd") if isinstance(result, dict) else None
