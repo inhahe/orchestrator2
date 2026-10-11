@@ -741,22 +741,9 @@ async def _push_session_list(target: WebSocket | None = None) -> None:
 
 
 def _account_email_for(claude_dir: Path) -> str | None:
-    """Read the signed-in email for a ``.claude`` account directory.
-
-    Mirrors ``state.detect_account_info`` but for an *arbitrary* config dir
-    (not just the process env), so ``/move`` can label each account.
-    """
-    try:
-        with open(claude_dir / ".claude.json", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return None
-    oauth = data.get("oauthAccount") if isinstance(data, dict) else None
-    if isinstance(oauth, dict):
-        em = oauth.get("emailAddress")
-        if isinstance(em, str) and em:
-            return em
-    return None
+    """The signed-in email of a ``.claude`` account directory, so ``/move``
+    can label each account; None when the CLI's file names none."""
+    return detect_account_info(str(claude_dir)).get("email")
 
 
 def _same_config_dir(a: str | None, b: str | None) -> bool:
@@ -818,10 +805,13 @@ async def _watch_login(rt: "SessionRuntime", method: str = "claudeai") -> None:
     cfg_dir = getattr(config, "config_dir", None)
 
     before = await asyncio.to_thread(auth.login_fingerprint, cfg_dir)
+    last = before
     deadline = time.monotonic() + LOGIN_WATCH_S
     while time.monotonic() < deadline:
         await asyncio.sleep(LOGIN_POLL_S)
-        now = await asyncio.to_thread(auth.login_fingerprint, cfg_dir)
+        # Handed the last reading, so an unchanged config file is not parsed.
+        now = await asyncio.to_thread(auth.login_fingerprint, cfg_dir, last)
+        last = now
         if auth.login_completed(before, now):
             info = await asyncio.to_thread(detect_account_info, cfg_dir)
             state.account = info

@@ -246,8 +246,24 @@ def config_dir_path(config_dir: str | None = None) -> Path:
     return Path(base) if base else Path.home() / ".claude"
 
 
+def global_config_path(config_dir: str | None = None) -> Path:
+    """The Claude CLI's own config file for an account: its ``.claude.json``.
+
+    *config_dir* is the account's ``CLAUDE_CONFIG_DIR`` (a session's own);
+    without one, the process environment's.  The CLI keeps the file in that
+    directory when it is set, and in the home directory -- beside
+    ``~/.claude``, not in it -- when it is not.  A legacy ``.config.json`` in
+    the config dir wins over both, as it does for the CLI.
+    """
+    base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
+    legacy = config_dir_path(base) / ".config.json"
+    if legacy.is_file():
+        return legacy
+    return (Path(base) if base else Path.home()) / ".claude.json"
+
+
 def detect_account_info(config_dir: str | None = None) -> dict[str, Any]:
-    """Read the signed-in account details from ``<config-dir>/.claude.json``.
+    """Read the signed-in account details from the CLI's ``.claude.json``.
 
     Returns a dict with whatever could be gathered (all keys optional):
     ``email``, ``display_name``, ``org_name``, ``org_type`` (e.g.
@@ -256,11 +272,12 @@ def detect_account_info(config_dir: str | None = None) -> dict[str, Any]:
     OAuth token in ``.credentials.json``) are deliberately never read here.
 
     ``config_dir`` scopes the read to a specific account (a cross-account hub
-    runtime's dir); without it the process env / default is used.
+    runtime's dir); without it the process env / default is used.  Where the
+    file is: ``global_config_path``.
     """
     cfg = config_dir_path(config_dir)
     info: dict[str, Any] = {"config_dir": str(cfg)}
-    path = cfg / ".claude.json"
+    path = global_config_path(config_dir)
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)

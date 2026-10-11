@@ -2051,7 +2051,11 @@ launch's key is now its session's alone (below).
 account out, signs in to an Anthropic Console account, creates an API key, and
 keeps it in `.claude.json` as `primaryApiKey` (not on macOS, where it goes to
 the keychain). That file is in the config dir when `CLAUDE_CONFIG_DIR` is set,
-and in the home directory, beside `~/.claude`, when it is not.
+and in the home directory, beside `~/.claude`, when it is not; a legacy
+`.config.json` in the config dir wins over both. `state.global_config_path`
+is the one place that knows this: the account details (`detect_account_info`,
+and through it `/usage`'s header and `/move`'s account names) and the login
+fingerprint all read the file it names.
 
 **What the session is billed to comes from its `init` message.** Each turn's
 `init` carries `apiKeySource`: `ANTHROPIC_API_KEY` (the environment or
@@ -2105,7 +2109,9 @@ subscription token. So `_watch_login` compares `auth.login_fingerprint`
 readings: that file's mtime, and a digest of `primaryApiKey`. The key is read
 only to be digested. A newer token file, or a key that differs from before,
 counts as completion. A file or key removed on the way, when the sign-in signs
-out the old login, does not.
+out the old login, does not. Each reading is handed the one before, and
+parses the CLI's config file only when its mtime or size has moved: the file
+holds every project's history, and the watcher reads every two seconds.
 
 **A launch's key bills that launch's session alone.** Asked 2026-10-10:
 *"can you make ANTHROPIC_API_KEY only work for the session that was loaded

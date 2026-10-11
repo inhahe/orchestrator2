@@ -18,6 +18,9 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
+
+from state import global_config_path
 
 log = logging.getLogger("orchestrator2.auth")
 
@@ -100,49 +103,67 @@ def _has_credentials_file(config_dir: str | None = None) -> bool:
     return bool(isinstance(oauth, dict) and oauth.get("accessToken"))
 
 
-def _global_config_path(config_dir: str | None) -> Path:
-    """The CLI's ``.claude.json`` for ``config_dir``'s account.
+class LoginFingerprint(NamedTuple):
+    """What a completed sign-in changes, as ``login_fingerprint`` read it.
 
-    Inside the config dir when one is named; otherwise in the home directory,
-    beside ``~/.claude`` rather than in it, as the CLI keeps it.
+    ``credentials_mtime``: the subscription token file's mtime.
+    ``config_stamp``: the CLI config file's ``(mtime_ns, size)`` when read.
+    ``key_digest``: a digest of the Console API key kept in that file.
+    Each None when absent.
     """
-    base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
-    return Path(base) / ".claude.json" if base else Path.home() / ".claude.json"
+    credentials_mtime: float | None
+    config_stamp: tuple[int, int] | None
+    key_digest: str | None
 
 
-def login_fingerprint(config_dir: str | None = None) -> tuple[float | None, str | None]:
+def login_fingerprint(config_dir: str | None = None,
+                      previous: LoginFingerprint | None = None) -> LoginFingerprint:
     """What a completed sign-in changes, for watching one finish.
 
     A subscription sign-in rewrites ``.credentials.json``.  A Console sign-in
     writes no subscription token: the CLI creates an API key and keeps it in
-    ``.claude.json`` as ``primaryApiKey``.  Returns that file's mtime and a
-    digest of that key, each None when absent.  The key itself is read only
-    to be digested.
+    its config file (``state.global_config_path``) as ``primaryApiKey``, read
+    only to be digested.  *previous*, the last reading, spares parsing that
+    file again while it is unchanged: it holds every project's history, can
+    run to megabytes, and a watcher reads every couple of seconds.
     """
+    path = global_config_path(config_dir)
     try:
-        with open(_global_config_path(config_dir), "r", encoding="utf-8") as f:
+        st = path.stat()
+        stamp: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    if previous is not None and stamp is not None and stamp == previous.config_stamp:
+        digest = previous.key_digest
+    else:
+        digest = _primary_key_digest(path)
+    return LoginFingerprint(credentials_mtime(config_dir), stamp, digest)
+
+
+def _primary_key_digest(path: Path) -> str | None:
+    """A digest of the API key the CLI config file at *path* keeps; None if none."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
-        data = None
+        return None
     key = data.get("primaryApiKey") if isinstance(data, dict) else None
-    digest = (hashlib.sha256(key.encode("utf-8")).hexdigest()
-              if isinstance(key, str) and key else None)
-    return credentials_mtime(config_dir), digest
+    return (hashlib.sha256(key.encode("utf-8")).hexdigest()
+            if isinstance(key, str) and key else None)
 
 
-def login_completed(before: tuple[float | None, str | None],
-                    now: tuple[float | None, str | None]) -> bool:
+def login_completed(before: LoginFingerprint, now: LoginFingerprint) -> bool:
     """Whether a sign-in finished between two ``login_fingerprint`` readings.
 
     Either kind writes something new: a subscription token file newer than
     before, or a Console API key that differs from before.  What a sign-in
     removes on its way (it signs the old login out first) is not completion.
     """
-    cred_before, key_before = before
-    cred_now, key_now = now
-    if cred_now is not None and (cred_before is None or cred_now > cred_before):
+    if now.credentials_mtime is not None and (
+            before.credentials_mtime is None
+            or now.credentials_mtime > before.credentials_mtime):
         return True
-    return key_now is not None and key_now != key_before
+    return now.key_digest is not None and now.key_digest != before.key_digest
 
 
 def credentials_mtime(config_dir: str | None = None) -> float | None:

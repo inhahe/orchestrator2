@@ -5890,24 +5890,55 @@ APIKEY_AUTH_MUTATIONS = [
      ""),
 
     ("the fingerprint leaves out the Console key",
-     "    return credentials_mtime(config_dir), digest\n",
-     "    return credentials_mtime(config_dir), None\n"),
+     "    return LoginFingerprint(credentials_mtime(config_dir), stamp, digest)\n",
+     "    return LoginFingerprint(credentials_mtime(config_dir), stamp, None)\n"),
 
     ("a Console sign-in is never seen to finish",
-     "    return key_now is not None and key_now != key_before\n",
+     "    return now.key_digest is not None and now.key_digest != before.key_digest\n",
      "    return False\n"),
 
     ("a key removed on the way counts as finishing",
-     "    return key_now is not None and key_now != key_before\n",
-     "    return key_now != key_before\n"),
+     "    return now.key_digest is not None and now.key_digest != before.key_digest\n",
+     "    return now.key_digest != before.key_digest\n"),
 
     ("the same token file counts as finishing",
-     "if cred_now is not None and (cred_before is None or cred_now > cred_before):",
-     "if cred_now is not None:"),
+     "            before.credentials_mtime is None\n"
+     "            or now.credentials_mtime > before.credentials_mtime):\n",
+     "            True):\n"),
 
+    ("an unchanged config file is parsed on every reading",
+     "    if previous is not None and stamp is not None and stamp == previous.config_stamp:\n",
+     "    if False:\n"),
+
+    ("a changed config file is taken as unchanged",
+     "    if previous is not None and stamp is not None and stamp == previous.config_stamp:\n",
+     "    if previous is not None:\n"),
+]
+
+# One resolver for the CLI's own config file.  tests/test_api_key_billing.py
+# and, for /move's account names and the watcher, tests/test_api_key_hub.py.
+APIKEY_RESOLVER_MUTATIONS = [
     ("without CLAUDE_CONFIG_DIR, .claude.json is looked for inside ~/.claude",
-     'return Path(base) / ".claude.json" if base else Path.home() / ".claude.json"',
-     'return Path(base or Path.home() / ".claude") / ".claude.json"'),
+     '    return (Path(base) if base else Path.home()) / ".claude.json"\n',
+     '    return config_dir_path(base) / ".claude.json"\n'),
+
+    ("a legacy .config.json is passed over, though the CLI reads it",
+     "    if legacy.is_file():\n        return legacy\n",
+     ""),
+
+    ("the default account's details are read inside ~/.claude",
+     "    path = global_config_path(config_dir)\n    try:\n",
+     '    path = cfg / ".claude.json"\n    try:\n'),
+]
+
+APIKEY_RESOLVER_SERVER_MUTATIONS = [
+    ("the move picker reads an account's email from a file the CLI may not",
+     '    return detect_account_info(str(claude_dir)).get("email")\n',
+     "    return None\n"),
+
+    ("the watcher hands no reading on, so the config file is parsed each time",
+     "        now = await asyncio.to_thread(auth.login_fingerprint, cfg_dir, last)\n",
+     "        now = await asyncio.to_thread(auth.login_fingerprint, cfg_dir, None)\n"),
 ]
 
 APIKEY_CMD_MUTATIONS = [
@@ -6571,6 +6602,10 @@ TARGETS = {
                         APIKEY_STATUSJS_MUTATIONS, "node"),
     "apikey-history": ("static/commands.js", "tests/reconnect_on_show.test.js",
                        APIKEY_HISTORY_MUTATIONS, "node"),
+    "apikey-resolver": ("state.py", "tests/test_api_key_billing.py",
+                        APIKEY_RESOLVER_MUTATIONS, "pytest"),
+    "apikey-resolver-server": ("server.py", "tests/test_api_key_hub.py",
+                               APIKEY_RESOLVER_SERVER_MUTATIONS, "pytest"),
     "sessionkey-server": ("server.py", "tests/test_session_api_key.py",
                           SESSIONKEY_SERVER_MUTATIONS, "pytest"),
     "sessionkey-move": ("server.py", "tests/test_move_stops_original.py",

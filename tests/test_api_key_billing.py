@@ -55,6 +55,8 @@ from state import (                                         # noqa: E402
     apply_api_key_source,
     apply_rate_limit_info,
     billed_to_api_key,
+    detect_account_info,
+    global_config_path,
     init_state_from_config,
     state_to_status_dict,
     take_cost,
@@ -330,24 +332,62 @@ def test_login_refuses_a_flow_it_does_not_know(monkeypatch):
 
 def test_the_fingerprint_digests_the_console_key_never_holds_it(tmp_path):
     cfg_dir = _account(tmp_path, api_key=FAKE_KEY)
-    cred, digest = auth.login_fingerprint(cfg_dir)
-    assert cred is not None
-    assert digest and FAKE_KEY not in digest
-    assert len(digest) == 64
+    fp = auth.login_fingerprint(cfg_dir)
+    assert fp.credentials_mtime is not None
+    assert fp.key_digest and FAKE_KEY not in fp.key_digest
+    assert len(fp.key_digest) == 64
 
 
 def test_the_fingerprint_of_an_account_with_no_login(tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
-    assert auth.login_fingerprint(str(empty)) == (None, None)
+    assert auth.login_fingerprint(str(empty)) == (None, None, None)
+
+
+def test_an_unchanged_config_file_is_not_read_again(monkeypatch, tmp_path):
+    # It holds every project's history, and the watcher looks every 2 s.
+    cfg_dir = _account(tmp_path, api_key=FAKE_KEY)
+    reads = []
+    real = auth._primary_key_digest
+    monkeypatch.setattr(auth, "_primary_key_digest",
+                        lambda p: reads.append(p) or real(p))
+    first = auth.login_fingerprint(cfg_dir)
+    again = auth.login_fingerprint(cfg_dir, first)
+    assert len(reads) == 1 and again.key_digest == first.key_digest
+    Path(cfg_dir, ".claude.json").write_text(
+        json.dumps({"primaryApiKey": FAKE_KEY + "-new"}), encoding="utf-8")
+    changed = auth.login_fingerprint(cfg_dir, again)
+    assert len(reads) == 2 and changed.key_digest != first.key_digest
 
 
 def test_without_a_config_dir_the_cli_keeps_its_config_in_the_home_dir(
         monkeypatch, tmp_path):
-    monkeypatch.setattr(auth.Path, "home", classmethod(lambda cls: tmp_path))
-    assert auth._global_config_path(None) == tmp_path / ".claude.json"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    assert global_config_path(None) == tmp_path / ".claude.json"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "acct"))
-    assert auth._global_config_path(None) == tmp_path / "acct" / ".claude.json"
+    assert global_config_path(None) == tmp_path / "acct" / ".claude.json"
+
+
+def test_a_legacy_config_file_wins_as_it_does_for_the_cli(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / ".config.json").write_text("{}", encoding="utf-8")
+    assert global_config_path(None) == tmp_path / ".claude" / ".config.json"
+
+
+def test_the_default_accounts_details_are_read_where_the_cli_keeps_them(
+        monkeypatch, tmp_path):
+    # Beside ~/.claude, not in it: a sign-in seen to finish names its account.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / ".claude.json").write_text(json.dumps(
+        {"oauthAccount": {"emailAddress": "me@example.com"}}), encoding="utf-8")
+    info = detect_account_info(None)
+    assert info["email"] == "me@example.com"
+    assert info["config_dir"] == str(tmp_path / ".claude")
+
+
+def _fp(cred, digest):
+    return auth.LoginFingerprint(cred, None, digest)
 
 
 @pytest.mark.parametrize("before, now, done", [
@@ -362,7 +402,7 @@ def test_without_a_config_dir_the_cli_keeps_its_config_in_the_home_dir(
     ((None, "k1"), (None, None), False),           # key removed on the way
 ])
 def test_what_counts_as_a_finished_sign_in(before, now, done):
-    assert auth.login_completed(before, now) is done
+    assert auth.login_completed(_fp(*before), _fp(*now)) is done
 
 
 # --------------------------------------------------------------------------

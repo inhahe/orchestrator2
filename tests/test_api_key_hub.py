@@ -111,13 +111,17 @@ def test_usage_for_a_subscription_session_still_fetches(hub, monkeypatch):
     assert "usage" in msgs[1] and "note" not in msgs[1]
 
 
-def _watch(hub, monkeypatch, readings, method):
+def _watch(hub, monkeypatch, readings, method, previous=None):
     # The last reading repeats: a sign-in never seen to finish times out
-    # (quickly, here) rather than running out of readings.
-    seen = iter(readings)
-    last = [readings[-1]]
+    # (quickly, here) rather than running out of readings.  Each is
+    # (credentials mtime, key digest); *previous* collects what each reading
+    # was handed as the one before it.
+    seen = iter([auth.LoginFingerprint(c, None, k) for c, k in readings])
+    last = [None]
 
-    def reading(_d=None):
+    def reading(_d=None, prev=None):
+        if previous is not None:
+            previous.append(prev)
         last[0] = next(seen, last[0])
         return last[0]
 
@@ -148,6 +152,26 @@ def test_a_subscription_sign_in_says_nothing_about_a_key(hub, monkeypatch):
     text = _watch(hub, monkeypatch, [(10.0, None), (20.0, None)], "claudeai")
     assert "Signed in to Claude as me@example.com." in text
     assert "billed per token" not in text
+
+
+def test_the_move_picker_names_an_account_from_the_file_its_cli_reads(monkeypatch, tmp_path):
+    # A legacy .config.json is what the CLI reads for such an account.
+    import copy_session
+    acct = tmp_path / ".claude-b"
+    acct.mkdir()
+    (acct / ".config.json").write_text(json.dumps(
+        {"oauthAccount": {"emailAddress": "b@example.com"}}), encoding="utf-8")
+    monkeypatch.setattr(copy_session, "discover_claude_dirs", lambda: [acct])
+    assert server._move_accounts_payload(None)[0]["email"] == "b@example.com"
+
+
+def test_each_reading_is_handed_the_one_before(hub, monkeypatch):
+    # So an unchanged config file is not parsed again (auth.login_fingerprint).
+    previous = []
+    _watch(hub, monkeypatch, [(10.0, None), (10.0, None), (20.0, None)],
+           "claudeai", previous)
+    assert previous[0] is None
+    assert [p.credentials_mtime for p in previous[1:]] == [10.0, 10.0]
 
 
 def test_typing_login_console_watches_for_a_console_sign_in(hub, monkeypatch):
