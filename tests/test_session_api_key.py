@@ -20,6 +20,7 @@ and the key now goes the same way:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import sys
@@ -328,12 +329,45 @@ def test_a_restart_hands_the_keys_over_in_the_childs_environment(monkeypatch):
         "a key on a command line"
 
 
-def test_the_session_a_restart_resumes_gets_its_key_as_the_launch_key(monkeypatch):
-    # The replacement is that session's launch again.
+def test_the_session_a_restart_resumes_gets_its_key_by_its_id(monkeypatch):
+    # Not as the launch key: the replacement looks it up for whichever
+    # session it opens.
     rt = _open_session(monkeypatch, key=KEY, sid="sid-live")
     seen = _restart(monkeypatch, rt, primary=True)
-    assert seen["env"]["ANTHROPIC_API_KEY"] == KEY
+    assert "ANTHROPIC_API_KEY" not in seen["env"]
+    assert json.loads(seen["env"][server.HANDOVER_KEYS_ENV]) == {"sid-live": KEY}
     assert seen["argv"][seen["argv"].index("--resume") + 1] == "sid-live"
+
+
+def test_a_new_conversation_keeps_its_key_across_a_restart(monkeypatch):
+    # No session id to keep it by: the replacement is that launch again, and
+    # starts a new conversation where the primary is now.
+    rt = _open_session(monkeypatch, key=KEY, sid=None)
+    rt.config = dataclasses.replace(rt.config, cwd="D:\\now-here")
+    seen = _restart(monkeypatch, rt, primary=True)
+    assert seen["env"]["ANTHROPIC_API_KEY"] == KEY
+    assert "--no-continue" in seen["argv"] and "--resume" not in seen["argv"]
+    assert seen["argv"][seen["argv"].index("--cwd") + 1] == "D:\\now-here"
+
+
+def test_a_picker_still_to_choose_keeps_the_launchs_key_across_a_restart(monkeypatch):
+    rt = _open_session(monkeypatch, key=KEY, sid=None)
+    monkeypatch.setattr(server, "_picker_mode", True)
+    seen = _restart(monkeypatch, rt, primary=True)
+    assert seen["env"]["ANTHROPIC_API_KEY"] == KEY
+    assert "--no-continue" not in seen["argv"]
+
+
+def test_a_closed_primarys_key_goes_only_by_its_id(monkeypatch):
+    # The replacement continues the most recent session, which may be
+    # another: the key goes to that session only if it is the one.
+    rt = _open_session(monkeypatch, key=KEY, sid="sid-p")
+    server._session_api_keys["sid-p"] = KEY
+    monkeypatch.setattr(server, "runtimes", {})
+    rt.state = None
+    seen = _restart(monkeypatch, rt, primary=True)
+    assert "ANTHROPIC_API_KEY" not in seen["env"]
+    assert json.loads(seen["env"][server.HANDOVER_KEYS_ENV]) == {"sid-p": KEY}
 
 
 def test_a_restart_gives_no_launch_key_to_a_primary_without_one(monkeypatch):
@@ -341,6 +375,142 @@ def test_a_restart_gives_no_launch_key_to_a_primary_without_one(monkeypatch):
     seen = _restart(monkeypatch, rt, primary=True)
     assert "ANTHROPIC_API_KEY" not in seen["env"]
     assert server.HANDOVER_KEYS_ENV not in seen["env"]
+
+
+def _seeded(monkeypatch, *args):
+    """The config and state the hub's own launch opens its session with."""
+    monkeypatch.setattr(server, "resolve_session_ref", lambda ref, _c, _d: ref)
+    monkeypatch.setattr(server, "read_session_title", lambda _s, _d=None: None)
+    st = init_state_from_config(parse_args(list(args)))
+    cfg, resume_id = server._seed_primary_session(parse_args(list(args)), st)
+    return cfg, st, resume_id
+
+
+def test_a_restarts_replacement_opens_a_session_with_the_key_it_ran_with(monkeypatch):
+    server._session_api_keys["sid-p"] = KEY
+    cfg, st, resume_id = _seeded(monkeypatch, "--resume", "sid-p")
+    assert resume_id == "sid-p"
+    assert cfg.api_key == KEY
+    assert billed_to_api_key(st)
+
+
+def test_a_session_the_launch_brought_a_key_for_keeps_that_one(monkeypatch):
+    server._session_api_keys["sid-p"] = OTHER
+    monkeypatch.setattr(server, "resolve_session_ref", lambda ref, _c, _d: ref)
+    monkeypatch.setattr(server, "read_session_title", lambda _s, _d=None: None)
+    launched = dataclasses.replace(parse_args(["--resume", "sid-p"]), api_key=KEY)
+    cfg, _ = server._seed_primary_session(launched, init_state_from_config(launched))
+    assert cfg.api_key == KEY
+
+
+def test_a_new_session_at_startup_gets_no_remembered_key(monkeypatch):
+    server._session_api_keys["sid-p"] = KEY
+    cfg, st, resume_id = _seeded(monkeypatch, "--no-continue")
+    assert resume_id is None and cfg.api_key is None
+    assert not billed_to_api_key(st)
+
+
+# --------------------------------------------------------------------------
+# A key follows its session, not the tab showing it
+# --------------------------------------------------------------------------
+
+def test_every_tick_remembers_the_key_a_session_runs_with(monkeypatch):
+    # So an id the runtime leaves -- /clear, /resume -- keeps it.  Viewers or not.
+    from session_runtime import SessionRuntime
+    st = State()
+    st.session_id = "sid-before-clear"
+    rt = SessionRuntime(config=dataclasses.replace(parse_args([]), api_key=KEY),
+                        state=st, rid="R5")
+    asyncio.run(server._tick_runtime(rt))
+    assert server._session_api_keys == {"sid-before-clear": KEY}
+
+
+class _QuietBridge:
+    def __init__(self, config, state, broadcaster):
+        self.config = config
+        self._initial_resume_id = None
+
+    async def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+
+def _switch(monkeypatch, tmp_path, *, key, picking=False, **where):
+    """The primary tab, on sid-a with *key*, switched with /resume or /cwd."""
+    import sdk_bridge
+    from session_runtime import SessionRuntime
+    monkeypatch.setattr(sdk_bridge, "SDKBridge", _QuietBridge)
+    monkeypatch.setattr(server, "_attach_queue_persistence", lambda st, cwd: 0)
+    monkeypatch.setattr(server, "resolve_session_ref", lambda ref, _c, _d: ref)
+    monkeypatch.setattr(server, "find_session_dir", lambda _s, _d=None: tmp_path)
+    monkeypatch.setattr(server, "read_session_title", lambda _s, _d=None: None)
+    monkeypatch.setattr(server, "find_session_cwd", lambda _s, _d=None: None)
+    cfg = dataclasses.replace(parse_args([]), api_key=key, cwd=str(tmp_path))
+    st = State()
+    st.session_id = "sid-a"
+    rt = SessionRuntime(config=cfg, state=st, rid="R0")
+    monkeypatch.setattr(server, "config", cfg)
+    monkeypatch.setattr(server, "state", st)
+    monkeypatch.setattr(server, "bridge", None)
+    monkeypatch.setattr(server, "_default_runtime", rt)
+    monkeypatch.setattr(server, "_picker_mode", picking)
+    monkeypatch.chdir(tmp_path)
+    ok, err = asyncio.run(server._reconfigure(**where))
+    assert ok, err
+    return server.config
+
+
+def test_resume_leaves_the_tabs_key_with_the_session_it_leaves(monkeypatch, tmp_path):
+    cfg = _switch(monkeypatch, tmp_path, key=KEY, resume="sid-b")
+    assert cfg.api_key is None, "the key followed the tab to another session"
+    assert server._session_api_keys == {"sid-a": KEY}
+
+
+def test_resume_gives_a_session_the_key_it_ran_with(monkeypatch, tmp_path):
+    server._session_api_keys["sid-b"] = OTHER
+    cfg = _switch(monkeypatch, tmp_path, key=KEY, resume="sid-b")
+    assert cfg.api_key == OTHER
+    assert billed_to_api_key(server.state)
+
+
+def test_cwd_gives_the_session_it_continues_the_key_it_ran_with(monkeypatch, tmp_path):
+    server._session_api_keys["sid-recent"] = OTHER
+    monkeypatch.setattr(server, "find_most_recent_session_for_cwd",
+                        lambda _c: types.SimpleNamespace(stem="sid-recent"))
+    cfg = _switch(monkeypatch, tmp_path, key=KEY, cwd=str(tmp_path))
+    assert cfg.api_key == OTHER
+    assert server.state.session_id == "sid-recent"
+
+
+def test_the_session_picked_in_the_picker_gets_the_launchs_key(monkeypatch, tmp_path):
+    cfg = _switch(monkeypatch, tmp_path, key=KEY, picking=True, resume="sid-b")
+    assert cfg.api_key == KEY
+
+
+def test_the_picker_gives_a_session_the_launch_brought_no_key_for_its_own(monkeypatch, tmp_path):
+    from session_runtime import SessionRuntime
+
+    class _Idle:
+        async def start(self):
+            pass
+
+    server._session_api_keys["sid-p"] = KEY
+    monkeypatch.setattr(server, "find_session_dir", lambda _s, _d=None: tmp_path)
+    monkeypatch.setattr(server, "read_session_title", lambda _s, _d=None: None)
+    monkeypatch.setattr(server, "find_session_cwd", lambda _s, _d=None: None)
+    cfg = parse_args([])
+    st = State()
+    rt = SessionRuntime(config=cfg, state=st, rid="R0")
+    rt.bridge = _Idle()
+    for name, value in (("config", cfg), ("state", st), ("bridge", rt.bridge),
+                        ("_default_runtime", rt), ("_picker_mode", True)):
+        monkeypatch.setattr(server, name, value)
+    out = asyncio.run(server.api_resume({"session_id": "sid-p"}))
+    assert out["ok"], out
+    assert server.config.api_key == KEY and rt.config.api_key == KEY
+    assert billed_to_api_key(st)
 
 
 def test_the_new_hub_takes_the_keys_out_of_its_environment(monkeypatch):

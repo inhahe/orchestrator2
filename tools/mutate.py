@@ -4939,12 +4939,20 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
      "        if a in (\"--agent-name\",):\n"),
 
     ("a restart keeps the launch's --cwd",
-     "        if sid and a == \"--cwd\":\n            i += 2\n            continue\n",
+     "        if (sid or fresh) and a == \"--cwd\":\n            i += 2\n            continue\n",
      ""),
 
     ("a restart drops --cwd with no session to follow",
-     "        if sid and a == \"--cwd\":\n",
+     "        if (sid or fresh) and a == \"--cwd\":\n",
      "        if a == \"--cwd\":\n"),
+
+    ("a restart of a new conversation continues another session",
+     '        child.extend(["--no-continue", "--cwd", config.cwd])\n',
+     '        child.extend(["--cwd", config.cwd])\n'),
+
+    ("a restart of a new conversation starts in the launch's directory",
+     "    fresh = state is not None and not sid and not _picker_mode\n",
+     "    fresh = False\n"),
 
     ("/resume in a session says a shared title is not found",
      "            if len(several) > 1:\n",
@@ -5982,21 +5990,53 @@ SESSIONKEY_SERVER_MUTATIONS = [
      "    if auth.is_logged_in():\n"),
 
     ("every session the hub opens inherits its launch's key",
-     '    overrides["api_key"] = api_key or (\n'
-     '        _session_api_keys.get(seed_id) if seed_id else None)\n',
+     '    overrides["api_key"] = _session_key(seed_id, api_key)\n',
      ""),
 
     ("a session reopened forgets the key it had",
-     '        _session_api_keys.get(seed_id) if seed_id else None)\n'
-     '    cfg = dataclasses.replace(config, **overrides)',
-     '        None)\n'
-     '    cfg = dataclasses.replace(config, **overrides)'),
+     "    return launch_key or (_session_api_keys.get(sid) if sid else None)\n",
+     "    return launch_key\n"),
 
     ("a remembered key beats the one a launch gives now",
-     '    overrides["api_key"] = api_key or (\n'
-     '        _session_api_keys.get(seed_id) if seed_id else None)',
-     '    overrides["api_key"] = (\n'
-     '        _session_api_keys.get(seed_id) if seed_id else None) or api_key'),
+     "    return launch_key or (_session_api_keys.get(sid) if sid else None)\n",
+     "    return (_session_api_keys.get(sid) if sid else None) or launch_key\n"),
+
+    ("a session left by /clear or /resume forgets its key",
+     "    _remember_session_key(rt)\n    st, cfg = rt.state, rt.config\n",
+     "    st, cfg = rt.state, rt.config\n"),
+
+    ("a restart's replacement opens a session without the key it ran with",
+     "    if not cfg.api_key:\n        key = _session_key(st.session_id)\n",
+     "    if False:\n        key = _session_key(st.session_id)\n"),
+
+    ("a session opened at startup with a remembered key is not billed to it",
+     "            cfg = dataclasses.replace(cfg, api_key=key)\n"
+     "            apply_api_key_source(st, OWN_KEY_SOURCE, cfg.config_dir)\n",
+     "            cfg = dataclasses.replace(cfg, api_key=key)\n"),
+
+    ("/resume carries the tab's key to the session it switches to",
+     '    overrides["api_key"] = _session_key(\n'
+     "        target, config.api_key if _picker_mode else None)\n",
+     ""),
+
+    ("/resume gives the session it switches to no key of its own",
+     "        target, config.api_key if _picker_mode else None)\n",
+     "        None, config.api_key if _picker_mode else None)\n"),
+
+    ("the session picked in the picker loses the launch's key",
+     "        target, config.api_key if _picker_mode else None)\n",
+     "        target, None)\n"),
+
+    ("/resume forgets the key of the session it leaves",
+     "    if _default_runtime is not None:\n"
+     "        _remember_session_key(_default_runtime)\n",
+     ""),
+
+    ("the picker gives a session the launch brought no key for none",
+     "    if not config.api_key and _default_runtime is not None:\n"
+     "        key = _session_key(session_id)\n",
+     "    if False:\n"
+     "        key = _session_key(session_id)\n"),
 
     ("a joining launch does not hand its key over",
      '        "api_key": cfg.api_key,\n',
@@ -6057,9 +6097,21 @@ SESSIONKEY_SERVER_MUTATIONS = [
      "    for rt in []:\n"
      '        key = getattr(rt.config, "api_key", None)\n'),
 
-    ("the session a restart resumes loses its key",
-     '        env["ANTHROPIC_API_KEY"] = primary_key\n',
+    ("a new conversation loses its key across a restart",
+     '        env["ANTHROPIC_API_KEY"] = launch_key\n',
      ""),
+
+    ("a resumed primary's key goes as the launch key as well",
+     "                  if state is not None and not sid else None)\n",
+     "                  if state is not None else None)\n"),
+
+    ("a closed primary's key goes to whatever session the replacement opens",
+     "                  if state is not None and not sid else None)\n",
+     "                  if not sid else None)\n"),
+
+    ("a picker still to choose is restarted as a new conversation",
+     "    fresh = state is not None and not sid and not _picker_mode\n",
+     "    fresh = state is not None and not sid\n"),
 
     ("the new hub leaves the handed-over keys in its environment",
      "    raw = os.environ.pop(HANDOVER_KEYS_ENV, None)",

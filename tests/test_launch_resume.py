@@ -439,7 +439,9 @@ def test_a_detached_child_is_given_the_account_it_followed():
     assert argv[argv.index("--config-dir") + 1] == r"C:\h\.claude-work"
 
 
-def _restart_argv(monkeypatch, argv, sid):
+def _restart_argv(monkeypatch, argv, sid, *, live=True, cwd=None):
+    """The replacement's argv.  *live*: whether the primary session is still
+    open (it may have been closed from the lobby); *cwd*: where it is now."""
     import subprocess
     seen = {}
 
@@ -449,10 +451,13 @@ def _restart_argv(monkeypatch, argv, sid):
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     monkeypatch.setattr(sys, "argv", argv)
-    monkeypatch.setattr(server, "config", parse_args([]))
+    cfg = parse_args([])
+    monkeypatch.setattr(server, "config",
+                        dataclasses.replace(cfg, cwd=cwd) if cwd else cfg)
     st = State()
     st.session_id = sid
-    monkeypatch.setattr(server, "state", st)
+    monkeypatch.setattr(server, "state", st if live else None)
+    monkeypatch.setattr(server, "_picker_mode", False)
     asyncio.run(server.api_restart())
     return seen["argv"]
 
@@ -467,9 +472,22 @@ def test_a_restart_lets_the_session_it_resumes_choose_the_directory(monkeypatch)
 
 
 def test_a_restart_with_no_session_keeps_the_directory(monkeypatch):
-    argv = _restart_argv(monkeypatch, ["server.py", "--cwd", r"D:\a"], None)
+    # The primary was closed: the replacement continues where the launch did.
+    argv = _restart_argv(monkeypatch, ["server.py", "--cwd", r"D:\a"], None,
+                         live=False)
 
     assert argv[argv.index("--cwd") + 1] == r"D:\a"
+    assert "--no-continue" not in argv
+
+
+def test_a_restart_of_a_new_conversation_starts_a_new_one_where_it_is(monkeypatch):
+    """Not the most recent session there, which would swap the conversation
+    for another, and not the launch's directory after /cwd moved it."""
+    argv = _restart_argv(monkeypatch, ["server.py", "--cwd", r"D:\a"], None,
+                         cwd=r"D:\b")
+
+    assert "--no-continue" in argv and "--resume" not in argv
+    assert argv.count("--cwd") == 1 and argv[argv.index("--cwd") + 1] == r"D:\b"
 
 
 def test_resume_inside_a_session_names_the_ones_that_share_a_title(machine, monkeypatch):

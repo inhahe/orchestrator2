@@ -141,18 +141,19 @@ log = logging.getLogger("orchestrator2")
 # CLI would inherit it, and where the SDK runs the CLI, a key outranks a
 # subscription login without asking.  So the key moves into that session's
 # Config.api_key and out of the environment; a launch that joins a running
-# hub hands it over with its request.  The hub
-# remembers the keys of sessions it closed, so one reopened from the lobby
-# keeps its key, and hands them all to its replacement on ⟳ Restart.  Only in
-# memory and in that child's environment: never on disk, never on a command
-# line, never logged, never sent to a browser.
+# hub hands it over with its request.  The key belongs to the session, not to
+# the tab showing it: the hub remembers it by session id, so the session keeps
+# it when reopened from the lobby, resumed with /resume, or brought back by ⟳
+# Restart, and a tab that switches to another session leaves it behind.  Only
+# in memory and in a restart's child's environment: never on disk, never on a
+# command line, never logged, never sent to a browser.
 
 #: Where ⟳ Restart hands its replacement the sessions' keys (JSON, session id
 #: -> key).  The replacement takes it out of its environment at once.
 HANDOVER_KEYS_ENV = "ORCH2_SESSION_API_KEYS"
 
-#: Session id -> API key, for sessions that had one and were closed while the
-#: hub runs.  A live session's key is in its Config.
+#: Session id -> the API key that session has run with while the hub ran
+#: (_remember_session_key).  A live session's key is also in its Config.
 _session_api_keys: dict[str, str] = {}
 
 
@@ -207,11 +208,25 @@ def _take_handed_over_keys() -> dict[str, str]:
 
 
 def _remember_session_key(rt: "SessionRuntime") -> None:
-    """Keep a closing session's key, for when the session is opened again."""
+    """Remember the key *rt*'s session runs with, by the session's id.
+
+    Every tick and at teardown, so a session id the runtime leaves -- closed,
+    ``/clear``, ``/resume`` elsewhere -- keeps the key it ran with.
+    """
     key = getattr(rt.config, "api_key", None)
     sid = getattr(rt.state, "session_id", None)
     if key and sid:
         _session_api_keys[sid] = key
+
+
+def _session_key(sid: str | None, launch_key: str | None = None) -> str | None:
+    """The API key a session about to be opened runs with.
+
+    *launch_key* is the key of the launch that is opening *sid*, if any: it
+    wins, as the launch asked for it.  Otherwise the key the session ran with
+    before, if the hub remembers one; None for a new session or one without.
+    """
+    return launch_key or (_session_api_keys.get(sid) if sid else None)
 
 
 def _session_keys_to_hand_over() -> dict[str, str]:
@@ -1207,6 +1222,8 @@ async def _tick_runtime(rt: SessionRuntime) -> bool:
     Split out of the ticker loop so the suppression rule is testable without
     driving an infinite loop.
     """
+    # Viewers or not: a session id this runtime leaves keeps its key.
+    _remember_session_key(rt)
     st, cfg = rt.state, rt.config
     if st is None or cfg is None or not rt.clients:
         return False
@@ -1369,6 +1386,44 @@ import contextlib
 from contextlib import asynccontextmanager
 
 
+def _seed_primary_session(cfg: Config, st: State) -> tuple[Config, str | None]:
+    """Which session the hub's own launch opens, seeded into *st* early.
+
+    Cheap disk reads, so a tab gets the session's history on its first
+    connect, before the bridge is up.  Returns the config to run the session
+    with, and the id its bridge is to resume (None for a new session):
+    ``--resume``'s, or the most recent in the directory unless
+    ``--no-continue``.
+    """
+    resume_id: str | None = None
+    if cfg.resume and cfg.resume != _PICKER_SENTINEL:
+        # Resolve the resume value to a real session UUID — it might be a
+        # title rather than an ID (e.g. ``--resume fastpyb``).  The same rule
+        # as a launch into a running hub (session.resolve_session_ref): the
+        # exact title of one session in this directory, never a substring of
+        # one, which could open "OS Lane A" for ``--resume "Lane A"``.
+        resolved = resolve_session_ref(cfg.resume, cfg.cwd, cfg.config_dir)
+        if resolved != cfg.resume:
+            cfg = dataclasses.replace(cfg, resume=resolved)
+        st.session_id = resolved
+        st.session_title = read_session_title(resolved, cfg.config_dir)
+        resume_id = resolved
+    elif not cfg.no_continue:
+        recent = find_most_recent_session_for_cwd(cfg.cwd)
+        if recent is not None:
+            st.session_id = recent.stem
+            st.session_title = read_session_title(recent.stem, cfg.config_dir)
+            resume_id = recent.stem
+    # A session this launch brought no key for keeps the one it ran with: the
+    # replacement ⟳ Restart starts is handed the old hub's keys (main()).
+    if not cfg.api_key:
+        key = _session_key(st.session_id)
+        if key:
+            cfg = dataclasses.replace(cfg, api_key=key)
+            apply_api_key_source(st, OWN_KEY_SOURCE, cfg.config_dir)
+    return cfg, resume_id
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start background tasks on startup, clean up on shutdown."""
@@ -1426,27 +1481,7 @@ async def lifespan(app: FastAPI):
     # first connect, even before the deferred bridge is up.  The resume id is
     # stashed for _deferred_bridge_startup to apply once the bridge exists.
     global _pending_resume_id
-    _pending_resume_id = None
-    if config.resume and config.resume != _PICKER_SENTINEL:
-        # Resolve the resume value to a real session UUID — it might be a
-        # title rather than an ID (e.g. ``--resume fastpyb``).  The same rule
-        # as a launch into a running hub (session.resolve_session_ref): the
-        # exact title of one session in this directory.  This used to fall
-        # back to a *substring* match across every project, which could open
-        # "OS Lane A" for ``--resume "Lane A"``.
-        _resolved_resume = resolve_session_ref(
-            config.resume, config.cwd, config.config_dir)
-        if _resolved_resume != config.resume:
-            config = dataclasses.replace(config, resume=_resolved_resume)
-        state.session_id = _resolved_resume
-        state.session_title = read_session_title(_resolved_resume, config.config_dir)
-        _pending_resume_id = _resolved_resume
-    elif not config.no_continue:
-        recent = find_most_recent_session_for_cwd(config.cwd)
-        if recent is not None:
-            state.session_id = recent.stem
-            state.session_title = read_session_title(recent.stem, config.config_dir)
-            _pending_resume_id = recent.stem
+    config, _pending_resume_id = _seed_primary_session(config, state)
 
     # The seeding block above may have rebound ``config`` (e.g. resolving a
     # --resume title to a real UUID via dataclasses.replace).  Re-point the
@@ -1684,8 +1719,7 @@ async def _create_runtime(
                 seed_id = recent.stem
     # Set every time, never inherited, like the name: the hub's config is its
     # launch's session's, and that launch's key is that session's alone.
-    overrides["api_key"] = api_key or (
-        _session_api_keys.get(seed_id) if seed_id else None)
+    overrides["api_key"] = _session_key(seed_id, api_key)
     cfg = dataclasses.replace(config, **overrides)
     # Build the state *inside* the session's config-dir scope so account
     # detection (detect_account_info / detect_subscription*) reads the
@@ -2822,7 +2856,16 @@ async def _reconfigure(
                     + ". /resume <id> picks one.")
             return False, f"session not found: {resume}"
 
+    # The session about to be shown: the one resumed, or for /cwd the most
+    # recent in the new directory; None for a new one.
+    recent = (find_most_recent_session_for_cwd(new_cwd)
+              if cwd and not new_resume and not config.no_continue else None)
+    target = new_resume or (recent.stem if recent is not None else None)
+
     # --- Stop existing bridge ---
+    # The session being left keeps the key it ran with.
+    if _default_runtime is not None:
+        _remember_session_key(_default_runtime)
     if bridge is not None:
         try:
             await bridge.stop()
@@ -2840,6 +2883,10 @@ async def _reconfigure(
     if not _picker_mode:
         overrides["initial_prompt"] = None
         overrides["session_note"] = None
+    # Its API key likewise: a key is its session's, so the session switched
+    # to runs with its own, if it ran with one, and never with the one left.
+    overrides["api_key"] = _session_key(
+        target, config.api_key if _picker_mode else None)
     config = dataclasses.replace(config, **overrides)
 
     # --- Reinitialise state + bridge ---
@@ -2870,13 +2917,11 @@ async def _reconfigure(
         bridge._initial_resume_id = new_resume
     elif cwd:
         os.chdir(new_cwd)
-        # Seed session from the new cwd (continue most recent).
-        if not config.no_continue:
-            recent = find_most_recent_session_for_cwd(new_cwd)
-            if recent is not None:
-                state.session_id = recent.stem
-                state.session_title = read_session_title(recent.stem, config.config_dir)
-                bridge._initial_resume_id = recent.stem
+        # Seed session from the new cwd (continue most recent, found above).
+        if recent is not None:
+            state.session_id = recent.stem
+            state.session_title = read_session_title(recent.stem, config.config_dir)
+            bridge._initial_resume_id = recent.stem
 
     # Same rule as startup: the queue follows the session, so this has to run
     # after the two branches above have decided which one (if any) we are on.
@@ -2980,14 +3025,19 @@ async def api_restart() -> dict[str, Any]:
     # or /resume it names the wrong directory, and the new process follows
     # the session to the right one (_settle_launch_resume).
     sid = state.session_id if state is not None else None
+    # A primary with no session id yet is a new conversation, and so is its
+    # replacement, in the directory the primary is in now: continuing the most
+    # recent session there would swap it for another one.  In picker mode
+    # nothing has been chosen yet.
+    fresh = state is not None and not sid and not _picker_mode
     child = [sys.executable, argv[0]]
     i = 1
     while i < len(argv):
         a = argv[i]
-        if sid and a == "--cwd":
+        if (sid or fresh) and a == "--cwd":
             i += 2
             continue
-        if sid and a.startswith("--cwd="):
+        if (sid or fresh) and a.startswith("--cwd="):
             i += 1
             continue
         if a in ("--detach", "--open", "--copy", "--wait-port",
@@ -3030,6 +3080,8 @@ async def api_restart() -> dict[str, Any]:
     # Resume exactly the current primary session on the fresh process.
     if sid:
         child.extend(["--resume", sid])
+    elif fresh:
+        child.extend(["--no-continue", "--cwd", config.cwd])
     # ...under the name it has *now*, rather than whatever the launch command
     # said: one that came from ORCH2_AGENT_NAME is no longer in the
     # environment (config.py consumes it), and the command line's is stale if
@@ -3048,12 +3100,14 @@ async def api_restart() -> dict[str, Any]:
     if cfg_dir:
         env["CLAUDE_CONFIG_DIR"] = cfg_dir
     # The sessions' API keys go to the replacement in its environment, which
-    # it empties at once.  The session it resumes gets its own as the launch
-    # key, the replacement being that session's launch again; the others are
-    # remembered there, for when they are reopened.
-    primary_key = getattr(config, "api_key", None) if sid else None
-    if primary_key:
-        env["ANTHROPIC_API_KEY"] = primary_key
+    # it empties at once: each by its session's id, the resumed primary's
+    # included, for whenever the session is opened there.  A primary with no
+    # session id yet -- a new conversation, or a picker still to choose -- is
+    # the replacement's own launch again, so its key goes as the launch key.
+    launch_key = (getattr(config, "api_key", None)
+                  if state is not None and not sid else None)
+    if launch_key:
+        env["ANTHROPIC_API_KEY"] = launch_key
     keys = _session_keys_to_hand_over()
     if keys:
         env[HANDOVER_KEYS_ENV] = json.dumps(keys)
@@ -3505,6 +3559,12 @@ async def api_resume(body: dict[str, Any]) -> dict[str, Any]:
     title = read_session_title(session_id, config.config_dir)
     if title:
         state.session_title = title
+    # The session picked is this launch's: its key, else the one it ran with.
+    if not config.api_key and _default_runtime is not None:
+        key = _session_key(session_id)
+        if key:
+            _replace_runtime_config(_default_runtime, api_key=key)
+            apply_api_key_source(state, OWN_KEY_SOURCE, config.config_dir)
 
     # Optionally switch cwd to match the session's recorded cwd.
     session_cwd = find_session_cwd(session_id)

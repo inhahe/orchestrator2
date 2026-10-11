@@ -2116,14 +2116,27 @@ every account, so:
   `/api/session/launch`, over loopback. A session already open takes it and
   reconnects, since the key is fixed when the CLI starts; a launch without
   one leaves an open session's key alone.
-- **The hub remembers it while it runs.** A session closed with a key leaves
-  it in `_session_api_keys` by session id, so reopened from the lobby it gets
-  it back; `/move` carries it to the copy. ⟳ Restart hands the keys to the
-  replacement in its environment, never its command line. The resumed
-  primary's key goes as the replacement's launch key, since the replacement
-  is that session's launch again; the rest go as JSON in
+- **The key is the session's, not the tab's, and the hub remembers it while
+  it runs.** Every tick records each live session's key by its session id in
+  `_session_api_keys` (`_remember_session_key`, also at teardown), so an id a
+  runtime leaves keeps the key it ran with: a session closed, or left by
+  `/clear` or `/resume`. Every path that opens a session asks `_session_key`:
+  the opening launch's own key if it brought one, else the one the session
+  ran with. So a session reopened from the lobby, resumed with `/resume`,
+  continued by `/cwd`, picked in the picker, or brought back by ⟳ Restart
+  runs with its own key, and a tab that switches sessions leaves its key
+  behind (`_reconfigure`). `/clear` keeps it: the new conversation is the
+  same launch's work. `/move` carries it to the copy.
+- **⟳ Restart hands the keys to the replacement in its environment,** never
+  its command line: all of them by session id, as JSON in
   `ORCH2_SESSION_API_KEYS`, which the replacement takes out at once
-  (`_take_handed_over_keys`). After the hub shuts down, nothing is left:
+  (`_take_handed_over_keys`) and looks up when it seeds the session it opens
+  (`_seed_primary_session`). A primary with no session id yet is a new
+  conversation, which no id can carry: its key goes as the replacement's
+  launch key, the replacement being that launch again, with `--no-continue`
+  and the primary's current directory, so it starts a new conversation there
+  rather than continuing whatever is most recent. A picker still to choose
+  passes the key the same way. After the hub shuts down, nothing is left:
   nothing was written to disk.
 - **The rest of the launch knows it.** A launch with a key needs no
   subscription sign-in, so `_ensure_logged_in` skips it. A `--detach` child is
