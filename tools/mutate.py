@@ -2510,11 +2510,13 @@ MODELLIVE_MUTATIONS = [
     ("a hung API hangs the command instead of costing it the budget",
      "            await asyncio.wait_for(\n"
      "                asyncio.to_thread(fetch_available_models,\n"
-     "                                  MODEL_SHOW_FETCH_BUDGET),\n"
+     "                                  MODEL_SHOW_FETCH_BUDGET,\n"
+     "                                  api_key=_model_list_key()),\n"
      "                MODEL_SHOW_FETCH_BUDGET + 1.0,\n"
      "            )",
      "            await asyncio.to_thread(fetch_available_models,\n"
-     "                                    MODEL_SHOW_FETCH_BUDGET)"),
+     "                                    MODEL_SHOW_FETCH_BUDGET,\n"
+     "                                    api_key=_model_list_key())"),
 
     ("a failed refresh propagates instead of falling back to the list we "
      "already have",
@@ -2532,6 +2534,11 @@ MODELLIVE_MUTATIONS = [
      "releases again",
      "MODEL_SHOW_COALESCE_S = 2.0",
      "MODEL_SHOW_COALESCE_S = 1800.0"),
+
+    ("the list is fetched without the primary session's own key, which is "
+     "not in the environment",
+     '    return getattr(config, "api_key", None)\n',
+     "    return None\n"),
 ]
 
 MODELFRESH_MUTATIONS = [
@@ -2559,6 +2566,10 @@ MODELFRESH_MUTATIONS = [
      "    if _model_cache is None:\n        return None\n"
      "    return max(0.0, time.monotonic() - _model_cache_at)",
      "    return max(0.0, time.monotonic() - _model_cache_at)"),
+
+    ("a key given for the model list is ignored",
+     '    api_key = (api_key or os.environ.get("ANTHROPIC_API_KEY", "")).strip()\n',
+     '    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()\n'),
 ]
 
 

@@ -265,7 +265,8 @@ def _fmt_window(n: int) -> str:
     return str(n)
 
 
-def fetch_available_models(timeout: float = 6.0) -> list[tuple[str, str]] | None:
+def fetch_available_models(timeout: float = 6.0,
+                           api_key: str | None = None) -> list[tuple[str, str]] | None:
     """Fetch the live model list from the Anthropic API (blocking).
 
     Returns a list of ``(model_id, description)`` tuples in the order the API
@@ -273,15 +274,17 @@ def fetch_available_models(timeout: float = 6.0) -> list[tuple[str, str]] | None
     (no credentials, network error, unexpected response).  On success the
     result is cached for later non-blocking reads via ``get_known_models``.
 
-    Auth uses ``ANTHROPIC_API_KEY`` when set, otherwise the Claude Code OAuth
-    token (with the oauth beta header the subscription API expects).
+    Auth uses *api_key* when given -- the hub passes its primary session's
+    own key, which it keeps out of its environment -- else
+    ``ANTHROPIC_API_KEY`` when set, otherwise the Claude Code OAuth token
+    (with the oauth beta header the subscription API expects).
 
     This blocks on the network, so off the event loop only (startup warm or
     the synchronous --list-models path).
     """
     global _model_cache, _model_cache_at
     headers = {"anthropic-version": "2023-06-01"}
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    api_key = (api_key or os.environ.get("ANTHROPIC_API_KEY", "")).strip()
     if api_key:
         headers["x-api-key"] = api_key
     else:

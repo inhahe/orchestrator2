@@ -2107,7 +2107,10 @@ every account, so:
   first thing in `main()`, and keeps it as `Config.api_key`. That field is
   `repr=False`, so no log line of a `Config` carries it. `config_to_dict`,
   which nothing called, is gone: it would have sent a `Config` to the
-  browser, the external-access password included.
+  browser, the external-access password included. The live model list
+  (`/model`), which looked for a key in the environment, is fetched with the
+  primary session's own key instead (`_model_list_key`), else the account's
+  login: a hub whose only credential is a launch's key can still list them.
 - **The session's CLI is given it** in `_make_options`, and its `/btw` fork
   too, so a side question is billed as its session is. The hub's own
   `Config` is its launch's session's, so `_create_runtime` sets every other

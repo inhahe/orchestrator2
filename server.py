@@ -931,6 +931,17 @@ _ticker_task: asyncio.Task | None = None
 _model_task: asyncio.Task | None = None
 
 
+def _model_list_key() -> str | None:
+    """The API key the model list is fetched with: the primary session's own.
+
+    None without one, and the fetch uses the account's login.  The launch
+    took the key out of the hub's environment, where the fetch would
+    otherwise look; without it here, a hub whose only credential is that key
+    could not list the models at all.
+    """
+    return getattr(config, "api_key", None)
+
+
 async def _model_cache_loop() -> None:
     """Keep the live model list (Anthropic ``/v1/models``) cached and fresh.
 
@@ -951,7 +962,8 @@ async def _model_cache_loop() -> None:
     """
     backoff = 30.0
     while True:
-        ok = bool(await asyncio.to_thread(fetch_available_models))
+        ok = bool(await asyncio.to_thread(fetch_available_models,
+                                          api_key=_model_list_key()))
         if ok:
             backoff = 30.0
             await asyncio.sleep(MODEL_CACHE_TTL)
@@ -1006,7 +1018,8 @@ async def _refresh_models_for_show() -> None:
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(fetch_available_models,
-                                  MODEL_SHOW_FETCH_BUDGET),
+                                  MODEL_SHOW_FETCH_BUDGET,
+                                  api_key=_model_list_key()),
                 MODEL_SHOW_FETCH_BUDGET + 1.0,
             )
         except asyncio.TimeoutError:

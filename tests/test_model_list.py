@@ -65,6 +65,22 @@ _MODELS_BODY = (
 )
 
 
+def test_a_key_given_is_the_one_sent(monkeypatch):
+    # The hub's sessions' keys are not in its environment.
+    _reset_cache()
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    sent = []
+
+    def fake_urlopen(req, timeout=None):
+        sent.append(req.get_header("X-api-key"))
+        return _FakeResponse(_MODELS_BODY)
+
+    monkeypatch.setattr(config.urllib.request, "urlopen", fake_urlopen)
+    assert config.fetch_available_models(api_key="sk-ant-api03-given") is not None
+    assert sent == ["sk-ant-api03-given"]
+    _reset_cache()
+
+
 def test_fetch_caches_live_list(monkeypatch):
     _reset_cache()
     _patch_fetch(monkeypatch, body=_MODELS_BODY)
@@ -340,6 +356,33 @@ def _slash_model(ws):
     return server._handle_ws_message(ws, {"type": "message", "text": "/model"})
 
 
+def test_the_list_is_fetched_with_the_primary_sessions_own_key(hub, monkeypatch):
+    # The launch took it out of the environment, where the fetch would look:
+    # a hub whose only credential is that key could not list the models.
+    import dataclasses
+    _reset_cache()
+    keys = []
+
+    def fake_fetch(timeout=6.0, api_key=None):
+        keys.append(api_key)
+        return None
+
+    monkeypatch.setattr(server, "fetch_available_models", fake_fetch)
+    monkeypatch.setattr(server, "config", dataclasses.replace(
+        server.config, api_key="sk-ant-api03-the-launchs"))
+    asyncio.run(server._refresh_models_for_show())
+
+    async def one_pass():
+        task = asyncio.create_task(server._model_cache_loop())
+        while len(keys) < 2:
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(one_pass())
+    assert keys == ["sk-ant-api03-the-launchs"] * 2
+
+
 def test_slash_model_fetches_before_answering(hub, monkeypatch):
     """The reported request: "i want /model to always read the current list
     when possible."  Previously it rendered whatever the hourly background
@@ -347,7 +390,7 @@ def test_slash_model_fetches_before_answering(hub, monkeypatch):
     _reset_cache()
     calls = []
 
-    def fake_fetch(timeout=6.0):
+    def fake_fetch(timeout=6.0, api_key=None):
         calls.append(timeout)
         config._model_cache = [("claude-opus-5-5", "Opus 5.5 — released mid-hour")]
         config._model_cache_at = config.time.monotonic()
@@ -373,7 +416,7 @@ def test_a_model_released_mid_hour_shows_up(hub, monkeypatch):
     # shipped since.
     config._model_cache_at = config.time.monotonic() - 41 * 60
 
-    def fake_fetch(timeout=6.0):
+    def fake_fetch(timeout=6.0, api_key=None):
         config._model_cache = [("claude-opus-5-5", "Opus 5.5"),
                                ("claude-opus-5", "Opus 5")]
         config._model_cache_at = config.time.monotonic()
@@ -395,7 +438,7 @@ def test_a_failed_refresh_still_answers_from_the_cache(hub, monkeypatch):
     config._model_cache = [("claude-opus-5", "Opus 5")]
     config._model_cache_at = config.time.monotonic() - 1800
 
-    def fake_fetch(timeout=6.0):
+    def fake_fetch(timeout=6.0, api_key=None):
         return None                      # what an HTTP error looks like
 
     monkeypatch.setattr(server, "fetch_available_models", fake_fetch)
@@ -423,7 +466,7 @@ def test_a_hanging_api_does_not_hang_the_command(hub, monkeypatch):
     config._model_cache_at = config.time.monotonic() - 600   # past coalescing
     gate = threading.Event()
 
-    def fake_fetch(timeout=6.0):
+    def fake_fetch(timeout=6.0, api_key=None):
         gate.wait(10)
         return None
 
@@ -450,7 +493,7 @@ def test_a_second_show_moments_later_does_not_refetch(hub, monkeypatch):
     _reset_cache()
     calls = []
 
-    def fake_fetch(timeout=6.0):
+    def fake_fetch(timeout=6.0, api_key=None):
         calls.append(1)
         config._model_cache = [("claude-opus-5", "Opus 5")]
         config._model_cache_at = config.time.monotonic()
@@ -482,7 +525,7 @@ def test_concurrent_shows_share_one_fetch(hub, monkeypatch):
     _reset_cache()
     calls = []
 
-    def fake_fetch(timeout=6.0):
+    def fake_fetch(timeout=6.0, api_key=None):
         calls.append(1)
         time.sleep(0.05)
         config._model_cache = [("claude-opus-5", "Opus 5")]
