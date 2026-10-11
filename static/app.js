@@ -665,11 +665,11 @@ const App = (() => {
       }
       // A resumed attach is followed by everything this tab missed, back to
       // back, up to the hub's position now (msg.seq).  Drawn a message at a
-      // time, a tab Chrome had frozen took seconds to catch up, repainting
-      // all the way (2026-10-10).  chat.js holds it instead, and draws it in
-      // one go when the last of it is in (onmessage), the socket goes
-      // (_connect, onclose), or the timer runs out.  The hub resumes only a
-      // socket's first attach, so no catch-up is under way here already.
+      // time, a long backlog takes seconds, repainting all the way, so
+      // chat.js holds it and draws it in one go when the last of it is in
+      // (onmessage), the socket goes (_connect, onclose), or the timer runs
+      // out.  The hub resumes only a socket's first attach, so no catch-up is
+      // under way here already.
       if (resumedHere && msg.seq > _stream.seq) {
         _catchUpTo = msg.seq;
         Chat.beginCatchUp();

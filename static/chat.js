@@ -319,10 +319,10 @@ const Chat = (() => {
           _autoScroll = false;
         }
         // Otherwise the view is where following left it, and what lies below
-        // arrived since: a burst of messages, not the user leaving.  Judged by
-        // position alone, what a burst adds between a scroll and this check
-        // read as the user scrolling away, and a tab following a catch-up
-        // stopped following partway through it (measured 2026-10-10).
+        // arrived since: a burst of messages, not the user leaving.  Position
+        // alone cannot tell the two apart: what a burst adds between a scroll
+        // and this check looks like the user scrolling away, and a tab
+        // following a catch-up would stop following partway through it.
       }, 60);
     });
   }
@@ -651,10 +651,9 @@ const Chat = (() => {
 
   // A tab that reconnects is sent what it missed back to back, and app.js
   // knows where that ends.  Drawn as it came, a message per task, the browser
-  // repainted between messages, and each message forced a layout or two:
-  // 1,294 messages for a tab hidden for 25 minutes, and frozen, took 1 s with
-  // tool runs collapsed and up to 16 s without (measured 2026-10-10).  So it
-  // is held, and drawn in one go without the layout reads (_drawingInBulk).
+  // would repaint between messages and each message would force a layout or
+  // two, so a backlog of a thousand-odd messages takes seconds.  So it is
+  // held, and drawn in one go without the layout reads (_drawingInBulk).
   function beginCatchUp() { _catchingUp = true; }
 
   function endCatchUp() {

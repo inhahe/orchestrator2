@@ -135,11 +135,11 @@ log = logging.getLogger("orchestrator2")
 
 
 # A launch's ANTHROPIC_API_KEY is for the session that launch opens, and no
-# other (asked for 2026-10-10, as the agent name already was).  Left in the
-# hub's environment, every session's CLI would inherit it, and where the SDK
-# runs the CLI, a key outranks a subscription login without asking.  So the
-# key moves into that session's Config.api_key and out of the environment;
-# a launch that joins a running hub hands it over with its request.  The hub
+# other, as its agent name is.  Left in the hub's environment, every session's
+# CLI would inherit it, and where the SDK runs the CLI, a key outranks a
+# subscription login without asking.  So the key moves into that session's
+# Config.api_key and out of the environment; a launch that joins a running
+# hub hands it over with its request.  The hub
 # remembers the keys of sessions it closed, so one reopened from the lobby
 # keeps its key, and hands them all to its replacement on ⟳ Restart.  Only in
 # memory and in that child's environment: never on disk, never on a command
