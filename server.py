@@ -2850,7 +2850,7 @@ async def _reconfigure(
     new_cwd = config.cwd
     if cwd:
         resolved = str(Path(cwd).resolve(strict=False))
-        if not Path(resolved).exists():
+        if not Path(resolved).is_dir():
             return False, f"directory not found: {cwd}"
         new_cwd = resolved
 
@@ -2881,6 +2881,15 @@ async def _reconfigure(
     target = _session_to_open(new_resume, new_cwd, config.config_dir,
                               continue_recent=bool(cwd) and not config.no_continue)
 
+    # Into the new directory before anything is torn down: one that has gone
+    # (the tab's own, which a session that cannot be followed resumes in) is
+    # an error while the tab still has a working session, not a dead tab.
+    if new_resume or cwd:
+        try:
+            os.chdir(new_cwd)
+        except OSError as exc:
+            return False, f"cannot work in {new_cwd}: {exc.strerror or exc}"
+
     # --- Stop existing bridge ---
     # The session being left keeps the key it ran with.
     if _default_runtime is not None:
@@ -2904,8 +2913,13 @@ async def _reconfigure(
         overrides["session_note"] = None
     # Its API key likewise: a key is its session's, so the session switched
     # to runs with its own, if it ran with one, and never with the one left.
+    # A tab that has not started a session yet -- the picker, or a new
+    # conversation before its first turn -- has nothing to leave the key
+    # with, so the key goes with the tab.
     overrides["api_key"] = _session_key(
-        target, config.api_key if _picker_mode else None)
+        target,
+        config.api_key if _picker_mode or not getattr(state, "session_id", None)
+        else None)
     config = dataclasses.replace(config, **overrides)
 
     # --- Reinitialise state + bridge ---
@@ -2928,10 +2942,8 @@ async def _reconfigure(
         title = read_session_title(new_resume, config.config_dir)
         if title:
             state.session_title = title
-        os.chdir(new_cwd)
         bridge._initial_resume_id = new_resume
     elif cwd:
-        os.chdir(new_cwd)
         # Seed session from the new cwd (continue most recent, found above).
         if target is not None:
             state.session_id = target

@@ -544,6 +544,49 @@ def test_a_session_whose_directory_is_gone_resumes_where_the_tab_is(machine, mon
     assert cfg.cwd == str(Path(machine.orch).resolve())
 
 
+class _RunningBridge(_QuietBridge):
+    stopped = False
+
+    async def stop(self):
+        _RunningBridge.stopped = True
+
+
+def _switched_from_a_tab_in(machine, monkeypatch, tab_cwd, **where):
+    """``_reconfigure(**where)`` from a primary tab working in *tab_cwd*."""
+    import sdk_bridge
+    monkeypatch.setattr(sdk_bridge, "SDKBridge", _QuietBridge)
+    monkeypatch.setattr(server, "_attach_queue_persistence",
+                        lambda st, cwd, config_dir=None: 0)
+    monkeypatch.setattr(server, "config", dataclasses.replace(
+        parse_args([]), cwd=tab_cwd, config_dir=str(machine.default)))
+    monkeypatch.setattr(server, "state", State())
+    _RunningBridge.stopped = False
+    monkeypatch.setattr(server, "bridge", _RunningBridge(None, None, None))
+    monkeypatch.setattr(server, "_default_runtime", None)
+    monkeypatch.setattr(server, "_picker_mode", False)
+    monkeypatch.chdir(machine.orch)
+    return asyncio.run(server._reconfigure(**where))
+
+
+def test_a_resume_with_nowhere_to_run_leaves_the_tab_working(machine, monkeypatch,
+                                                            tmp_path):
+    """Neither the session's directory nor the tab's exists any more."""
+    _session(machine.default, str(tmp_path / "deleted"), LIVE, "OS F")
+    ok, err = _switched_from_a_tab_in(machine, monkeypatch,
+                                      str(tmp_path / "also-deleted"), resume=LIVE)
+    assert not ok and "also-deleted" in err
+    assert not _RunningBridge.stopped
+
+
+def test_cwd_to_a_file_is_refused(machine, monkeypatch, tmp_path):
+    a_file = tmp_path / "notes.txt"
+    a_file.write_text("x", encoding="utf-8")
+    ok, err = _switched_from_a_tab_in(machine, monkeypatch, machine.orch,
+                                      cwd=str(a_file))
+    assert not ok and "directory not found" in err
+    assert not _RunningBridge.stopped
+
+
 def test_a_directory_given_with_the_resume_is_kept(machine, monkeypatch):
     _session(machine.default, machine.os, LIVE, "OS F")
     cfg = _resumed_from_the_orchestrator(machine, monkeypatch, LIVE, cwd=machine.orch)

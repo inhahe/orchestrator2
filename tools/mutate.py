@@ -4978,6 +4978,14 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
      "        _replace_runtime_config(_default_runtime, cwd=resolved)\n",
      ""),
 
+    ("/cwd takes a file for a directory",
+     "        if not Path(resolved).is_dir():\n"
+     '            return False, f"directory not found: {cwd}"\n',
+     "        if not Path(resolved).exists():\n"
+     '            return False, f"directory not found: {cwd}"\n'),
+    ("the tab is torn down before its new directory is tried",
+     '            return False, f"cannot work in {new_cwd}: {exc.strerror or exc}"\n',
+     "            pass\n"),
     ("a session's directory is taken though it no longer exists",
      "    return resolved if Path(resolved).is_dir() else None\n",
      "    return resolved\n"),
@@ -6101,16 +6109,22 @@ SESSIONKEY_SERVER_MUTATIONS = [
 
     ("/resume carries the tab's key to the session it switches to",
      '    overrides["api_key"] = _session_key(\n'
-     "        target, config.api_key if _picker_mode else None)\n",
+     "        target,\n"
+     '        config.api_key if _picker_mode or not getattr(state, "session_id", None)\n'
+     "        else None)\n",
      ""),
 
     ("/resume gives the session it switches to no key of its own",
-     "        target, config.api_key if _picker_mode else None)\n",
-     "        None, config.api_key if _picker_mode else None)\n"),
+     "        target,\n        config.api_key if _picker_mode or not",
+     "        None,\n        config.api_key if _picker_mode or not"),
 
     ("the session picked in the picker loses the launch's key",
-     "        target, config.api_key if _picker_mode else None)\n",
-     "        target, None)\n"),
+     "        config.api_key if _picker_mode or not getattr(",
+     "        config.api_key if not getattr("),
+
+    ("a tab yet to start a session loses the launch's key on /cwd",
+     '        config.api_key if _picker_mode or not getattr(state, "session_id", None)\n',
+     "        config.api_key if _picker_mode\n"),
 
     ("/resume forgets the key of the session it leaves",
      "    if _default_runtime is not None:\n"

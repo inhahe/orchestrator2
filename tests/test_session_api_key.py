@@ -475,8 +475,8 @@ class _QuietBridge:
         pass
 
 
-def _switch(monkeypatch, tmp_path, *, key, picking=False, **where):
-    """The primary tab, on sid-a with *key*, switched with /resume or /cwd."""
+def _switch(monkeypatch, tmp_path, *, key, picking=False, sid="sid-a", **where):
+    """The primary tab, on *sid* with *key*, switched with /resume or /cwd."""
     import sdk_bridge
     from session_runtime import SessionRuntime
     monkeypatch.setattr(sdk_bridge, "SDKBridge", _QuietBridge)
@@ -488,7 +488,7 @@ def _switch(monkeypatch, tmp_path, *, key, picking=False, **where):
     monkeypatch.setattr(server, "find_session_cwd", lambda _s, _d=None: None)
     cfg = dataclasses.replace(parse_args([]), api_key=key, cwd=str(tmp_path))
     st = State()
-    st.session_id = "sid-a"
+    st.session_id = sid
     rt = SessionRuntime(config=cfg, state=st, rid="R0")
     monkeypatch.setattr(server, "config", cfg)
     monkeypatch.setattr(server, "state", st)
@@ -521,6 +521,15 @@ def test_cwd_gives_the_session_it_continues_the_key_it_ran_with(monkeypatch, tmp
     cfg = _switch(monkeypatch, tmp_path, key=KEY, cwd=str(tmp_path))
     assert cfg.api_key == OTHER
     assert server.state.session_id == "sid-recent"
+
+
+def test_a_tab_yet_to_start_a_session_takes_its_key_along(monkeypatch, tmp_path):
+    """A new conversation has no id to leave the key with before its first
+    turn: /cwd then must not lose the key the launch brought."""
+    monkeypatch.setattr(server, "find_most_recent_session_for_cwd",
+                        lambda _c, _d=None: None)
+    cfg = _switch(monkeypatch, tmp_path, key=KEY, sid=None, cwd=str(tmp_path))
+    assert cfg.api_key == KEY
 
 
 def test_the_session_picked_in_the_picker_gets_the_launchs_key(monkeypatch, tmp_path):
