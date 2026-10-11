@@ -452,15 +452,44 @@ def test_a_restarts_replacement_still_to_choose_shows_no_console_picker():
 # A key follows its session, not the tab showing it
 # --------------------------------------------------------------------------
 
-def test_every_tick_remembers_the_key_a_session_runs_with(monkeypatch):
-    # So an id the runtime leaves -- /clear, /resume -- keeps it.  Viewers or not.
-    from session_runtime import SessionRuntime
-    st = State()
-    st.session_id = "sid-before-clear"
-    rt = SessionRuntime(config=dataclasses.replace(parse_args([]), api_key=KEY),
-                        state=st, rid="R5")
-    asyncio.run(server._tick_runtime(rt))
-    assert server._session_api_keys == {"sid-before-clear": KEY}
+def _named_by_the_cli(monkeypatch, key, *messages):
+    """A hub bridge running with *key*, handed *messages* by its CLI."""
+    import sdk_bridge
+    monkeypatch.setattr(sdk_bridge, "read_session_title", lambda _s, _d=None: None)
+
+    async def bcast(_msg):
+        pass
+
+    br = server._new_bridge(dataclasses.replace(parse_args([]), api_key=key),
+                            State(), bcast)
+
+    async def go():
+        for m in messages:
+            await br._handle_system_message(m, during_turn=True)
+    asyncio.run(go())
+    return br
+
+
+def _init(sid):
+    return types.SimpleNamespace(subtype="init", data={
+        "session_id": sid, "apiKeySource": "ANTHROPIC_API_KEY"})
+
+
+def test_a_sessions_key_is_remembered_the_moment_its_cli_names_it(monkeypatch):
+    # So an id the runtime leaves at once -- /clear, /resume -- keeps it.
+    _named_by_the_cli(monkeypatch, KEY, _init("sid-new"))
+    assert server._session_api_keys == {"sid-new": KEY}
+
+
+def test_each_id_the_cli_gives_keeps_the_key(monkeypatch):
+    # The SDK started another session than the one asked for.
+    _named_by_the_cli(monkeypatch, KEY, _init("sid-asked"), _init("sid-started"))
+    assert server._session_api_keys == {"sid-asked": KEY, "sid-started": KEY}
+
+
+def test_a_session_without_a_key_is_named_with_none(monkeypatch):
+    _named_by_the_cli(monkeypatch, None, _init("sid-new"))
+    assert server._session_api_keys == {}
 
 
 class _QuietBridge:

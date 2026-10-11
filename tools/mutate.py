@@ -6111,9 +6111,15 @@ SESSIONKEY_SERVER_MUTATIONS = [
      "    return launch_key or (_session_api_keys.get(sid) if sid else None)\n",
      "    return (_session_api_keys.get(sid) if sid else None) or launch_key\n"),
 
-    ("a session left by /clear or /resume forgets its key",
-     "    _remember_session_key(rt)\n    st, cfg = rt.state, rt.config\n",
-     "    st, cfg = rt.state, rt.config\n"),
+    ("a hub bridge does not report the session ids its CLI gives",
+     "    br.on_session_id = _note_session_key\n",
+     ""),
+
+    ("a session named with a key is not remembered with it",
+     "    key = getattr(cfg, \"api_key\", None)\n    if key:\n"
+     "        _session_api_keys[sid] = key\n",
+     "    key = getattr(cfg, \"api_key\", None)\n    if key:\n"
+     "        pass\n"),
 
     ("a restart's replacement opens a session without the key it ran with",
      "    if not cfg.api_key:\n        key = _session_key(resume_id)\n",
@@ -6295,6 +6301,15 @@ SESSIONKEY_BRIDGE_MUTATIONS = [
      '        if getattr(self.config, "api_key", None):\n'
      '            kwargs["env"]["ANTHROPIC_API_KEY"] = self.config.api_key\n',
      ""),
+
+    ("a session id the CLI gives is not reported",
+     "        if self.on_session_id is not None:\n"
+     "            self.on_session_id(sid, self.config)\n",
+     ""),
+
+    ("an init's session id is not reported",
+     "            if sid:\n                self._take_session_id(sid)\n",
+     "            if sid:\n                self.state.session_id = sid\n"),
 ]
 
 SESSIONKEY_BTW_MUTATIONS = [

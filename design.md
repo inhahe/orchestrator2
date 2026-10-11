@@ -2193,10 +2193,14 @@ every account, so:
   reconnects, since the key is fixed when the CLI starts; a launch without
   one leaves an open session's key alone.
 - **The key is the session's, not the tab's, and the hub remembers it while
-  it runs.** Every tick records each live session's key by its session id in
-  `_session_api_keys` (`_remember_session_key`, also at teardown), so an id a
-  runtime leaves keeps the key it ran with: a session closed, or left by
-  `/clear` or `/resume`. Every path that opens a session asks `_session_key`:
+  it runs.** A session's key is recorded by its id in `_session_api_keys` the
+  moment the session has one: every id a CLI gives its bridge (an init, a
+  result, a trim's new transcript) goes through `SDKBridge._take_session_id`
+  to `on_session_id`, which every hub bridge (`_new_bridge`) points at
+  `_note_session_key`. The hub's own departures (teardown, `/cwd`, `/resume`)
+  also record it (`_remember_session_key`), for a session it seeded whose CLI
+  has not named it yet. So an id a runtime leaves keeps the key it ran with:
+  a session closed, or left by `/clear` or `/resume`, however soon. Every path that opens a session asks `_session_key`:
   the opening launch's own key if it brought one, else the one the session
   ran with. So a session reopened from the lobby, resumed with `/resume`,
   continued by `/cwd`, picked in the picker, or brought back by ⟳ Restart

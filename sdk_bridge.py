@@ -885,6 +885,10 @@ class SDKBridge:
         self._dispatcher_task: asyncio.Task | None = None
         self._worker_task: asyncio.Task | None = None
         self._initial_resume_id: str | None = None
+        # Told every session id the CLI gives this bridge, with the Config it
+        # runs on: the hub remembers the session's API key under the id from
+        # that moment (see _take_session_id).
+        self.on_session_id: Callable[[str, Config], None] | None = None
         # Set by connect(), consumed by the new CLI's first init.
         self._cost_settle_due = False
         # Monotonic stamp of the last background-task liveness probe.
@@ -1057,6 +1061,18 @@ class SDKBridge:
             unknown = _EFFORT_UNKNOWN_RE.search(line)
             if unknown is not None:
                 self._effort_refused(unknown.group(1), line)
+
+    def _take_session_id(self, sid: str) -> None:
+        """Make *sid* the session this bridge runs, and tell ``on_session_id``.
+
+        Every id the CLI gives (an init, a result, a trim's new transcript)
+        comes through here, so whatever must hold for a session from the
+        moment it has an id -- the hub's record of its key -- holds before
+        any ``/clear`` or switch can take the id away again.
+        """
+        self.state.session_id = sid
+        if self.on_session_id is not None:
+            self.on_session_id(sid, self.config)
 
     def _effort_refused(self, level: str, line: str) -> None:
         """The CLI ignored effort *level*; *line* is its warning saying so.
@@ -3209,7 +3225,7 @@ class SDKBridge:
 
         elif isinstance(msg, ResultMessage):
             if msg.session_id:
-                state.session_id = msg.session_id
+                self._take_session_id(msg.session_id)
             raw_usage = getattr(msg, "usage", None)
             raw_model_usage = getattr(msg, "model_usage", None)
             if isinstance(raw_usage, dict):
@@ -4215,7 +4231,7 @@ class SDKBridge:
                 await self._settle_cost(data_dict.get("claude_code_version"), sid)
             old_sid = state.session_id
             if sid:
-                state.session_id = sid
+                self._take_session_id(sid)
                 # Don't clobber a user-set pending title with a (title-less)
                 # disk read — keep showing what /rename set until we can
                 # persist it.
@@ -4985,7 +5001,7 @@ class SDKBridge:
                         current_streaming_text = ""
 
                     if msg.session_id:
-                        state.session_id = msg.session_id
+                        self._take_session_id(msg.session_id)
 
                     # The CLI's own "idle" follows in the same instant --
                     # measured -- and so is routed here too, into a queue that
@@ -6206,7 +6222,7 @@ class SDKBridge:
                                        getattr(config, "config_dir", None))
             new_sid = trim_session(state.session_id, proj, max_ctx)
             if new_sid:
-                state.session_id = new_sid
+                self._take_session_id(new_sid)
                 await self.reconnect()
                 await self.broadcast({
                     "type": "system_msg", "subtype": "info",

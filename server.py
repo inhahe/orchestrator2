@@ -207,16 +207,41 @@ def _take_handed_over_keys() -> dict[str, str]:
             if isinstance(sid, str) and sid and isinstance(key, str) and key}
 
 
+def _note_session_key(sid: str, cfg: Config) -> None:
+    """Remember that session *sid* runs with *cfg*'s key, if it has one.
+
+    Every bridge's ``on_session_id``: called the moment the CLI gives a
+    session its id, so an id the runtime later leaves -- closed, ``/clear``,
+    ``/resume`` elsewhere -- keeps the key it ran with.
+    """
+    key = getattr(cfg, "api_key", None)
+    if key:
+        _session_api_keys[sid] = key
+
+
+def _new_bridge(cfg: Config, st: State, broadcaster: Any) -> "SDKBridge":
+    """An SDKBridge for one of the hub's runtimes, which remembers its
+    sessions' keys (``_note_session_key``).
+
+    Imports sdk_bridge, which pulls in claude_agent_sdk and mcp: the first
+    call, from ``_deferred_bridge_startup``, is kept off the hot path.
+    """
+    from sdk_bridge import SDKBridge
+    br = SDKBridge(config=cfg, state=st, broadcaster=broadcaster)
+    br.on_session_id = _note_session_key
+    return br
+
+
 def _remember_session_key(rt: "SessionRuntime") -> None:
     """Remember the key *rt*'s session runs with, by the session's id.
 
-    Every tick and at teardown, so a session id the runtime leaves -- closed,
-    ``/clear``, ``/resume`` elsewhere -- keeps the key it ran with.
+    Where the hub itself makes a runtime leave its session (teardown,
+    ``/cwd``, ``/resume``): a session it seeded may not have reached its
+    CLI, and so ``on_session_id``, yet.
     """
-    key = getattr(rt.config, "api_key", None)
     sid = getattr(rt.state, "session_id", None)
-    if key and sid:
-        _session_api_keys[sid] = key
+    if sid:
+        _note_session_key(sid, rt.config)
 
 
 def _session_key(sid: str | None, launch_key: str | None = None) -> str | None:
@@ -1258,8 +1283,6 @@ async def _tick_runtime(rt: SessionRuntime) -> bool:
     Split out of the ticker loop so the suppression rule is testable without
     driving an infinite loop.
     """
-    # Viewers or not: a session id this runtime leaves keeps its key.
-    _remember_session_key(rt)
     st, cfg = rt.state, rt.config
     if st is None or cfg is None or not rt.clients:
         return False
@@ -1597,9 +1620,8 @@ async def _deferred_bridge_startup(*, start: bool) -> None:
     """
     global bridge
     try:
-        from sdk_bridge import SDKBridge  # heavy import, kept off the hot path
         _bcast = _default_runtime.broadcast if _default_runtime is not None else broadcast
-        bridge = SDKBridge(config=config, state=state, broadcaster=_bcast)
+        bridge = _new_bridge(config, state, _bcast)
         if _default_runtime is not None:
             _default_runtime.bridge = bridge
         if _pending_resume_id:
@@ -1746,8 +1768,7 @@ async def _create_runtime(
     rt = SessionRuntime(config=cfg, state=st)
     runtimes[rt.rid] = rt
 
-    from sdk_bridge import SDKBridge  # already imported by now; cheap
-    br = SDKBridge(config=cfg, state=st, broadcaster=rt.broadcast)
+    br = _new_bridge(cfg, st, rt.broadcast)
     rt.bridge = br
 
     if seed_id:
@@ -2923,10 +2944,9 @@ async def _reconfigure(
     config = dataclasses.replace(config, **overrides)
 
     # --- Reinitialise state + bridge ---
-    from sdk_bridge import SDKBridge  # already imported once by now; cheap
     state = init_state_from_config(config)
     _bcast = _default_runtime.broadcast if _default_runtime is not None else broadcast
-    bridge = SDKBridge(config=config, state=state, broadcaster=_bcast)
+    bridge = _new_bridge(config, state, _bcast)
     _bridge_ready.set()
 
     # Keep the default runtime pointing at the fresh config/state/bridge so the
