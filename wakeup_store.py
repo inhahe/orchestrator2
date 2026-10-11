@@ -45,6 +45,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterator, NamedTuple
 
+from account import account_dir
+
 #: A record older than this is not a schedule, it is litter.
 WAKEUP_MAX_AGE_S = 24 * 3600
 
@@ -76,9 +78,7 @@ def _sanitize(s: str) -> str:
 
 
 def _state_dir() -> Path:
-    base = os.environ.get("CLAUDE_CONFIG_DIR")
-    root = Path(base) if base else Path.home() / ".claude"
-    return root / "orchestrator2" / "wakeups"
+    return account_dir() / "orchestrator2" / "wakeups"
 
 
 def wakeup_file_for(cwd: str, session_id: str) -> Path:

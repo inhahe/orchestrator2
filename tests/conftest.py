@@ -13,11 +13,22 @@ default rather than something each file has to remember.
 **No test inherits a name from the developer's shell** (``ORCH2_AGENT_NAME``,
 ``CLAUDE_CODE_SESSION_NAME``): ``parse_args`` consumes the first, and a
 session running this suite from its Bash tool carries the second.
+
+**No test inherits another's account.**  ``account.adopt_from_environment``
+makes the process's account module state; each test starts un-adopted, so
+the environment is the account, as for a tool.
 """
 
 from __future__ import annotations
 
+import os
+import sys
+
 import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import account  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -27,3 +38,9 @@ def _private_agent_registry(monkeypatch, tmp_path_factory):
         str(tmp_path_factory.mktemp("agent-registry") / "agents.db"))
     monkeypatch.delenv("ORCH2_AGENT_NAME", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_SESSION_NAME", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _unadopted_account(monkeypatch):
+    monkeypatch.setattr(account, "_adopted", False)
+    monkeypatch.setattr(account, "_hub", None)

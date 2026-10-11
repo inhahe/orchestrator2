@@ -245,8 +245,9 @@ session ran in (`find_session_cwd`), unless a directory was given with the
 resume. Changing the hub process's directory alone left the CLI where it was.
 
 **A session on another account is opened in that account by name, never
-through the hub's environment.** `main()` sets `CLAUDE_CONFIG_DIR` once, at
-launch, and nothing changes it afterwards. Everything about a session takes
+through the hub's environment.** The hub has no `CLAUDE_CONFIG_DIR` in its
+environment at all (below); its own account is fixed at launch
+(`account.hub_account`). Everything about a session takes
 its config dir explicitly: `find_most_recent_session_for_cwd`,
 `project_dir_for_cwd` (the context trim's too), `init_state_from_config`'s
 account details and plan, and the files a session keeps, its queued prompts
@@ -254,6 +255,34 @@ and its record of background tasks, which live in its own account so they
 follow it to whichever hub opens it. Pointing the environment at the session's
 account for a moment instead would show any worker thread reading it then --
 the sign-in watcher, a model-list fetch -- another account.
+
+**A CLI on the default account runs with `CLAUDE_CONFIG_DIR` unset**
+(`account.py`). The CLI reads the variable for two things: where an account's
+files are (`$CLAUDE_CONFIG_DIR`, else `~/.claude`), and where its *global*
+config is -- user-scope MCP servers, trusted projects, the account's details
+-- which is `$CLAUDE_CONFIG_DIR/.claude.json` when the variable is set and
+`~/.claude.json` when it is not (`getGlobalClaudeFile` in Claude Code's
+`utils/env.ts`). So `~/.claude` named outright is the default account with a
+second global config that a plain `claude` never sees. The SDK starts a CLI
+with the hub's environment plus what the session adds, and cannot take a
+variable away, so `main()` takes `CLAUDE_CONFIG_DIR` out of the hub's
+environment at once (`account.adopt_from_environment`, `--config-dir`
+winning) and puts the account in the primary session's Config. From then on:
+
+- every lookup that means "the hub's account" asks `account.hub_account()` /
+  `account.account_dir()`, not the environment;
+- every CLI -- a session's (`SDKBridge._make_options`), a side question's
+  (`btw.py`), a sign-in's (`auth._auth_env`) -- is given the variable only
+  for an account that is not the default (`account.cli_config_dir`), so the
+  default, by name or not, finds it unset;
+- a process of ours that needs the account -- the `--resume` picker, the
+  `--detach` child, the ⟳ Restart replacement -- is handed it
+  (`account.child_env`) and adopts it in turn.
+
+A launch joining a hub still sends its account by name, `~/.claude` for the
+default, because the hub may run on another one; the name only becomes
+"unset" where a CLI is started. Before `adopt_from_environment` runs -- a
+tool, a test -- the environment is the account, as for the CLI.
 
 ### Connecting
 
@@ -1951,8 +1980,8 @@ Note that `/model <id>` never validates the id against the list, so any model
 can be selected by name regardless of what the picker shows.
 
 Caveat: the cache is process-global, but credentials are per config dir.
-`main()` pins `CLAUDE_CONFIG_DIR` for the process, so the list reflects the
-*hub's* account even for a runtime opened under a different one.
+It is fetched with the hub's account (`account.account_dir()`), so the list
+reflects the *hub's* account even for a runtime opened under a different one.
 
 ## 6f. Plan limits: `/usage` (`plan_usage.py`, `static/usage.js`)
 
@@ -1974,8 +2003,8 @@ come from the login record, which is also how the TUI decides whether there
 is a Sonnet-only limit.
 
 **Whose limits.** They are the *runtime's* account's:
-`plan_usage.usage_report(rt.config.config_dir)`, falling back to the process's
-`CLAUDE_CONFIG_DIR` like everything else (§6a's model list is the exception,
+`plan_usage.usage_report(rt.config.config_dir)`, falling back to the hub's
+account like everything else (§6a's model list is the exception,
 because it is process-global). A session moved to another account shows that
 account's limits, and the report names the account (email, or the config
 dir's folder) because one hub runs several.
@@ -2052,7 +2081,7 @@ how to use them. if not, implement it?"*. The CLI always could; the hub could
 not tell which a session was using.
 
 **The CLI decides, and a key wins.** The SDK starts each session's CLI with
-the hub's environment plus the session's `CLAUDE_CONFIG_DIR`, and runs it
+the hub's environment plus the session's account, and runs it
 non-interactively, where the CLI uses an API key without asking and turns its
 subscription login off. Measured against CLI 2.1.280 with fake credentials (a
 401 names the credential that was sent):
@@ -2077,13 +2106,10 @@ and in the home directory, beside `~/.claude`, when it is not; a legacy
 `.config.json` in the config dir wins over both. `state.global_config_path`
 is the one place that knows this: the account details (`detect_account_info`,
 and through it `/usage`'s header and `/move`'s account names) and the login
-fingerprint all read the file it names. The default `~/.claude` given by name
-is a CLI's `CLAUDE_CONFIG_DIR` like any other, so it names
-`~/.claude/.claude.json`, which only a CLI started that way writes. Until one
-has, `detect_account_info` reads the account from `~/.claude.json`: the same
-login, since the credentials are in `~/.claude` either way. (That a session's
-CLI is started that way at all is an open issue: see known-issues.md, "A
-default-account session's CLI reads a second global config".)
+fingerprint all read the file it names. It names it for the CLI as the hub
+starts it, so for the default account -- `~/.claude` by name included, which
+its CLI finds unset (see "A CLI on the default account runs with
+`CLAUDE_CONFIG_DIR` unset") -- `~/.claude.json`.
 
 **What the session is billed to comes from its `init` message.** Each turn's
 `init` carries `apiKeySource`: `ANTHROPIC_API_KEY` (the environment or

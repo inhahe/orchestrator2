@@ -18,6 +18,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from account import account_dir
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -245,8 +247,7 @@ MODEL_CACHE_TTL = 3600.0
 
 def _read_oauth_token() -> str | None:
     """Read the Claude Code OAuth access token from credentials, if present."""
-    base = os.environ.get("CLAUDE_CONFIG_DIR")
-    path = Path(base if base else Path.home() / ".claude") / ".credentials.json"
+    path = account_dir() / ".credentials.json"
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -295,7 +296,7 @@ def fetch_available_models(timeout: float = 6.0,
         if not token:
             log.warning("model list: no credentials (no ANTHROPIC_API_KEY and "
                         "no OAuth token in %s) — using the fallback list",
-                        os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
+                        account_dir())
             return None
         headers["Authorization"] = f"Bearer {token}"
         headers["anthropic-beta"] = "oauth-2025-04-20"

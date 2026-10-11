@@ -78,6 +78,7 @@ except Exception:  # pragma: no cover - defensive
 #: several accounts write to.
 AGENT_POLL_INTERVAL = 5.0
 
+from account import cli_config_dir
 from config import (
     DISPATCHER_DEAD,
     INTERRUPT_SENTINEL,
@@ -1222,11 +1223,12 @@ class SDKBridge:
         # is the only way to keep it out of the children.
         os.environ.pop("CLAUDE_CODE_SESSION_NAME", None)
 
-        # Cross-account hub support: if the session's config specifies a
-        # non-default CLAUDE_CONFIG_DIR, inject it into the subprocess env
-        # so the bridge connects with the correct account.
-        if getattr(self.config, "config_dir", None):
-            kwargs["env"]["CLAUDE_CONFIG_DIR"] = self.config.config_dir
+        # The session's account (its own, else the hub's): named for any but
+        # the default, which the CLI must find unset -- see account.py.  The
+        # hub's environment carries none, so nothing else can give it one.
+        cli_dir = cli_config_dir(getattr(self.config, "config_dir", None))
+        if cli_dir:
+            kwargs["env"]["CLAUDE_CONFIG_DIR"] = cli_dir
 
         # The session's own API key, from the launch that opened it
         # (Config.api_key).  The hub's environment carries none, so a session
@@ -1547,7 +1549,7 @@ class SDKBridge:
         # Re-read account details each connect so a fresh /login (then /connect)
         # updates the displayed email/plan without a restart.  Scoped to this
         # runtime's account dir — a cross-account session must read its own
-        # CLAUDE_CONFIG_DIR, not the hub process's env account.
+        # account, not the hub's.
         try:
             self.state.account = detect_account_info(getattr(self.config, "config_dir", None))
         except Exception:

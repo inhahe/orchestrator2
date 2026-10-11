@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from account import account_dir, cli_config_dir
 from config import (
     MARKERS,
     RL_TYPE_LABEL,
@@ -193,8 +194,7 @@ def check_authentication() -> tuple[bool, str]:
         val = os.environ.get(v, "").strip().lower()
         if val and val not in ("0", "false", "no"):
             return True, f"{v} set"
-    base = os.environ.get("CLAUDE_CONFIG_DIR")
-    path = Path(base if base else Path.home() / ".claude") / ".credentials.json"
+    path = account_dir() / ".credentials.json"
     if path.exists():
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -237,54 +237,27 @@ def detect_subscription_plan(config_dir: str | None = None) -> str | None:
 
 
 def config_dir_path(config_dir: str | None = None) -> Path:
-    """Resolve a Claude config dir.
-
-    An explicit ``config_dir`` (a cross-account runtime's dir) wins; otherwise
-    fall back to the process env (``CLAUDE_CONFIG_DIR``) or ``~/.claude``.
+    """Where account *config_dir* keeps its files: it, if given (a
+    cross-account runtime's), else the hub's account (``account.account_dir``).
     """
-    base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
-    return Path(base) if base else Path.home() / ".claude"
+    return account_dir(config_dir)
 
 
 def global_config_path(config_dir: str | None = None) -> Path:
     """The Claude CLI's own config file for an account: its ``.claude.json``.
 
-    *config_dir* is the account's ``CLAUDE_CONFIG_DIR`` (a session's own);
-    without one, the process environment's.  The CLI keeps the file in that
-    directory when it is set, and in the home directory -- beside
-    ``~/.claude``, not in it -- when it is not.  A legacy ``.config.json`` in
-    the config dir wins over both, as it does for the CLI.
+    *config_dir* is the account (a session's own); without one, the hub's.
+    The CLI keeps the file in its ``CLAUDE_CONFIG_DIR`` when it is given one,
+    and in the home directory -- beside ``~/.claude``, not in it -- when it is
+    not, which is how every CLI on the default account is started
+    (``account.cli_config_dir``).  A legacy ``.config.json`` in the config dir
+    wins over both, as it does for the CLI.
     """
-    base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
-    legacy = config_dir_path(base) / ".config.json"
+    legacy = account_dir(config_dir) / ".config.json"
     if legacy.is_file():
         return legacy
-    return (Path(base) if base else Path.home()) / ".claude.json"
-
-
-def _oauth_account(path: Path) -> dict[str, Any] | None:
-    """The ``oauthAccount`` record of the CLI config file at *path*; None if
-    the file is missing, unreadable or has none."""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return None
-    oauth = data.get("oauthAccount") if isinstance(data, dict) else None
-    return oauth if isinstance(oauth, dict) else None
-
-
-def _names_the_default_dir(config_dir: str | None) -> bool:
-    """Whether the account *config_dir* (else the environment's) is the
-    default ``~/.claude`` given explicitly rather than left unset."""
-    base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
-    if not base:
-        return False
-    default = Path.home() / ".claude"
-    try:
-        return Path(base).resolve() == default.resolve()
-    except OSError:
-        return False
+    cli_dir = cli_config_dir(config_dir)
+    return (Path(cli_dir) if cli_dir else Path.home()) / ".claude.json"
 
 
 def detect_account_info(config_dir: str | None = None) -> dict[str, Any]:
@@ -297,21 +270,18 @@ def detect_account_info(config_dir: str | None = None) -> dict[str, Any]:
     OAuth token in ``.credentials.json``) are deliberately never read here.
 
     ``config_dir`` scopes the read to a specific account (a cross-account hub
-    runtime's dir); without it the process env / default is used.  Where the
-    file is: ``global_config_path``.
-
-    The default ``~/.claude`` named outright is the one account with two such
-    files: a CLI told it keeps its own copy in it, written at its first start,
-    while a plain ``claude`` keeps ``~/.claude.json``.  Both describe the one
-    login whose credentials ``~/.claude`` holds, so until the first exists the
-    second answers.
+    runtime's dir); without it the hub's account is used.  Where the file is:
+    ``global_config_path``.
     """
     cfg = config_dir_path(config_dir)
     info: dict[str, Any] = {"config_dir": str(cfg)}
-    oauth = _oauth_account(global_config_path(config_dir))
-    if oauth is None and _names_the_default_dir(config_dir):
-        oauth = _oauth_account(Path.home() / ".claude.json")
-    if oauth is None:
+    try:
+        with open(global_config_path(config_dir), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return info
+    oauth = data.get("oauthAccount") if isinstance(data, dict) else None
+    if not isinstance(oauth, dict):
         return info
     email = oauth.get("emailAddress")
     if isinstance(email, str) and email:

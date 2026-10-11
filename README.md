@@ -306,6 +306,8 @@ orchestrator2 uses the config dir given by `CLAUDE_CONFIG_DIR` (or `~/.claude` w
 orch --config-dir "C:\Users\me\.claude-alt"
 ```
 
+A session on the default account runs its `claude` with `CLAUDE_CONFIG_DIR` unset, however it was named (`--config-dir ~/.claude` included), so it sees the same user-level MCP servers, trusted projects and settings in `~/.claude.json` as a plain `claude` does. Named outright, the CLI would read a separate `~/.claude/.claude.json` instead.
+
 Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reconnect). The active account is shown in the status bar's **account** field (hover for the config dir).
 
 ### Using an Anthropic API key

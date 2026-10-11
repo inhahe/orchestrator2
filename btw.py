@@ -39,6 +39,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from account import cli_config_dir
 from config import MAX_SDK_MESSAGE_BYTES
 
 # Tools the fork may not use.  Everything that can modify the working tree, the
@@ -105,8 +106,10 @@ def build_btw_options(options_cls: Any, *, config: Any, state: Any,
     }
     if stderr_cb is not None:
         kwargs["stderr"] = stderr_cb
-    if getattr(config, "config_dir", None):
-        kwargs["env"]["CLAUDE_CONFIG_DIR"] = config.config_dir
+    # Its session's account, given as the session's CLI is (account.py).
+    cli_dir = cli_config_dir(getattr(config, "config_dir", None))
+    if cli_dir:
+        kwargs["env"]["CLAUDE_CONFIG_DIR"] = cli_dir
     # Billed as its session is: to the session's own API key, if it has one.
     if getattr(config, "api_key", None):
         kwargs["env"]["ANTHROPIC_API_KEY"] = config.api_key

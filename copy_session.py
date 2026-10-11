@@ -38,6 +38,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from account import account_dir, hub_account
+
 # Title prefix that tells tray_minimizer to leave this window visible (never
 # minimize it to the tray).  Must match tray_minimizer.NO_HIDE_TITLE_PREFIX.
 # When server.py runs us as the --resume/--copy picker in our own console
@@ -82,7 +84,8 @@ def discover_claude_dirs() -> list[Path]:
     """Find candidate ``.claude`` directories on this machine.
 
     Scans the home directory for ``.claude*`` folders that contain a
-    ``projects`` sub-folder, plus ``CLAUDE_CONFIG_DIR`` if set.  Returns a
+    ``projects`` sub-folder, plus this process's account
+    (``account.hub_account``) if it has one elsewhere.  Returns a
     de-duplicated list sorted by name.
     """
     found: dict[str, Path] = {}
@@ -103,9 +106,9 @@ def discover_claude_dirs() -> list[Path]:
     except OSError:
         pass
 
-    env = os.environ.get("CLAUDE_CONFIG_DIR")
-    if env:
-        _consider(Path(env))
+    own = hub_account()
+    if own:
+        _consider(Path(own))
 
     # The plain default, even if it doesn't match the glob for some reason.
     _consider(home / ".claude")
@@ -378,13 +381,9 @@ def _fmt_time(mtime: float) -> str:
 
 
 def current_claude_dir() -> Path:
-    """The .claude directory of the account selected by the environment.
-
-    Mirrors the SDK/CLI resolution: ``CLAUDE_CONFIG_DIR`` if set, else
-    ``~/.claude``.
-    """
-    env = os.environ.get("CLAUDE_CONFIG_DIR")
-    return Path(env) if env else Path.home() / ".claude"
+    """The .claude directory of this process's account
+    (``account.account_dir``): ``CLAUDE_CONFIG_DIR``'s, else ``~/.claude``."""
+    return account_dir()
 
 
 

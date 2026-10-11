@@ -531,17 +531,18 @@ def _config_dirs() -> list:
 
     ``copy_session`` is the lobby's own discovery (stdlib only, imported here
     lazily so this module stays importable on its own); without it, the
-    default account and ``CLAUDE_CONFIG_DIR``.
+    default account and this process's (``account.account_dir``).
     """
     from pathlib import Path
     try:
         from copy_session import discover_claude_dirs
         return list(discover_claude_dirs())
     except Exception:
+        from account import account_dir
         dirs = [Path.home() / ".claude"]
-        env = os.environ.get("CLAUDE_CONFIG_DIR")
-        if env:
-            dirs.append(Path(env))
+        own = account_dir()
+        if own not in dirs:
+            dirs.append(own)
         return dirs
 
 

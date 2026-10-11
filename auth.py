@@ -3,9 +3,9 @@
 Thin wrappers around the ``claude auth`` CLI so the orchestrator can detect
 whether the active config dir is signed in and kick off the same OAuth login
 flows Claude Code uses: a Claude subscription, or an Anthropic Console
-account billed per token.  All calls honour the ``CLAUDE_CONFIG_DIR`` that
-``server.main()`` has already pinned, so login lands in the same session store
-the SDK reads from.
+account billed per token.  Each call is for one account: a session's own,
+or else the hub's (``account.hub_account``), so a login lands where that
+account's CLIs read it.
 """
 
 from __future__ import annotations
@@ -13,13 +13,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import NamedTuple
 
+from account import account_dir, child_env
 from state import global_config_path
 
 log = logging.getLogger("orchestrator2.auth")
@@ -41,26 +41,18 @@ def find_claude_cli() -> str | None:
     return None
 
 
-def _auth_env(config_dir: str | None) -> dict | None:
-    """Build a subprocess env pinned to ``config_dir``'s Claude account.
-
-    Returns ``None`` (inherit the current environment) when no override is
-    given, else a copy of ``os.environ`` with ``CLAUDE_CONFIG_DIR`` set — so a
-    cross-account hub runtime checks / logs in the *right* account instead of
-    the hub process's own env account.
-    """
-    if not config_dir:
-        return None
-    env = dict(os.environ)
-    env["CLAUDE_CONFIG_DIR"] = str(Path(config_dir).resolve())
-    return env
+def _auth_env(config_dir: str | None) -> dict:
+    """The environment for a ``claude auth`` process on account *config_dir*
+    (None: the hub's), so a cross-account runtime checks and signs in to the
+    right account (``account.child_env``)."""
+    return child_env(config_dir)
 
 
 def auth_status(config_dir: str | None = None) -> dict:
     """Return ``claude auth status --json`` as a dict (empty on failure).
 
-    Runs under ``config_dir``'s account when given, else the current process
-    environment's ``CLAUDE_CONFIG_DIR``.  Keys include ``loggedIn`` (bool),
+    Runs under ``config_dir``'s account when given, else the hub's.  Keys
+    include ``loggedIn`` (bool),
     ``email``, ``authMethod``, ``subscriptionType``.
     """
     cli = find_claude_cli()
@@ -92,8 +84,7 @@ def _has_credentials_file(config_dir: str | None = None) -> bool:
     token — so a present token means "effectively signed in".  ``config_dir``
     (a cross-account runtime's dir) overrides the process env.
     """
-    base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
-    path = Path(base if base else Path.home() / ".claude") / ".credentials.json"
+    path = account_dir(config_dir) / ".credentials.json"
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -174,8 +165,7 @@ def credentials_mtime(config_dir: str | None = None) -> float | None:
     reliable than ``claude auth status``, which reports ``loggedIn:true`` even
     for a dead session.
     """
-    base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
-    path = Path(base if base else Path.home() / ".claude") / ".credentials.json"
+    path = account_dir(config_dir) / ".credentials.json"
     try:
         return path.stat().st_mtime
     except OSError:
@@ -230,10 +220,7 @@ def launch_login(*, method: str = "claudeai", new_window: bool = True,
             "manually."
         )
     args = [cli, "auth", "login", f"--{method}"]
-    kwargs: dict = {}
-    env = _auth_env(config_dir)
-    if env is not None:
-        kwargs["env"] = env
+    kwargs: dict = {"env": _auth_env(config_dir)}
     try:
         if sys.platform == "win32" and new_window:
             # New visible console so the interactive login is usable even when

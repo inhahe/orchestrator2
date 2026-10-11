@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from account import account_dir
 from tool_manager import format_tool_header
 
 log = logging.getLogger(__name__)
@@ -54,10 +55,9 @@ def claude_projects_dir(config_dir: str | None = None) -> Path:
 
     *config_dir* explicitly overrides the account (thread-safe, no env
     mutation) — used when loading a cross-account hub session's history.
-    Falls back to ``CLAUDE_CONFIG_DIR`` then ``~/.claude``.
+    Falls back to the hub's account (``account.account_dir``).
     """
-    base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
-    return Path(base if base else Path.home() / ".claude") / "projects"
+    return account_dir(config_dir) / "projects"
 
 
 def _sanitize_cwd(cwd: str) -> str:
@@ -93,11 +93,9 @@ def _sanitize_cwd(cwd: str) -> str:
 QUEUE_MAX_AGE_S = 24 * 3600
 
 def _orch2_state_dir(config_dir: str | None = None) -> Path:
-    """Return ``<config-dir>/orchestrator2``: *config_dir*'s, else
-    ``CLAUDE_CONFIG_DIR``'s, else ``~/.claude``'s."""
-    base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
-    root = Path(base) if base else Path.home() / ".claude"
-    return root / "orchestrator2"
+    """Return ``<config-dir>/orchestrator2``: *config_dir*'s, else the hub's
+    account's."""
+    return account_dir(config_dir) / "orchestrator2"
 
 
 def queue_file_for_cwd(cwd: str, session_id: str | None = None,
@@ -1253,7 +1251,7 @@ def sessions_anywhere() -> list[dict[str, Any]]:
         from copy_session import discover_claude_dirs
         dirs = [str(p) for p in discover_claude_dirs()]
     except Exception:
-        dirs = [os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")]
+        dirs = [str(account_dir())]
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for cdir in dirs:
@@ -1453,17 +1451,15 @@ def write_session_title(
 ) -> None:
     """Set a session's title by appending a ``custom-title`` record.
 
-    *config_dir* scopes the write to a specific account's projects tree.  When
-    it names an account other than the hub process's own
-    ``CLAUDE_CONFIG_DIR``, the SDK ``rename_session`` path is skipped entirely:
-    the SDK resolves the file via the *process* env, so it would either write
-    to the wrong account or fail.  We locate the file ourselves via
-    ``find_session_dir(session_id, config_dir)`` and append the record
-    directly, which is account-correct and side-effect-free.
+    *config_dir* scopes the write to a specific account's projects tree.  The
+    file is found with ``find_session_dir(session_id, config_dir)`` and the
+    record appended directly, byte-identical to what the CLI and the SDK's
+    ``rename_session`` write -- but in the right account, where the SDK's
+    helper looks only in the one its process environment names.
 
-    Either way the rename is also *pinned* on our side (``_pin_rename``),
-    because appending to the JSONL alone does not make a rename stick — see the
-    long note above ``_RENAME_PIN_PATH``.
+    The rename is also *pinned* on our side (``_pin_rename``), because
+    appending to the JSONL alone does not make a rename stick — see the long
+    note above ``_RENAME_PIN_PATH``.
     """
     project = find_session_dir(session_id, config_dir)
     jsonl = (project / f"{session_id}.jsonl") if project is not None else None
@@ -1473,38 +1469,6 @@ def write_session_title(
     prev = (_resolve_title_raw(jsonl)[0]
             if jsonl is not None and jsonl.exists() else None)
 
-    # Only trust the SDK helper when we're targeting the process's own
-    # account (config_dir is None or matches the env).  Otherwise the SDK's
-    # env-scoped lookup would misfire, so go straight to the manual append.
-    env_dir = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip() or None
-    same_account = config_dir is None or (
-        env_dir is not None and os.path.normpath(config_dir) == os.path.normpath(env_dir)
-    )
-    if same_account:
-        sdk_ok = False
-        try:
-            from claude_agent_sdk import rename_session as _sdk_rename  # type: ignore
-            # The SDK appends with O_APPEND exactly as we do, so it lands after
-            # a dirty tail exactly as we would. Heal first either way.
-            if jsonl is not None and jsonl.exists():
-                heal_tail_before_append(jsonl)
-            _sdk_rename(session_id, title)
-            sdk_ok = True
-        except (ImportError, AttributeError):
-            pass
-        except FileNotFoundError:
-            # The SDK searches by its own project-dir logic and may miss the
-            # file (e.g. a non-default CLAUDE_CONFIG_DIR).  Fall through to the
-            # manual append, which locates the file via our find_session_dir.
-            pass
-        if sdk_ok:
-            # Preferred path: it goes through the running CLI, which also
-            # updates that process's in-memory title — so its next compaction
-            # stamp agrees with us instead of fighting us.  Pin anyway: the CLI
-            # process can be replaced (resume) and lose that memory.
-            if jsonl is not None:
-                _pin_rename(jsonl, title, prev)
-            return
     if project is None:
         raise OSError(f"session {session_id} not found on disk")
     assert jsonl is not None
@@ -2275,7 +2239,7 @@ def list_projects(config_dir: str | None = None) -> list[dict[str, Any]]:
     """Light-weight project listing (for session picker / REST endpoint).
 
     *config_dir* overrides which account's ``projects`` dir is scanned; when
-    ``None`` it falls back to ``CLAUDE_CONFIG_DIR`` / ``~/.claude``.
+    ``None`` it is the hub's account's.
     """
     projects_dir = claude_projects_dir(config_dir)
     if not projects_dir.exists():

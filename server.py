@@ -71,6 +71,14 @@ if TYPE_CHECKING:  # pragma: no cover
     )
     from sdk_bridge import SDKBridge  # noqa: F401
 
+from account import (
+    account_dir,
+    adopt_from_environment,
+    child_env,
+    default_dir,
+    hub_account,
+    set_hub_account,
+)
 from config import (
     WAKEUP_DEFAULT_DELAY,
     WAKEUP_MAX_DELAY,
@@ -170,10 +178,10 @@ def _take_launch_api_key() -> str | None:
 def _detach_child_env(cfg: Config) -> dict[str, str]:
     """The environment for the headless child a ``--detach`` launch hands off to.
 
-    The same launch, finished in another process, so it is given the key this
-    one took out of its environment.
+    The same launch, finished in another process, so it is given the account
+    and the key this one took out of its environment.
     """
-    env = dict(os.environ)
+    env = child_env(cfg.config_dir)
     if cfg.api_key:
         env["ANTHROPIC_API_KEY"] = cfg.api_key
     return env
@@ -327,7 +335,7 @@ def _replace_runtime_config(rt: "SessionRuntime", **changes: Any) -> None:
 def _ensure_logged_in(*, block: bool, api_key: str | None = None) -> bool:
     """Auto-login to the Claude account (the way Claude Code does) if needed.
 
-    Runs under the CLAUDE_CONFIG_DIR already pinned by ``main()``.  When not
+    Runs in the hub's account, adopted by ``main()``.  When not
     signed in, spawns ``claude auth login`` in a visible console.  With
     ``block=True`` (the --detach parent) it then waits until the login
     completes so the headless child starts already authenticated; with
@@ -444,7 +452,7 @@ def _recent_disk_sessions(limit: int = 40) -> list[dict[str, Any]]:
         config_dirs = [str(p) for p in discover_claude_dirs()]
     except Exception:
         log.warning("failed to discover Claude config dirs", exc_info=True)
-        config_dirs = [os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")]
+        config_dirs = [str(account_dir())]
 
     out: list[dict[str, Any]] = []
     seen_sids: set[str] = set()
@@ -3150,11 +3158,9 @@ async def api_restart() -> dict[str, Any]:
     for key, value in (getattr(state, "agent_labels", None) or {}).items():
         child.extend(["--agent-label", f"{key}={value}"])
 
-    # Preserve the account so session discovery + the SDK subprocess use it.
-    env = dict(os.environ)
-    cfg_dir = getattr(config, "config_dir", None) if config is not None else None
-    if cfg_dir:
-        env["CLAUDE_CONFIG_DIR"] = cfg_dir
+    # Hand the account over: the replacement adopts it, as this one did.
+    env = child_env(
+        getattr(config, "config_dir", None) if config is not None else None)
     # The sessions' API keys go to the replacement in its environment, which
     # it empties at once: each by its session's id, the resumed primary's
     # included, for whenever the session is opened there.  A primary with no
@@ -3292,7 +3298,7 @@ async def api_whoami() -> dict[str, Any]:
     return {
         "app": "orchestrator2",
         "pid": os.getpid(),
-        "account": os.environ.get("CLAUDE_CONFIG_DIR") or "",
+        "account": hub_account() or "",
         "port": getattr(config, "port", None) if config else None,
         "sessions": len(runtimes),
         "namespace": _path_namespace(),
@@ -5730,8 +5736,8 @@ def _probe_hub(port: int) -> dict | None:
     """Return a running orchestrator2 hub's ``/api/whoami`` on *port*, or None.
 
     Any orchestrator2 hub on the port is eligible — different accounts share
-    the same hub, with each session spawning its own bridge subprocess using
-    the launcher's ``CLAUDE_CONFIG_DIR``.
+    the same hub, with each session spawning its own bridge subprocess in
+    the launcher's account.
 
     Retries the HTTP request a few times on *timeout* (the hub is up but its
     event loop was momentarily busy).  Without this, a transient stall would
@@ -5857,9 +5863,8 @@ def _settle_launch_resume(cfg: Config) -> tuple[Config, str | None, str | None]:
     ref = (cfg.resume or "").strip()
     if not ref or ref == _PICKER_SENTINEL:
         return cfg, None, None
-    account = (cfg.config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
-               or str(Path.home() / ".claude"))
-    account_given = bool(cfg.config_dir or os.environ.get("CLAUDE_CONFIG_DIR"))
+    account_given = bool(cfg.config_dir or hub_account())
+    account = str(account_dir(cfg.config_dir))
     everything: list[dict[str, Any]] | None = None
 
     def _all() -> list[dict[str, Any]]:
@@ -6395,9 +6400,8 @@ def _run_launch_picker(mode: str, launch_cwd: str | None = None) -> dict | None:
       CREATE_NEW_CONSOLE — so the picker is always something the user can
       actually see, while the server itself stays hidden in the tray.
 
-    The chosen id is passed back through a temp JSON file.  The child
-    inherits our environment (notably CLAUDE_CONFIG_DIR) so it lists the
-    same account.
+    The chosen id is passed back through a temp JSON file.  The child is
+    given our account (``child_env``), so it lists the same one.
     """
     import subprocess
     import tempfile
@@ -6456,6 +6460,7 @@ def _run_launch_picker(mode: str, launch_cwd: str | None = None) -> dict | None:
             argv,
             creationflags=creationflags,
             cwd=os.path.dirname(script) or None,
+            env=child_env(),
         )
         proc.wait()
     except Exception:
@@ -6614,12 +6619,12 @@ def main() -> None:
     if notice:
         print(notice)
 
-    # Set CLAUDE_CONFIG_DIR before any SDK or session code runs.  When
-    # --config-dir is passed it wins; otherwise the SDK/CLI use whatever
-    # CLAUDE_CONFIG_DIR is inherited from the environment (or ~/.claude when
-    # unset).
-    if config.config_dir:
-        os.environ["CLAUDE_CONFIG_DIR"] = str(Path(config.config_dir).resolve())
+    # The account, before any CLI or session lookup: --config-dir, else the
+    # CLAUDE_CONFIG_DIR inherited, which comes out of the environment here so
+    # that no CLI inherits it (see account.py).  The primary session carries
+    # it in its Config from now on.
+    config = dataclasses.replace(
+        config, config_dir=adopt_from_environment(config.config_dir))
 
     # Console: keep the short, PID-less format.  File: prefix every
     # record with the PID so concurrent orchestrator2 instances
@@ -6683,16 +6688,15 @@ def main() -> None:
         sys.exit(2)
     if _note:
         print(_note)
-    if config.config_dir:
-        # The session may be on another account: pin it as above.
-        os.environ["CLAUDE_CONFIG_DIR"] = str(Path(config.config_dir).resolve())
+    # The session may be on another account: the hub works in it, as above.
+    set_hub_account(config.config_dir)
 
     # --- Central-hub reuse -------------------------------------------------
     # If an orchestrator2 hub is already serving on our port, join it — open
     # the launched session there and point a browser at it — instead of
     # starting a second, independent server.  Different accounts are fine:
-    # each session spawns its own bridge subprocess with the launcher's
-    # CLAUDE_CONFIG_DIR.  Skipped by --standalone and the in-browser resume
+    # each session spawns its own bridge subprocess in the launcher's
+    # account, sent by name (the default as ~/.claude).  Skipped by --standalone and the in-browser resume
     # picker.  Runs before --detach so a hub short-circuits the spawn.
     #
     # Also skipped by --wait-port: that flag marks a *restart child* whose whole
@@ -6707,10 +6711,7 @@ def main() -> None:
             and _probe_hub(config.port) is not None):
         rid = _launch_into_hub(
             config.port,
-            **_hub_launch_kwargs(
-                config,
-                config.config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
-                or str(Path.home() / ".claude")),
+            **_hub_launch_kwargs(config, config.config_dir or str(default_dir())),
         )
         if rid:
             _announce_joined(config.port, rid, config.open_browser)
@@ -6846,9 +6847,7 @@ def main() -> None:
         if not config.standalone and not config.wait_port \
                 and config.resume != _PICKER_SENTINEL:
             sock.close()  # release the useless fallback port
-            join_cfg_dir = (config.config_dir
-                            or os.environ.get("CLAUDE_CONFIG_DIR")
-                            or str(Path.home() / ".claude"))
+            join_cfg_dir = config.config_dir or str(default_dir())
             import time as _time
             deadline = _time.monotonic() + 30.0
             rid = None

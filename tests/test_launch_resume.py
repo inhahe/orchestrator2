@@ -403,7 +403,11 @@ def test_following_an_account_pins_it_for_the_launch(machine, monkeypatch, tmp_p
 
     _main(monkeypatch, _cfg(machine, machine.os, "OS F old"), tmp_path)
 
-    assert os.environ["CLAUDE_CONFIG_DIR"] == str(machine.other.resolve())
+    import account
+    assert account.hub_account() == str(machine.other.resolve())
+    assert server.config.config_dir == str(machine.other)
+    # ...and the environment carries none, for no CLI to inherit.
+    assert "CLAUDE_CONFIG_DIR" not in os.environ
 
 
 def test_joining_says_where_the_session_is(monkeypatch, capsys):

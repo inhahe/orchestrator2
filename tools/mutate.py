@@ -2216,8 +2216,8 @@ BTWFORK_MUTATIONS = [
 
     ("the fork runs against the wrong account, where the session does not "
      "exist",
-     '    if getattr(config, "config_dir", None):\n'
-     '        kwargs["env"]["CLAUDE_CONFIG_DIR"] = config.config_dir\n',
+     '    if cli_dir:\n'
+     '        kwargs["env"]["CLAUDE_CONFIG_DIR"] = cli_dir\n',
      ""),
 
     ("the fork can run Bash, so an aside can rebuild or commit things while "
@@ -4857,7 +4857,7 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
      "              ]"),
 
     ("the environment's account is not a choice",
-     "    account_given = bool(cfg.config_dir or os.environ.get(\"CLAUDE_CONFIG_DIR\"))",
+     "    account_given = bool(cfg.config_dir or hub_account())",
      "    account_given = bool(cfg.config_dir)"),
 
     ("the title elsewhere must match its case",
@@ -4913,8 +4913,8 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
      "            lines.append(\"Resume it by its id (--resume <id>).\" if need else\n"),
 
     ("the picker is settled as a title",
-     "    if not ref or ref == _PICKER_SENTINEL:\n        return cfg, None, None\n    account = (",
-     "    if not ref:\n        return cfg, None, None\n    account = ("),
+     "    if not ref or ref == _PICKER_SENTINEL:\n        return cfg, None, None\n    account_given = bool(",
+     "    if not ref:\n        return cfg, None, None\n    account_given = bool("),
 
     ("an unsettled launch goes on to the hub",
      "    if _err:\n        print(_err, file=sys.stderr)\n",
@@ -4929,9 +4929,8 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
      "    if _note:\n        pass\n"),
 
     ("a followed account is not pinned",
-     "        # The session may be on another account: pin it as above.\n"
-     "        os.environ[\"CLAUDE_CONFIG_DIR\"] = str(Path(config.config_dir).resolve())\n",
-     "        pass\n"),
+     "    set_hub_account(config.config_dir)\n",
+     ""),
 
     ("a joined launch prints no address",
      "    print(f\"Joined running orchestrator2 hub on port {port}: session {rid} \"\n"
@@ -5962,28 +5961,75 @@ APIKEY_AUTH_MUTATIONS = [
 # and, for /move's account names and the watcher, tests/test_api_key_hub.py.
 APIKEY_RESOLVER_MUTATIONS = [
     ("without CLAUDE_CONFIG_DIR, .claude.json is looked for inside ~/.claude",
-     '    return (Path(base) if base else Path.home()) / ".claude.json"\n',
-     '    return config_dir_path(base) / ".claude.json"\n'),
+     '    return (Path(cli_dir) if cli_dir else Path.home()) / ".claude.json"\n',
+     '    return account_dir(config_dir) / ".claude.json"\n'),
 
     ("a legacy .config.json is passed over, though the CLI reads it",
      "    if legacy.is_file():\n        return legacy\n",
      ""),
 
     ("the default account's details are read inside ~/.claude",
-     "    oauth = _oauth_account(global_config_path(config_dir))\n",
-     '    oauth = _oauth_account(cfg / ".claude.json")\n'),
+     '        with open(global_config_path(config_dir), "r", encoding="utf-8") as f:\n',
+     '        with open(cfg / ".claude.json", "r", encoding="utf-8") as f:\n'),
+]
 
-    ("~/.claude named outright, before any CLI wrote its copy, has no account",
-     "    if oauth is None and _names_the_default_dir(config_dir):\n",
-     "    if False:\n"),
+# A CLI on the default account runs with CLAUDE_CONFIG_DIR unset, and the hub
+# keeps none of its own.  tests/test_account.py.
+ACCTENV_MODULE_MUTATIONS = [
+    ("~/.claude named outright is given to a CLI by name",
+     "    if _same_path(path, default_dir()):\n        return None\n",
+     ""),
+    ("the hub leaves its account in its environment, for every CLI to inherit",
+     '    inherited = (os.environ.pop("CLAUDE_CONFIG_DIR", None) or "").strip() or None\n',
+     '    inherited = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip() or None\n'),
+    ("the environment's account beats --config-dir",
+     "    chosen = given or inherited\n",
+     "    chosen = inherited or given\n"),
+    ("the account adopted is not the hub's",
+     "    if _adopted:\n        return _hub\n",
+     ""),
+    ("the hub's account is kept as named",
+     "    _hub = normalize(config_dir)\n",
+     "    _hub = config_dir\n"),
+    ("a session without its own account has the default, not the hub's",
+     "    return normalize(config_dir or hub_account())\n",
+     "    return normalize(config_dir)\n"),
+    ("a child inherits whatever account the base environment names",
+     '    env.pop("CLAUDE_CONFIG_DIR", None)\n',
+     ""),
+    ("the hub's own files are looked for in the default account",
+     "    base = config_dir or hub_account()\n",
+     "    base = config_dir\n"),
+]
 
-    ("~/.claude named outright reads the home directory's file first",
-     "    oauth = _oauth_account(global_config_path(config_dir))\n",
-     "    oauth = None\n"),
+ACCTENV_STATE_MUTATIONS = [
+    ("~/.claude named outright is read inside it, where its CLI no longer writes",
+     "    cli_dir = cli_config_dir(config_dir)\n",
+     "    cli_dir = str(account_dir(config_dir))\n"),
+]
 
-    ("another account is given the default one's details",
-     "        return Path(base).resolve() == default.resolve()\n",
-     "        return True\n"),
+ACCTENV_BRIDGE_MUTATIONS = [
+    ("a session's CLI is given its account as named",
+     '        cli_dir = cli_config_dir(getattr(self.config, "config_dir", None))\n',
+     '        cli_dir = getattr(self.config, "config_dir", None)\n'),
+]
+
+ACCTENV_BTW_MUTATIONS = [
+    ("a side question's CLI is given its account as named",
+     '    cli_dir = cli_config_dir(getattr(config, "config_dir", None))\n',
+     '    cli_dir = getattr(config, "config_dir", None)\n'),
+]
+
+ACCTENV_AUTH_MUTATIONS = [
+    ("a sign-in is given its account as named",
+     "    return child_env(config_dir)\n",
+     '    return {"CLAUDE_CONFIG_DIR": str(config_dir)} if config_dir else {}\n'),
+]
+
+ACCTENV_SERVER_MUTATIONS = [
+    ("a detached child is not handed the account",
+     "    env = child_env(cfg.config_dir)\n",
+     "    env = dict(os.environ)\n"),
 ]
 
 APIKEY_RESOLVER_SERVER_MUTATIONS = [
@@ -6590,14 +6636,8 @@ ACCOUNT_MOVE_MUTATIONS = [
 
 ACCOUNT_SESSION_MUTATIONS = [
     ("the account given for a session's own files is ignored",
-     "def _orch2_state_dir(config_dir: str | None = None) -> Path:\n"
-     '    """Return ``<config-dir>/orchestrator2``: *config_dir*\'s, else\n'
-     '    ``CLAUDE_CONFIG_DIR``\'s, else ``~/.claude``\'s."""\n'
-     '    base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR")\n',
-     "def _orch2_state_dir(config_dir: str | None = None) -> Path:\n"
-     '    """Return ``<config-dir>/orchestrator2``: *config_dir*\'s, else\n'
-     '    ``CLAUDE_CONFIG_DIR``\'s, else ``~/.claude``\'s."""\n'
-     '    base = os.environ.get("CLAUDE_CONFIG_DIR")\n'),
+     '    return account_dir(config_dir) / "orchestrator2"\n',
+     '    return account_dir() / "orchestrator2"\n'),
 
     ("the account given for a project directory is ignored",
      "    return claude_projects_dir(config_dir) / _sanitize_cwd(resolved)\n",
@@ -6940,6 +6980,18 @@ TARGETS = {
                       EFFORT_BRIDGE_MUTATIONS, "pytest"),
     "effort-server": ("server.py", "tests/test_effort_levels.py",
                       EFFORT_SERVER_MUTATIONS, "pytest"),
+    "acctenv-module": ("account.py", "tests/test_account.py",
+                       ACCTENV_MODULE_MUTATIONS, "pytest"),
+    "acctenv-state": ("state.py", "tests/test_account.py",
+                      ACCTENV_STATE_MUTATIONS, "pytest"),
+    "acctenv-bridge": ("sdk_bridge.py", "tests/test_account.py",
+                       ACCTENV_BRIDGE_MUTATIONS, "pytest"),
+    "acctenv-btw": ("btw.py", "tests/test_account.py",
+                    ACCTENV_BTW_MUTATIONS, "pytest"),
+    "acctenv-auth": ("auth.py", "tests/test_account.py",
+                     ACCTENV_AUTH_MUTATIONS, "pytest"),
+    "acctenv-server": ("server.py", "tests/test_account.py",
+                       ACCTENV_SERVER_MUTATIONS, "pytest"),
 }
 
 

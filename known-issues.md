@@ -218,34 +218,27 @@ numbered message at or before the tab's position is dropped, so no route to a
 double delivery can draw anything twice. Tabs loaded before the fix keep their
 doubled sockets until reloaded (F5). design.md §7, *One socket per tab*.
 
-## A default-account session's CLI reads a second global config — OPEN (found 2026-10-11)
+## A default-account session's CLI read a second global config — FIXED (2026-10-11)
 
 The CLI keeps its global config (user-scope MCP servers, project trust,
 onboarding, `oauthAccount`) in `$CLAUDE_CONFIG_DIR/.claude.json` when that
 variable is set, and in `~/.claude.json` when it is not
 (`getGlobalClaudeFile` in Claude Code's `utils/env.ts`). Setting it to the
-default `~/.claude` therefore gives a CLI a second, separate global config.
+default `~/.claude` gave a CLI a second, separate global config.
 
-The hub does that for every session it opens on the default account by name.
-A launch that joins a running hub sends `config_dir = ~/.claude` when it has
-none (`server.py` main: the `_hub_launch_kwargs(...)` call and `join_cfg_dir`),
-and `SDKBridge._make_options` passes any `config_dir` to the CLI as
-`CLAUDE_CONFIG_DIR`. On this machine `~/.claude/.claude.json` exists beside
-`~/.claude.json`, with 6 projects against 30 and `numStartups` 1. So a session
-opened this way may not see the user's `claude mcp add` servers or trusted
-projects, and anything it saves there a plain `claude` never sees.
+The hub did that for every session it opened on the default account by name:
+a launch joining a running hub sent `config_dir = ~/.claude` when it had none,
+and `SDKBridge._make_options` passed any `config_dir` to the CLI as
+`CLAUDE_CONFIG_DIR`. On this machine `~/.claude/.claude.json` existed beside
+`~/.claude.json`, with 6 projects against 30 and `numStartups` 1, so such
+sessions could miss the user's `claude mcp add` servers and trusted projects.
 
-`detect_account_info` papers over the display half: it falls back to
-`~/.claude.json` for the account details. The proper fix is for a
-default-account session's CLI to run with `CLAUDE_CONFIG_DIR` *unset*. The SDK
-can only add variables to the child's environment
-(`{**os.environ, **options.env}`), never remove one, so that needs the hub's
-own environment to carry no `CLAUDE_CONFIG_DIR`. That means `main()` would
-record the hub's account in `Config.config_dir` rather than `os.environ`, and
-every `os.environ.get("CLAUDE_CONFIG_DIR")` that means "the hub's account"
-(`server.py`, `session.py`, `state.py`) would read it from there. Each
-session's account would then be either a named non-default dir, passed as
-`CLAUDE_CONFIG_DIR`, or the default, passed as nothing.
+Fixed by `account.py`: the hub takes `CLAUDE_CONFIG_DIR` out of its own
+environment at startup (the SDK can only add to a CLI's environment, never
+remove), every "the hub's account" lookup asks `account.hub_account()`, and a
+CLI is given the variable only for an account that is not the default. See
+design.md, "A CLI on the default account runs with `CLAUDE_CONFIG_DIR` unset".
+`~/.claude/.claude.json` is now unused; it was left in place.
 
 ## Hidden tabs reconnect once a minute — OPEN (found 2026-10-02)
 

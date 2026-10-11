@@ -59,6 +59,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from account import hub_account
+
 log = logging.getLogger(__name__)
 
 __all__ = [
@@ -1063,9 +1065,9 @@ def _config_dirs() -> list[Path]:
     for p in sorted(home.glob(".claude*")):
         if p.is_dir() and (p / "sessions").is_dir():
             out.append(p)
-    env = os.environ.get("CLAUDE_CONFIG_DIR")
-    if env:
-        e = Path(env)
+    own = hub_account()
+    if own:
+        e = Path(own)
         if e.is_dir() and e not in out:
             out.append(e)
     return out
