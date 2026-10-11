@@ -237,6 +237,13 @@ single funnel for every way a session is born — the launch API and the lobby's
 `/api/session/launch` turns that into `{"ok": false, "error": …}`, and the
 launcher prints the reason before falling back to its own server.
 
+**A session resumed from another directory runs there.** The CLI looks for a
+session only in its own directory's project, and is started in the session's
+`Config.cwd`. So `/resume <id>` in the primary tab (`_reconfigure`) and the
+browser picker's choice (`/api/resume`) set that cwd to the directory the
+session ran in (`find_session_cwd`), unless a directory was given with the
+resume. Changing the hub process's directory alone left the CLI where it was.
+
 **A session on another account is opened in that account by name, never
 through the hub's environment.** `main()` sets `CLAUDE_CONFIG_DIR` once, at
 launch, and nothing changes it afterwards. Everything about a session takes

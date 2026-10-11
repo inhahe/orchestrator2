@@ -302,14 +302,14 @@ def test_every_call_site_seeds_the_session_first():
     it could only ever look up the id-less slot -- and restored it into a
     session that was explicitly meant to be fresh.
 
-    Pins the ordering textually, because the three call sites live in async
+    Pins the ordering textually, because the call sites live in async
     startup paths that a unit test cannot cheaply drive.
     """
     src = (Path(__file__).resolve().parent.parent / "server.py").read_text(
         encoding="utf-8")
     calls = [i for i, line in enumerate(src.splitlines())
              if "_attach_queue_persistence(" in line and "def " not in line]
-    assert len(calls) == 3, f"call sites moved; found {len(calls)}"
+    assert len(calls) == 4, f"call sites moved; found {len(calls)}"
     lines = src.splitlines()
     for i in calls:
         window = "\n".join(lines[max(0, i - 40):i])

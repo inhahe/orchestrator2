@@ -1,5 +1,17 @@
 # Known issues / tech debt — orchestrator2
 
+## A session resumed from another directory started its CLI in the old one — FIXED (2026-10-10)
+
+Found while fixing the picker's restart. `/resume <id>` in the primary tab,
+and a session chosen in the browser picker, which lists every project's
+sessions, only changed the hub process's directory to the one the session ran
+in. The CLI is started in the session's `Config.cwd`, which stayed where it
+was, and the CLI looks for a session only in its own directory's project. So
+a session from another directory could not be resumed. Both now set the
+session's `Config.cwd` to the directory it ran in, unless a directory was
+given with the resume. The picker also restores the queue kept for the
+session it opens, which nothing loaded before. design.md §4.
+
 ## A session billed to an API key was shown as a subscription — FIXED (2026-10-10)
 
 Found while answering *"Does orchestrator2 support using API keys?"*. The CLI

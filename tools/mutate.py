@@ -4962,6 +4962,27 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
      "        if (sid or fresh) and a == \"--cwd\":\n",
      "        if a == \"--cwd\":\n"),
 
+    ("a session resumed from another directory runs its CLI in this one",
+     "        if not cwd:\n"
+     "            session_cwd = find_session_cwd(new_resume, config.config_dir)\n",
+     "        if False:\n"
+     "            session_cwd = find_session_cwd(new_resume, config.config_dir)\n"),
+
+    ("a directory given with a resume is overruled by the session's",
+     "        if not cwd:\n"
+     "            session_cwd = find_session_cwd(new_resume, config.config_dir)\n",
+     "        if True:\n"
+     "            session_cwd = find_session_cwd(new_resume, config.config_dir)\n"),
+
+    ("a session picked from another directory runs its CLI in this one",
+     "            _replace_runtime_config(_default_runtime, cwd=resolved)\n",
+     ""),
+
+    ("a picked session's queue is not brought back",
+     "    # Its queue, kept for it in that directory, comes back as on any open.\n"
+     "    _attach_queue_persistence(state, config.cwd, config.config_dir)\n",
+     ""),
+
     ("a restart of a new conversation continues another session",
      '        child.extend(["--start-fresh", "--cwd", config.cwd])\n',
      '        child.extend(["--cwd", config.cwd])\n'),

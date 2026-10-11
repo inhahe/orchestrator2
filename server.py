@@ -1360,8 +1360,8 @@ def _attach_queue_persistence(st, cwd: str, config_dir: str | None = None) -> in
     only thing that decides which queue is eligible: :func:`load_persisted_queue`
     returns nothing at all for a session with no id, and otherwise nothing that
     is not that exact session's own recent work.  So a ``--no-continue`` session
-    -- which has no id by definition -- cannot inherit anything, and the three
-    call sites need no flag to say so; they only need to run *after* seeding.
+    -- which has no id by definition -- cannot inherit anything, and the call
+    sites need no flag to say so; they only need to run *after* seeding.
     That ordering is what the original bug got wrong, and it is pinned by a test.
 
     The save side is always wired, including when nothing was restored: a fresh
@@ -2849,6 +2849,13 @@ async def _reconfigure(
                     + ", ".join(sid for sid, _t in several)
                     + ". /resume <id> picks one.")
             return False, f"session not found: {resume}"
+        # The CLI looks for a session only in its own directory's project, so
+        # one from another directory is resumed from there, unless a
+        # directory was given with it.
+        if not cwd:
+            session_cwd = find_session_cwd(new_resume, config.config_dir)
+            if session_cwd and Path(session_cwd).is_dir():
+                new_cwd = str(Path(session_cwd).resolve(strict=False))
 
     # The session about to be shown: the one resumed, or for /cwd the most
     # recent in the new directory; None for a new one.
@@ -2903,11 +2910,7 @@ async def _reconfigure(
         title = read_session_title(new_resume, config.config_dir)
         if title:
             state.session_title = title
-        session_cwd = find_session_cwd(new_resume)
-        if session_cwd:
-            resolved_cwd = str(Path(session_cwd).resolve(strict=False))
-            if Path(resolved_cwd).exists():
-                os.chdir(resolved_cwd)
+        os.chdir(new_cwd)
         bridge._initial_resume_id = new_resume
     elif cwd:
         os.chdir(new_cwd)
@@ -3557,13 +3560,17 @@ async def api_resume(body: dict[str, Any]) -> dict[str, Any]:
         if key:
             _replace_runtime_config(_default_runtime, api_key=key)
 
-    # Optionally switch cwd to match the session's recorded cwd.
-    session_cwd = find_session_cwd(session_id)
-    if session_cwd:
+    # Resumed from the directory it ran in: the CLI looks for a session only
+    # in its own directory's project, and starts in the Config's cwd.
+    session_cwd = find_session_cwd(session_id, config.config_dir)
+    if session_cwd and _default_runtime is not None:
         resolved = str(Path(session_cwd).resolve(strict=False))
-        if Path(resolved).exists():
+        if Path(resolved).is_dir():
             os.chdir(resolved)
+            _replace_runtime_config(_default_runtime, cwd=resolved)
             log.info("switched cwd to %s for session %s", resolved, session_id[:8])
+    # Its queue, kept for it in that directory, comes back as on any open.
+    _attach_queue_persistence(state, config.cwd, config.config_dir)
 
     # Start the bridge with the selected session.
     bridge._initial_resume_id = session_id

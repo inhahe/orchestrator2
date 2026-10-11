@@ -499,6 +499,83 @@ def test_a_restart_of_a_new_conversation_starts_a_new_one_where_it_is(monkeypatc
     assert argv.count("--cwd") == 1 and argv[argv.index("--cwd") + 1] == r"D:\b"
 
 
+class _QuietBridge:
+    def __init__(self, config, state, broadcaster):
+        self.config = config
+        self._initial_resume_id = None
+
+    async def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+
+def _resumed_from_the_orchestrator(machine, monkeypatch, sid, cwd=None):
+    """The primary tab, in machine.orch, after /resume *sid* (and a cwd)."""
+    import sdk_bridge
+    monkeypatch.setattr(sdk_bridge, "SDKBridge", _QuietBridge)
+    monkeypatch.setattr(server, "_attach_queue_persistence",
+                        lambda st, cwd, config_dir=None: 0)
+    monkeypatch.setattr(server, "config", dataclasses.replace(
+        parse_args([]), cwd=machine.orch, config_dir=str(machine.default)))
+    monkeypatch.setattr(server, "state", State())
+    monkeypatch.setattr(server, "bridge", None)
+    monkeypatch.setattr(server, "_default_runtime", None)
+    monkeypatch.setattr(server, "_picker_mode", False)
+    monkeypatch.chdir(machine.orch)
+    ok, err = asyncio.run(server._reconfigure(resume=sid, cwd=cwd))
+    assert ok, err
+    return server.config
+
+
+def test_a_session_resumed_from_another_directory_runs_there(machine, monkeypatch):
+    """The CLI looks for a session only in its own directory's project, and
+    is started in the session's Config cwd: chdir alone left it where it was."""
+    _session(machine.default, machine.os, LIVE, "OS F")
+    cfg = _resumed_from_the_orchestrator(machine, monkeypatch, LIVE)
+    assert cfg.cwd == str(Path(machine.os).resolve())
+
+
+def test_a_directory_given_with_the_resume_is_kept(machine, monkeypatch):
+    _session(machine.default, machine.os, LIVE, "OS F")
+    cfg = _resumed_from_the_orchestrator(machine, monkeypatch, LIVE, cwd=machine.orch)
+    assert cfg.cwd == str(Path(machine.orch).resolve())
+
+
+def test_a_session_picked_from_another_directory_runs_there(machine, monkeypatch):
+    # The picker lists every project's sessions, and picks by id.
+    from session_runtime import SessionRuntime
+    _session(machine.default, machine.os, LIVE, "OS F")
+
+    class _Idle:
+        def __init__(self):
+            self.config = None
+            self._initial_resume_id = None
+
+        async def start(self):
+            pass
+
+    cfg = dataclasses.replace(parse_args([]), cwd=machine.orch,
+                              config_dir=str(machine.default))
+    st = State()
+    rt = SessionRuntime(config=cfg, state=st, rid="R0")
+    rt.bridge = _Idle()
+    attached = []
+    monkeypatch.setattr(server, "_attach_queue_persistence",
+                        lambda s, cwd, config_dir=None: attached.append((s.session_id, cwd)) or 0)
+    for name, value in (("config", cfg), ("state", st), ("bridge", rt.bridge),
+                        ("_default_runtime", rt), ("_picker_mode", True)):
+        monkeypatch.setattr(server, name, value)
+    monkeypatch.chdir(machine.orch)
+    out = asyncio.run(server.api_resume({"session_id": LIVE}))
+    assert out["ok"], out
+    here = str(Path(machine.os).resolve())
+    assert server.config.cwd == here and rt.bridge.config.cwd == here
+    # ...and its queue, kept for that session in that directory, comes back.
+    assert attached == [(LIVE, here)]
+
+
 def test_resume_inside_a_session_names_the_ones_that_share_a_title(machine, monkeypatch):
     """"session not found" was the answer to a title two sessions share."""
     _session(machine.default, machine.os, LIVE, "OS F")
