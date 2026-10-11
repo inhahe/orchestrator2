@@ -386,6 +386,37 @@ def test_the_default_accounts_details_are_read_where_the_cli_keeps_them(
     assert info["config_dir"] == str(tmp_path / ".claude")
 
 
+def test_the_default_account_named_outright_is_still_known(monkeypatch, tmp_path):
+    """/move lists ~/.claude by name; no CLI has yet run with it named, so
+    only the home directory's file has the account."""
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude.json").write_text(json.dumps(
+        {"oauthAccount": {"emailAddress": "me@example.com"}}), encoding="utf-8")
+    assert detect_account_info(str(tmp_path / ".claude"))["email"] == "me@example.com"
+
+
+def test_its_own_copy_wins_once_a_cli_has_written_it(monkeypatch, tmp_path):
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude.json").write_text(json.dumps(
+        {"oauthAccount": {"emailAddress": "old@example.com"}}), encoding="utf-8")
+    (tmp_path / ".claude" / ".claude.json").write_text(json.dumps(
+        {"oauthAccount": {"emailAddress": "me@example.com"}}), encoding="utf-8")
+    assert detect_account_info(str(tmp_path / ".claude"))["email"] == "me@example.com"
+
+
+def test_another_account_is_not_given_the_default_ones(monkeypatch, tmp_path):
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    (tmp_path / "acct-b").mkdir()
+    (tmp_path / ".claude.json").write_text(json.dumps(
+        {"oauthAccount": {"emailAddress": "me@example.com"}}), encoding="utf-8")
+    assert "email" not in detect_account_info(str(tmp_path / "acct-b"))
+
+
 def _fp(cred, digest):
     return auth.LoginFingerprint(cred, None, digest)
 

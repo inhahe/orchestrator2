@@ -5970,8 +5970,20 @@ APIKEY_RESOLVER_MUTATIONS = [
      ""),
 
     ("the default account's details are read inside ~/.claude",
-     "    path = global_config_path(config_dir)\n    try:\n",
-     '    path = cfg / ".claude.json"\n    try:\n'),
+     "    oauth = _oauth_account(global_config_path(config_dir))\n",
+     '    oauth = _oauth_account(cfg / ".claude.json")\n'),
+
+    ("~/.claude named outright, before any CLI wrote its copy, has no account",
+     "    if oauth is None and _names_the_default_dir(config_dir):\n",
+     "    if False:\n"),
+
+    ("~/.claude named outright reads the home directory's file first",
+     "    oauth = _oauth_account(global_config_path(config_dir))\n",
+     "    oauth = None\n"),
+
+    ("another account is given the default one's details",
+     "        return Path(base).resolve() == default.resolve()\n",
+     "        return True\n"),
 ]
 
 APIKEY_RESOLVER_SERVER_MUTATIONS = [

@@ -2074,7 +2074,13 @@ and in the home directory, beside `~/.claude`, when it is not; a legacy
 `.config.json` in the config dir wins over both. `state.global_config_path`
 is the one place that knows this: the account details (`detect_account_info`,
 and through it `/usage`'s header and `/move`'s account names) and the login
-fingerprint all read the file it names.
+fingerprint all read the file it names. The default `~/.claude` given by name
+is a CLI's `CLAUDE_CONFIG_DIR` like any other, so it names
+`~/.claude/.claude.json`, which only a CLI started that way writes. Until one
+has, `detect_account_info` reads the account from `~/.claude.json`: the same
+login, since the credentials are in `~/.claude` either way. (That a session's
+CLI is started that way at all is an open issue: see known-issues.md, "A
+default-account session's CLI reads a second global config".)
 
 **What the session is billed to comes from its `init` message.** Each turn's
 `init` carries `apiKeySource`: `ANTHROPIC_API_KEY` (the environment or

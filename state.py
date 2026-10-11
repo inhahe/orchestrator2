@@ -262,6 +262,31 @@ def global_config_path(config_dir: str | None = None) -> Path:
     return (Path(base) if base else Path.home()) / ".claude.json"
 
 
+def _oauth_account(path: Path) -> dict[str, Any] | None:
+    """The ``oauthAccount`` record of the CLI config file at *path*; None if
+    the file is missing, unreadable or has none."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    oauth = data.get("oauthAccount") if isinstance(data, dict) else None
+    return oauth if isinstance(oauth, dict) else None
+
+
+def _names_the_default_dir(config_dir: str | None) -> bool:
+    """Whether the account *config_dir* (else the environment's) is the
+    default ``~/.claude`` given explicitly rather than left unset."""
+    base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
+    if not base:
+        return False
+    default = Path.home() / ".claude"
+    try:
+        return Path(base).resolve() == default.resolve()
+    except OSError:
+        return False
+
+
 def detect_account_info(config_dir: str | None = None) -> dict[str, Any]:
     """Read the signed-in account details from the CLI's ``.claude.json``.
 
@@ -274,17 +299,19 @@ def detect_account_info(config_dir: str | None = None) -> dict[str, Any]:
     ``config_dir`` scopes the read to a specific account (a cross-account hub
     runtime's dir); without it the process env / default is used.  Where the
     file is: ``global_config_path``.
+
+    The default ``~/.claude`` named outright is the one account with two such
+    files: a CLI told it keeps its own copy in it, written at its first start,
+    while a plain ``claude`` keeps ``~/.claude.json``.  Both describe the one
+    login whose credentials ``~/.claude`` holds, so until the first exists the
+    second answers.
     """
     cfg = config_dir_path(config_dir)
     info: dict[str, Any] = {"config_dir": str(cfg)}
-    path = global_config_path(config_dir)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return info
-    oauth = data.get("oauthAccount") if isinstance(data, dict) else None
-    if not isinstance(oauth, dict):
+    oauth = _oauth_account(global_config_path(config_dir))
+    if oauth is None and _names_the_default_dir(config_dir):
+        oauth = _oauth_account(Path.home() / ".claude.json")
+    if oauth is None:
         return info
     email = oauth.get("emailAddress")
     if isinstance(email, str) and email:
