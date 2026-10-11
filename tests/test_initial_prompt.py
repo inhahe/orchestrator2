@@ -461,7 +461,8 @@ class _FakeBridge:
 def _reconfigure(monkeypatch, tmp_path, *, picking):
     _FakeBridge.made = []
     monkeypatch.setattr(sdk_bridge, "SDKBridge", _FakeBridge)
-    monkeypatch.setattr(server, "_attach_queue_persistence", lambda st, cwd: 0)
+    monkeypatch.setattr(server, "_attach_queue_persistence",
+                        lambda st, cwd, config_dir=None: 0)
     monkeypatch.setattr(server, "config", parse_args(
         ["--initial-prompt", PROMPT, "--session-note", "you moved"]))
     monkeypatch.setattr(server, "state", State())

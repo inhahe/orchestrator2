@@ -41,6 +41,7 @@ callers learned to wait:
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import os
 import sys
 
@@ -494,6 +495,18 @@ def test_the_context_trim_still_happens_when_nothing_is_running(monkeypatch):
     assert trims == ["sess-old"]
     assert state.session_id == "sess-new"
     assert connects == ["sess-new"]
+
+
+def test_a_session_on_another_account_is_trimmed_in_that_account(monkeypatch, tmp_path):
+    """Its session file is under its own config dir, not the hub's."""
+    import dataclasses
+    br, state, sent, connects, trims = _trim_bridge(monkeypatch, bg=False)
+    br.config = dataclasses.replace(br.config, config_dir=str(tmp_path / "acct-b"))
+    projects = []
+    monkeypatch.setattr(sdk_bridge, "trim_session",
+                        lambda sid, proj, max_ctx: projects.append(proj) or None)
+    asyncio.run(br._between_turns("done", False))
+    assert projects and Path(projects[0]).is_relative_to(tmp_path / "acct-b"), projects
 
 
 # ---------------------------------------------------------------------------

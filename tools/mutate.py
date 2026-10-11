@@ -415,8 +415,10 @@ RECONNECT_MUTATIONS = [
 QUEUE_MUTATIONS = [
     ("the queue is keyed by cwd alone again (the original bug)",
      '    slot = _sanitize_cwd(session_id) if session_id else "new"\n'
-     '    return _orch2_state_dir() / "queues" / f"{_sanitize_cwd(resolved)}__{slot}.json"',
-     '    return _orch2_state_dir() / "queues" / f"{_sanitize_cwd(resolved)}.json"'),
+     '    return (_orch2_state_dir(config_dir) / "queues"\n'
+     '            / f"{_sanitize_cwd(resolved)}__{slot}.json")',
+     '    return (_orch2_state_dir(config_dir) / "queues"\n'
+     '            / f"{_sanitize_cwd(resolved)}.json")'),
 
     ("the recorded session id is not checked on load",
      '    if data.get("session_id") != session_id:\n        return []\n    saved_at = data.get("saved_at")\n    if not isinstance(saved_at, (int, float)):\n        return []\n    if max_age_s > 0 and (time.time() - saved_at) > max_age_s:\n        return []\n    items = data.get("queue")',
@@ -446,38 +448,40 @@ QUEUE_MUTATIONS = [
      "        # No session, nothing to restore *into*."),
 
     ("a queue is saved for a session with no identity to restore it into",
-     '    if session_id is None:\n        return\n    path = queue_file_for_cwd(cwd, session_id)\n',
-     '    path = queue_file_for_cwd(cwd, session_id)\n'),
+     '    if session_id is None:\n        return\n    path = queue_file_for_cwd(cwd, session_id, config_dir)\n',
+     '    path = queue_file_for_cwd(cwd, session_id, config_dir)\n'),
 
     ("non-string queue entries are trusted",
      "    return [x for x in items if isinstance(x, str)]",
      "    return list(items)"),
 
     ("the session id is not sanitised, so it can escape the queues directory",
-     '    slot = _sanitize_cwd(session_id) if session_id else "new"\n    return _orch2_state_dir() / "queues" / f"{_sanitize_cwd(resolved)}__{slot}.json"',
-     '    slot = session_id if session_id else "new"\n    return _orch2_state_dir() / "queues" / f"{_sanitize_cwd(resolved)}__{slot}.json"'),
+     '    slot = _sanitize_cwd(session_id) if session_id else "new"\n    return (_orch2_state_dir(config_dir) / "queues"\n',
+     '    slot = session_id if session_id else "new"\n    return (_orch2_state_dir(config_dir) / "queues"\n'),
 ]
 
 SERVER_QUEUE_MUTATIONS = [
     ("the queue is looked up without a session id at all",
-     "        saved = load_persisted_queue(cwd, st.session_id)",
-     "        saved = load_persisted_queue(cwd)"),
+     "        saved = load_persisted_queue(cwd, st.session_id, config_dir=config_dir)",
+     "        saved = load_persisted_queue(cwd, config_dir=config_dir)"),
 
     ("the save captures the id once instead of reading it each time",
-     "        lambda: save_persisted_queue(cwd, list(st.queued_prompts), st.session_id)",
+     "        lambda: save_persisted_queue(cwd, list(st.queued_prompts), st.session_id,\n"
+     "                                     config_dir)",
      "        lambda _sid=st.session_id: save_persisted_queue("
-     "cwd, list(st.queued_prompts), _sid)"),
+     "cwd, list(st.queued_prompts), _sid,\n"
+     "                                     config_dir)"),
 
     ("a broken queue file takes the whole session down with it",
      "    except Exception:\n        saved = []",
      "    except ValueError:\n        saved = []"),
 
     ("the runtime never attaches persistence at all",
-     "        _attach_queue_persistence(st, cfg.cwd)",
+     "    _attach_queue_persistence(st, cfg.cwd, cfg.config_dir)\n",
      ""),
 
     ("startup attaches before it knows which session it is on (the ordering bug)",
-     "    _attach_queue_persistence(state, config.cwd)\n\n"
+     "    _attach_queue_persistence(state, config.cwd, config.config_dir)\n\n"
      "    # If --resume was passed without an argument",
      "    # If --resume was passed without an argument"),
 ]
@@ -1903,7 +1907,8 @@ LOSTBG_MUTATIONS = [
     ("the record is not cleared when read, so every resume re-reports the "
      "same dead tasks forever",
      "        try:\n"
-     "            save_persisted_bg_tasks(self.config.cwd, {}, resume_sid)\n"
+     "            save_persisted_bg_tasks(self.config.cwd, {}, resume_sid,\n"
+     "                                    getattr(self.config, \"config_dir\", None))\n"
      "        except Exception:\n"
      "            pass",
      "        pass"),
@@ -1948,8 +1953,8 @@ LOSTBG_SESSION_MUTATIONS = [
 
     ("a session with no id reads the shared \"new\" slot, inheriting another "
      "session's dead tasks",
-     "    if session_id is None:\n        return []\n    path = bg_tasks_file_for_cwd(cwd, session_id)",
-     "    path = bg_tasks_file_for_cwd(cwd, session_id)"),
+     "    if session_id is None:\n        return []\n    path = bg_tasks_file_for_cwd(cwd, session_id, config_dir)",
+     "    path = bg_tasks_file_for_cwd(cwd, session_id, config_dir)"),
 
     ("an emptied registry leaves its file behind, so a session that finished "
      "its work still reports it as lost",
@@ -2981,12 +2986,12 @@ MOVESTOP_MUTATIONS = [
      "    delay = max(1.0,\n"),
 
     ("the original keeps its queue file, so reopening it re-sends the prompts",
-     "        await asyncio.to_thread(save_persisted_queue, cwd, [], sid)\n",
+     "        await asyncio.to_thread(save_persisted_queue, cwd, [], sid, src_cfg)\n",
      ""),
 
     ("the queue is taken from the original even when the move then fails",
      "    return {\n        \"queue\": queue,\n",
-     "    save_persisted_queue(cwd, [], sid)\n"
+     "    save_persisted_queue(cwd, [], sid, rt.config.config_dir)\n"
      "    return {\n        \"queue\": queue,\n"),
 
     ("a failed move reopens another account's session without its queue",
@@ -6224,6 +6229,78 @@ APIKEY_STATUSJS_MUTATIONS = [
      ""),
 ]
 
+# A session on another account is opened and kept there, with the hub's
+# environment left alone.  tests/test_session_account.py; the trim in
+# tests/test_reconnect_bg_tasks.py, and /move in
+# tests/test_move_stops_original.py.
+ACCOUNT_SERVER_MUTATIONS = [
+    ("a session on another account is looked for in the hub's",
+     "        recent = find_most_recent_session_for_cwd(resolved_cwd, config_dir)\n",
+     "        recent = find_most_recent_session_for_cwd(resolved_cwd)\n"),
+
+    ("a launch on another account looks for its session in the hub's",
+     "        recent = find_most_recent_session_for_cwd(cwd or config.cwd, config_dir)\n",
+     "        recent = find_most_recent_session_for_cwd(cwd or config.cwd)\n"),
+
+    ("a session opened on another account keeps its queue in the hub's",
+     "    _attach_queue_persistence(st, cfg.cwd, cfg.config_dir)\n",
+     "    _attach_queue_persistence(st, cfg.cwd)\n"),
+
+    ("a queue is looked for in the hub's account",
+     "        saved = load_persisted_queue(cwd, st.session_id, config_dir=config_dir)\n",
+     "        saved = load_persisted_queue(cwd, st.session_id)\n"),
+
+    ("a queue is kept in the hub's account",
+     "        lambda: save_persisted_queue(cwd, list(st.queued_prompts), st.session_id,\n"
+     "                                     config_dir)\n",
+     "        lambda: save_persisted_queue(cwd, list(st.queued_prompts), st.session_id)\n"),
+]
+
+ACCOUNT_MOVE_MUTATIONS = [
+    ("/move clears the original's queue in the hub's account, and it runs twice",
+     "        await asyncio.to_thread(save_persisted_queue, cwd, [], sid, src_cfg)\n",
+     "        await asyncio.to_thread(save_persisted_queue, cwd, [], sid)\n"),
+
+    ("/move files the copy's record of dead tasks where it will not look",
+     "            save_persisted_bg_tasks, dest_cwd, carry[\"bg_tasks\"], new_id,\n"
+     "            target_cfg)\n",
+     "            save_persisted_bg_tasks, dest_cwd, carry[\"bg_tasks\"], new_id)\n"),
+]
+
+ACCOUNT_SESSION_MUTATIONS = [
+    ("the account given for a session's own files is ignored",
+     "def _orch2_state_dir(config_dir: str | None = None) -> Path:\n"
+     '    """Return ``<config-dir>/orchestrator2``: *config_dir*\'s, else\n'
+     '    ``CLAUDE_CONFIG_DIR``\'s, else ``~/.claude``\'s."""\n'
+     '    base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR")\n',
+     "def _orch2_state_dir(config_dir: str | None = None) -> Path:\n"
+     '    """Return ``<config-dir>/orchestrator2``: *config_dir*\'s, else\n'
+     '    ``CLAUDE_CONFIG_DIR``\'s, else ``~/.claude``\'s."""\n'
+     '    base = os.environ.get("CLAUDE_CONFIG_DIR")\n'),
+
+    ("the account given for a project directory is ignored",
+     "    return claude_projects_dir(config_dir) / _sanitize_cwd(resolved)\n",
+     "    return claude_projects_dir() / _sanitize_cwd(resolved)\n"),
+]
+
+ACCOUNT_BRIDGE_MUTATIONS = [
+    ("a session's record of running tasks is kept in the hub's account",
+     '                self.state.session_id, getattr(self.config, "config_dir", None),\n',
+     "                self.state.session_id,\n"),
+
+    ("a session's record of running tasks is read from the hub's account",
+     "                self.config.cwd, resume_sid,\n"
+     '                config_dir=getattr(self.config, "config_dir", None))\n',
+     "                self.config.cwd, resume_sid)\n"),
+]
+
+ACCOUNT_TRIM_MUTATIONS = [
+    ("a session on another account is trimmed in the hub's",
+     "            proj = project_dir_for_cwd(config.cwd,\n"
+     '                                       getattr(config, "config_dir", None))\n',
+     "            proj = project_dir_for_cwd(config.cwd)\n"),
+]
+
 
 TARGETS = {
     "chat": ("static/chat.js", "tests/hidden_window.test.js",
@@ -6508,6 +6585,16 @@ TARGETS = {
                          SESSIONKEY_STATE_MUTATIONS, "pytest"),
     "sessionkey-cmd": ("commands.py", "tests/test_session_api_key.py",
                        SESSIONKEY_CMD_MUTATIONS, "pytest"),
+    "account-server": ("server.py", "tests/test_session_account.py",
+                       ACCOUNT_SERVER_MUTATIONS, "pytest"),
+    "account-move": ("server.py", "tests/test_move_stops_original.py",
+                     ACCOUNT_MOVE_MUTATIONS, "pytest"),
+    "account-session": ("session.py", "tests/test_session_account.py",
+                        ACCOUNT_SESSION_MUTATIONS, "pytest"),
+    "account-bridge": ("sdk_bridge.py", "tests/test_session_account.py",
+                       ACCOUNT_BRIDGE_MUTATIONS, "pytest"),
+    "account-trim": ("sdk_bridge.py", "tests/test_reconnect_bg_tasks.py",
+                     ACCOUNT_TRIM_MUTATIONS, "pytest"),
 }
 
 

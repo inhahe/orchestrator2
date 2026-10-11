@@ -442,7 +442,8 @@ def _switch(monkeypatch, tmp_path, *, key, picking=False, **where):
     import sdk_bridge
     from session_runtime import SessionRuntime
     monkeypatch.setattr(sdk_bridge, "SDKBridge", _QuietBridge)
-    monkeypatch.setattr(server, "_attach_queue_persistence", lambda st, cwd: 0)
+    monkeypatch.setattr(server, "_attach_queue_persistence",
+                        lambda st, cwd, config_dir=None: 0)
     monkeypatch.setattr(server, "resolve_session_ref", lambda ref, _c, _d: ref)
     monkeypatch.setattr(server, "find_session_dir", lambda _s, _d=None: tmp_path)
     monkeypatch.setattr(server, "read_session_title", lambda _s, _d=None: None)

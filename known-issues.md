@@ -604,22 +604,26 @@ original*.
 Not exercised against a live hub. `tests/test_move_stops_original.py` drives
 the real `_do_move` and `_teardown_runtime`, with only the SDK side faked.
 
-## Another account's session never gets its queue back — OPEN (found 2026-09-27)
+## Another account's session never gets its queue back — FIXED (2026-10-10)
 
 Found while fixing `/move`. It was not reported, and it has not been checked
 live: this comes from reading the code.
 
-`_create_runtime` calls `_attach_queue_persistence` inside
+`_create_runtime` called `_attach_queue_persistence` inside
 `_env_config_dir(config_dir)`. So a session in an account other than the hub's
-*loads* its queue from `<that account>/orchestrator2/queues/`. Every *save*
-happens later, from the deque's `on_change`, outside that context, and lands in
-`<hub account>/orchestrator2/queues/`. Nothing ever writes where the load looks,
-so that session's queued prompts survive neither a hub restart nor a reopen.
-Nothing goes to the wrong session: the files are keyed by session id.
+*loaded* its queue from `<that account>/orchestrator2/queues/`. Every *save*
+happened later, from the deque's `on_change`, outside that context, and landed in
+`<hub account>/orchestrator2/queues/`. Nothing ever wrote where the load looked,
+so that session's queued prompts survived neither a hub restart nor a reopen.
+Nothing went to the wrong session: the files are keyed by session id.
 
-The likely fix is to load outside the context, so that loads and saves both use
-the hub's directory. `/move`'s failure path already works around it by putting
-the queue back itself (design.md §8, *A move stops the original*).
+Fixed when `_env_config_dir` went (2026-10-10; it showed worker threads another
+account in the hub's environment, design.md §6g): the queue, and the
+background-task record with it, are kept in the session's own account for both
+the load and the save, so they follow the session to whichever hub opens it.
+`/move`'s failure path still puts the queue back itself should the reopen find
+nothing (design.md §8, *A move stops the original*). A cross-account session's
+queue saved by an older hub, in the hub's account, is not looked for there.
 
 ## Switching to a tab replayed what it missed, visibly, and stole the scroll — FIXED (2026-09-26)
 

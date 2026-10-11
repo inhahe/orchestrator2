@@ -237,6 +237,17 @@ single funnel for every way a session is born — the launch API and the lobby's
 `/api/session/launch` turns that into `{"ok": false, "error": …}`, and the
 launcher prints the reason before falling back to its own server.
 
+**A session on another account is opened in that account by name, never
+through the hub's environment.** `main()` sets `CLAUDE_CONFIG_DIR` once, at
+launch, and nothing changes it afterwards. Everything about a session takes
+its config dir explicitly: `find_most_recent_session_for_cwd`,
+`project_dir_for_cwd` (the context trim's too), `init_state_from_config`'s
+account details and plan, and the files a session keeps, its queued prompts
+and its record of background tasks, which live in its own account so they
+follow it to whichever hub opens it. Pointing the environment at the session's
+account for a moment instead would show any worker thread reading it then --
+the sign-in watcher, a model-list fetch -- another account.
+
 ### Connecting
 
 `connect()` wraps the SDK handshake in `asyncio.wait_for(..., CONNECT_TIMEOUT)`.
@@ -3169,11 +3180,10 @@ about how it does so matter:
 Stopping first has a cost: a failure *after* the stop (the copy cannot be
 written, or its runtime will not start) would otherwise leave nothing running.
 So `_move_failed` reopens the original — same id, account and name, loop
-re-armed — and says so. The reopen normally restores the queue from its own
-file. For another account's session that restore looks in the wrong
-directory (known-issues.md), so if the reopened queue is empty the carried
-queue is put back by hand. It is never added on top of a restored queue, which
-would run each prompt twice. If even the reopen fails, the user is told the
+re-armed — and says so. The reopen restores the queue from its own file,
+which the move clears only once the copy has the prompts. Should that restore
+find nothing, the carried queue is put back by hand. It is never added on top
+of a restored queue, which would run each prompt twice. If even the reopen fails, the user is told the
 original was stopped and has to be opened from the list. Failures *before* the stop (no session, no
 target, a bad directory, a missing source file) change nothing and just report.
 

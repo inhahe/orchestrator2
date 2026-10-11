@@ -91,17 +91,20 @@ def _sanitize_cwd(cwd: str) -> str:
 # a prompt the user has long since re-typed, re-thought, or forgotten.
 QUEUE_MAX_AGE_S = 24 * 3600
 
-def _orch2_state_dir() -> Path:
-    """Return ``<config-dir>/orchestrator2`` (config-dir = CLAUDE_CONFIG_DIR or ~/.claude)."""
-    base = os.environ.get("CLAUDE_CONFIG_DIR")
+def _orch2_state_dir(config_dir: str | None = None) -> Path:
+    """Return ``<config-dir>/orchestrator2``: *config_dir*'s, else
+    ``CLAUDE_CONFIG_DIR``'s, else ``~/.claude``'s."""
+    base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR")
     root = Path(base) if base else Path.home() / ".claude"
     return root / "orchestrator2"
 
 
-def queue_file_for_cwd(cwd: str, session_id: str | None = None) -> Path:
+def queue_file_for_cwd(cwd: str, session_id: str | None = None,
+                       config_dir: str | None = None) -> Path:
     """Path to the persisted queue file for a session working in *cwd*.
 
-    Scoped by account (the config dir), *cwd* and **session id**.  The session
+    Scoped by account (the session's config dir, *config_dir*; the process
+    environment's without one), *cwd* and **session id**.  The session
     id is in the filename rather than only inside the file so that two sessions
     open on the same directory cannot overwrite each other's queue -- the hub
     hosts several at once, and both would otherwise save to one path and the
@@ -117,11 +120,13 @@ def queue_file_for_cwd(cwd: str, session_id: str | None = None) -> Path:
     except OSError:
         resolved = cwd
     slot = _sanitize_cwd(session_id) if session_id else "new"
-    return _orch2_state_dir() / "queues" / f"{_sanitize_cwd(resolved)}__{slot}.json"
+    return (_orch2_state_dir(config_dir) / "queues"
+            / f"{_sanitize_cwd(resolved)}__{slot}.json")
 
 
 def load_persisted_queue(cwd: str, session_id: str | None = None, *,
-                         max_age_s: float = QUEUE_MAX_AGE_S) -> list[str]:
+                         max_age_s: float = QUEUE_MAX_AGE_S,
+                         config_dir: str | None = None) -> list[str]:
     """Load the pending-prompt queue *session_id* left in *cwd*.
 
     Returns ``[]`` for anything that is not unambiguously this session's own
@@ -146,7 +151,7 @@ def load_persisted_queue(cwd: str, session_id: str | None = None, *,
         # the file, instead of depending on every call site to ask correctly.
         # A --no-continue session has no id, so it can never inherit anything.
         return []
-    path = queue_file_for_cwd(cwd, session_id)
+    path = queue_file_for_cwd(cwd, session_id, config_dir)
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -168,7 +173,8 @@ def load_persisted_queue(cwd: str, session_id: str | None = None, *,
 
 
 def save_persisted_queue(cwd: str, items: Any,
-                         session_id: str | None = None) -> None:
+                         session_id: str | None = None,
+                         config_dir: str | None = None) -> None:
     """Atomically write *session_id*'s pending-prompt queue for *cwd* to disk.
 
     When *items* is empty the file is removed so stale empties don't linger.
@@ -182,7 +188,7 @@ def save_persisted_queue(cwd: str, items: Any,
     """
     if session_id is None:
         return
-    path = queue_file_for_cwd(cwd, session_id)
+    path = queue_file_for_cwd(cwd, session_id, config_dir)
     lst = [str(x) for x in items]
     try:
         if not lst:
@@ -230,7 +236,8 @@ def save_persisted_queue(cwd: str, items: Any,
 BG_TASKS_MAX_AGE_S = 24 * 3600
 
 
-def bg_tasks_file_for_cwd(cwd: str, session_id: str | None = None) -> Path:
+def bg_tasks_file_for_cwd(cwd: str, session_id: str | None = None,
+                          config_dir: str | None = None) -> Path:
     """Path to the persisted background-task record for a session in *cwd*.
 
     Scoped exactly like :func:`queue_file_for_cwd`, and for the same reason:
@@ -242,7 +249,8 @@ def bg_tasks_file_for_cwd(cwd: str, session_id: str | None = None) -> Path:
     except OSError:
         resolved = cwd
     slot = _sanitize_cwd(session_id) if session_id else "new"
-    return _orch2_state_dir() / "bgtasks" / f"{_sanitize_cwd(resolved)}__{slot}.json"
+    return (_orch2_state_dir(config_dir) / "bgtasks"
+            / f"{_sanitize_cwd(resolved)}__{slot}.json")
 
 
 def bg_task_items(tasks: Any) -> list[dict]:
@@ -276,7 +284,8 @@ def bg_task_items(tasks: Any) -> list[dict]:
 
 
 def save_persisted_bg_tasks(cwd: str, tasks: Any,
-                            session_id: str | None = None) -> None:
+                            session_id: str | None = None,
+                            config_dir: str | None = None) -> None:
     """Atomically mirror *session_id*'s live background tasks for *cwd*.
 
     *tasks* is the ``State.background_tasks`` mapping. When it is empty the
@@ -291,7 +300,7 @@ def save_persisted_bg_tasks(cwd: str, tasks: Any,
     """
     if session_id is None:
         return
-    path = bg_tasks_file_for_cwd(cwd, session_id)
+    path = bg_tasks_file_for_cwd(cwd, session_id, config_dir)
     items = bg_task_items(tasks)
     try:
         if not items:
@@ -311,7 +320,8 @@ def save_persisted_bg_tasks(cwd: str, tasks: Any,
 
 
 def load_persisted_bg_tasks(cwd: str, session_id: str | None = None, *,
-                            max_age_s: float = BG_TASKS_MAX_AGE_S) -> list[dict]:
+                            max_age_s: float = BG_TASKS_MAX_AGE_S,
+                            config_dir: str | None = None) -> list[dict]:
     """Load the background tasks *session_id* had running when it last spoke.
 
     Returns ``[]`` for anything that is not unambiguously this session's own
@@ -320,7 +330,7 @@ def load_persisted_bg_tasks(cwd: str, session_id: str | None = None, *,
     """
     if session_id is None:
         return []
-    path = bg_tasks_file_for_cwd(cwd, session_id)
+    path = bg_tasks_file_for_cwd(cwd, session_id, config_dir)
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -341,9 +351,10 @@ def load_persisted_bg_tasks(cwd: str, session_id: str | None = None, *,
     return [x for x in items if isinstance(x, dict) and x.get("task_id")]
 
 
-def clear_persisted_bg_tasks(cwd: str, session_id: str | None = None) -> None:
+def clear_persisted_bg_tasks(cwd: str, session_id: str | None = None,
+                             config_dir: str | None = None) -> None:
     """Drop the record, so it is reported exactly once."""
-    save_persisted_bg_tasks(cwd, {}, session_id)
+    save_persisted_bg_tasks(cwd, {}, session_id, config_dir)
 
 
 def _bg_task_label(item: dict) -> str:
@@ -711,13 +722,14 @@ def normalize_path_for_compare(p: str) -> str:
 # Project / session discovery
 # ---------------------------------------------------------------------------
 
-def project_dir_for_cwd(cwd: str) -> Path:
-    """Return the on-disk project directory for *cwd*."""
+def project_dir_for_cwd(cwd: str, config_dir: str | None = None) -> Path:
+    """Return the on-disk project directory for *cwd* in *config_dir*'s
+    account (the process environment's without one)."""
     try:
         resolved = str(Path(cwd).resolve(strict=False))
     except OSError:
         resolved = cwd
-    return claude_projects_dir() / _sanitize_cwd(resolved)
+    return claude_projects_dir(config_dir) / _sanitize_cwd(resolved)
 
 
 def find_project_for_cwd(cwd: str) -> Path | None:
@@ -749,9 +761,11 @@ def find_project_for_cwd(cwd: str) -> Path | None:
     return None
 
 
-def find_most_recent_session_for_cwd(cwd: str) -> Path | None:
-    """Return the most-recently-modified ``.jsonl`` in the project for *cwd*."""
-    project = project_dir_for_cwd(cwd)
+def find_most_recent_session_for_cwd(cwd: str,
+                                     config_dir: str | None = None) -> Path | None:
+    """Return the most-recently-modified ``.jsonl`` in the project for *cwd*,
+    in *config_dir*'s account (the process environment's without one)."""
+    project = project_dir_for_cwd(cwd, config_dir)
     if not project.exists():
         return None
     candidates: list[tuple[Path, float]] = []

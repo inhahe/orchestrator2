@@ -84,8 +84,9 @@ def move(monkeypatch, tmp_path):
     cfg = parse_args(["--cwd", str(src_cwd), "--config-dir", str(src_cfg)])
     st = init_state_from_config(cfg)
     st.session_id = SID
-    # As _create_runtime does: the queue is mirrored to disk on every change.
-    server._attach_queue_persistence(st, cfg.cwd)
+    # As _create_runtime does: the queue is mirrored to disk on every change,
+    # in the session's own account.
+    server._attach_queue_persistence(st, cfg.cwd, cfg.config_dir)
     orig = SessionRuntime(config=cfg, state=st, rid="orig")
     orig.bridge = _Bridge(events)
     mover, watcher = _Ws("mover"), _Ws("watcher")
@@ -98,8 +99,8 @@ def move(monkeypatch, tmp_path):
     fail = {"copy_runtime": False, "reopen": False}
     lobby: list[str] = []
     # Whether a runtime restores its queue from disk as it starts, as the real
-    # _create_runtime does when the file is where it looks (the hub's own
-    # account).  Off by default: the other-account case, where it is not.
+    # _create_runtime does.  Off by default: a reopen whose restore finds
+    # nothing, which the move must cover itself.
     opts = {"restore_queue": False}
 
     async def fake_send_to(ws, m):
@@ -111,11 +112,12 @@ def move(monkeypatch, tmp_path):
             raise RuntimeError("the copy would not start")
         if fail["reopen"] and kw.get("resume") == SID:
             raise RuntimeError("the original would not start either")
-        c = parse_args(["--cwd", kw["cwd"]])
+        c = parse_args(["--cwd", kw["cwd"]]
+                       + (["--config-dir", kw["config_dir"]] if kw.get("config_dir") else []))
         s = init_state_from_config(c)
         s.session_id = kw["resume"]
         if opts["restore_queue"]:
-            server._attach_queue_persistence(s, c.cwd)
+            server._attach_queue_persistence(s, c.cwd, c.config_dir)
         rt = SessionRuntime(config=c, state=s,
                             rid="reopened" if kw.get("resume") == SID else "copy")
         rt.bridge = _Bridge(events)
@@ -158,7 +160,8 @@ def move(monkeypatch, tmp_path):
     return {"orig": orig, "state": st, "events": events, "sent": sent,
             "created": created, "attached": attached, "fail": fail, "run": run,
             "opts": opts, "lobby": lobby,
-            "cwd": str(src_cwd), "mover": mover, "watcher": watcher}
+            "cwd": str(src_cwd), "mover": mover, "watcher": watcher,
+            "src_cfg": str(src_cfg), "dst_cfg": str(dst_cfg)}
 
 
 def _new_id(m):
@@ -244,11 +247,12 @@ def test_reopening_the_original_will_not_send_its_queue_again(move):
     file and *sends* it.  After a move those prompts belong to the copy; left
     behind, opening the original from Recent would run them a second time."""
     move["state"].queued_prompts.extend(["next thing"])
-    assert load_persisted_queue(move["cwd"], SID) == ["next thing"]   # precondition
+    kept = dict(config_dir=move["src_cfg"])
+    assert load_persisted_queue(move["cwd"], SID, **kept) == ["next thing"]   # precondition
 
     move["run"]()
 
-    assert load_persisted_queue(move["cwd"], SID) == []
+    assert load_persisted_queue(move["cwd"], SID, **kept) == []
 
 
 def _capture_runtimes(monkeypatch):
@@ -266,8 +270,7 @@ def _capture_runtimes(monkeypatch):
 
 def test_a_failed_move_leaves_the_original_its_queue(move, monkeypatch):
     """Only a move that *worked* takes the queue away.  The reopen gets it
-    back even where its own restore finds nothing: that read looks in the
-    session's account while every save lands in the hub's."""
+    back even where its own restore finds nothing."""
     move["state"].queued_prompts.extend(["next thing"])
     move["fail"]["copy_runtime"] = True
     landed = _capture_runtimes(monkeypatch)
@@ -275,12 +278,13 @@ def test_a_failed_move_leaves_the_original_its_queue(move, monkeypatch):
     move["run"]()
 
     assert list(landed["reopened"].state.queued_prompts) == ["next thing"]
-    assert load_persisted_queue(move["cwd"], SID) == ["next thing"]
+    assert load_persisted_queue(move["cwd"], SID,
+                                config_dir=move["src_cfg"]) == ["next thing"]
 
 
 def test_a_reopen_that_finds_its_queue_does_not_get_it_twice(move, monkeypatch):
-    """The hub's own account: the reopen restores the queue itself, and
-    putting it back by hand as well would run every prompt twice."""
+    """The reopen restores the queue itself, and putting it back by hand
+    as well would run every prompt twice."""
     move["opts"]["restore_queue"] = True
     move["state"].queued_prompts.extend(["next thing"])
     move["fail"]["copy_runtime"] = True
@@ -368,7 +372,8 @@ def test_the_copy_is_told_which_background_tasks_died(move):
 
     move["run"]()
 
-    items = load_persisted_bg_tasks(move["cwd"], _new_id(move))
+    items = load_persisted_bg_tasks(move["cwd"], _new_id(move),
+                                    config_dir=move["dst_cfg"])
     assert [i["name"] for i in items] == ["full build"]
 
 

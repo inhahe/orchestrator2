@@ -1344,8 +1344,10 @@ async def _status_ticker() -> None:
 # Queued-prompt disk persistence
 # ---------------------------------------------------------------------------
 
-def _attach_queue_persistence(st, cwd: str) -> int:
+def _attach_queue_persistence(st, cwd: str, config_dir: str | None = None) -> int:
     """Wire *st.queued_prompts* to disk, restoring this session's own queue.
+
+    Kept in the session's own account, *config_dir* (the hub's without one).
 
     Persisting the queue lets typed-but-not-yet-run prompts survive a full
     server restart (a browser reload already survives via server-side state).
@@ -1373,7 +1375,7 @@ def _attach_queue_persistence(st, cwd: str) -> int:
     """
     saved: list[str] = []
     try:
-        saved = load_persisted_queue(cwd, st.session_id)
+        saved = load_persisted_queue(cwd, st.session_id, config_dir=config_dir)
     except Exception:
         saved = []
     if saved:
@@ -1386,7 +1388,8 @@ def _attach_queue_persistence(st, cwd: str) -> int:
     # that gains an id on its first turn re-keys its file from the "__new" slot
     # to its own instead of stranding it under a name nothing will look up.
     st.queued_prompts.on_change = (
-        lambda: save_persisted_queue(cwd, list(st.queued_prompts), st.session_id)
+        lambda: save_persisted_queue(cwd, list(st.queued_prompts), st.session_id,
+                                     config_dir)
     )
     return len(saved)
 
@@ -1505,7 +1508,7 @@ async def lifespan(app: FastAPI):
     # is what selects the queue to restore.  Wiring this before the block above
     # is what let a --no-continue session inherit (and immediately send) a
     # prompt left by an older session in the same directory.
-    _attach_queue_persistence(state, config.cwd)
+    _attach_queue_persistence(state, config.cwd, config.config_dir)
 
     # If --resume was passed without an argument, defer SDK start until the
     # user picks a session from the graphical picker.
@@ -1589,28 +1592,6 @@ async def _deferred_bridge_startup(*, start: bool) -> None:
 # ---------------------------------------------------------------------------
 # Runtime lifecycle — spin up / tear down live sessions on demand
 # ---------------------------------------------------------------------------
-
-@contextlib.contextmanager
-def _env_config_dir(config_dir: str | None):
-    """Temporarily set ``CLAUDE_CONFIG_DIR`` for session-discovery calls.
-
-    Cross-account hub sessions store their session files under a different
-    config dir.  The session-discovery helpers in ``session.py`` read
-    ``os.environ["CLAUDE_CONFIG_DIR"]`` to find the right directory.
-    """
-    if not config_dir:
-        yield
-        return
-    orig = os.environ.get("CLAUDE_CONFIG_DIR")
-    os.environ["CLAUDE_CONFIG_DIR"] = config_dir
-    try:
-        yield
-    finally:
-        if orig is None:
-            os.environ.pop("CLAUDE_CONFIG_DIR", None)
-        else:
-            os.environ["CLAUDE_CONFIG_DIR"] = orig
-
 
 async def _create_runtime(
     *,
@@ -1718,28 +1699,24 @@ async def _create_runtime(
     # session's lane.
     overrides["agent_labels"] = dict(agent_labels or {})
 
-    # Decide which on-disk session (if any) seeds this runtime.
-    # Session files live under CLAUDE_CONFIG_DIR, so scope the lookup to
-    # the session's account when it differs from the hub's.  Decided before
-    # the config is: a session reopened keeps the key it had.
+    # Decide which on-disk session (if any) seeds this runtime: in the
+    # session's own account, whose config dir holds its session files.
+    # Decided before the config is: a session reopened keeps the key it had.
     seed_id: str | None = None
-    with _env_config_dir(config_dir):
-        if resume:
-            seed_id = resume
-        elif not no_continue:
-            recent = find_most_recent_session_for_cwd(resolved_cwd)
-            if recent is not None:
-                seed_id = recent.stem
+    if resume:
+        seed_id = resume
+    elif not no_continue:
+        recent = find_most_recent_session_for_cwd(resolved_cwd, config_dir)
+        if recent is not None:
+            seed_id = recent.stem
     # Set every time, never inherited, like the name: the hub's config is its
     # launch's session's, and that launch's key is that session's alone.
     overrides["api_key"] = _session_key(seed_id, api_key)
     cfg = dataclasses.replace(config, **overrides)
-    # Build the state *inside* the session's config-dir scope so account
-    # detection (detect_account_info / detect_subscription*) reads the
-    # launched session's CLAUDE_CONFIG_DIR — not the hub's.  Otherwise a
-    # cross-account session shows the hub account's email/subscription.
-    with _env_config_dir(config_dir):
-        st = init_state_from_config(cfg)
+    # The state reads the account details from the session's own config dir
+    # (cfg.config_dir), not the hub's: a cross-account session shows its own
+    # account's email and plan.
+    st = init_state_from_config(cfg)
     rt = SessionRuntime(config=cfg, state=st)
     runtimes[rt.rid] = rt
 
@@ -1747,16 +1724,15 @@ async def _create_runtime(
     br = SDKBridge(config=cfg, state=st, broadcaster=rt.broadcast)
     rt.bridge = br
 
-    with _env_config_dir(config_dir):
-        if seed_id:
-            st.session_id = seed_id
-            br._initial_resume_id = seed_id
-        # After the seeding above, never before: st.session_id is what selects
-        # the queue.  ``no_continue`` leaves it None, which is precisely the
-        # "start fresh" case that must not inherit an older session's pending
-        # prompt -- a restored prompt is *sent*, not merely shown (connect()
-        # ends by poking the worker), so inheriting one silently re-runs work.
-        _attach_queue_persistence(st, cfg.cwd)
+    if seed_id:
+        st.session_id = seed_id
+        br._initial_resume_id = seed_id
+    # After the seeding above, never before: st.session_id is what selects
+    # the queue.  ``no_continue`` leaves it None, which is precisely the
+    # "start fresh" case that must not inherit an older session's pending
+    # prompt -- a restored prompt is *sent*, not merely shown (connect()
+    # ends by poking the worker), so inheriting one silently re-runs work.
+    _attach_queue_persistence(st, cfg.cwd, cfg.config_dir)
 
     if seed_id:
         # Read the display title in the background.  Scanning the session's
@@ -2938,7 +2914,7 @@ async def _reconfigure(
 
     # Same rule as startup: the queue follows the session, so this has to run
     # after the two branches above have decided which one (if any) we are on.
-    _attach_queue_persistence(state, config.cwd)
+    _attach_queue_persistence(state, config.cwd, config.config_dir)
 
     _picker_mode = False
     await bridge.start()
@@ -3355,8 +3331,7 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     # second bridge against the same session file.
     target_sid = resume
     if target_sid is None and not no_continue:
-        with _env_config_dir(config_dir):
-            recent = find_most_recent_session_for_cwd(cwd or config.cwd)
+        recent = find_most_recent_session_for_cwd(cwd or config.cwd, config_dir)
         if recent is not None:
             target_sid = recent.stem
     if target_sid:
@@ -4749,7 +4724,8 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
     # restart gets.  Filed where the copy's bridge will look: its cwd, its id.
     if carry["bg_tasks"]:
         await asyncio.to_thread(
-            save_persisted_bg_tasks, dest_cwd, carry["bg_tasks"], new_id)
+            save_persisted_bg_tasks, dest_cwd, carry["bg_tasks"], new_id,
+            target_cfg)
 
     # Spin up a runtime bound to the target account *and directory*, resuming
     # the copy.  `dest_cwd` is `cwd` unless the move moved it.
@@ -4774,7 +4750,7 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
         # -- and reopening the original restores that file and *sends* it, so
         # the prompts would run twice.  Only now, once the copy has them: a
         # move that failed reopens the original from this same file.
-        await asyncio.to_thread(save_persisted_queue, cwd, [], sid)
+        await asyncio.to_thread(save_persisted_queue, cwd, [], sid, src_cfg)
     loop_moved = _rearm_carried_wakeup(new_rt, carry["wakeup"])
     log.info("switch: %s → %s (account %s, cwd %s)", sid[:8], new_id[:8],
              Path(target_cfg).name, dest_cwd)

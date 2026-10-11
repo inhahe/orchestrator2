@@ -137,7 +137,6 @@ from session import (
     load_persisted_bg_tasks,
     save_persisted_bg_tasks,
     describe_integrity_problem,
-    find_most_recent_session_for_cwd,
     find_session_dir,
     read_session_title,
     render_session_history,
@@ -2292,7 +2291,7 @@ class SDKBridge:
         try:
             save_persisted_bg_tasks(
                 self.config.cwd, self.state.background_tasks,
-                self.state.session_id,
+                self.state.session_id, getattr(self.config, "config_dir", None),
             )
         except Exception as exc:
             log.debug("bg task persist failed: %r", exc)
@@ -2358,7 +2357,9 @@ class SDKBridge:
         if not resume_sid:
             return 0
         try:
-            items = load_persisted_bg_tasks(self.config.cwd, resume_sid)
+            items = load_persisted_bg_tasks(
+                self.config.cwd, resume_sid,
+                config_dir=getattr(self.config, "config_dir", None))
         except Exception as exc:
             log.warning("could not read the lost-bg-task record: %r", exc)
             return 0
@@ -2368,7 +2369,8 @@ class SDKBridge:
         # announce path costs one notice, where the other order would repeat it
         # on every resume forever.
         try:
-            save_persisted_bg_tasks(self.config.cwd, {}, resume_sid)
+            save_persisted_bg_tasks(self.config.cwd, {}, resume_sid,
+                                    getattr(self.config, "config_dir", None))
         except Exception:
             pass
         labels = [_bg_task_label(i) for i in items]
@@ -6057,7 +6059,8 @@ class SDKBridge:
         max_ctx = getattr(state, "_max_context_tokens", config.max_context_tokens)
         if (max_ctx > 0 and state.context_tokens > max_ctx and state.session_id
                 and not self._active_bg_tasks()):
-            proj = project_dir_for_cwd(config.cwd)
+            proj = project_dir_for_cwd(config.cwd,
+                                       getattr(config, "config_dir", None))
             new_sid = trim_session(state.session_id, proj, max_ctx)
             if new_sid:
                 state.session_id = new_sid
