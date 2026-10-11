@@ -23,6 +23,8 @@ limits, and ``/login`` could only start a subscription sign-in.  Now:
 * ``/login console`` signs the account in to an Anthropic Console account,
   for which the CLI creates an API key (on Windows, ``primaryApiKey`` in
   ``.claude.json``).
+* The cost figure is the CLI's running total: ``total_cost_usd`` never resets
+  between turns, so adding each turn's up counted the earlier turns again.
 
 The hub's half (``/usage``, the login watcher) is in
 tests/test_api_key_hub.py, because importing server.py is slow.
@@ -40,11 +42,12 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from claude_agent_sdk import SystemMessage                  # noqa: E402
+from claude_agent_sdk import ResultMessage, SystemMessage  # noqa: E402
 
 import auth                                                 # noqa: E402
 import commands                                             # noqa: E402
 import plan_usage                                           # noqa: E402
+import sdk_bridge                                           # noqa: E402
 from config import parse_args                               # noqa: E402
 from sdk_bridge import SDKBridge                            # noqa: E402
 from state import (                                         # noqa: E402
@@ -54,6 +57,7 @@ from state import (                                         # noqa: E402
     billed_to_api_key,
     init_state_from_config,
     state_to_status_dict,
+    take_cost,
 )
 
 SID = "a11-0000-key"
@@ -237,6 +241,52 @@ def test_every_init_is_read_not_only_the_first():
     asyncio.run(br._handle_system_message(_init("none"), during_turn=False))
     asyncio.run(br._handle_system_message(_init("apiKeyHelper"), during_turn=False))
     assert st.api_key_source == "apiKeyHelper"
+
+
+def _result(cost):
+    return ResultMessage(subtype="success", duration_ms=10, duration_api_ms=5,
+                         is_error=False, num_turns=1, session_id=SID,
+                         total_cost_usd=cost)
+
+
+def test_the_cost_is_the_clis_running_total_not_a_sum():
+    st = State()
+    take_cost(st, _result(1.0))
+    take_cost(st, _result(2.5))
+    assert st.total_cost_usd == 2.5
+
+
+@pytest.mark.parametrize("junk", [None, -1.0, True, "3"])
+def test_a_result_without_a_usable_cost_keeps_the_last(junk):
+    st = State()
+    take_cost(st, _result(2.0))
+    take_cost(st, _result(junk))
+    assert st.total_cost_usd == 2.0
+
+
+def test_results_between_turns_take_the_running_total():
+    br, st = _bridge()
+    asyncio.run(br._handle_async_message(_result(1.0)))
+    asyncio.run(br._handle_async_message(_result(2.5)))
+    assert st.total_cost_usd == 2.5
+
+
+def test_a_turns_result_takes_the_running_total(monkeypatch):
+    monkeypatch.setattr(sdk_bridge, "TURN_END_SETTLE_S", 0.01)
+    br, st = _bridge()
+    costs = iter([1.0, 2.5])
+
+    class Client:
+        async def query(self, _prompt):
+            br.turn_msg_queue.put_nowait(_result(next(costs)))
+
+        async def interrupt(self):  # pragma: no cover
+            pass
+
+    br.client = Client()
+    asyncio.run(br.run_turn("first"))
+    asyncio.run(br.run_turn("second"))
+    assert st.total_cost_usd == 2.5
 
 
 # --------------------------------------------------------------------------

@@ -2064,6 +2064,17 @@ config dir.
 the first `init`, and the only judge of a cloud provider, which `apiKeySource`
 does not name.
 
+**The cost is the CLI's running total.** `total_cost_usd` in a result is the
+CLI's process-wide total: nothing resets it between turns, and its budget check
+reads the same total. On resume the CLI restores the total it last saved for
+the session, but only if that session was the last in its directory to save
+one. The hub had been adding each result's figure to the last, so it counted
+every earlier turn again. It now takes the latest (`state.take_cost`): what
+Claude Code itself would show. That starts again when a session's CLI is
+replaced and the CLI cannot restore it, and the tooltip says so. No sum the hub
+could keep would be better, because it cannot tell a restored total from a new
+one.
+
 **`/login console`** launches `claude auth login --console` for the session's
 account. It always starts, signed in or not, and says first that it replaces
 the account's login, a subscription included, once the browser sign-in

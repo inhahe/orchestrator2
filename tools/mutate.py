@@ -5807,6 +5807,14 @@ APIKEY_STATE_MUTATIONS = [
      'return state.api_key_source not in (None, "none")',
      'return state.api_key_source is not None'),
 
+    ("each result's cost is added to the last -- the double count",
+     "        state.total_cost_usd = float(cost)\n",
+     "        state.total_cost_usd += float(cost)\n"),
+
+    ("a negative or boolean cost is taken",
+     "isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0",
+     "isinstance(cost, (int, float))"),
+
     ("a subscription rate limit makes a key session a subscription again",
      "    if rl_type in SUBSCRIPTION_RL_TYPES and not billed_to_api_key(state):\n",
      "    if rl_type in SUBSCRIPTION_RL_TYPES:\n"),
@@ -5829,6 +5837,17 @@ APIKEY_BRIDGE_MUTATIONS = [
      "            if isinstance(data_dict, dict):\n                apply_api_key_source(",
      "            if isinstance(data_dict, dict) and first_init:\n"
      "                apply_api_key_source("),
+
+    ("results between turns are added up",
+     '            take_cost(state, msg)\n'
+     '            subtype = getattr(msg, "subtype", None) or "unknown"',
+     '            state.total_cost_usd += msg.total_cost_usd or 0\n'
+     '            subtype = getattr(msg, "subtype", None) or "unknown"'),
+
+    ("a turn's results are added up",
+     "                    # The running total, compaction included.\n"
+     "                    take_cost(state, msg)\n",
+     "                    state.total_cost_usd += msg.total_cost_usd or 0\n"),
 ]
 
 APIKEY_AUTH_MUTATIONS = [

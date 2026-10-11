@@ -18,6 +18,16 @@ says plan limits don't apply. `/status` says what the session is billed to.
 `/login console` signs an account in to an Anthropic Console account, billed
 per token. design.md §6g.
 
+## The session's cost counted every earlier turn again — FIXED (2026-10-10)
+
+`total_cost_usd` in a result is the CLI's running total for the session, not
+the turn's cost. The hub added each result's figure to the last, so after
+three turns costing $1 each it showed $6, not $3. Subscription sessions showed
+the figure only in `/status`; API-key sessions show it in the status bar,
+where it is money. The hub now takes the latest figure, as Claude Code itself
+shows it. That figure starts again when a session's CLI is replaced and the
+CLI cannot restore the total it saved. design.md §6g.
+
 ## A tab woken from a freeze still drew what it missed slowly — FIXED (2026-10-10)
 
 > "sometimes clicking on a tab again that's working still replays the recent

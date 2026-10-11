@@ -94,6 +94,7 @@ from config import (
 from state import (
     State,
     apply_api_key_source,
+    take_cost,
     apply_rate_limit_info,
     config_dir_path,
     detect_account_info,
@@ -3074,8 +3075,7 @@ class SDKBridge:
             ctx = extract_context_tokens(raw_usage, raw_model_usage)
             if ctx:
                 state.context_tokens = ctx
-            if hasattr(msg, "total_cost_usd"):
-                state.total_cost_usd += msg.total_cost_usd or 0
+            take_cost(state, msg)
             subtype = getattr(msg, "subtype", None) or "unknown"
             state.last_result_subtype = subtype
 
@@ -4935,12 +4935,12 @@ class SDKBridge:
                     # ``_end_ghost_turn`` cover the post-compact stream.
                     was_compact = state.compact_during_last_turn
                     state.compact_during_last_turn = False
+                    # The running total, compaction included.
+                    take_cost(state, msg)
 
                     if not was_compact:
                         # Real end of turn — book metrics.
                         state.turns += 1
-                        if hasattr(msg, "total_cost_usd") and msg.total_cost_usd:
-                            state.total_cost_usd += msg.total_cost_usd
                         raw_usage = getattr(msg, "usage", None)
                         raw_model_usage = getattr(msg, "model_usage", None)
                         if isinstance(raw_usage, dict):

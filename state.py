@@ -327,6 +327,19 @@ def apply_api_key_source(state: State, source: Any, config_dir: str | None) -> N
                                    if state.is_subscription else None)
 
 
+def take_cost(state: State, msg: Any) -> None:
+    """Record the cost a ResultMessage reports.
+
+    ``total_cost_usd`` is the CLI's running total for the session, not the
+    turn's: nothing resets it between turns, and on resume the CLI restores
+    the total it last saved for the session when it can.  So it replaces the
+    figure rather than adding to it.
+    """
+    cost = getattr(msg, "total_cost_usd", None)
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
+        state.total_cost_usd = float(cost)
+
+
 # ---------------------------------------------------------------------------
 # Rate-limit helpers
 # ---------------------------------------------------------------------------
@@ -893,7 +906,9 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
     rate_field: str | None = None
     rate_limits: dict[str, Any] = {}
     cost = f"${state.total_cost_usd:.4f}"
-    cost_note = "what this session's turns have cost, as Claude Code reports it."
+    cost_note = ("Claude Code's running total for this session. It starts again "
+                 "when the session's CLI is replaced and Claude Code cannot "
+                 "restore it.")
     if state.is_subscription:
         plan_field = f"{state.subscription_plan or 'sub'}"
         plan_title = "Claude subscription plan"
