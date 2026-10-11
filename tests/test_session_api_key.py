@@ -517,7 +517,7 @@ def test_resume_gives_a_session_the_key_it_ran_with(monkeypatch, tmp_path):
 def test_cwd_gives_the_session_it_continues_the_key_it_ran_with(monkeypatch, tmp_path):
     server._session_api_keys["sid-recent"] = OTHER
     monkeypatch.setattr(server, "find_most_recent_session_for_cwd",
-                        lambda _c: types.SimpleNamespace(stem="sid-recent"))
+                        lambda _c, _d=None: types.SimpleNamespace(stem="sid-recent"))
     cfg = _switch(monkeypatch, tmp_path, key=KEY, cwd=str(tmp_path))
     assert cfg.api_key == OTHER
     assert server.state.session_id == "sid-recent"

@@ -56,7 +56,8 @@ def _turn(n):
 
 
 def _write(path: Path, records, mode="w") -> Path:
-    with open(path, mode, encoding="utf-8") as f:
+    # newline="": LF, as the CLI writes it, whatever the platform.
+    with open(path, mode, encoding="utf-8", newline="") as f:
         f.write("".join(json.dumps(r) + "\n" for r in records))
     return path
 

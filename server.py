@@ -229,6 +229,33 @@ def _session_key(sid: str | None, launch_key: str | None = None) -> str | None:
     return launch_key or (_session_api_keys.get(sid) if sid else None)
 
 
+def _session_to_open(resume: str | None, cwd: str, config_dir: str | None, *,
+                     continue_recent: bool) -> str | None:
+    """The on-disk session a runtime opens: *resume* if given, else -- when
+    *continue_recent* -- the most recent session in *cwd* in *config_dir*'s
+    account; None for a new conversation."""
+    if resume:
+        return resume
+    if continue_recent:
+        recent = find_most_recent_session_for_cwd(cwd, config_dir)
+        if recent is not None:
+            return recent.stem
+    return None
+
+
+def _session_dir(sid: str, config_dir: str | None) -> str | None:
+    """The directory session *sid* ran in, resolved, if it still exists.
+
+    The CLI looks for a session only in its own directory's project, so a
+    session is resumed from there.
+    """
+    session_cwd = find_session_cwd(sid, config_dir)
+    if not session_cwd:
+        return None
+    resolved = str(Path(session_cwd).resolve(strict=False))
+    return resolved if Path(resolved).is_dir() else None
+
+
 def _session_keys_to_hand_over() -> dict[str, str]:
     """Every session's key: the closed ones remembered, and the live ones."""
     keys = dict(_session_api_keys)
@@ -1351,18 +1378,16 @@ def _attach_queue_persistence(st, cwd: str, config_dir: str | None = None) -> in
     **Restoring is gated on the session, not the directory.**  A restored
     prompt is not merely displayed -- ``connect()`` finishes by calling
     ``_poke_for_queued_prompt()``, so the worker pops it and *sends* it as a
-    real turn without the user doing anything.  Handing that to the wrong
-    session means a brand-new session silently re-runs an old one's prompt,
-    which is what happened (see known-issues.md, "A new session inherited an
-    old session's queued prompt").
+    real turn without the user doing anything.  Handed to the wrong session,
+    a brand-new session would silently re-run an old one's prompt.
 
     **``st.session_id`` must already be seeded when this is called.**  It is the
     only thing that decides which queue is eligible: :func:`load_persisted_queue`
     returns nothing at all for a session with no id, and otherwise nothing that
     is not that exact session's own recent work.  So a ``--no-continue`` session
     -- which has no id by definition -- cannot inherit anything, and the call
-    sites need no flag to say so; they only need to run *after* seeding.
-    That ordering is what the original bug got wrong, and it is pinned by a test.
+    sites need no flag to say so; they only need to run *after* seeding, which
+    a test pins.
 
     The save side is always wired, including when nothing was restored: a fresh
     session still deserves to have its own queue survive a restart, from the
@@ -1435,10 +1460,11 @@ def _seed_primary_session(cfg: Config) -> tuple[Config, str | None, str | None]:
         if resolved != cfg.resume:
             cfg = dataclasses.replace(cfg, resume=resolved)
         resume_id = resolved
-    elif cfg.resume is None and not cfg.no_continue and not cfg.start_fresh:
-        recent = find_most_recent_session_for_cwd(cfg.cwd)
-        if recent is not None:
-            resume_id = recent.stem
+    else:
+        resume_id = _session_to_open(
+            None, cfg.cwd, cfg.config_dir,
+            continue_recent=(cfg.resume is None and not cfg.no_continue
+                             and not cfg.start_fresh))
     if resume_id:
         title = read_session_title(resume_id, cfg.config_dir)
     # A session this launch brought no key for keeps the one it ran with: the
@@ -1707,13 +1733,8 @@ async def _create_runtime(
     # Decide which on-disk session (if any) seeds this runtime: in the
     # session's own account, whose config dir holds its session files.
     # Decided before the config is: a session reopened keeps the key it had.
-    seed_id: str | None = None
-    if resume:
-        seed_id = resume
-    elif not no_continue:
-        recent = find_most_recent_session_for_cwd(resolved_cwd, config_dir)
-        if recent is not None:
-            seed_id = recent.stem
+    seed_id = _session_to_open(resume, resolved_cwd, config_dir,
+                               continue_recent=not no_continue)
     # Set every time, never inherited, like the name: the hub's config is its
     # launch's session's, and that launch's key is that session's alone.
     overrides["api_key"] = _session_key(seed_id, api_key)
@@ -2853,15 +2874,12 @@ async def _reconfigure(
         # one from another directory is resumed from there, unless a
         # directory was given with it.
         if not cwd:
-            session_cwd = find_session_cwd(new_resume, config.config_dir)
-            if session_cwd and Path(session_cwd).is_dir():
-                new_cwd = str(Path(session_cwd).resolve(strict=False))
+            new_cwd = _session_dir(new_resume, config.config_dir) or new_cwd
 
     # The session about to be shown: the one resumed, or for /cwd the most
     # recent in the new directory; None for a new one.
-    recent = (find_most_recent_session_for_cwd(new_cwd)
-              if cwd and not new_resume and not config.no_continue else None)
-    target = new_resume or (recent.stem if recent is not None else None)
+    target = _session_to_open(new_resume, new_cwd, config.config_dir,
+                              continue_recent=bool(cwd) and not config.no_continue)
 
     # --- Stop existing bridge ---
     # The session being left keeps the key it ran with.
@@ -2915,10 +2933,10 @@ async def _reconfigure(
     elif cwd:
         os.chdir(new_cwd)
         # Seed session from the new cwd (continue most recent, found above).
-        if recent is not None:
-            state.session_id = recent.stem
-            state.session_title = read_session_title(recent.stem, config.config_dir)
-            bridge._initial_resume_id = recent.stem
+        if target is not None:
+            state.session_id = target
+            state.session_title = read_session_title(target, config.config_dir)
+            bridge._initial_resume_id = target
 
     # Same rule as startup: the queue follows the session, so this has to run
     # after the two branches above have decided which one (if any) we are on.
@@ -3340,11 +3358,8 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     # resume id, or — for a plain continue — the most recent session in cwd).
     # If a runtime is already hosting it, reuse that one so we never spin up a
     # second bridge against the same session file.
-    target_sid = resume
-    if target_sid is None and not no_continue:
-        recent = find_most_recent_session_for_cwd(cwd or config.cwd, config_dir)
-        if recent is not None:
-            target_sid = recent.stem
+    target_sid = _session_to_open(resume, cwd or config.cwd, config_dir,
+                                  continue_recent=not no_continue)
     if target_sid:
         existing = next(
             (r for r in runtimes.values()
@@ -3562,13 +3577,11 @@ async def api_resume(body: dict[str, Any]) -> dict[str, Any]:
 
     # Resumed from the directory it ran in: the CLI looks for a session only
     # in its own directory's project, and starts in the Config's cwd.
-    session_cwd = find_session_cwd(session_id, config.config_dir)
-    if session_cwd and _default_runtime is not None:
-        resolved = str(Path(session_cwd).resolve(strict=False))
-        if Path(resolved).is_dir():
-            os.chdir(resolved)
-            _replace_runtime_config(_default_runtime, cwd=resolved)
-            log.info("switched cwd to %s for session %s", resolved, session_id[:8])
+    resolved = _session_dir(session_id, config.config_dir)
+    if resolved and _default_runtime is not None:
+        os.chdir(resolved)
+        _replace_runtime_config(_default_runtime, cwd=resolved)
+        log.info("switched cwd to %s for session %s", resolved, session_id[:8])
     # Its queue, kept for it in that directory, comes back as on any open.
     _attach_queue_persistence(state, config.cwd, config.config_dir)
 

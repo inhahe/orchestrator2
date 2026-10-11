@@ -4964,19 +4964,23 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
 
     ("a session resumed from another directory runs its CLI in this one",
      "        if not cwd:\n"
-     "            session_cwd = find_session_cwd(new_resume, config.config_dir)\n",
+     "            new_cwd = _session_dir(new_resume, config.config_dir) or new_cwd\n",
      "        if False:\n"
-     "            session_cwd = find_session_cwd(new_resume, config.config_dir)\n"),
+     "            new_cwd = _session_dir(new_resume, config.config_dir) or new_cwd\n"),
 
     ("a directory given with a resume is overruled by the session's",
      "        if not cwd:\n"
-     "            session_cwd = find_session_cwd(new_resume, config.config_dir)\n",
+     "            new_cwd = _session_dir(new_resume, config.config_dir) or new_cwd\n",
      "        if True:\n"
-     "            session_cwd = find_session_cwd(new_resume, config.config_dir)\n"),
+     "            new_cwd = _session_dir(new_resume, config.config_dir) or new_cwd\n"),
 
     ("a session picked from another directory runs its CLI in this one",
-     "            _replace_runtime_config(_default_runtime, cwd=resolved)\n",
+     "        _replace_runtime_config(_default_runtime, cwd=resolved)\n",
      ""),
+
+    ("a session's directory is taken though it no longer exists",
+     "    return resolved if Path(resolved).is_dir() else None\n",
+     "    return resolved\n"),
 
     ("a picked session's queue is not brought back",
      "    # Its queue, kept for it in that directory, comes back as on any open.\n"
@@ -6197,12 +6201,12 @@ SESSIONKEY_SERVER_MUTATIONS = [
      ""),
 
     ("a picker still to choose opens the directory's most recent session",
-     "    elif cfg.resume is None and not cfg.no_continue and not cfg.start_fresh:\n",
-     "    elif not cfg.no_continue and not cfg.start_fresh:\n"),
+     "            continue_recent=(cfg.resume is None and not cfg.no_continue\n",
+     "            continue_recent=(not cfg.no_continue\n"),
 
     ("a restart's fresh start continues the most recent session after all",
-     "    elif cfg.resume is None and not cfg.no_continue and not cfg.start_fresh:\n",
-     "    elif cfg.resume is None and not cfg.no_continue:\n"),
+     "                             and not cfg.start_fresh))\n",
+     "                             ))\n"),
 
     ("a restart's replacement still to choose shows a console picker",
      "    if cfg.resume == _PICKER_SENTINEL and not cfg.wait_port:\n",
@@ -6413,12 +6417,12 @@ COST_BRIDGE_MUTATIONS = [
 # tests/test_move_stops_original.py.
 ACCOUNT_SERVER_MUTATIONS = [
     ("a session on another account is looked for in the hub's",
-     "        recent = find_most_recent_session_for_cwd(resolved_cwd, config_dir)\n",
-     "        recent = find_most_recent_session_for_cwd(resolved_cwd)\n"),
+     "        recent = find_most_recent_session_for_cwd(cwd, config_dir)\n",
+     "        recent = find_most_recent_session_for_cwd(cwd)\n"),
 
     ("a launch on another account looks for its session in the hub's",
-     "        recent = find_most_recent_session_for_cwd(cwd or config.cwd, config_dir)\n",
-     "        recent = find_most_recent_session_for_cwd(cwd or config.cwd)\n"),
+     "    target_sid = _session_to_open(resume, cwd or config.cwd, config_dir,\n",
+     "    target_sid = _session_to_open(resume, cwd or config.cwd, None,\n"),
 
     ("a session opened on another account keeps its queue in the hub's",
      "    _attach_queue_persistence(st, cfg.cwd, cfg.config_dir)\n",

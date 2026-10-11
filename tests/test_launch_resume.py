@@ -537,6 +537,13 @@ def test_a_session_resumed_from_another_directory_runs_there(machine, monkeypatc
     assert cfg.cwd == str(Path(machine.os).resolve())
 
 
+def test_a_session_whose_directory_is_gone_resumes_where_the_tab_is(machine, monkeypatch,
+                                                                     tmp_path):
+    _session(machine.default, str(tmp_path / "deleted"), LIVE, "OS F")
+    cfg = _resumed_from_the_orchestrator(machine, monkeypatch, LIVE)
+    assert cfg.cwd == str(Path(machine.orch).resolve())
+
+
 def test_a_directory_given_with_the_resume_is_kept(machine, monkeypatch):
     _session(machine.default, machine.os, LIVE, "OS F")
     cfg = _resumed_from_the_orchestrator(machine, monkeypatch, LIVE, cwd=machine.orch)
