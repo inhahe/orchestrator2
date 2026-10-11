@@ -134,7 +134,112 @@ import plan_usage
 log = logging.getLogger("orchestrator2")
 
 
-def _ensure_logged_in(*, block: bool) -> bool:
+# A launch's ANTHROPIC_API_KEY is for the session that launch opens, and no
+# other (asked for 2026-10-10, as the agent name already was).  Left in the
+# hub's environment, every session's CLI would inherit it, and where the SDK
+# runs the CLI, a key outranks a subscription login without asking.  So the
+# key moves into that session's Config.api_key and out of the environment;
+# a launch that joins a running hub hands it over with its request.  The hub
+# remembers the keys of sessions it closed, so one reopened from the lobby
+# keeps its key, and hands them all to its replacement on ⟳ Restart.  Only in
+# memory and in that child's environment: never on disk, never on a command
+# line, never logged, never sent to a browser.
+
+#: Where ⟳ Restart hands its replacement the sessions' keys (JSON, session id
+#: -> key).  The replacement takes it out of its environment at once.
+HANDOVER_KEYS_ENV = "ORCH2_SESSION_API_KEYS"
+
+#: Session id -> API key, for sessions that had one and were closed while the
+#: hub runs.  A live session's key is in its Config.
+_session_api_keys: dict[str, str] = {}
+
+
+def _take_launch_api_key() -> str | None:
+    """This launch's ``ANTHROPIC_API_KEY``, taken out of the environment.
+
+    Out before anything else runs: every CLI this process starts inherits its
+    environment, and the key is the launched session's alone.  None if unset
+    or blank.
+    """
+    return (os.environ.pop("ANTHROPIC_API_KEY", None) or "").strip() or None
+
+
+def _detach_child_env(cfg: Config) -> dict[str, str]:
+    """The environment for the headless child a ``--detach`` launch hands off to.
+
+    The same launch, finished in another process, so it is given the key this
+    one took out of its environment.
+    """
+    env = dict(os.environ)
+    if cfg.api_key:
+        env["ANTHROPIC_API_KEY"] = cfg.api_key
+    return env
+
+
+def _env_api_key_notice(key: str | None) -> str | None:
+    """What a launch says about the key in its environment; None without one."""
+    if not key:
+        return None
+    return ("ANTHROPIC_API_KEY is set: only the session this launch opens is "
+            "billed per token to that key. Every other session keeps its "
+            "account's own login.")
+
+
+def _take_handed_over_keys() -> dict[str, str]:
+    """The keys a restarting hub handed this one, taken out of the environment.
+
+    Out at once, before any CLI could inherit them.  Anything malformed is
+    dropped: the sessions fall back to their accounts' logins.
+    """
+    raw = os.environ.pop(HANDOVER_KEYS_ENV, None)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {sid: key for sid, key in data.items()
+            if isinstance(sid, str) and sid and isinstance(key, str) and key}
+
+
+def _remember_session_key(rt: "SessionRuntime") -> None:
+    """Keep a closing session's key, for when the session is opened again."""
+    key = getattr(rt.config, "api_key", None)
+    sid = getattr(rt.state, "session_id", None)
+    if key and sid:
+        _session_api_keys[sid] = key
+
+
+def _session_keys_to_hand_over() -> dict[str, str]:
+    """Every session's key: the closed ones remembered, and the live ones."""
+    keys = dict(_session_api_keys)
+    for rt in runtimes.values():
+        key = getattr(rt.config, "api_key", None)
+        sid = getattr(rt.state, "session_id", None)
+        if key and sid:
+            keys[sid] = key
+    return keys
+
+
+def _replace_runtime_config(rt: "SessionRuntime", **changes: Any) -> None:
+    """Give a live session a changed Config.
+
+    The runtime and its bridge share one, and the primary session's is also
+    the hub's own ``config``, which /cwd and /resume rebuild from.  Changing
+    only some of them would let the old value come back.
+    """
+    global config
+    new_cfg = dataclasses.replace(rt.config, **changes)
+    if rt is _default_runtime:
+        config = new_cfg
+    rt.config = new_cfg
+    if rt.bridge is not None:
+        rt.bridge.config = new_cfg
+
+
+def _ensure_logged_in(*, block: bool, api_key: str | None = None) -> bool:
     """Auto-login to the Claude account (the way Claude Code does) if needed.
 
     Runs under the CLAUDE_CONFIG_DIR already pinned by ``main()``.  When not
@@ -142,9 +247,10 @@ def _ensure_logged_in(*, block: bool) -> bool:
     ``block=True`` (the --detach parent) it then waits until the login
     completes so the headless child starts already authenticated; with
     ``block=False`` it returns immediately and the worker's connect-retry
-    picks up the credentials once they land.
+    picks up the credentials once they land.  A launch with an ``api_key`` of
+    its own needs no sign-in: that is what its session is billed to.
     """
-    if auth.is_logged_in():
+    if api_key or auth.is_logged_in():
         return True
     ok, msg = auth.launch_login()
     print(f"Not signed in to Claude — {msg}")
@@ -1471,6 +1577,7 @@ async def _create_runtime(
     agent_labels: dict[str, str] | None = None,
     initial_prompt: str | None = None,
     resume_interrupted_turn: bool | None = None,
+    api_key: str | None = None,
 ) -> SessionRuntime:
     """Spin up a fresh live session runtime (config clone + state + bridge).
 
@@ -1493,6 +1600,10 @@ async def _create_runtime(
     * ``resume_interrupted_turn`` — whether opening the session finishes a
       turn its last process cut off.  None keeps the hub's setting.  ``/move``
       passes True: the move itself cut that turn, and the copy carries on.
+    * ``api_key`` — this session's own API key (the launch's
+      ``ANTHROPIC_API_KEY``).  Without one, a session the hub remembers a
+      key for (``_session_api_keys``) gets that.  Never inherited from the
+      hub.
     * otherwise — continue the most recent session in *cwd*.
 
     Registers the runtime, starts its bridge, and refreshes the lobby.
@@ -1556,6 +1667,23 @@ async def _create_runtime(
     # Labels the same way: the hub's --agent-label lane=b is not every
     # session's lane.
     overrides["agent_labels"] = dict(agent_labels or {})
+
+    # Decide which on-disk session (if any) seeds this runtime.
+    # Session files live under CLAUDE_CONFIG_DIR, so scope the lookup to
+    # the session's account when it differs from the hub's.  Decided before
+    # the config is: a session reopened keeps the key it had.
+    seed_id: str | None = None
+    with _env_config_dir(config_dir):
+        if resume:
+            seed_id = resume
+        elif not no_continue:
+            recent = find_most_recent_session_for_cwd(resolved_cwd)
+            if recent is not None:
+                seed_id = recent.stem
+    # Set every time, never inherited, like the name: the hub's config is its
+    # launch's session's, and that launch's key is that session's alone.
+    overrides["api_key"] = api_key or (
+        _session_api_keys.get(seed_id) if seed_id else None)
     cfg = dataclasses.replace(config, **overrides)
     # Build the state *inside* the session's config-dir scope so account
     # detection (detect_account_info / detect_subscription*) reads the
@@ -1570,17 +1698,7 @@ async def _create_runtime(
     br = SDKBridge(config=cfg, state=st, broadcaster=rt.broadcast)
     rt.bridge = br
 
-    # Decide which on-disk session (if any) seeds this runtime.
-    # Session files live under CLAUDE_CONFIG_DIR, so scope the lookup to
-    # the session's account when it differs from the hub's.
-    seed_id: str | None = None
     with _env_config_dir(config_dir):
-        if resume:
-            seed_id = resume
-        elif not no_continue:
-            recent = find_most_recent_session_for_cwd(resolved_cwd)
-            if recent is not None:
-                seed_id = recent.stem
         if seed_id:
             st.session_id = seed_id
             br._initial_resume_id = seed_id
@@ -1869,6 +1987,8 @@ async def _teardown_runtime(rt: SessionRuntime, *, force: bool = False,
     # at the end only for readability: the state it reads survives the whole
     # function, so the position is not load-bearing.
     _record_teardown(rt, reason)
+    # Opened again while the hub runs, the session keeps its key.
+    _remember_session_key(rt)
     runtimes.pop(rt.rid, None)
     _cancel_idle_timer(rt)
     if rt is _default_runtime:
@@ -2925,6 +3045,16 @@ async def api_restart() -> dict[str, Any]:
     cfg_dir = getattr(config, "config_dir", None) if config is not None else None
     if cfg_dir:
         env["CLAUDE_CONFIG_DIR"] = cfg_dir
+    # The sessions' API keys go to the replacement in its environment, which
+    # it empties at once.  The session it resumes gets its own as the launch
+    # key, the replacement being that session's launch again; the others are
+    # remembered there, for when they are reopened.
+    primary_key = getattr(config, "api_key", None) if sid else None
+    if primary_key:
+        env["ANTHROPIC_API_KEY"] = primary_key
+    keys = _session_keys_to_hand_over()
+    if keys:
+        env[HANDOVER_KEYS_ENV] = json.dumps(keys)
 
     # Give the replacement its OWN visible console rather than running it
     # headless.  Two reasons, both learned the hard way:
@@ -3137,6 +3267,10 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     # Only for a session this launch opens: one already open has no cut-off
     # turn to finish.
     resume_interrupted_turn = body.get("resume_interrupted_turn") is True
+    # The launch's ANTHROPIC_API_KEY, for this session alone (see
+    # HANDOVER_KEYS_ENV).
+    api_key = body.get("api_key")
+    api_key = (api_key.strip() if isinstance(api_key, str) else "") or None
 
     # A title is resolved to its session's id first, as the hub's own startup
     # does -- left as the title, it became this runtime's session id until the
@@ -3192,10 +3326,12 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
             # model.  Config is frozen and shared by the runtime and its
             # bridge, so both get the replacement.
             if cli_path and getattr(existing.config, "cli_path", None) != cli_path:
-                new_cfg = dataclasses.replace(existing.config, cli_path=cli_path)
-                existing.config = new_cfg
-                if existing.bridge is not None:
-                    existing.bridge.config = new_cfg
+                _replace_runtime_config(existing, cli_path=cli_path)
+                need_reconnect = True
+            # And its API key, likewise fixed at connect time.  A launch
+            # without one leaves the key the session has.
+            if api_key and getattr(existing.config, "api_key", None) != api_key:
+                _replace_runtime_config(existing, api_key=api_key)
                 need_reconnect = True
             # And its labels and name: the launch described this session,
             # which happens to be open already.  Applied live, without the
@@ -3245,7 +3381,8 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
                                    cli_path=cli_path, agent_name=agent_name,
                                    agent_labels=agent_labels,
                                    initial_prompt=initial_prompt,
-                                   resume_interrupted_turn=resume_interrupted_turn)
+                                   resume_interrupted_turn=resume_interrupted_turn,
+                                   api_key=api_key)
     except Exception as exc:
         log.exception("hub session launch failed")
         return {"ok": False, "error": str(exc)}
@@ -4463,7 +4600,7 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
                 cwd=cwd, resume=sid, config_dir=src_cfg,
                 agent_name=carry["agent_name"],
                 agent_labels=carry["agent_labels"],
-                resume_interrupted_turn=True)
+                resume_interrupted_turn=True, api_key=carry["api_key"])
         except Exception:
             log.exception("move: could not reopen the original session")
             await send_to(ws, {"type": "move_error", "message": (
@@ -4544,7 +4681,7 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
             cwd=dest_cwd, resume=new_id, config_dir=target_cfg,
             session_note=note, agent_name=carry["agent_name"],
             agent_labels=carry["agent_labels"],
-            resume_interrupted_turn=True)
+            resume_interrupted_turn=True, api_key=carry["api_key"])
     except Exception as exc:
         log.exception("move: failed to start runtime for copied session")
         await _move_failed(f"Couldn't start the moved session: {exc}")
@@ -4611,6 +4748,9 @@ def _move_carry(rt: SessionRuntime, cwd: str, sid: str) -> dict[str, Any]:
         "wakeup": wakeup,
         "agent_name": getattr(st, "agent_name", None),
         "agent_labels": dict(getattr(st, "agent_labels", None) or {}),
+        # The session's own API key: the moved session is the same work, and
+        # stays billed as it was.
+        "api_key": getattr(rt.config, "api_key", None),
     }
 
 
@@ -5019,6 +5159,12 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             await _handle_usage(ws, rt)
             return
 
+        # /apikey -- the session's own API key, in a Config only this module
+        # can replace.
+        if kind == "apikey":
+            await _handle_apikey(ws, rt, payload)
+            return
+
         # `/model` with no argument is "what can I switch to?", so it must
         # answer from the API rather than from an hour-old cache.  Awaited, not
         # fired-and-forgotten: the whole point is that the list rendered a line
@@ -5228,6 +5374,50 @@ async def _handle_mcp(ws: WebSocket, rt: "SessionRuntime", payload: str) -> None
         servers, tools_mode=tools_mode, filter_name=filter_name,
     )
     await send_to(ws, {"type": "modal", "title": "MCP Servers", "content": content})
+
+
+async def _handle_apikey(ws: WebSocket, rt: "SessionRuntime", payload: str) -> None:
+    """``/apikey``: whether this session has an API key of its own.
+
+    A session's own key is the ``ANTHROPIC_API_KEY`` of the launch that opened
+    it (``Config.api_key``; see ``HANDOVER_KEYS_ENV``).  ``/apikey off`` drops
+    it, here and in what the hub remembers, and reconnects the session's CLI
+    on its account's own login.  The key itself is never shown.
+    """
+    arg = payload.strip().lower()
+    key = getattr(rt.config, "api_key", None)
+    level = "info"
+    if arg not in ("", "off"):
+        # Never repeated back: what was typed may be a key, pasted in hope.
+        level = "error"
+        text = ("/apikey takes nothing but off: it says whether this session "
+                "has an API key of its own, and /apikey off drops it. A key is "
+                "never typed here. Set ANTHROPIC_API_KEY in the environment of "
+                "the launch that opens the session, or put the key in the "
+                "account's settings.json.")
+    elif arg == "" and key:
+        text = ("This session has its own API key, from the launch that opened "
+                "it, and is billed per token to that key. /apikey off drops it.")
+    elif arg == "":
+        text = ("This session has no API key of its own, so it uses its "
+                "account's login (and a key in the account's settings.json, if "
+                "there is one). A launch with ANTHROPIC_API_KEY set gives the "
+                "session it opens a key of its own.")
+    elif not key:
+        text = "This session has no API key of its own."
+    else:
+        _replace_runtime_config(rt, api_key=None)
+        sid = getattr(rt.state, "session_id", None)
+        if sid:
+            _session_api_keys.pop(sid, None)
+        if rt.bridge is not None:
+            # Through the worker, never a task of its own: see the note on
+            # the reconnect in api_session_launch.
+            rt.bridge.event_queue.put_nowait(("connect", ""))
+        text = ("This session no longer has an API key of its own: reconnecting "
+                "on its account's own login.")
+    await send_to(ws, {"type": "system_msg", "subtype": level,
+                       "data": {"message": text}})
 
 
 async def _handle_usage(ws: WebSocket, rt: "SessionRuntime") -> None:
@@ -5693,6 +5883,7 @@ def _hub_launch_kwargs(cfg: Config, config_dir: str | None) -> dict[str, Any]:
         "agent_labels": dict(cfg.agent_labels or {}),
         "initial_prompt": cfg.initial_prompt,
         "resume_interrupted_turn": cfg.resume_interrupted_turn,
+        "api_key": cfg.api_key,
     }
 
 
@@ -5795,6 +5986,7 @@ def _launch_into_hub(
     agent_labels: dict[str, str] | None = None,
     initial_prompt: str | None = None,
     resume_interrupted_turn: bool = False,
+    api_key: str | None = None,
 ) -> str | None:
     """Ask a running hub to open a session; return its ``rid`` (or None).
 
@@ -5814,7 +6006,9 @@ def _launch_into_hub(
     its --initial-prompt, and its session was sent the prompt of whichever
     launch had started the hub instead, because sessions inherited that.
     And ``resume_interrupted_turn``: whether the session this launch opens
-    finishes a turn that was cut off.
+    finishes a turn that was cut off.  And ``api_key``, the launch's
+    ``ANTHROPIC_API_KEY``, for that session alone; it goes only to the hub on
+    this machine, over loopback.
     """
     import urllib.request
 
@@ -5831,6 +6025,7 @@ def _launch_into_hub(
         "agent_labels": agent_labels or {},
         "initial_prompt": initial_prompt,
         "resume_interrupted_turn": bool(resume_interrupted_turn),
+        "api_key": api_key,
     }).encode("utf-8")
     try:
         req = urllib.request.Request(
@@ -6297,6 +6492,14 @@ def main() -> None:
     # tray launcher — see _report_launch_failure.
     config = _parse_args_or_report()
 
+    # This launch's API key is the session's it opens (see HANDOVER_KEYS_ENV),
+    # and a restarting hub's are the sessions' it handed over.
+    config = dataclasses.replace(config, api_key=_take_launch_api_key())
+    _session_api_keys.update(_take_handed_over_keys())
+    notice = _env_api_key_notice(config.api_key)
+    if notice:
+        print(notice)
+
     # Set CLAUDE_CONFIG_DIR before any SDK or session code runs.  When
     # --config-dir is passed it wins; otherwise the SDK/CLI use whatever
     # CLAUDE_CONFIG_DIR is inherited from the environment (or ~/.claude when
@@ -6409,7 +6612,7 @@ def main() -> None:
         # Ensure we're signed in before spawning the headless child, blocking
         # in this visible terminal so the child starts authenticated and
         # doesn't pop its own login window.
-        _ensure_logged_in(block=True)
+        _ensure_logged_in(block=True, api_key=config.api_key)
         sock, actual_port = _bind_port("0.0.0.0", config.port)
         if actual_port != config.port:
             print(f"Port {config.port} in use — using {actual_port} instead.")
@@ -6448,6 +6651,7 @@ def main() -> None:
             stdout=subprocess.DEVNULL,
             stderr=err_file,
             close_fds=True,
+            env=_detach_child_env(config),
             **kwargs,
         )
         err_file.close()
@@ -6504,7 +6708,7 @@ def main() -> None:
     # opens and startup proceeds; the worker's connect-retry succeeds once the
     # credentials appear.
     if not config.skip_auto_login:
-        _ensure_logged_in(block=False)
+        _ensure_logged_in(block=False, api_key=config.api_key)
 
     # Bind the socket ourselves so we know the actual port before
     # uvicorn starts (needed for --open and the startup message).

@@ -1,0 +1,453 @@
+"""An API key for the one session whose launch had it.
+
+Asked 2026-10-10: "can you make ANTHROPIC_API_KEY only work for the session
+that was loaded with that key set? i think there's another key that was
+already made to behave that way?"  The other one is the agent name
+(``--agent-name`` / ``ORCH2_AGENT_NAME``; tests/test_agent_name_per_session.py),
+and the key now goes the same way:
+
+* The launch reads ``ANTHROPIC_API_KEY`` from its environment.  The session it
+  opens is given the key; no other session is.  The hub drops the variable
+  from its own environment, which every session's CLI inherits.
+* A launch that joins a running hub hands the key over with its request.
+* The hub remembers it against the session for as long as the hub runs, and
+  hands it to its replacement on a restart, so the session keeps it when it
+  is reopened from the lobby.  In memory only: never on disk, on a command
+  line, in a log, or sent to a browser.
+* ``/apikey`` says whether a session has one; ``/apikey off`` drops it.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+import types
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import btw                                       # noqa: E402
+import server                                    # noqa: E402
+from config import parse_args                    # noqa: E402
+from sdk_bridge import SDKBridge                 # noqa: E402
+from state import State, init_state_from_config  # noqa: E402
+
+KEY = "sk-ant-api03-not-a-real-key"
+OTHER = "sk-ant-api03-another-fake-key"
+
+
+@pytest.fixture(autouse=True)
+def _isolated(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv(server.HANDOVER_KEYS_ENV, raising=False)
+    monkeypatch.setattr(server, "_session_api_keys", {})
+
+
+# --------------------------------------------------------------------------
+# The launch's own key
+# --------------------------------------------------------------------------
+
+def test_the_launch_takes_its_key_out_of_the_environment(monkeypatch):
+    # Left there, every session's CLI would inherit it -- the report.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", f"  {KEY}  ")
+    assert server._take_launch_api_key() == KEY
+    assert "ANTHROPIC_API_KEY" not in os.environ
+
+
+def test_a_blank_key_is_no_key(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "   ")
+    assert server._take_launch_api_key() is None
+    assert "ANTHROPIC_API_KEY" not in os.environ
+
+
+def test_a_detached_child_is_given_the_key_its_launch_took(monkeypatch):
+    # The same launch, finished in another process.
+    import dataclasses
+    cfg = dataclasses.replace(parse_args([]), api_key=KEY)
+    assert server._detach_child_env(cfg)["ANTHROPIC_API_KEY"] == KEY
+    assert "ANTHROPIC_API_KEY" not in server._detach_child_env(parse_args([]))
+
+
+def test_a_launch_with_a_key_does_not_ask_for_a_sign_in(monkeypatch):
+    import auth
+
+    def no(*a, **k):
+        raise AssertionError("asked about a subscription sign-in")
+
+    monkeypatch.setattr(auth, "is_logged_in", no)
+    monkeypatch.setattr(auth, "launch_login", no)
+    assert server._ensure_logged_in(block=False, api_key=KEY) is True
+
+
+def test_the_key_is_never_in_the_configs_repr():
+    cfg = parse_args([])
+    import dataclasses
+    cfg = dataclasses.replace(cfg, api_key=KEY)
+    assert KEY not in repr(cfg)
+
+
+def _config_of_new_runtime(monkeypatch, tmp_path, hub_key=None, **kw):
+    """The Config _create_runtime builds, caught before any bridge starts."""
+    import dataclasses
+    monkeypatch.setattr(server, "config",
+                        dataclasses.replace(parse_args([]), api_key=hub_key))
+    seen = {}
+
+    def stop(cfg):
+        seen["cfg"] = cfg
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(server, "init_state_from_config", stop)
+    kw.setdefault("no_continue", True)
+    with pytest.raises(RuntimeError):
+        asyncio.run(server._create_runtime(cwd=str(tmp_path), **kw))
+    return seen["cfg"]
+
+
+def test_a_session_the_hub_opens_does_not_inherit_the_launchs_key(monkeypatch, tmp_path):
+    # The hub's own config is its launch's session's: its key is that
+    # session's alone.
+    cfg = _config_of_new_runtime(monkeypatch, tmp_path, hub_key=KEY)
+    assert cfg.api_key is None
+
+
+def test_a_session_opened_with_a_key_gets_that_key(monkeypatch, tmp_path):
+    cfg = _config_of_new_runtime(monkeypatch, tmp_path, hub_key=KEY, api_key=OTHER)
+    assert cfg.api_key == OTHER
+
+
+def test_a_session_reopened_by_id_keeps_the_key_it_had(monkeypatch, tmp_path):
+    server._session_api_keys["sid-1"] = KEY
+    cfg = _config_of_new_runtime(monkeypatch, tmp_path, resume="sid-1",
+                                 no_continue=False)
+    assert cfg.api_key == KEY
+
+
+def test_a_key_given_now_beats_the_one_remembered(monkeypatch, tmp_path):
+    server._session_api_keys["sid-1"] = KEY
+    cfg = _config_of_new_runtime(monkeypatch, tmp_path, resume="sid-1",
+                                 no_continue=False, api_key=OTHER)
+    assert cfg.api_key == OTHER
+
+
+def test_another_session_does_not_get_a_remembered_key(monkeypatch, tmp_path):
+    server._session_api_keys["sid-1"] = KEY
+    cfg = _config_of_new_runtime(monkeypatch, tmp_path, resume="sid-2",
+                                 no_continue=False)
+    assert cfg.api_key is None
+
+
+# --------------------------------------------------------------------------
+# The session's CLI, and its /btw fork, get it; nothing else does
+# --------------------------------------------------------------------------
+
+def _options_env(cfg):
+    st = init_state_from_config(cfg)
+
+    async def bc(_m):
+        pass
+
+    br = SDKBridge(config=cfg, state=st, broadcaster=bc)
+    return br._make_options().env
+
+
+def test_the_sessions_cli_is_given_its_key():
+    import dataclasses
+    cfg = dataclasses.replace(parse_args([]), api_key=KEY)
+    assert _options_env(cfg)["ANTHROPIC_API_KEY"] == KEY
+
+
+def test_a_session_without_one_is_given_none():
+    assert "ANTHROPIC_API_KEY" not in _options_env(parse_args([]))
+
+
+def test_a_side_question_is_billed_like_its_session():
+    import dataclasses
+    cfg = dataclasses.replace(parse_args([]), api_key=KEY)
+    st = State()
+    st.session_id = "sid-1"
+    opts = btw.build_btw_options(lambda **kw: types.SimpleNamespace(**kw),
+                                 config=cfg, state=st)
+    assert opts.env["ANTHROPIC_API_KEY"] == KEY
+
+
+# --------------------------------------------------------------------------
+# A launch that joins a running hub hands it over
+# --------------------------------------------------------------------------
+
+def test_the_hand_over_includes_it():
+    import dataclasses
+    cfg = dataclasses.replace(parse_args([]), api_key=KEY)
+    assert server._hub_launch_kwargs(cfg, None)["api_key"] == KEY
+
+
+def test_the_hand_over_puts_it_on_the_wire(monkeypatch):
+    import urllib.request
+    seen = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"ok": true, "rid": "R9"}'
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen.update(json.loads(req.data.decode("utf-8")))
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    server._launch_into_hub(8787, cwd="C:\\w", resume=None, no_continue=False,
+                            api_key=KEY)
+    assert seen["api_key"] == KEY
+    assert seen["url"].startswith("http://127.0.0.1:"), "only over loopback"
+
+
+def test_the_hub_opens_the_session_with_it(monkeypatch, tmp_path):
+    got = {}
+
+    class _RT:
+        rid = "R7"
+
+    async def fake_create_runtime(**kw):
+        got.update(kw)
+        return _RT()
+
+    monkeypatch.setattr(server, "_create_runtime", fake_create_runtime)
+    monkeypatch.setattr(server, "config", parse_args([]))
+    res = asyncio.run(server.api_session_launch({
+        "cwd": str(tmp_path), "no_continue": True, "api_key": KEY}))
+    assert got["api_key"] == KEY
+    assert KEY not in json.dumps(res)
+
+
+class _LiveBridge:
+    def __init__(self, cfg):
+        self.event_queue = asyncio.Queue()
+        self.config = cfg
+
+
+def _open_session(monkeypatch, *, key=None, sid="sid-live"):
+    import dataclasses
+    st = State()
+    st.session_id = sid
+    cfg = dataclasses.replace(parse_args([]), api_key=key)
+    rt = types.SimpleNamespace(rid="R1", state=st, config=cfg,
+                               bridge=_LiveBridge(cfg))
+    monkeypatch.setattr(server, "runtimes", {"R1": rt})
+    monkeypatch.setattr(server, "config", parse_args([]))
+    return rt
+
+
+def test_a_key_for_a_session_already_open_is_applied(monkeypatch):
+    rt = _open_session(monkeypatch)
+    asyncio.run(server.api_session_launch(
+        {"cwd": "C:\\w", "resume": "sid-live", "api_key": KEY}))
+    assert rt.config.api_key == KEY
+    assert rt.bridge.config is rt.config, "runtime and bridge disagree on the key"
+    assert rt.bridge.event_queue.get_nowait() == ("connect", "")
+
+
+def test_a_launch_without_one_leaves_an_open_sessions_key_alone(monkeypatch):
+    rt = _open_session(monkeypatch, key=KEY)
+    asyncio.run(server.api_session_launch({"cwd": "C:\\w", "resume": "sid-live"}))
+    assert rt.config.api_key == KEY
+    assert rt.bridge.event_queue.empty()
+
+
+# --------------------------------------------------------------------------
+# Remembered while the hub runs, and handed to a restart
+# --------------------------------------------------------------------------
+
+def test_closing_a_session_remembers_its_key(monkeypatch):
+    import dataclasses
+    from session_runtime import SessionRuntime
+    st = State()
+    st.session_id = "sid-9"
+    rt = SessionRuntime(config=dataclasses.replace(parse_args([]), api_key=KEY),
+                        state=st, rid="R9")
+
+    class _Bridge:
+        async def stop(self):
+            pass
+
+    rt.bridge = _Bridge()
+
+    async def nothing(*_a, **_k):
+        pass
+
+    monkeypatch.setattr(server, "runtimes", {"R9": rt})
+    monkeypatch.setattr(server, "_push_session_list", nothing)
+    asyncio.run(server._teardown_runtime(rt, force=True))
+    assert server._session_api_keys == {"sid-9": KEY}
+
+
+def test_a_session_without_a_key_leaves_nothing_to_remember(monkeypatch):
+    rt = _open_session(monkeypatch, sid="sid-9")
+    server._remember_session_key(rt)
+    assert server._session_api_keys == {}
+
+
+def _restart(monkeypatch, rt, *, primary):
+    """The replacement a restart would start: its argv and environment."""
+    import subprocess
+    seen = {}
+
+    def fake_popen(args, **kw):
+        seen["argv"] = list(args)
+        seen["env"] = dict(kw.get("env") or {})
+        raise OSError("not really")
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(sys, "argv", ["server.py"])
+    monkeypatch.setattr(server, "state", rt.state)
+    if primary:
+        monkeypatch.setattr(server, "config", rt.config)
+    asyncio.run(server.api_restart())
+    return seen
+
+
+def test_a_restart_hands_the_keys_over_in_the_childs_environment(monkeypatch):
+    rt = _open_session(monkeypatch, key=KEY, sid="sid-live")
+    server._session_api_keys["sid-closed"] = OTHER
+
+    seen = _restart(monkeypatch, rt, primary=True)
+
+    handed = json.loads(seen["env"][server.HANDOVER_KEYS_ENV])
+    assert handed == {"sid-live": KEY, "sid-closed": OTHER}
+    assert not any(KEY in a or OTHER in a for a in seen["argv"]), \
+        "a key on a command line"
+
+
+def test_the_session_a_restart_resumes_gets_its_key_as_the_launch_key(monkeypatch):
+    # The replacement is that session's launch again.
+    rt = _open_session(monkeypatch, key=KEY, sid="sid-live")
+    seen = _restart(monkeypatch, rt, primary=True)
+    assert seen["env"]["ANTHROPIC_API_KEY"] == KEY
+    assert seen["argv"][seen["argv"].index("--resume") + 1] == "sid-live"
+
+
+def test_a_restart_gives_no_launch_key_to_a_primary_without_one(monkeypatch):
+    rt = _open_session(monkeypatch, sid="sid-live")
+    seen = _restart(monkeypatch, rt, primary=True)
+    assert "ANTHROPIC_API_KEY" not in seen["env"]
+    assert server.HANDOVER_KEYS_ENV not in seen["env"]
+
+
+def test_the_new_hub_takes_the_keys_out_of_its_environment(monkeypatch):
+    monkeypatch.setenv(server.HANDOVER_KEYS_ENV, json.dumps({"sid-1": KEY}))
+    assert server._take_handed_over_keys() == {"sid-1": KEY}
+    assert server.HANDOVER_KEYS_ENV not in os.environ
+
+
+@pytest.mark.parametrize("junk", ["not json", "[1, 2]", '{"sid": 3}'])
+def test_a_garbled_hand_over_is_ignored(monkeypatch, junk):
+    monkeypatch.setenv(server.HANDOVER_KEYS_ENV, junk)
+    assert server._take_handed_over_keys() == {}
+    assert server.HANDOVER_KEYS_ENV not in os.environ
+
+
+# --------------------------------------------------------------------------
+# /apikey
+# --------------------------------------------------------------------------
+
+class _FakeWS:
+    def __init__(self):
+        self.sent = []
+
+    async def send_text(self, data):
+        self.sent.append(json.loads(data))
+
+
+def _apikey(monkeypatch, rt, payload):
+    ws = _FakeWS()
+    asyncio.run(server._handle_apikey(ws, rt, payload))
+    text = " ".join((m.get("data") or {}).get("message", "") for m in ws.sent)
+    assert KEY not in text, "the key itself was shown"
+    return text
+
+
+def test_apikey_says_a_session_has_its_own_key(monkeypatch):
+    rt = _open_session(monkeypatch, key=KEY)
+    assert "its own API key" in _apikey(monkeypatch, rt, "")
+
+
+def test_apikey_says_a_session_has_none(monkeypatch):
+    rt = _open_session(monkeypatch)
+    assert "no API key of its own" in _apikey(monkeypatch, rt, "")
+
+
+def test_apikey_off_drops_it_and_reconnects(monkeypatch):
+    rt = _open_session(monkeypatch, key=KEY, sid="sid-live")
+    server._session_api_keys["sid-live"] = KEY
+    text = _apikey(monkeypatch, rt, "off")
+    assert rt.config.api_key is None
+    assert rt.bridge.config is rt.config
+    assert "sid-live" not in server._session_api_keys
+    assert rt.bridge.event_queue.get_nowait() == ("connect", "")
+    assert "account's own login" in text
+
+
+def test_apikey_off_on_the_primary_session_changes_the_hubs_config_too(monkeypatch):
+    # /cwd and /resume rebuild the primary session from the hub's config:
+    # left there, the key would come back.
+    rt = _open_session(monkeypatch, key=KEY)
+    monkeypatch.setattr(server, "_default_runtime", rt)
+    monkeypatch.setattr(server, "config", rt.config)
+    _apikey(monkeypatch, rt, "off")
+    assert server.config.api_key is None
+
+
+def test_apikey_off_without_a_key_changes_nothing(monkeypatch):
+    rt = _open_session(monkeypatch)
+    _apikey(monkeypatch, rt, "off")
+    assert rt.bridge.event_queue.empty()
+
+
+def test_apikey_refuses_what_it_does_not_know(monkeypatch):
+    rt = _open_session(monkeypatch, key=KEY)
+    text = _apikey(monkeypatch, rt, "on")
+    assert rt.config.api_key == KEY
+    assert "/apikey off" in text
+
+
+def test_a_key_pasted_after_apikey_is_not_repeated_or_taken(monkeypatch):
+    # _apikey also checks the reply never contains the key.
+    rt = _open_session(monkeypatch)
+    text = _apikey(monkeypatch, rt, OTHER.replace("another", "pasted"))
+    assert rt.config.api_key is None
+    assert "settings.json" in text
+
+
+def test_apikey_reaches_the_hub_not_the_cli():
+    import commands
+    assert commands.classify("/apikey off") == ("apikey", "off")
+    assert commands.classify("/apikey") == ("apikey", "")
+
+
+def test_a_session_given_a_key_does_not_start_out_as_a_subscription():
+    # Until its CLI's init says, the guess is the key.
+    import dataclasses
+    st = init_state_from_config(dataclasses.replace(parse_args([]), api_key=KEY))
+    assert st.is_subscription is False
+
+
+# --------------------------------------------------------------------------
+# What the hub says at launch
+# --------------------------------------------------------------------------
+
+def test_no_key_no_notice(monkeypatch):
+    assert server._env_api_key_notice(None) is None
+
+
+def test_the_launch_is_told_only_its_session_is_billed_to_it():
+    text = server._env_api_key_notice(KEY)
+    assert "only the session this launch opens" in text
+    assert KEY not in text

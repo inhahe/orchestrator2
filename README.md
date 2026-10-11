@@ -24,7 +24,7 @@ claude auth login          # from a terminal, or
 /login                     # from inside orchestrator2 (then /connect)
 ```
 
-To pay per token with an Anthropic API key instead of a Claude subscription, see [Using an Anthropic API key](#using-an-anthropic-api-key).
+To pay per token with an Anthropic API key instead of a Claude subscription, for one session or for every session on an account, see [Using an Anthropic API key](#using-an-anthropic-api-key).
 
 **4. Run it**
 
@@ -310,9 +310,18 @@ Switch accounts at runtime with `/logout` then `/login` (then `/connect` to reco
 
 ### Using an Anthropic API key
 
-A session can be billed per token to an Anthropic API key instead of a Claude subscription. The key belongs to an **account** (a config dir), so every session on that account uses it; give a key an account of its own to keep your subscriptions for everything else. A key wins over a subscription login on the same account, so an account with both is billed to the key.
+A session can be billed per token to an Anthropic API key instead of a Claude subscription, either one session at a time or every session on an account.
 
-There are three ways to give an account a key:
+**One session: set `ANTHROPIC_API_KEY` where you launch it.** Only the session that launch opens is billed to the key. Every other session keeps its account's own login, in the same hub too:
+
+```bat
+set ANTHROPIC_API_KEY=sk-ant-api03-...
+python server.py --cwd "%cd%" --open
+```
+
+That works whether the launch starts the hub or joins one already running; a joining launch hands the key to the hub on this machine. The hub keeps the key with the session while it runs: closed and reopened from the session list, moved with `/move`, or brought back by ⟳ Restart, the session still has it. It is held in memory only, never written to disk, so after the hub shuts down, launch the session with the key again. `/apikey` says whether a session has a key of its own, and `/apikey off` drops it; the session then reconnects on its account's login.
+
+**Every session on an account:** give the account a key. A key there wins over the account's subscription login, and over a session's own key too, so give a key an account of its own to keep your subscriptions for everything else. Two ways:
 
 - **`/login console`** in a session on that account. It opens the Anthropic Console sign-in; the Claude CLI then creates an API key and keeps it in the account's config. This replaces the account's current login, a subscription included, once you finish signing in (close the window instead and nothing changes). `/login force` signs it back in to a subscription.
 - **Your own key, in the account's `settings.json`.** Add an `env` entry to `<config-dir>\settings.json` (keep whatever else the file holds):
@@ -326,11 +335,10 @@ There are three ways to give an account a key:
   ```
 
   Or have a command print the key, so it isn't stored in the file: `"apiKeyHelper": "<command>"`. Remove the entry to go back to the account's subscription.
-- **`ANTHROPIC_API_KEY` in the hub's environment.** Every session the hub runs, on every account, is then billed to it. Set it where the hub starts: a launch that joins a running hub opens its session in the hub's environment, not the launching shell's.
 
-A session picks up a new key when its CLI starts: run `/connect` in one that was already open. To start sessions on a new account, launch with `--config-dir <dir>`; once it has sessions, `/move` can move others there.
+A session picks up an account's new key when its CLI starts: run `/connect` in one that was already open. To start sessions on a new account, launch with `--config-dir <dir>`; once it has sessions, `/move` can move others there.
 
-You can see which a session uses. The status bar's plan field reads **`API $0.1234`** instead of the plan name (hover for the key's source). `/status` says what the session is billed to, and `/usage` explains that plan limits don't apply to a session billed to a key.
+You can see which a session uses. The status bar's plan field reads **`API $0.1234`** instead of the plan name (hover for the key's source). The figure is Claude Code's running total for the session: it starts again when the session's CLI is replaced and Claude Code can't restore it, so the Anthropic Console is the place for the actual bill. `/status` says what the session is billed to, and `/usage` explains that plan limits don't apply to a session billed to a key.
 
 ## Features
 
@@ -526,6 +534,7 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/export [path]` | Save conversation as markdown |
 | `/login [force\|console]` | Show sign-in status, or launch the Claude login flow. Automatically re-authenticates when the last turn failed with a 401; `/login force` re-authenticates even when it thinks you're already signed in (use this if you hit auth errors but it insists you're logged in). `/login console` signs the session's account in to an Anthropic Console account instead, billed per token to an API key the Claude CLI creates for it; see [Using an Anthropic API key](#using-an-anthropic-api-key). After you finish signing in the browser, it confirms the signed-in account by email and updates the status bar's **account** field, then prompts you to `/connect`. |
 | `/logout` | Sign the active account out |
+| `/apikey [off]` | Say whether this session has an API key of its own: the `ANTHROPIC_API_KEY` of the launch that opened it. `/apikey off` drops the key and reconnects the session on its account's own login. A key is never typed here; see [Using an Anthropic API key](#using-an-anthropic-api-key). |
 | `/connect` | Reconnect. If the browser↔server WebSocket has dropped (e.g. server restart), revives it client-side even after auto-reconnect has given up; if the socket is alive, reconnects the SDK bridge. Prompts typed while disconnected are queued and sent once reconnected. |
 | `/resume [id\|title]` | Resume a specific session, or open the session picker |
 | `/quit`, `/exit`, `/q` | Graceful exit |

@@ -84,8 +84,9 @@ def build_btw_options(options_cls: Any, *, config: Any, state: Any,
     reconnect misreport itself.
 
     What it does inherit is everything that decides *which account and which
-    conversation* this is: the cwd, the config dir, and the model. Getting the
-    config dir wrong would fork someone else's session, or nothing at all.
+    conversation* this is: the cwd, the config dir, the model, and the
+    session's own API key. Getting the config dir wrong would fork someone
+    else's session, or nothing at all.
     """
     kwargs: dict[str, Any] = {
         "cwd": config.cwd,
@@ -106,6 +107,9 @@ def build_btw_options(options_cls: Any, *, config: Any, state: Any,
         kwargs["stderr"] = stderr_cb
     if getattr(config, "config_dir", None):
         kwargs["env"]["CLAUDE_CONFIG_DIR"] = config.config_dir
+    # Billed as its session is: to the session's own API key, if it has one.
+    if getattr(config, "api_key", None):
+        kwargs["env"]["ANTHROPIC_API_KEY"] = config.api_key
     if getattr(config, "disable_prompt_cache", False):
         kwargs["env"]["DISABLE_PROMPT_CACHING"] = "1"
     # A fork inherits the interrupted-turn recovery flag from nothing -- and

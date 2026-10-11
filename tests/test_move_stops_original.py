@@ -328,6 +328,37 @@ def test_the_name_and_labels_come_along(move):
     assert kw["agent_name"] == "Lane-A" and kw["agent_labels"] == {"lane": "a"}
 
 
+KEY = "sk-ant-api03-not-a-real-key"
+
+
+def _keyed(move, monkeypatch):
+    """The original billed to its launch's own key (test_session_api_key.py).
+    Closing it records the key with the hub, so the record is this test's."""
+    import dataclasses
+    monkeypatch.setattr(server, "_session_api_keys", {})
+    move["orig"].config = dataclasses.replace(move["orig"].config, api_key=KEY)
+
+
+def test_the_sessions_own_api_key_comes_along(move, monkeypatch):
+    """The same work, carrying on, billed as it was."""
+    _keyed(move, monkeypatch)
+
+    move["run"]()
+
+    kw = next(kw for kw in move["created"] if kw["resume"] != SID)
+    assert kw["api_key"] == KEY
+
+
+def test_an_original_put_back_after_a_failed_move_keeps_its_key(move, monkeypatch):
+    _keyed(move, monkeypatch)
+    move["fail"]["copy_runtime"] = True
+
+    move["run"]()
+
+    kw = next(kw for kw in move["created"] if kw["resume"] == SID)
+    assert kw["api_key"] == KEY
+
+
 def test_the_copy_is_told_which_background_tasks_died(move):
     """They were processes of the original's CLI; they cannot move.  The copy
     gets the same notice a session cut off by a restart does."""

@@ -2032,8 +2032,10 @@ subscription login off. Measured against CLI 2.1.280 with fake credentials (a
 | a subscription login, and the key in `settings.json`'s `env` | the key |
 | a subscription login, and an `apiKeyHelper` | the key |
 
-So a key belongs to an account, as a login does: the hub's environment gives
-it to every account, an account's `settings.json` to that account's sessions.
+So the CLI takes a key from where its environment and its account give it. An
+account's `settings.json` gives it to that account's sessions; the hub's
+environment would give it to every session on every account, which is why a
+launch's key is now its session's alone (below).
 `claude auth login --console` is the CLI's own way to get one: it signs the
 account out, signs in to an Anthropic Console account, creates an API key, and
 keeps it in `.claude.json` as `primaryApiKey` (not on macOS, where it goes to
@@ -2061,7 +2063,8 @@ When the key goes, the account's plan is read back from the session's own
 config dir.
 
 `detect_subscription()`, from the hub's environment, is still the guess until
-the first `init`, and the only judge of a cloud provider, which `apiKeySource`
+the first `init` (a session given its own key starts out as not a
+subscription), and the only judge of a cloud provider, which `apiKeySource`
 does not name.
 
 **The cost is the CLI's running total.** `total_cost_usd` in a result is the
@@ -2087,12 +2090,62 @@ only to be digested. A newer token file, or a key that differs from before,
 counts as completion. A file or key removed on the way, when the sign-in signs
 out the old login, does not.
 
+**A launch's key bills that launch's session alone.** Asked 2026-10-10:
+*"can you make ANTHROPIC_API_KEY only work for the session that was loaded
+with that key set? i think there's another key that was already made to
+behave that way?"* The other is the agent name (§9a), and the key goes the
+same way. Left in the hub's environment, it reached every session's CLI on
+every account, so:
+
+- **The launch takes it out of its environment** (`_take_launch_api_key`),
+  first thing in `main()`, and keeps it as `Config.api_key`. That field is
+  `repr=False`, so no log line of a `Config` carries it. `config_to_dict`,
+  which nothing called, is gone: it would have sent a `Config` to the
+  browser, the external-access password included.
+- **The session's CLI is given it** in `_make_options`, and its `/btw` fork
+  too, so a side question is billed as its session is. The hub's own
+  `Config` is its launch's session's, so `_create_runtime` sets every other
+  session's key explicitly, never inheriting it, as it does the name.
+- **A launch that joins a running hub hands it over** in its request to
+  `/api/session/launch`, over loopback. A session already open takes it and
+  reconnects, since the key is fixed when the CLI starts; a launch without
+  one leaves an open session's key alone.
+- **The hub remembers it while it runs.** A session closed with a key leaves
+  it in `_session_api_keys` by session id, so reopened from the lobby it gets
+  it back; `/move` carries it to the copy. ⟳ Restart hands the keys to the
+  replacement in its environment, never its command line. The resumed
+  primary's key goes as the replacement's launch key, since the replacement
+  is that session's launch again; the rest go as JSON in
+  `ORCH2_SESSION_API_KEYS`, which the replacement takes out at once
+  (`_take_handed_over_keys`). After the hub shuts down, nothing is left:
+  nothing was written to disk.
+- **The rest of the launch knows it.** A launch with a key needs no
+  subscription sign-in, so `_ensure_logged_in` skips it. A `--detach` child is
+  given the key in its environment (`_detach_child_env`), being the same
+  launch. The launch says once that only its session is billed to the key.
+- **`/apikey` says whether a session has a key of its own; `/apikey off`
+  drops it,** from the session and from what is remembered, and reconnects.
+  The handler changes the session's `Config` through
+  `_replace_runtime_config`. The runtime, its bridge and, for the primary,
+  the hub's own `config` share one, and `/cwd` rebuilds from the last: a key
+  dropped from fewer would come back. A key is never typed: anything after
+  `/apikey` but `off` is refused without being repeated, since it may be a
+  key pasted in hope.
+
+An account's own key wins over a session's: the CLI applies `settings.json`'s
+`env` over the environment it was started with. Measured by pointing the CLI
+at a local stand-in for the API, both keys fake: every request carried the
+`settings.json` key.
+
 Tests: `tests/test_api_key_billing.py` (state, the bridge, `/status`, the
 report, `auth`, `/login`), `tests/test_api_key_hub.py` (`/usage`, the
-watcher), `tests/usage.test.js` (the note) and
-`tests/reconnect_on_show.test.js` (the tooltip). Mutation targets:
-`apikey-state`, `apikey-bridge`, `apikey-auth`, `apikey-cmd`,
-`apikey-server`, `apikey-usagejs`, `apikey-statusjs`.
+watcher), `tests/test_session_api_key.py` (a key for one session),
+`tests/test_move_stops_original.py` (the key going with `/move`),
+`tests/usage.test.js` (the note) and `tests/reconnect_on_show.test.js` (the
+tooltip). Mutation targets: `apikey-state`, `apikey-bridge`, `apikey-auth`,
+`apikey-cmd`, `apikey-server`, `apikey-usagejs`, `apikey-statusjs`,
+`sessionkey-server`, `sessionkey-move`, `sessionkey-bridge`, `sessionkey-btw`,
+`sessionkey-config`, `sessionkey-state`, `sessionkey-cmd`.
 
 ## 6b. Subprocess ownership (`proc_guard.py`)
 

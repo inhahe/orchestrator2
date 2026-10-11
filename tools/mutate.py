@@ -4035,13 +4035,13 @@ AGENTNAME_SERVER_MUTATIONS = [
 
     ("--cli-path for a session that is already open is recorded but never "
      "applied",
-     "                    existing.bridge.config = new_cfg\n"
+     "                _replace_runtime_config(existing, cli_path=cli_path)\n"
      "                need_reconnect = True\n",
-     "                    existing.bridge.config = new_cfg\n"),
+     "                _replace_runtime_config(existing, cli_path=cli_path)\n"),
 
     ("the runtime and its bridge disagree about which CLI it runs",
-     "                if existing.bridge is not None:\n"
-     "                    existing.bridge.config = new_cfg\n",
+     "    if rt.bridge is not None:\n"
+     "        rt.bridge.config = new_cfg\n",
      ""),
 
     ("a detached child loses a name that came from the environment",
@@ -4755,10 +4755,8 @@ INITPROMPT_SERVER_MUTATIONS = [
 
     ("the request leaves it out",
      '        "initial_prompt": initial_prompt,\n'
-     '        "resume_interrupted_turn": bool(resume_interrupted_turn),\n'
-     '    }).encode("utf-8")',
-     '        "resume_interrupted_turn": bool(resume_interrupted_turn),\n'
-     '    }).encode("utf-8")'),
+     '        "resume_interrupted_turn": bool(resume_interrupted_turn),\n',
+     '        "resume_interrupted_turn": bool(resume_interrupted_turn),\n'),
 
     ("the launch API ignores it",
      '    initial_prompt = body.get("initial_prompt")\n',
@@ -5493,12 +5491,13 @@ CUTOFF_SERVER_MUTATIONS = [
      ""),
 
     ("a launch that joins a hub drops the flag",
-     "        \"resume_interrupted_turn\": cfg.resume_interrupted_turn,\n    }",
-     "    }"),
+     "        \"resume_interrupted_turn\": cfg.resume_interrupted_turn,\n",
+     ""),
 
     ("the flag is not put on the wire",
-     "        \"resume_interrupted_turn\": bool(resume_interrupted_turn),\n    }).encode(\"utf-8\")",
-     "    }).encode(\"utf-8\")"),
+     "        \"resume_interrupted_turn\": bool(resume_interrupted_turn),\n"
+     "        \"api_key\": api_key,\n",
+     "        \"api_key\": api_key,\n"),
 
     ("the hub ignores the launch's flag",
      "    resume_interrupted_turn = body.get(\"resume_interrupted_turn\") is True",
@@ -5509,16 +5508,18 @@ CUTOFF_SERVER_MUTATIONS = [
      "    resume_interrupted_turn = bool(body.get(\"resume_interrupted_turn\"))"),
 
     ("the hub does not pass it to the session it opens",
-     "                                   resume_interrupted_turn=resume_interrupted_turn)",
-     "                                   resume_interrupted_turn=None)"),
+     "                                   resume_interrupted_turn=resume_interrupted_turn,\n",
+     "                                   resume_interrupted_turn=None,\n"),
 
     ("a moved session abandons the turn the move cut",
-     "            agent_labels=carry[\"agent_labels\"],\n            resume_interrupted_turn=True)",
-     "            agent_labels=carry[\"agent_labels\"])"),
+     "            agent_labels=carry[\"agent_labels\"],\n"
+     "            resume_interrupted_turn=True, api_key=carry[\"api_key\"])",
+     "            agent_labels=carry[\"agent_labels\"], api_key=carry[\"api_key\"])"),
 
     ("an original reopened after a failed move abandons it",
-     "                agent_labels=carry[\"agent_labels\"],\n                resume_interrupted_turn=True)",
-     "                agent_labels=carry[\"agent_labels\"])"),
+     "                agent_labels=carry[\"agent_labels\"],\n"
+     "                resume_interrupted_turn=True, api_key=carry[\"api_key\"])",
+     "                agent_labels=carry[\"agent_labels\"], api_key=carry[\"api_key\"])"),
 ]
 
 CUTOFF_CONFIG_MUTATIONS = [
@@ -5934,6 +5935,175 @@ APIKEY_SERVER_MUTATIONS = [
 
 ]
 
+# A launch's ANTHROPIC_API_KEY bills the session that launch opens and no other
+# (2026-10-10: "can you make ANTHROPIC_API_KEY only work for the session that
+# was loaded with that key set?"), as --agent-name already named one.
+# tests/test_session_api_key.py; design.md §6g.
+SESSIONKEY_SERVER_MUTATIONS = [
+    ("the launch's key stays in the environment, for every CLI -- the report",
+     '    return (os.environ.pop("ANTHROPIC_API_KEY", None) or "").strip() or None',
+     '    return (os.environ.get("ANTHROPIC_API_KEY") or "").strip() or None'),
+
+    ("a detached child is not given the key its launch took",
+     '        env["ANTHROPIC_API_KEY"] = cfg.api_key\n',
+     ""),
+
+    ("a launch with a key of its own is sent to a subscription sign-in",
+     "    if api_key or auth.is_logged_in():\n",
+     "    if auth.is_logged_in():\n"),
+
+    ("every session the hub opens inherits its launch's key",
+     '    overrides["api_key"] = api_key or (\n'
+     '        _session_api_keys.get(seed_id) if seed_id else None)\n',
+     ""),
+
+    ("a session reopened forgets the key it had",
+     '        _session_api_keys.get(seed_id) if seed_id else None)\n'
+     '    cfg = dataclasses.replace(config, **overrides)',
+     '        None)\n'
+     '    cfg = dataclasses.replace(config, **overrides)'),
+
+    ("a remembered key beats the one a launch gives now",
+     '    overrides["api_key"] = api_key or (\n'
+     '        _session_api_keys.get(seed_id) if seed_id else None)',
+     '    overrides["api_key"] = (\n'
+     '        _session_api_keys.get(seed_id) if seed_id else None) or api_key'),
+
+    ("a joining launch does not hand its key over",
+     '        "api_key": cfg.api_key,\n',
+     ""),
+
+    ("the key is not put on the wire",
+     '        "api_key": api_key,\n    }).encode("utf-8")',
+     '    }).encode("utf-8")'),
+
+    ("the hub ignores the key a launch sent",
+     '    api_key = (api_key.strip() if isinstance(api_key, str) else "") or None\n',
+     "    api_key = None\n"),
+
+    ("a new session is not given the key its launch sent",
+     "                                   api_key=api_key)",
+     "                                   api_key=None)"),
+
+    ("a session already open ignores a launch's key",
+     '            if api_key and getattr(existing.config, "api_key", None) != api_key:\n',
+     "            if False:\n"),
+
+    ("a launch without a key takes an open session's away",
+     '            if api_key and getattr(existing.config, "api_key", None) != api_key:\n',
+     '            if getattr(existing.config, "api_key", None) != api_key:\n'),
+
+    ("a launch's key for an open session waits for a reconnect that never comes",
+     "                _replace_runtime_config(existing, api_key=api_key)\n"
+     "                need_reconnect = True\n",
+     "                _replace_runtime_config(existing, api_key=api_key)\n"),
+
+    ("closing a session forgets its key",
+     "    _remember_session_key(rt)\n    runtimes.pop(rt.rid, None)",
+     "    runtimes.pop(rt.rid, None)"),
+
+    ("a closing session's key is not kept",
+     "        _session_api_keys[sid] = key\n",
+     "        pass\n"),
+
+    ("a restart hands no keys over",
+     "    if keys:\n        env[HANDOVER_KEYS_ENV] = json.dumps(keys)\n",
+     ""),
+
+    ("a restart hands over only the closed sessions' keys",
+     "    for rt in runtimes.values():\n"
+     '        key = getattr(rt.config, "api_key", None)\n',
+     "    for rt in []:\n"
+     '        key = getattr(rt.config, "api_key", None)\n'),
+
+    ("the session a restart resumes loses its key",
+     '        env["ANTHROPIC_API_KEY"] = primary_key\n',
+     ""),
+
+    ("the new hub leaves the handed-over keys in its environment",
+     "    raw = os.environ.pop(HANDOVER_KEYS_ENV, None)",
+     "    raw = os.environ.get(HANDOVER_KEYS_ENV)"),
+
+    ("a garbled hand-over stops the new hub",
+     "    try:\n        data = json.loads(raw)\n    except ValueError:\n        return {}\n",
+     "    data = json.loads(raw)\n"),
+
+    ("a launch's key is not announced",
+     "    if not key:\n        return None\n    return (\"ANTHROPIC_API_KEY is set:",
+     "    if True:\n        return None\n    return (\"ANTHROPIC_API_KEY is set:"),
+
+    ("/apikey off keeps the key",
+     "        _replace_runtime_config(rt, api_key=None)\n",
+     ""),
+
+    ("/apikey off leaves the key remembered",
+     "            _session_api_keys.pop(sid, None)\n",
+     ""),
+
+    ("/apikey off does not reconnect",
+     '            rt.bridge.event_queue.put_nowait(("connect", ""))\n'
+     '        text = ("This session no longer',
+     '        text = ("This session no longer'),
+
+    ("/apikey with a word it does not know drops the key",
+     '    if arg not in ("", "off"):\n',
+     '    if arg not in ("", "off") and False:\n'),
+
+    ("a dropped key comes back to the primary session with /cwd",
+     "    if rt is _default_runtime:\n        config = new_cfg\n",
+     ""),
+]
+
+SESSIONKEY_MOVE_MUTATIONS = [
+    ("a moved session loses its key",
+     '        "api_key": getattr(rt.config, "api_key", None),\n',
+     ""),
+
+    ("the copy starts without the session's key",
+     '            agent_labels=carry["agent_labels"],\n'
+     '            resume_interrupted_turn=True, api_key=carry["api_key"])',
+     '            agent_labels=carry["agent_labels"],\n'
+     '            resume_interrupted_turn=True)'),
+
+    ("an original put back after a failed move loses its key",
+     '                agent_labels=carry["agent_labels"],\n'
+     '                resume_interrupted_turn=True, api_key=carry["api_key"])',
+     '                agent_labels=carry["agent_labels"],\n'
+     '                resume_interrupted_turn=True)'),
+]
+
+SESSIONKEY_BRIDGE_MUTATIONS = [
+    ("the session's CLI is not given its key",
+     '        if getattr(self.config, "api_key", None):\n'
+     '            kwargs["env"]["ANTHROPIC_API_KEY"] = self.config.api_key\n',
+     ""),
+]
+
+SESSIONKEY_BTW_MUTATIONS = [
+    ("a side question is billed to the account, not the session's key",
+     '    if getattr(config, "api_key", None):\n'
+     '        kwargs["env"]["ANTHROPIC_API_KEY"] = config.api_key\n',
+     ""),
+]
+
+SESSIONKEY_CONFIG_MUTATIONS = [
+    ("the key shows in the config's repr, and so in any log of it",
+     "    api_key: str | None = field(default=None, repr=False)\n",
+     "    api_key: str | None = None\n"),
+]
+
+SESSIONKEY_STATE_MUTATIONS = [
+    ("a session given a key starts out as a subscription",
+     '    sub = detect_subscription() and not getattr(config, "api_key", None)\n',
+     "    sub = detect_subscription()\n"),
+]
+
+SESSIONKEY_CMD_MUTATIONS = [
+    ("/apikey goes to the CLI as a command it does not know",
+     '    if cmd == "apikey":\n',
+     '    if cmd == "apikey-never":\n'),
+]
+
 APIKEY_USAGEJS_MUTATIONS = [
     ("a key session's note is drawn as an empty report",
      "    if (typeof data.note === 'string' && data.note) {\n",
@@ -5945,6 +6115,7 @@ APIKEY_STATUSJS_MUTATIONS = [
      "    _set(elPlan, 'title', status.plan_title || 'Plan');\n",
      ""),
 ]
+
 
 TARGETS = {
     "chat": ("static/chat.js", "tests/hidden_window.test.js",
@@ -6213,6 +6384,20 @@ TARGETS = {
                        APIKEY_USAGEJS_MUTATIONS, "node"),
     "apikey-statusjs": ("static/status.js", "tests/reconnect_on_show.test.js",
                         APIKEY_STATUSJS_MUTATIONS, "node"),
+    "sessionkey-server": ("server.py", "tests/test_session_api_key.py",
+                          SESSIONKEY_SERVER_MUTATIONS, "pytest"),
+    "sessionkey-move": ("server.py", "tests/test_move_stops_original.py",
+                        SESSIONKEY_MOVE_MUTATIONS, "pytest"),
+    "sessionkey-bridge": ("sdk_bridge.py", "tests/test_session_api_key.py",
+                          SESSIONKEY_BRIDGE_MUTATIONS, "pytest"),
+    "sessionkey-btw": ("btw.py", "tests/test_session_api_key.py",
+                       SESSIONKEY_BTW_MUTATIONS, "pytest"),
+    "sessionkey-config": ("config.py", "tests/test_session_api_key.py",
+                          SESSIONKEY_CONFIG_MUTATIONS, "pytest"),
+    "sessionkey-state": ("state.py", "tests/test_session_api_key.py",
+                         SESSIONKEY_STATE_MUTATIONS, "pytest"),
+    "sessionkey-cmd": ("commands.py", "tests/test_session_api_key.py",
+                       SESSIONKEY_CMD_MUTATIONS, "pytest"),
 }
 
 

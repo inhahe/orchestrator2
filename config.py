@@ -82,7 +82,7 @@ SHORT_OUTPUT_TOOLS = frozenset({
 SLASH_COMMANDS = [
     "/help", "/history", "/status", "/debug", "/cost", "/usage", "/cwd", "/clear", "/cls",
     "/interrupt", "/i", "/compact", "/effort", "/thinking", "/model",
-    "/login", "/logout",
+    "/login", "/logout", "/apikey",
     "/connect", "/reconnect", "/resume", "/rename", "/move", "/export",
     "/models",
     "/btw", "/graphify", "/autocompact", "/max-context", "/recycle", "/bell", "/mcp",
@@ -571,18 +571,13 @@ class Config:
     agent_labels: dict[str, str] = field(default_factory=dict)
     config_dir: str | None = None      # CLAUDE_CONFIG_DIR override
     cli_path: str | None = None        # claude.exe to run instead of the bundled one
+    # The API key this session's CLI is given: the one in the environment of
+    # the launch that opened the session, or one the hub remembered for it.
+    # Never inherited by another session (server._create_runtime), never put
+    # on a command line, and kept out of repr() so no log line can carry it.
+    api_key: str | None = field(default=None, repr=False)
     skip_auto_login: bool = False      # internal: child skips the login check
     wait_port: bool = False            # internal: retry binding --port while an old instance releases it (restart)
-
-
-def config_to_dict(config: Config) -> dict:
-    """Serializable snapshot for sending to the frontend as initial state."""
-    import dataclasses
-    d = dataclasses.asdict(config)
-    # Convert non-serializable defaults.
-    d["allowed_tools"] = list(config.allowed_tools)
-    d["disallowed_tools"] = list(config.disallowed_tools)
-    return d
 
 
 # ---------------------------------------------------------------------------

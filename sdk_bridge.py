@@ -94,7 +94,6 @@ from config import (
 from state import (
     State,
     apply_api_key_source,
-    take_cost,
     apply_rate_limit_info,
     config_dir_path,
     detect_account_info,
@@ -106,6 +105,7 @@ from state import (
     ring_bell,
     state_to_panels_dict,
     state_to_status_dict,
+    take_cost,
 )
 from wakeup_store import clear_wakeup, save_wakeup
 from btw import (
@@ -1140,6 +1140,12 @@ class SDKBridge:
         # so the bridge connects with the correct account.
         if getattr(self.config, "config_dir", None):
             kwargs["env"]["CLAUDE_CONFIG_DIR"] = self.config.config_dir
+
+        # The session's own API key, from the launch that opened it
+        # (Config.api_key).  The hub's environment carries none, so a session
+        # without one is billed to its account's login.
+        if getattr(self.config, "api_key", None):
+            kwargs["env"]["ANTHROPIC_API_KEY"] = self.config.api_key
 
         # Opt-in workaround for the bundled CLI's cache_control TTL-ordering
         # bug (see Config.disable_prompt_cache): turning off prompt caching

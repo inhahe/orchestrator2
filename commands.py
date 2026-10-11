@@ -197,6 +197,10 @@ def classify(line: str) -> tuple[str, str]:
         # Plan limits -- a network fetch, so handled in server.py (like /mcp)
         # rather than by the synchronous immediate dispatch table below.
         return "usage", ""
+    if cmd == "apikey":
+        # The session's own API key lives in its runtime's Config, which only
+        # server.py can replace.
+        return "apikey", arg
     if cmd == "cwd":
         if arg:
             return "switch-cwd", arg
@@ -284,6 +288,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         ("/model [name]",                "show/set model; no arg lists available"),
         ("/login [force|console]",       "sign in to your Claude account (force = re-auth even if it thinks you're signed in; console = an Anthropic Console account, billed per token to an API key)"),
         ("/logout",                      "sign out of your Claude account"),
+        ("/apikey [off]",                "whether this session has its own API key (a launch's ANTHROPIC_API_KEY); off = drop it"),
         ("/connect",                     "reconnect (revives a dropped browser socket, or the SDK)"),
         ("/resume [id|title]",           "resume a session (or open picker)"),
         ("/rename <name>",               "set the session title -- also the name other sessions address it by"),

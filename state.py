@@ -781,7 +781,9 @@ class State:
 def init_state_from_config(config: Config) -> State:
     """Create a fresh State populated from parsed Config."""
     initial_effort = None if config.effort in (None, "auto") else config.effort
-    sub = detect_subscription()
+    # A session given its own API key is billed to it, whatever its account
+    # has; its CLI's init confirms which (apply_api_key_source).
+    sub = detect_subscription() and not getattr(config, "api_key", None)
     return State(
         effort=initial_effort,
         model=config.model,

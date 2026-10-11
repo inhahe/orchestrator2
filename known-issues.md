@@ -16,7 +16,30 @@ Fixed: the hub takes the CLI's own word, the `apiKeySource` in each turn's
 `init`. A key-billed session's plan field reads `API $<cost>`, and `/usage`
 says plan limits don't apply. `/status` says what the session is billed to.
 `/login console` signs an account in to an Anthropic Console account, billed
-per token. design.md §6g.
+per token.
+
+And a launch's `ANTHROPIC_API_KEY`, which stayed in the hub's environment and
+so billed every session on every account, now bills only the session that
+launch opens (*"can you make ANTHROPIC_API_KEY only work for the session that
+was loaded with that key set?"*). The hub keeps it with that session in
+memory, and `/apikey off` drops it. design.md §6g.
+
+## Four timing tests fail under heavy load — OPEN (found 2026-10-10)
+
+A full `pytest tests/` run, made while a mutation sweep ran on a machine
+already at 100% CPU, failed four tests that pass alone and as whole files:
+
+- `test_bridge_shutdown.py::test_disconnect_kills_the_cli_even_when_the_sdk_raises`
+  and `::test_stop_finishes_the_shutdown_even_if_the_caller_is_cancelled`
+  waited for a child process to die within their time limit, and it hadn't.
+- `test_initial_prompt.py::test_it_waits_out_a_turn_the_cli_starts_as_it_connects`
+  and `::test_a_prompt_left_from_an_earlier_run_goes_before_it` found no
+  prompt sent yet when they looked.
+
+Each waits a fixed time for something another process or task does. Under
+that load the wait was not enough. The fix is to wait on the event itself,
+with a much longer outer limit, rather than a fixed time. Until then, rerun a
+failure alone before believing it.
 
 ## The session's cost counted every earlier turn again — FIXED (2026-10-10)
 

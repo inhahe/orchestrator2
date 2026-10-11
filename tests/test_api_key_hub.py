@@ -2,7 +2,8 @@
 
 ``/usage`` for a key session, and seeing ``/login console`` finish.  The
 rest, and the background, is tests/test_api_key_billing.py; this file is
-apart because importing server.py is slow.
+apart because importing server.py is slow.  A key for one session alone is
+tests/test_session_api_key.py.
 """
 
 from __future__ import annotations
