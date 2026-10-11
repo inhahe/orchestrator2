@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -103,6 +104,7 @@ from state import (
     fmt_tok,
     humanize_size,
     in_bg_wait,
+    restores_saved_cost,
     ring_bell,
     state_to_panels_dict,
     state_to_status_dict,
@@ -140,7 +142,9 @@ from session import (
     describe_integrity_problem,
     find_session_dir,
     read_session_title,
+    load_session_cost,
     render_session_history,
+    save_session_cost,
     saved_cost,
     trim_session,
     write_session_title,
@@ -874,6 +878,8 @@ class SDKBridge:
         self._dispatcher_task: asyncio.Task | None = None
         self._worker_task: asyncio.Task | None = None
         self._initial_resume_id: str | None = None
+        # Set by connect(), consumed by the new CLI's first init.
+        self._cost_settle_due = False
         # Monotonic stamp of the last background-task liveness probe.
         self._bg_probe_at: float = 0.0
         # The in-flight /btw fork, and a counter for naming them.  One at
@@ -1358,11 +1364,9 @@ class SDKBridge:
                 # Left unmatched, so the next connect tries again.
                 self.state.human_title = None
                 log.debug("could not read the session title", exc_info=True)
-        # The CLI this one replaces may have been killed before it could save
-        # its cost total, which this one would then start without.
-        if self.state.cost_reported is not None:
-            carry_cost(self.state,
-                       await asyncio.to_thread(self._restored_cost, target))
+        # What the new CLI restores of the session's cost depends on which CLI
+        # it is, which its first init says (_settle_cost).
+        self._cost_settle_due = True
         # A session given a name or labels (--agent-name, --agent-label) keeps
         # them when it comes back without the flags -- reopened from the
         # lobby, restored after a hub restart.  Looked up once per session,
@@ -2028,16 +2032,97 @@ class SDKBridge:
                      "its job: background work the process-tree walk cannot "
                      "see", left, cli_pid if cli_pid is not None else job.pid)
 
-    def _restored_cost(self, sid: str | None) -> float | None:
-        """The cost total a CLI resuming *sid* starts from: what its transcript
-        last saved (``session.saved_cost``), 0.0 for a new session, None when
-        the transcript cannot be found or read.  File I/O: off the loop."""
-        if not sid:
-            return 0.0
-        project = find_session_dir(sid, getattr(self.config, "config_dir", None))
-        if project is None:
-            return None
-        return saved_cost(project / f"{sid}.jsonl", sid)
+    async def _settle_cost(self, version: Any, sid: str) -> None:
+        """A new CLI's first init: carry over what the CLIs before it spent
+        that it will not count, and mark where it starts (``_settle_cost_sync``).
+
+        Never fails the turn: on any error nothing is carried, and the figure
+        goes on from what the new CLI reports.
+        """
+        try:
+            await asyncio.to_thread(self._settle_cost_sync, version, sid)
+        except Exception:
+            log.warning("could not settle the session's cost", exc_info=True)
+            self.state.cost_reported = None
+        self._keep_cost()
+
+    def _settle_cost_sync(self, version: Any, sid: str) -> None:
+        """``_settle_cost``'s work, file I/O included: off the loop.
+
+        *version* is the new CLI's (init's ``claude_code_version``), and with
+        it what the CLI starts from (``state.restores_saved_cost``): the
+        transcript's last saved total, or nothing.  The CLI before it ended at
+        what it saved on its way out, if it is one that saves totals and the
+        transcript has one past the mark, or else at what it last reported.
+        A state that has nothing yet first takes what the hub kept of the
+        session (``session.load_session_cost``).  The transcript is read only
+        past the mark, and before it only once, when a CLI that restores
+        follows ones that saved nothing.
+        """
+        st = self.state
+        cfg_dir = getattr(self.config, "config_dir", None)
+        if st.cost_reported is None and st.cost_mark_size is None:
+            self._take_kept_cost(sid, cfg_dir)
+        restores = restores_saved_cost(version)
+        project = find_session_dir(sid, cfg_dir)
+        jsonl = project / f"{sid}.jsonl" if project is not None else None
+        size = jsonl.stat().st_size if jsonl is not None else None
+        mark = (st.cost_mark_size if st.cost_mark_size is not None
+                and size is not None and st.cost_mark_size <= size else None)
+        saved_on_exit = (saved_cost(jsonl, sid, mark, size)
+                         if st.cost_restores and mark is not None else None)
+        if saved_on_exit is not None:
+            last_saved = saved_on_exit
+        elif mark is not None:
+            last_saved = st.cost_mark_saved
+        else:
+            last_saved = None       # looked for only when a carry needs it
+        if st.cost_reported is not None:
+            final = saved_on_exit if saved_on_exit is not None else st.cost_reported
+            if restores and last_saved is None and jsonl is not None:
+                last_saved = saved_cost(jsonl, sid, 0, size) or 0.0
+            restored = last_saved if restores else 0.0
+            if restored is None:
+                st.cost_reported = None     # no transcript: nothing to go on
+            else:
+                carry_cost(st, final, restored)
+        st.cost_mark_size = size
+        st.cost_mark_saved = last_saved
+        st.cost_restores = restores
+
+    def _take_kept_cost(self, sid: str, cfg_dir: str | None) -> None:
+        """Start from what the hub kept of *sid*'s cost (``_keep_cost``)."""
+        kept = load_session_cost(sid, cfg_dir) or {}
+
+        def number(key: str) -> float | None:
+            v = kept.get(key)
+            ok = (isinstance(v, (int, float)) and not isinstance(v, bool)
+                  and math.isfinite(v))
+            return float(v) if ok else None
+
+        st = self.state
+        reported = number("reported")
+        st.cost_carried = number("carried") or 0.0
+        st.cost_reported = reported if reported is not None and reported >= 0 else None
+        size = kept.get("mark_size")
+        st.cost_mark_size = (size if isinstance(size, int) and not isinstance(size, bool)
+                             and size >= 0 else None)
+        st.cost_mark_saved = number("mark_saved")
+        restores = kept.get("restores")
+        st.cost_restores = restores if isinstance(restores, bool) else None
+        st.total_cost_usd = (st.cost_reported or 0.0) + st.cost_carried
+
+    def _keep_cost(self) -> None:
+        """Keep what the hub knows of the session's cost, for when its state
+        is next made from scratch: reopened, or brought back by a restart."""
+        st = self.state
+        if not st.session_id:
+            return
+        save_session_cost(st.session_id, {
+            "reported": st.cost_reported, "carried": st.cost_carried,
+            "mark_size": st.cost_mark_size, "mark_saved": st.cost_mark_saved,
+            "restores": st.cost_restores,
+        }, getattr(self.config, "config_dir", None))
 
     def _warn_if_foreign_task(self, what: str) -> None:
         """Log loudly if an SDK teardown is running off the worker task.
@@ -3102,6 +3187,7 @@ class SDKBridge:
             if ctx:
                 state.context_tokens = ctx
             take_cost(state, msg)
+            self._keep_cost()
             subtype = getattr(msg, "subtype", None) or "unknown"
             state.last_result_subtype = subtype
 
@@ -4089,6 +4175,11 @@ class SDKBridge:
             if isinstance(data_dict, dict):
                 apply_api_key_source(state, data_dict.get("apiKeySource"),
                                      getattr(self.config, "config_dir", None))
+            # A new CLI's first: it says which CLI it is, and so what it
+            # restored of the session's cost.
+            if self._cost_settle_due and sid and isinstance(data_dict, dict):
+                self._cost_settle_due = False
+                await self._settle_cost(data_dict.get("claude_code_version"), sid)
             old_sid = state.session_id
             if sid:
                 state.session_id = sid
@@ -4963,6 +5054,7 @@ class SDKBridge:
                     state.compact_during_last_turn = False
                     # The running total, compaction included.
                     take_cost(state, msg)
+                    self._keep_cost()
 
                     if not was_compact:
                         # Real end of turn — book metrics.
@@ -6375,6 +6467,9 @@ class SDKBridge:
         state.total_cost_usd = 0.0
         state.cost_reported = None
         state.cost_carried = 0.0
+        state.cost_mark_size = None
+        state.cost_mark_saved = None
+        state.cost_restores = None
         state.last_usage = {}
         state.last_result_subtype = None
         state.last_compact_trigger = None

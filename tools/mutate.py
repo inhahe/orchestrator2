@@ -5877,8 +5877,10 @@ APIKEY_BRIDGE_MUTATIONS = [
 
     ("results between turns are added up",
      '            take_cost(state, msg)\n'
+     '            self._keep_cost()\n'
      '            subtype = getattr(msg, "subtype", None) or "unknown"',
      '            state.total_cost_usd += msg.total_cost_usd or 0\n'
+     '            self._keep_cost()\n'
      '            subtype = getattr(msg, "subtype", None) or "unknown"'),
 
     ("a turn's results are added up",
@@ -6294,8 +6296,8 @@ APIKEY_STATUSJS_MUTATIONS = [
      ""),
 ]
 
-# What a killed CLI spent is carried across its replacement; one stopped
-# cleanly carries its own total on.  tests/test_session_cost.py.
+# What each CLI spent counts once across the session's CLIs and hubs, by
+# what each version restores.  tests/test_session_cost.py.
 COST_SESSION_MUTATIONS = [
     ("another session's saved total is taken for this one's",
      '            or rec.get("sessionId") != session_id:\n',
@@ -6306,59 +6308,90 @@ COST_SESSION_MUTATIONS = [
      "            ):\n"),
 
     ("the first saved total is taken, not the last",
-     "                for line in reversed(lines if pos == 0 else lines[1:]):\n",
-     "                for line in (lines if pos == 0 else lines[1:]):\n"),
+     "            for line in reversed(lines if pos == start else lines[1:]):\n",
+     "            for line in (lines if pos == start else lines[1:]):\n"),
 
     ("a record cut between two reads is lost",
-     '                head = lines[0] if pos > 0 else b""\n',
-     '                head = b""\n'),
+     '            head = lines[0] if pos > start else b""\n',
+     '            head = b""\n'),
 
-    ("a session that saved nothing restores an unknown total",
-     "    return 0.0\n\n\ndef _saved_total",
-     "    return None\n\n\ndef _saved_total"),
+    ("a range is read past its start",
+     "            step = min(chunk, pos - start)\n",
+     "            step = min(chunk, pos)\n"),
 ]
 
 COST_STATE_MUTATIONS = [
-    ("what a killed CLI spent is dropped",
-     "        state.cost_carried += max(0.0, state.cost_reported - restored)\n",
-     "        pass\n"),
+    ("what the new CLI does not count is dropped -- the gap",
+     "    state.cost_carried += final - restored\n",
+     "    pass\n"),
 
-    ("more restored than reported is carried as a refund",
-     "        state.cost_carried += max(0.0, state.cost_reported - restored)\n",
-     "        state.cost_carried += state.cost_reported - restored\n"),
+    ("a restore cannot take back what was carried already",
+     "    state.cost_carried += final - restored\n",
+     "    state.cost_carried += max(0.0, final - restored)\n"),
 
     ("what was carried is left out of the figure",
      "        state.total_cost_usd = state.cost_reported + state.cost_carried\n",
      "        state.total_cost_usd = state.cost_reported\n"),
 
-    ("a connect tried again carries the same spend twice",
-     "        state.cost_carried += max(0.0, state.cost_reported - restored)\n"
-     "    state.cost_reported = None\n",
-     "        state.cost_carried += max(0.0, state.cost_reported - restored)\n"),
+    ("a carried CLI's last report is carried again",
+     "    state.cost_carried += final - restored\n    state.cost_reported = None\n",
+     "    state.cost_carried += final - restored\n"),
 
-    ("a restored total that could not be read is taken as nothing restored",
-     "    if state.cost_reported is not None and restored is not None:\n",
-     "    if state.cost_reported is not None:\n"
-     "        restored = restored or 0.0\n"),
+    ("the SDK's CLI is taken to restore what it does not",
+     "    return parts > (2, 1, 259)\n",
+     "    return True\n"),
+
+    ("a CLI that does not say its version is taken not to restore",
+     "    except ValueError:\n        return True\n    return parts",
+     "    except ValueError:\n        return False\n    return parts"),
 ]
 
 COST_BRIDGE_MUTATIONS = [
-    ("a connect never carries what a killed CLI spent -- the gap",
-     "        if self.state.cost_reported is not None:\n"
-     "            carry_cost(self.state,\n",
-     "        if False:\n"
-     "            carry_cost(self.state,\n"),
+    ("a new CLI never settles -- the gap",
+     "        self._cost_settle_due = True\n",
+     ""),
 
-    ("the restored total is looked for in the hub's account",
-     '        project = find_session_dir(sid, getattr(self.config, "config_dir", None))\n'
-     "        if project is None:\n            return None\n"
-     '        return saved_cost(project / f"{sid}.jsonl", sid)\n',
-     "        project = find_session_dir(sid)\n"
-     "        if project is None:\n            return None\n"
-     '        return saved_cost(project / f"{sid}.jsonl", sid)\n'),
+    ("every init settles again",
+     "                self._cost_settle_due = False\n"
+     "                await self._settle_cost(",
+     "                await self._settle_cost("),
 
-    ("/clear keeps what was carried for the session it wiped",
-     "        state.cost_carried = 0.0\n",
+    ("the CLI's version is not asked",
+     "        restores = restores_saved_cost(version)\n",
+     "        restores = True\n"),
+
+    ("what the last CLI saved on its way out is not looked for",
+     "                         if st.cost_restores and mark is not None else None)\n",
+     "                         if False else None)\n"),
+
+    ("what a restoring CLI starts from is not looked for",
+     "            if restores and last_saved is None and jsonl is not None:\n",
+     "            if False:\n"),
+
+    ("a state from scratch ignores what the hub kept",
+     "        if st.cost_reported is None and st.cost_mark_size is None:\n"
+     "            self._take_kept_cost(sid, cfg_dir)\n",
+     ""),
+
+    ("a turn's result is not kept",
+     "                    take_cost(state, msg)\n"
+     "                    self._keep_cost()\n",
+     "                    take_cost(state, msg)\n"),
+
+    ("a result between turns is not kept",
+     "            take_cost(state, msg)\n"
+     "            self._keep_cost()\n"
+     '            subtype = getattr(msg, "subtype", None) or "unknown"',
+     "            take_cost(state, msg)\n"
+     '            subtype = getattr(msg, "subtype", None) or "unknown"'),
+
+    ("a settle that fails leaves the old report to be carried again",
+     '            log.warning("could not settle the session\'s cost", exc_info=True)\n'
+     "            self.state.cost_reported = None\n",
+     '            log.warning("could not settle the session\'s cost", exc_info=True)\n'),
+
+    ("/clear keeps where the wiped session's CLI started",
+     "        state.cost_mark_size = None\n",
      ""),
 ]
 

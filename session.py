@@ -1093,41 +1093,41 @@ def title_from_jsonl(jsonl: Path) -> str | None:
 
 
 # --- What a CLI resuming a session restores of its cost ---------------------
-# A CLI saves its running cost total in the transcript, as a ``cost-state``
-# record, when it exits cleanly, and one resuming the session starts from the
-# last of them saved for that session id (CLI 2.1.280; the record's own
-# schema caps the total at 1e9).  One killed outright saves nothing.
+# CLI 2.1.280 saves its running cost total in the transcript, as a
+# ``cost-state`` record, when it exits cleanly, and one resuming the session
+# starts from the last of them saved for that session id (the record's own
+# schema caps the total at 1e9).  2.1.259, the SDK's, neither saves one nor
+# restores from one.  A CLI killed outright saves nothing.
 
 _COST_STATE = b'"cost-state"'
 _COST_STATE_MAX = 1e9
 
 
-def saved_cost(jsonl: Path, session_id: str, *, chunk: int = 1 << 20) -> float | None:
-    """The cost total a CLI resuming *session_id* from *jsonl* starts from.
+def saved_cost(jsonl: Path, session_id: str, start: int = 0, end: int | None = None,
+               *, chunk: int = 1 << 20) -> float | None:
+    """The last cost total saved for *session_id* in bytes [*start*, *end*)
+    of *jsonl*; *end* defaults to the file's size.
 
-    The last ``cost-state`` record for that session with a total the CLI
-    would accept; 0.0 when there is none, None when the file cannot be read.
-    Read backwards a *chunk* at a time from the end, where a clean exit
-    leaves it.
+    That is, the last ``cost-state`` record for the session with a total the
+    CLI would accept; None when the range holds none.  Read backwards a
+    *chunk* at a time from *end*, where a clean exit leaves the record.
+    OSError when the file cannot be read.
     """
-    try:
-        with jsonl.open("rb") as f:
-            pos = f.seek(0, os.SEEK_END)
-            head = b""          # the start of a line cut by the last read
-            while pos > 0:
-                step = min(chunk, pos)
-                pos -= step
-                f.seek(pos)
-                block = f.read(step) + head
-                lines = block.split(b"\n")
-                head = lines[0] if pos > 0 else b""
-                for line in reversed(lines if pos == 0 else lines[1:]):
-                    total = _saved_total(line, session_id)
-                    if total is not None:
-                        return total
-    except OSError:
-        return None
-    return 0.0
+    with jsonl.open("rb") as f:
+        pos = f.seek(0, os.SEEK_END) if end is None else end
+        head = b""          # the start of a line cut by the last read
+        while pos > start:
+            step = min(chunk, pos - start)
+            pos -= step
+            f.seek(pos)
+            block = f.read(step) + head
+            lines = block.split(b"\n")
+            head = lines[0] if pos > start else b""
+            for line in reversed(lines if pos == start else lines[1:]):
+                total = _saved_total(line, session_id)
+                if total is not None:
+                    return total
+    return None
 
 
 def _saved_total(line: bytes, session_id: str) -> float | None:
@@ -1146,6 +1146,50 @@ def _saved_total(line: bytes, session_id: str) -> float | None:
             and math.isfinite(total) and 0 <= total <= _COST_STATE_MAX):
         return float(total)
     return None
+
+
+# --- What the hub knows of a session's cost, kept with its other files ------
+# The CLI's own total is lost with its process unless it saves one (above),
+# and what the hub carried over for CLIs that saved none (state.carry_cost)
+# would be lost with the hub.  So it is kept per session, in the session's
+# account, like its queued prompts.
+
+def session_cost_file(session_id: str, config_dir: str | None = None) -> Path:
+    """Where the hub keeps what it knows of *session_id*'s cost."""
+    return _orch2_state_dir(config_dir) / "costs" / f"{_sanitize_cwd(session_id)}.json"
+
+
+def load_session_cost(session_id: str,
+                      config_dir: str | None = None) -> dict[str, Any] | None:
+    """What ``save_session_cost`` kept for *session_id*; None if nothing usable."""
+    try:
+        with open(session_cost_file(session_id, config_dir), "r",
+                  encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("session_id") != session_id:
+        return None
+    return data
+
+
+def save_session_cost(session_id: str, record: dict[str, Any],
+                      config_dir: str | None = None) -> None:
+    """Keep *record* as what the hub knows of *session_id*'s cost.
+
+    Written whole and replaced atomically.  Failures are swallowed: keeping
+    the figure must never break a turn.
+    """
+    path = session_cost_file(session_id, config_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({**record, "session_id": session_id,
+                       "saved_at": time.time()}, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 def sessions_titled(title: str, cwd: str, config_dir: str | None = None

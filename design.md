@@ -2087,28 +2087,46 @@ every other session, `detect_subscription()`, from the hub's environment, is
 the guess until the first `init`, and it is the only judge of a cloud
 provider, which `apiKeySource` does not name.
 
-**The cost is the CLI's running total, carried across the CLI being
-replaced.** `total_cost_usd` in a result is the CLI's running total for the
-session: nothing resets it between turns. The hub had been adding each
-result's figure to the last, so it counted every earlier turn again; it takes
-the latest (`state.take_cost`), what Claude Code itself shows.
+**The cost is what each of the session's CLIs spent, counted once.**
+`total_cost_usd` in a result is the CLI's running total for the session:
+nothing resets it between turns. The hub had been adding each result's figure
+to the last, so it counted every earlier turn again; it takes the latest
+(`state.take_cost`), plus what it carried over from the CLIs before.
 
-A CLI resuming a session starts from the total its predecessor saved in the
-transcript: a `cost-state` record, written when a CLI exits cleanly, as the
-SDK's disconnect lets it (stdin closed, then five seconds' grace), and looked
-up by session id. Measured with CLI 2.1.280 against a local stand-in for the
-API, with a fake key, at $0.0105 a turn: $0.021, resumed, $0.0315, resumed,
-$0.042. So a CLI replaced cleanly carries the total on by itself, and adding
-each process's figure to the last, as a review proposed, would count it all
-twice. A CLI killed outright saves nothing: its successor starts from the
-last clean save, and what the killed one spent after that is gone from the
-CLI's figure (measured: $0.042 shown, $0.0525 spent). So a connect that takes
-over from a CLI which reported a total asks what the new one will restore
-(`session.saved_cost`: the transcript's last usable `cost-state` for the
-session, read backwards from the end, where a clean exit leaves it) and keeps
-the difference (`state.carry_cost`, into `cost_carried`, which every later
-figure adds). A figure a hub loses by being killed itself is not recovered:
-the next hub starts from the CLI's last save.
+What a CLI resuming the session starts from depends on the CLI. Measured where
+the SDK runs them, against a local stand-in for the API with a fake key, at
+$0.0105 a turn:
+
+- 2.1.280 saves its total in the transcript, a `cost-state` record looked up
+  by session id, when it exits cleanly, as the SDK's disconnect lets it (stdin
+  closed, then five seconds' grace). The next starts from the last one saved:
+  $0.021, resumed, $0.0315, resumed, $0.042. Killed outright, it saves
+  nothing, and its successor starts from the save before it ($0.042 shown,
+  $0.0525 spent).
+- 2.1.259, the SDK's own and the default, neither saves nor restores: every
+  new process starts from $0, after a clean stop or a kill alike. Resumed
+  after a 2.1.280 that saved $0.021, it started from $0, and a 2.1.280 after
+  it restored the $0.021 again, missing 2.1.259's turn.
+
+So taking the latest figure alone dropped the session's cost on every
+`/model`, `/effort` or `/connect` on the default CLI. When a new CLI's first
+`init` says which CLI it is, `SDKBridge._settle_cost` carries over what the CLIs
+before it spent that it will not count (`state.carry_cost`, into
+`cost_carried`): what the last one ended at (what it saved on its way out, if
+it saves totals and the transcript has one past the mark, else what it last
+reported) less what the new one starts from (`state.restores_saved_cost`: the
+transcript's last saved total, `session.saved_cost`, or nothing). That can be
+negative, when a restoring CLI picks up a total that was carried already. The
+mark (`cost_mark_size`) is where in the transcript the running CLI started:
+the transcript is read only past it, and before it only once, when a CLI that
+restores follows ones that saved nothing. The figure is what the first CLI
+the hub saw counted, and everything spent since.
+
+The hub keeps what it knows per session (`session.save_session_cost`, beside
+the session's queue, after every result and settle), and a state made from
+scratch -- reopened from the lobby, or after a restart -- starts from it, so
+the figure survives both. Spend a hub saw only after its last kept result is
+lost if the hub itself is killed.
 
 **`/login console`** launches `claude auth login --console` for the session's
 account. It always starts, signed in or not, and says first that it replaces

@@ -352,10 +352,9 @@ def take_cost(state: State, msg: Any) -> None:
     """Record the cost a ResultMessage reports.
 
     ``total_cost_usd`` is the CLI's running total for the session, not the
-    turn's: nothing resets it between turns, and a CLI resuming the session
-    starts from the total its predecessor saved.  So it replaces the figure
-    rather than adding to it, plus what ``carry_cost`` kept of CLIs that saved
-    nothing.
+    turn's: nothing resets it between turns.  So it replaces the figure
+    rather than adding to it, plus what ``carry_cost`` kept of the CLIs
+    before this one.
     """
     cost = getattr(msg, "total_cost_usd", None)
     if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
@@ -363,19 +362,32 @@ def take_cost(state: State, msg: Any) -> None:
         state.total_cost_usd = state.cost_reported + state.cost_carried
 
 
-def carry_cost(state: State, restored: float | None) -> None:
-    """A new CLI is taking the session over: keep what the last one spent.
+def restores_saved_cost(version: Any) -> bool:
+    """Whether a CLI of *version* (init's ``claude_code_version``) starts
+    from the cost total its session's transcript last saved.
 
-    *restored* is the total the new CLI starts from: the last one the
-    session's transcript saved (``session.saved_cost``), 0.0 if none, None
-    when that could not be read.  A CLI saves its total there when it exits
-    cleanly, so one replaced cleanly is carried on by the CLI itself.  One
-    killed outright saved nothing, and what it spent past *restored* would
-    otherwise drop out of the figure.  The figure itself stands until the new
-    CLI reports.
+    Measured where the SDK runs it: 2.1.259 starts from nothing, 2.1.280 from
+    the saved total.  A version not reported, or not understood, is taken to.
     """
-    if state.cost_reported is not None and restored is not None:
-        state.cost_carried += max(0.0, state.cost_reported - restored)
+    try:
+        parts = tuple(int(p) for p in str(version).split(".")[:3])
+    except ValueError:
+        return True
+    return parts > (2, 1, 259)
+
+
+def carry_cost(state: State, final: float, restored: float) -> None:
+    """A new CLI has taken the session over: keep what the CLIs before it spent.
+
+    *final* is what the last CLI's total came to: what it saved on its way
+    out, or else what it last reported.  *restored* is what the new one
+    starts from: the transcript's last saved total, or nothing, depending on
+    its version (``restores_saved_cost``).  The difference is what the new
+    CLI's figure leaves out, and it can be negative: a CLI that restores
+    picks up a total an older one saved, which was carried already.  The
+    figure itself stands until the new CLI reports.
+    """
+    state.cost_carried += final - restored
     state.cost_reported = None
 
 
@@ -639,11 +651,17 @@ class State:
 
     # Metrics
     context_tokens: int = 0
-    # The session's cost: the CLI's running total, plus what CLIs replaced
-    # without saving theirs had spent (take_cost, carry_cost).
+    # The session's cost: the CLI's running total, plus what the CLIs before
+    # it spent that it does not count (take_cost, carry_cost).  The mark is
+    # where in the transcript the running CLI started, and the last total
+    # saved before that point (None: not looked for); cost_restores is
+    # whether the running CLI saves and restores such totals.
     total_cost_usd: float = 0.0
     cost_reported: float | None = None    # the running CLI's last total
     cost_carried: float = 0.0
+    cost_mark_size: int | None = None
+    cost_mark_saved: float | None = None
+    cost_restores: bool | None = None
     turns: int = 0
     last_usage: dict[str, Any] = field(default_factory=dict)
 
@@ -956,7 +974,7 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
     rate_field: str | None = None
     rate_limits: dict[str, Any] = {}
     cost = f"${state.total_cost_usd:.4f}"
-    cost_note = "Claude Code's running total for this session."
+    cost_note = "What this session has cost, as Claude Code counts it."
     if state.is_subscription:
         plan_field = f"{state.subscription_plan or 'sub'}"
         plan_title = "Claude subscription plan"

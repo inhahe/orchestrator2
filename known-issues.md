@@ -52,11 +52,16 @@ the figure only in `/status`; API-key sessions show it in the status bar,
 where it is money. The hub now takes the latest figure, as Claude Code itself
 shows it.
 
-A CLI replaced cleanly saves its total and its successor carries it on. One
-killed outright saves nothing, so what it spent dropped out of the figure
-when its successor connected: measured, $0.042 shown for $0.0525 spent. The
-hub now reads what the successor restores from the transcript and carries the
-difference over (`state.carry_cost`). design.md §6g.
+Taking the latest figure was not the whole fix: what a new CLI starts from
+depends on the CLI. The SDK's own, 2.1.259 and the default, starts every new
+process from $0, so on it the figure dropped to nothing at every `/model`,
+`/effort` or `/connect`, and on every reopen. 2.1.280 starts from the total
+its predecessor saved at a clean exit, but one killed outright saves nothing
+($0.042 shown for $0.0525 spent), and a session switching between the two
+was miscounted either way. When a new CLI's first init says which CLI it is,
+the hub now carries over what the CLIs before it spent that it will not
+count (`state.carry_cost`), and keeps that per session, so the figure
+survives a reopen and a restart too. design.md §6g.
 
 ## A tab woken from a freeze still drew what it missed slowly — FIXED (2026-10-10)
 
