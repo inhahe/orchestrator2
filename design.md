@@ -2146,13 +2146,24 @@ negative, when a restoring CLI picks up a total that was carried already. The
 mark (`cost_mark_size`) is where in the transcript the running CLI started:
 the transcript is read only past it, and before it only once, when a CLI that
 restores follows ones that saved nothing. The figure is what the first CLI
-the hub saw counted, and everything spent since.
+the hub saw counted, and everything spent since. A restoring CLI with no
+transcript to read restores nothing, so everything before it is carried. The
+context trim replaces the transcript, so it drops the mark (the new one is
+read from its start) but keeps the figure. A CLI that started another session
+than the one asked for starts the figure over (`state.forget_cost`, as
+`/clear` does); the settle runs only once the init's id is the state's, so
+what is kept goes under the session it describes. That look-back reads the
+whole transcript in a thread while the turn's dispatcher waits: once per
+session at most, and just after the CLI has itself parsed that file to resume
+it. Running it in the background instead would race the new CLI's first
+result for `cost_reported`.
 
 The hub keeps what it knows per session (`session.save_session_cost`, beside
-the session's queue, after every result and settle), and a state made from
-scratch -- reopened from the lobby, or after a restart -- starts from it, so
-the figure survives both. Spend a hub saw only after its last kept result is
-lost if the hub itself is killed.
+the session's queue, after every result and settle; written in a thread, in
+order, by `_keep_cost`), and a state made from scratch -- reopened from the
+lobby, or after a restart -- starts from it, so the figure survives both.
+Spend a hub saw only after its last kept result is lost if the hub itself is
+killed.
 
 **`/login console`** launches `claude auth login --console` for the session's
 account. It always starts, signed in or not, and says first that it replaces

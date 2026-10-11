@@ -102,6 +102,7 @@ from state import (
     extract_context_tokens,
     fmt_duration,
     fmt_tok,
+    forget_cost,
     humanize_size,
     in_bg_wait,
     restores_saved_cost,
@@ -891,6 +892,7 @@ class SDKBridge:
         self.on_session_id: Callable[[str, Config], None] | None = None
         # Set by connect(), consumed by the new CLI's first init.
         self._cost_settle_due = False
+        self._keep_cost_lock = asyncio.Lock()
         # Monotonic stamp of the last background-task liveness probe.
         self._bg_probe_at: float = 0.0
         # The in-flight /btw fork, and a counter for naming them.  One at
@@ -2093,7 +2095,7 @@ class SDKBridge:
         except Exception:
             log.warning("could not settle the session's cost", exc_info=True)
             self.state.cost_reported = None
-        self._keep_cost()
+        await self._keep_cost()
 
     def _settle_cost_sync(self, version: Any, sid: str) -> None:
         """``_settle_cost``'s work, file I/O included: off the loop.
@@ -2128,13 +2130,11 @@ class SDKBridge:
             last_saved = None       # looked for only when a carry needs it
         if st.cost_reported is not None:
             final = saved_on_exit if saved_on_exit is not None else st.cost_reported
-            if restores and last_saved is None and jsonl is not None:
-                last_saved = saved_cost(jsonl, sid, 0, size) or 0.0
-            restored = last_saved if restores else 0.0
-            if restored is None:
-                st.cost_reported = None     # no transcript: nothing to go on
-            else:
-                carry_cost(st, final, restored)
+            if restores and last_saved is None:
+                # No transcript, nothing to restore: it counts from nothing.
+                last_saved = (saved_cost(jsonl, sid, 0, size) or 0.0
+                              if jsonl is not None else 0.0)
+            carry_cost(st, final, last_saved if restores else 0.0)
         st.cost_mark_size = size
         st.cost_mark_saved = last_saved
         st.cost_restores = restores
@@ -2161,17 +2161,24 @@ class SDKBridge:
         st.cost_restores = restores if isinstance(restores, bool) else None
         st.total_cost_usd = (st.cost_reported or 0.0) + st.cost_carried
 
-    def _keep_cost(self) -> None:
+    async def _keep_cost(self) -> None:
         """Keep what the hub knows of the session's cost, for when its state
-        is next made from scratch: reopened, or brought back by a restart."""
-        st = self.state
-        if not st.session_id:
-            return
-        save_session_cost(st.session_id, {
-            "reported": st.cost_reported, "carried": st.cost_carried,
-            "mark_size": st.cost_mark_size, "mark_saved": st.cost_mark_saved,
-            "restores": st.cost_restores,
-        }, getattr(self.config, "config_dir", None))
+        is next made from scratch: reopened, or brought back by a restart.
+
+        The write runs in a thread, off the loop every tab shares.  The lock
+        keeps two writes in the order they were asked for; each takes the
+        figures as they are once it has the lock, so the last write is the
+        latest figure.
+        """
+        async with self._keep_cost_lock:
+            st = self.state
+            if not st.session_id:
+                return
+            await asyncio.to_thread(save_session_cost, st.session_id, {
+                "reported": st.cost_reported, "carried": st.cost_carried,
+                "mark_size": st.cost_mark_size, "mark_saved": st.cost_mark_saved,
+                "restores": st.cost_restores,
+            }, getattr(self.config, "config_dir", None))
 
     def _warn_if_foreign_task(self, what: str) -> None:
         """Log loudly if an SDK teardown is running off the worker task.
@@ -3236,7 +3243,7 @@ class SDKBridge:
             if ctx:
                 state.context_tokens = ctx
             take_cost(state, msg)
-            self._keep_cost()
+            await self._keep_cost()
             subtype = getattr(msg, "subtype", None) or "unknown"
             state.last_result_subtype = subtype
 
@@ -4224,14 +4231,21 @@ class SDKBridge:
             if isinstance(data_dict, dict):
                 apply_api_key_source(state, data_dict.get("apiKeySource"),
                                      getattr(self.config, "config_dir", None))
+            old_sid = state.session_id
+            if sid and old_sid and sid != old_sid:
+                # Another session than the one this state ran (the SDK
+                # started a new one): its figure, kept under its own id, is
+                # not this one's.
+                forget_cost(state)
+            if sid:
+                self._take_session_id(sid)
             # A new CLI's first: it says which CLI it is, and so what it
-            # restored of the session's cost.
+            # restored of the session's cost.  After the id is the CLI's, so
+            # what is kept is kept under it.
             if self._cost_settle_due and sid and isinstance(data_dict, dict):
                 self._cost_settle_due = False
                 await self._settle_cost(data_dict.get("claude_code_version"), sid)
-            old_sid = state.session_id
             if sid:
-                self._take_session_id(sid)
                 # Don't clobber a user-set pending title with a (title-less)
                 # disk read — keep showing what /rename set until we can
                 # persist it.
@@ -5103,7 +5117,7 @@ class SDKBridge:
                     state.compact_during_last_turn = False
                     # The running total, compaction included.
                     take_cost(state, msg)
-                    self._keep_cost()
+                    await self._keep_cost()
 
                     if not was_compact:
                         # Real end of turn — book metrics.
@@ -6222,6 +6236,10 @@ class SDKBridge:
                                        getattr(config, "config_dir", None))
             new_sid = trim_session(state.session_id, proj, max_ctx)
             if new_sid:
+                # The marks are offsets into the transcript just replaced;
+                # the new one is read from its start.  What was spent stays.
+                state.cost_mark_size = None
+                state.cost_mark_saved = None
                 self._take_session_id(new_sid)
                 await self.reconnect()
                 await self.broadcast({
@@ -6513,12 +6531,7 @@ class SDKBridge:
         state.session_title = None
         state.context_tokens = 0
         state.turns = 0
-        state.total_cost_usd = 0.0
-        state.cost_reported = None
-        state.cost_carried = 0.0
-        state.cost_mark_size = None
-        state.cost_mark_saved = None
-        state.cost_restores = None
+        forget_cost(state)
         state.last_usage = {}
         state.last_result_subtype = None
         state.last_compact_trigger = None

@@ -403,6 +403,17 @@ def restores_saved_cost(version: Any) -> bool:
     return parts > (2, 1, 259)
 
 
+def forget_cost(state: State) -> None:
+    """Start the cost figure over: *state* now runs a session it has no
+    figure for (``/clear``, or a CLI that started another session)."""
+    state.total_cost_usd = 0.0
+    state.cost_reported = None
+    state.cost_carried = 0.0
+    state.cost_mark_size = None
+    state.cost_mark_saved = None
+    state.cost_restores = None
+
+
 def carry_cost(state: State, final: float, restored: float) -> None:
     """A new CLI has taken the session over: keep what the CLIs before it spent.
 

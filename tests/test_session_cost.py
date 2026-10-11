@@ -244,6 +244,15 @@ def test_a_restoring_cli_after_ones_that_saved_nothing_looks_back_once(tmp_path)
     assert s.st.cost_mark_saved == 0.5
 
 
+def test_a_restoring_cli_with_no_transcript_to_restore_from_carries_it_all(tmp_path):
+    # It can restore nothing, so it counts from nothing.
+    s = _bridge(tmp_path)
+    _cli(s, OLD, [0.042])
+    s.jsonl.unlink()
+    _cli(s, NEW, [0.01])
+    assert s.st.total_cost_usd == pytest.approx(0.052)
+
+
 def test_a_first_cli_carries_nothing_and_reads_nothing(tmp_path):
     s = _bridge(tmp_path)
     _write(s.jsonl, [_record(0.5)], "a")
@@ -259,9 +268,20 @@ def test_a_first_cli_carries_nothing_and_reads_nothing(tmp_path):
 def test_what_the_hub_knows_is_kept_with_each_result(tmp_path):
     s = _bridge(tmp_path)
     _cli(s, OLD, [0.0105])
-    s.br._keep_cost()
+    asyncio.run(s.br._keep_cost())
     kept = load_session_cost(SID, s.cfg_dir)
     assert kept["reported"] == 0.0105 and kept["restores"] is False
+
+
+def test_keeping_it_writes_off_the_event_loop(tmp_path, monkeypatch):
+    import threading
+    s = _bridge(tmp_path)
+    _cli(s, OLD, [0.0105])
+    writers = []
+    monkeypatch.setattr(sdk_bridge, "save_session_cost",
+                        lambda *_a, **_k: writers.append(threading.get_ident()))
+    asyncio.run(s.br._keep_cost())
+    assert writers and writers[0] != threading.get_ident()
 
 
 def _sdk_result(cost):
@@ -344,6 +364,25 @@ def test_a_new_clis_first_init_settles_and_the_next_does_not(tmp_path, monkeypat
         await s.br._handle_system_message(init, during_turn=True)
     asyncio.run(go())
     assert settled == [(OLD, SID)]
+
+
+def test_a_cli_that_started_another_session_starts_its_cost_afresh(tmp_path, monkeypatch):
+    """The SDK started session Y when X was asked for: X's figure and its
+    kept record are X's, and Y's figure is Y's own."""
+    monkeypatch.setattr(sdk_bridge, "read_session_title", lambda _s, _d=None: None)
+    other = "c0570000-0000-0000-0000-000000000002"
+    s = _bridge(tmp_path)
+    _cli(s, OLD, [0.04])
+    asyncio.run(s.br._keep_cost())
+    s.br._cost_settle_due = True        # as connect() leaves it
+    init = types.SimpleNamespace(subtype="init", data={
+        "session_id": other, "claude_code_version": OLD, "apiKeySource": "none"})
+    asyncio.run(s.br._handle_system_message(init, during_turn=True))
+    assert load_session_cost(SID, s.cfg_dir)["reported"] == 0.04
+    assert (s.st.cost_reported, s.st.cost_carried, s.st.total_cost_usd) == (None, 0.0, 0.0)
+    take_cost(s.st, _result(0.01))
+    assert s.st.total_cost_usd == pytest.approx(0.01)
+    assert load_session_cost(other, s.cfg_dir) is not None
 
 
 class _CLI:

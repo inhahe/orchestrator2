@@ -5910,10 +5910,10 @@ APIKEY_BRIDGE_MUTATIONS = [
 
     ("results between turns are added up",
      '            take_cost(state, msg)\n'
-     '            self._keep_cost()\n'
+     '            await self._keep_cost()\n'
      '            subtype = getattr(msg, "subtype", None) or "unknown"',
      '            state.total_cost_usd += msg.total_cost_usd or 0\n'
-     '            self._keep_cost()\n'
+     '            await self._keep_cost()\n'
      '            subtype = getattr(msg, "subtype", None) or "unknown"'),
 
     ("a turn's results are added up",
@@ -6443,6 +6443,11 @@ COST_STATE_MUTATIONS = [
      "    return parts > (2, 1, 259)\n",
      "    return True\n"),
 
+    ("a figure started over keeps where the old transcript was read to",
+     "    state.cost_reported = None\n    state.cost_carried = 0.0\n"
+     "    state.cost_mark_size = None\n",
+     "    state.cost_reported = None\n    state.cost_carried = 0.0\n"),
+
     ("a CLI that does not say its version is taken not to restore",
      "    except ValueError:\n        return True\n    return parts",
      "    except ValueError:\n        return False\n    return parts"),
@@ -6467,8 +6472,23 @@ COST_BRIDGE_MUTATIONS = [
      "                         if False else None)\n"),
 
     ("what a restoring CLI starts from is not looked for",
-     "            if restores and last_saved is None and jsonl is not None:\n",
+     "                last_saved = (saved_cost(jsonl, sid, 0, size) or 0.0\n",
+     "                last_saved = (0.0\n"),
+
+    ("a restoring CLI with no transcript has what came before dropped",
+     "            carry_cost(st, final, last_saved if restores else 0.0)\n",
+     "            if restores and jsonl is None:\n"
+     "                st.cost_reported = None\n"
+     "            else:\n"
+     "                carry_cost(st, final, last_saved if restores else 0.0)\n"),
+
+    ("a CLI that started another session keeps the one asked for's figure",
+     "            if sid and old_sid and sid != old_sid:\n",
      "            if False:\n"),
+
+    ("the session's cost is written on the event loop",
+     "            await asyncio.to_thread(save_session_cost, st.session_id, {\n",
+     "            save_session_cost(st.session_id, {\n"),
 
     ("a state from scratch ignores what the hub kept",
      "        if st.cost_reported is None and st.cost_mark_size is None:\n"
@@ -6477,12 +6497,12 @@ COST_BRIDGE_MUTATIONS = [
 
     ("a turn's result is not kept",
      "                    take_cost(state, msg)\n"
-     "                    self._keep_cost()\n",
+     "                    await self._keep_cost()\n",
      "                    take_cost(state, msg)\n"),
 
     ("a result between turns is not kept",
      "            take_cost(state, msg)\n"
-     "            self._keep_cost()\n"
+     "            await self._keep_cost()\n"
      '            subtype = getattr(msg, "subtype", None) or "unknown"',
      "            take_cost(state, msg)\n"
      '            subtype = getattr(msg, "subtype", None) or "unknown"'),
@@ -6492,9 +6512,9 @@ COST_BRIDGE_MUTATIONS = [
      "            self.state.cost_reported = None\n",
      '            log.warning("could not settle the session\'s cost", exc_info=True)\n'),
 
-    ("/clear keeps where the wiped session's CLI started",
-     "        state.cost_mark_size = None\n",
-     ""),
+    ("/clear keeps the wiped session's figure",
+     "        forget_cost(state)\n        state.last_usage = {}\n",
+     "        state.last_usage = {}\n"),
 ]
 
 # A session on another account is opened and kept there, with the hub's
@@ -6567,6 +6587,12 @@ ACCOUNT_TRIM_MUTATIONS = [
      "            proj = project_dir_for_cwd(config.cwd,\n"
      '                                       getattr(config, "config_dir", None))\n',
      "            proj = project_dir_for_cwd(config.cwd)\n"),
+
+    ("the trim keeps offsets into the transcript it replaced",
+     "                state.cost_mark_size = None\n"
+     "                state.cost_mark_saved = None\n"
+     "                self._take_session_id(new_sid)\n",
+     "                self._take_session_id(new_sid)\n"),
 ]
 
 

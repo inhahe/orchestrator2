@@ -497,6 +497,17 @@ def test_the_context_trim_still_happens_when_nothing_is_running(monkeypatch):
     assert connects == ["sess-new"]
 
 
+def test_the_trim_forgets_where_the_old_transcript_was_read_to(monkeypatch):
+    """The cost marks are offsets into the transcript the trim replaced; the
+    new one is read from its start.  What the session spent is kept."""
+    br, state, sent, connects, trims = _trim_bridge(monkeypatch, bg=False)
+    state.cost_mark_size, state.cost_mark_saved = 123_456, 0.5
+    state.cost_reported, state.cost_carried = 0.75, 0.25
+    asyncio.run(br._between_turns("done", False))
+    assert (state.cost_mark_size, state.cost_mark_saved) == (None, None)
+    assert (state.cost_reported, state.cost_carried) == (0.75, 0.25)
+
+
 def test_a_session_on_another_account_is_trimmed_in_that_account(monkeypatch, tmp_path):
     """Its session file is under its own config dir, not the hub's."""
     import dataclasses
