@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -1124,6 +1125,62 @@ def title_from_jsonl(jsonl: Path) -> str | None:
     if not jsonl.exists():
         return None
     return _resolve_title(jsonl)
+
+
+# --- What a CLI resuming a session restores of its cost ---------------------
+# A CLI saves its running cost total in the transcript, as a ``cost-state``
+# record, when it exits cleanly, and one resuming the session starts from the
+# last of them saved for that session id (CLI 2.1.280; the record's own
+# schema caps the total at 1e9).  One killed outright saves nothing.
+
+_COST_STATE = b'"cost-state"'
+_COST_STATE_MAX = 1e9
+
+
+def saved_cost(jsonl: Path, session_id: str, *, chunk: int = 1 << 20) -> float | None:
+    """The cost total a CLI resuming *session_id* from *jsonl* starts from.
+
+    The last ``cost-state`` record for that session with a total the CLI
+    would accept; 0.0 when there is none, None when the file cannot be read.
+    Read backwards a *chunk* at a time from the end, where a clean exit
+    leaves it.
+    """
+    try:
+        with jsonl.open("rb") as f:
+            pos = f.seek(0, os.SEEK_END)
+            head = b""          # the start of a line cut by the last read
+            while pos > 0:
+                step = min(chunk, pos)
+                pos -= step
+                f.seek(pos)
+                block = f.read(step) + head
+                lines = block.split(b"\n")
+                head = lines[0] if pos > 0 else b""
+                for line in reversed(lines if pos == 0 else lines[1:]):
+                    total = _saved_total(line, session_id)
+                    if total is not None:
+                        return total
+    except OSError:
+        return None
+    return 0.0
+
+
+def _saved_total(line: bytes, session_id: str) -> float | None:
+    """*line*'s saved total if it is a usable ``cost-state`` for *session_id*."""
+    if _COST_STATE not in line:
+        return None
+    try:
+        rec = json.loads(line)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(rec, dict) or rec.get("type") != "cost-state" \
+            or rec.get("sessionId") != session_id:
+        return None
+    total = rec.get("totalCostUSD")
+    if (isinstance(total, (int, float)) and not isinstance(total, bool)
+            and math.isfinite(total) and 0 <= total <= _COST_STATE_MAX):
+        return float(total)
+    return None
 
 
 def sessions_titled(title: str, cwd: str, config_dir: str | None = None

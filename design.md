@@ -2087,16 +2087,28 @@ every other session, `detect_subscription()`, from the hub's environment, is
 the guess until the first `init`, and it is the only judge of a cloud
 provider, which `apiKeySource` does not name.
 
-**The cost is the CLI's running total.** `total_cost_usd` in a result is the
-CLI's process-wide total: nothing resets it between turns, and its budget check
-reads the same total. On resume the CLI restores the total it last saved for
-the session, but only if that session was the last in its directory to save
-one. The hub had been adding each result's figure to the last, so it counted
-every earlier turn again. It now takes the latest (`state.take_cost`): what
-Claude Code itself would show. That starts again when a session's CLI is
-replaced and the CLI cannot restore it, and the tooltip says so. No sum the hub
-could keep would be better, because it cannot tell a restored total from a new
-one.
+**The cost is the CLI's running total, carried across the CLI being
+replaced.** `total_cost_usd` in a result is the CLI's running total for the
+session: nothing resets it between turns. The hub had been adding each
+result's figure to the last, so it counted every earlier turn again; it takes
+the latest (`state.take_cost`), what Claude Code itself shows.
+
+A CLI resuming a session starts from the total its predecessor saved in the
+transcript: a `cost-state` record, written when a CLI exits cleanly, as the
+SDK's disconnect lets it (stdin closed, then five seconds' grace), and looked
+up by session id. Measured with CLI 2.1.280 against a local stand-in for the
+API, with a fake key, at $0.0105 a turn: $0.021, resumed, $0.0315, resumed,
+$0.042. So a CLI replaced cleanly carries the total on by itself, and adding
+each process's figure to the last, as a review proposed, would count it all
+twice. A CLI killed outright saves nothing: its successor starts from the
+last clean save, and what the killed one spent after that is gone from the
+CLI's figure (measured: $0.042 shown, $0.0525 spent). So a connect that takes
+over from a CLI which reported a total asks what the new one will restore
+(`session.saved_cost`: the transcript's last usable `cost-state` for the
+session, read backwards from the end, where a clean exit leaves it) and keeps
+the difference (`state.carry_cost`, into `cost_carried`, which every later
+figure adds). A figure a hub loses by being killed itself is not recovered:
+the next hub starts from the CLI's last save.
 
 **`/login console`** launches `claude auth login --console` for the session's
 account. It always starts, signed in or not, and says first that it replaces
@@ -2180,15 +2192,19 @@ at a local stand-in for the API, both keys fake: every request carried the
 `settings.json` key.
 
 Tests: `tests/test_api_key_billing.py` (state, the bridge, `/status`, the
-report, `auth`, `/login`), `tests/test_api_key_hub.py` (`/usage`, the
-watcher), `tests/test_session_api_key.py` (a key for one session),
+report, `auth` and its resolver, `/login`), `tests/test_api_key_hub.py`
+(`/usage`, the watcher, `/move`'s account names),
+`tests/test_session_api_key.py` (a key for one session, following it),
+`tests/test_session_cost.py` (the cost across a CLI being replaced),
 `tests/test_move_stops_original.py` (the key going with `/move`),
-`tests/usage.test.js` (the note) and `tests/reconnect_on_show.test.js` (the
-tooltip, the prompt history). Mutation targets: `apikey-state`,
-`apikey-bridge`, `apikey-auth`, `apikey-cmd`, `apikey-server`,
-`apikey-usagejs`, `apikey-statusjs`, `apikey-history`,
+`tests/test_model_list.py` (the model list's key), `tests/usage.test.js` (the
+note) and `tests/reconnect_on_show.test.js` (the tooltip, the prompt history).
+Mutation targets: `apikey-state`, `apikey-bridge`, `apikey-auth`,
+`apikey-cmd`, `apikey-server`, `apikey-usagejs`, `apikey-statusjs`,
+`apikey-history`, `apikey-resolver`, `apikey-resolver-server`,
 `sessionkey-server`, `sessionkey-move`, `sessionkey-bridge`, `sessionkey-btw`,
-`sessionkey-config`, `sessionkey-state`, `sessionkey-cmd`.
+`sessionkey-config`, `sessionkey-state`, `sessionkey-cmd`, `cost-session`,
+`cost-state`, `cost-bridge`.
 
 ## 6b. Subprocess ownership (`proc_guard.py`)
 

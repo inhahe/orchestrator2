@@ -48,8 +48,13 @@ the turn's cost. The hub added each result's figure to the last, so after
 three turns costing $1 each it showed $6, not $3. Subscription sessions showed
 the figure only in `/status`; API-key sessions show it in the status bar,
 where it is money. The hub now takes the latest figure, as Claude Code itself
-shows it. That figure starts again when a session's CLI is replaced and the
-CLI cannot restore the total it saved. design.md §6g.
+shows it.
+
+A CLI replaced cleanly saves its total and its successor carries it on. One
+killed outright saves nothing, so what it spent dropped out of the figure
+when its successor connected: measured, $0.042 shown for $0.0525 spent. The
+hub now reads what the successor restores from the transcript and carries the
+difference over (`state.carry_cost`). design.md §6g.
 
 ## A tab woken from a freeze still drew what it missed slowly — FIXED (2026-10-10)
 

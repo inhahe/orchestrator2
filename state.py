@@ -352,13 +352,31 @@ def take_cost(state: State, msg: Any) -> None:
     """Record the cost a ResultMessage reports.
 
     ``total_cost_usd`` is the CLI's running total for the session, not the
-    turn's: nothing resets it between turns, and on resume the CLI restores
-    the total it last saved for the session when it can.  So it replaces the
-    figure rather than adding to it.
+    turn's: nothing resets it between turns, and a CLI resuming the session
+    starts from the total its predecessor saved.  So it replaces the figure
+    rather than adding to it, plus what ``carry_cost`` kept of CLIs that saved
+    nothing.
     """
     cost = getattr(msg, "total_cost_usd", None)
     if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
-        state.total_cost_usd = float(cost)
+        state.cost_reported = float(cost)
+        state.total_cost_usd = state.cost_reported + state.cost_carried
+
+
+def carry_cost(state: State, restored: float | None) -> None:
+    """A new CLI is taking the session over: keep what the last one spent.
+
+    *restored* is the total the new CLI starts from: the last one the
+    session's transcript saved (``session.saved_cost``), 0.0 if none, None
+    when that could not be read.  A CLI saves its total there when it exits
+    cleanly, so one replaced cleanly is carried on by the CLI itself.  One
+    killed outright saved nothing, and what it spent past *restored* would
+    otherwise drop out of the figure.  The figure itself stands until the new
+    CLI reports.
+    """
+    if state.cost_reported is not None and restored is not None:
+        state.cost_carried += max(0.0, state.cost_reported - restored)
+    state.cost_reported = None
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +639,11 @@ class State:
 
     # Metrics
     context_tokens: int = 0
+    # The session's cost: the CLI's running total, plus what CLIs replaced
+    # without saving theirs had spent (take_cost, carry_cost).
     total_cost_usd: float = 0.0
+    cost_reported: float | None = None    # the running CLI's last total
+    cost_carried: float = 0.0
     turns: int = 0
     last_usage: dict[str, Any] = field(default_factory=dict)
 
@@ -934,9 +956,7 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
     rate_field: str | None = None
     rate_limits: dict[str, Any] = {}
     cost = f"${state.total_cost_usd:.4f}"
-    cost_note = ("Claude Code's running total for this session. It starts again "
-                 "when the session's CLI is replaced and Claude Code cannot "
-                 "restore it.")
+    cost_note = "Claude Code's running total for this session."
     if state.is_subscription:
         plan_field = f"{state.subscription_plan or 'sub'}"
         plan_title = "Claude subscription plan"

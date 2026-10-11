@@ -95,6 +95,7 @@ from state import (
     State,
     apply_api_key_source,
     apply_rate_limit_info,
+    carry_cost,
     config_dir_path,
     detect_account_info,
     extract_context_tokens,
@@ -140,6 +141,7 @@ from session import (
     find_session_dir,
     read_session_title,
     render_session_history,
+    saved_cost,
     trim_session,
     write_session_title,
     project_dir_for_cwd,
@@ -1356,6 +1358,11 @@ class SDKBridge:
                 # Left unmatched, so the next connect tries again.
                 self.state.human_title = None
                 log.debug("could not read the session title", exc_info=True)
+        # The CLI this one replaces may have been killed before it could save
+        # its cost total, which this one would then start without.
+        if self.state.cost_reported is not None:
+            carry_cost(self.state,
+                       await asyncio.to_thread(self._restored_cost, target))
         # A session given a name or labels (--agent-name, --agent-label) keeps
         # them when it comes back without the flags -- reopened from the
         # lobby, restored after a hub restart.  Looked up once per session,
@@ -2020,6 +2027,17 @@ class SDKBridge:
             log.info("ended %d process(es) claude.exe pid %s left running in "
                      "its job: background work the process-tree walk cannot "
                      "see", left, cli_pid if cli_pid is not None else job.pid)
+
+    def _restored_cost(self, sid: str | None) -> float | None:
+        """The cost total a CLI resuming *sid* starts from: what its transcript
+        last saved (``session.saved_cost``), 0.0 for a new session, None when
+        the transcript cannot be found or read.  File I/O: off the loop."""
+        if not sid:
+            return 0.0
+        project = find_session_dir(sid, getattr(self.config, "config_dir", None))
+        if project is None:
+            return None
+        return saved_cost(project / f"{sid}.jsonl", sid)
 
     def _warn_if_foreign_task(self, what: str) -> None:
         """Log loudly if an SDK teardown is running off the worker task.
@@ -6355,6 +6373,8 @@ class SDKBridge:
         state.context_tokens = 0
         state.turns = 0
         state.total_cost_usd = 0.0
+        state.cost_reported = None
+        state.cost_carried = 0.0
         state.last_usage = {}
         state.last_result_subtype = None
         state.last_compact_trigger = None

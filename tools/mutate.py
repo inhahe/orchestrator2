@@ -5837,8 +5837,8 @@ APIKEY_STATE_MUTATIONS = [
      'return state.api_key_source is not None'),
 
     ("each result's cost is added to the last -- the double count",
-     "        state.total_cost_usd = float(cost)\n",
-     "        state.total_cost_usd += float(cost)\n"),
+     "        state.cost_reported = float(cost)\n",
+     "        state.cost_reported = (state.cost_reported or 0.0) + float(cost)\n"),
 
     ("a negative or boolean cost is taken",
      "isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0",
@@ -6260,6 +6260,74 @@ APIKEY_STATUSJS_MUTATIONS = [
      ""),
 ]
 
+# What a killed CLI spent is carried across its replacement; one stopped
+# cleanly carries its own total on.  tests/test_session_cost.py.
+COST_SESSION_MUTATIONS = [
+    ("another session's saved total is taken for this one's",
+     '            or rec.get("sessionId") != session_id:\n',
+     "            or False:\n"),
+
+    ("a total the CLI would refuse is taken",
+     "            and math.isfinite(total) and 0 <= total <= _COST_STATE_MAX):\n",
+     "            ):\n"),
+
+    ("the first saved total is taken, not the last",
+     "                for line in reversed(lines if pos == 0 else lines[1:]):\n",
+     "                for line in (lines if pos == 0 else lines[1:]):\n"),
+
+    ("a record cut between two reads is lost",
+     '                head = lines[0] if pos > 0 else b""\n',
+     '                head = b""\n'),
+
+    ("a session that saved nothing restores an unknown total",
+     "    return 0.0\n\n\ndef _saved_total",
+     "    return None\n\n\ndef _saved_total"),
+]
+
+COST_STATE_MUTATIONS = [
+    ("what a killed CLI spent is dropped",
+     "        state.cost_carried += max(0.0, state.cost_reported - restored)\n",
+     "        pass\n"),
+
+    ("more restored than reported is carried as a refund",
+     "        state.cost_carried += max(0.0, state.cost_reported - restored)\n",
+     "        state.cost_carried += state.cost_reported - restored\n"),
+
+    ("what was carried is left out of the figure",
+     "        state.total_cost_usd = state.cost_reported + state.cost_carried\n",
+     "        state.total_cost_usd = state.cost_reported\n"),
+
+    ("a connect tried again carries the same spend twice",
+     "        state.cost_carried += max(0.0, state.cost_reported - restored)\n"
+     "    state.cost_reported = None\n",
+     "        state.cost_carried += max(0.0, state.cost_reported - restored)\n"),
+
+    ("a restored total that could not be read is taken as nothing restored",
+     "    if state.cost_reported is not None and restored is not None:\n",
+     "    if state.cost_reported is not None:\n"
+     "        restored = restored or 0.0\n"),
+]
+
+COST_BRIDGE_MUTATIONS = [
+    ("a connect never carries what a killed CLI spent -- the gap",
+     "        if self.state.cost_reported is not None:\n"
+     "            carry_cost(self.state,\n",
+     "        if False:\n"
+     "            carry_cost(self.state,\n"),
+
+    ("the restored total is looked for in the hub's account",
+     '        project = find_session_dir(sid, getattr(self.config, "config_dir", None))\n'
+     "        if project is None:\n            return None\n"
+     '        return saved_cost(project / f"{sid}.jsonl", sid)\n',
+     "        project = find_session_dir(sid)\n"
+     "        if project is None:\n            return None\n"
+     '        return saved_cost(project / f"{sid}.jsonl", sid)\n'),
+
+    ("/clear keeps what was carried for the session it wiped",
+     "        state.cost_carried = 0.0\n",
+     ""),
+]
+
 # A session on another account is opened and kept there, with the hub's
 # environment left alone.  tests/test_session_account.py; the trim in
 # tests/test_reconnect_bg_tasks.py, and /move in
@@ -6630,6 +6698,12 @@ TARGETS = {
                        ACCOUNT_BRIDGE_MUTATIONS, "pytest"),
     "account-trim": ("sdk_bridge.py", "tests/test_reconnect_bg_tasks.py",
                      ACCOUNT_TRIM_MUTATIONS, "pytest"),
+    "cost-session": ("session.py", "tests/test_session_cost.py",
+                     COST_SESSION_MUTATIONS, "pytest"),
+    "cost-state": ("state.py", "tests/test_session_cost.py",
+                   COST_STATE_MUTATIONS, "pytest"),
+    "cost-bridge": ("sdk_bridge.py", "tests/test_session_cost.py",
+                    COST_BRIDGE_MUTATIONS, "pytest"),
 }
 
 
