@@ -85,7 +85,9 @@ from config import (
     parse_bell_events,
 )
 from state import (
+    OWN_KEY_SOURCE,
     State,
+    apply_api_key_source,
     billed_to_api_key,
     config_dir_path,
     detect_account_info,
@@ -3329,9 +3331,13 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
                 _replace_runtime_config(existing, cli_path=cli_path)
                 need_reconnect = True
             # And its API key, likewise fixed at connect time.  A launch
-            # without one leaves the key the session has.
+            # without one leaves the key the session has.  Billed to it from
+            # now, as a session opened with one is (init_state_from_config).
             if api_key and getattr(existing.config, "api_key", None) != api_key:
                 _replace_runtime_config(existing, api_key=api_key)
+                if existing.state is not None:
+                    apply_api_key_source(existing.state, OWN_KEY_SOURCE,
+                                         getattr(existing.config, "config_dir", None))
                 need_reconnect = True
             # And its labels and name: the launch described this session,
             # which happens to be open already.  Applied live, without the
@@ -5407,6 +5413,11 @@ async def _handle_apikey(ws: WebSocket, rt: "SessionRuntime", payload: str) -> N
         text = "This session has no API key of its own."
     else:
         _replace_runtime_config(rt, api_key=None)
+        # Back on its account's login from now, as if the CLI had said so;
+        # the next init confirms or corrects it.
+        if rt.state is not None:
+            apply_api_key_source(rt.state, "none",
+                                 getattr(rt.config, "config_dir", None))
         sid = getattr(rt.state, "session_id", None)
         if sid:
             _session_api_keys.pop(sid, None)

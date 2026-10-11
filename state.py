@@ -284,6 +284,10 @@ def detect_account_info(config_dir: str | None = None) -> dict[str, Any]:
     return info
 
 
+#: The ``apiKeySource`` of a key in the CLI's environment, which is where a
+#: session's own key (``Config.api_key``) goes.
+OWN_KEY_SOURCE = "ANTHROPIC_API_KEY"
+
 # How each ``apiKeySource`` is named to the user.
 _API_KEY_SOURCE_NAMES = {
     "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY",
@@ -781,15 +785,14 @@ class State:
 def init_state_from_config(config: Config) -> State:
     """Create a fresh State populated from parsed Config."""
     initial_effort = None if config.effort in (None, "auto") else config.effort
-    # A session given its own API key is billed to it, whatever its account
-    # has; its CLI's init confirms which (apply_api_key_source).
-    sub = detect_subscription() and not getattr(config, "api_key", None)
-    return State(
+    config_dir = getattr(config, "config_dir", None)
+    sub = detect_subscription()
+    state = State(
         effort=initial_effort,
         model=config.model,
         is_subscription=sub,
-        subscription_plan=detect_subscription_plan() if sub else None,
-        account=detect_account_info(getattr(config, "config_dir", None)),
+        subscription_plan=detect_subscription_plan(config_dir) if sub else None,
+        account=detect_account_info(config_dir),
         collapse_tools=config.collapse_tools,
         collapse_threshold=config.collapse_threshold,
         max_dom_messages=config.max_dom_messages,
@@ -804,6 +807,12 @@ def init_state_from_config(config: Config) -> State:
         agent_name=getattr(config, "agent_name", None),
         agent_labels=dict(getattr(config, "agent_labels", None) or {}),
     )
+    if getattr(config, "api_key", None):
+        # A session given its own key is billed to it, whatever its account
+        # has, from the start: the status bar and /usage say so before the
+        # first turn.  Its CLI's init confirms or corrects it.
+        apply_api_key_source(state, OWN_KEY_SOURCE, config_dir)
+    return state
 
 
 # ---------------------------------------------------------------------------

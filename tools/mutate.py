@@ -6023,9 +6023,21 @@ SESSIONKEY_SERVER_MUTATIONS = [
      '            if getattr(existing.config, "api_key", None) != api_key:\n'),
 
     ("a launch's key for an open session waits for a reconnect that never comes",
-     "                _replace_runtime_config(existing, api_key=api_key)\n"
+     "                                         getattr(existing.config, \"config_dir\", None))\n"
      "                need_reconnect = True\n",
-     "                _replace_runtime_config(existing, api_key=api_key)\n"),
+     "                                         getattr(existing.config, \"config_dir\", None))\n"),
+
+    ("a key given to an open session is not billed until its next turn",
+     "                if existing.state is not None:\n"
+     "                    apply_api_key_source(existing.state, OWN_KEY_SOURCE,\n",
+     "                if False:\n"
+     "                    apply_api_key_source(existing.state, OWN_KEY_SOURCE,\n"),
+
+    ("/apikey off leaves the session billed to a key until its next turn",
+     "        if rt.state is not None:\n"
+     "            apply_api_key_source(rt.state, \"none\",\n",
+     "        if False:\n"
+     "            apply_api_key_source(rt.state, \"none\",\n"),
 
     ("closing a session forgets its key",
      "    _remember_session_key(rt)\n    runtimes.pop(rt.rid, None)",
@@ -6123,8 +6135,12 @@ SESSIONKEY_CONFIG_MUTATIONS = [
 
 SESSIONKEY_STATE_MUTATIONS = [
     ("a session given a key starts out as a subscription",
-     '    sub = detect_subscription() and not getattr(config, "api_key", None)\n',
-     "    sub = detect_subscription()\n"),
+     "        apply_api_key_source(state, OWN_KEY_SOURCE, config_dir)\n",
+     "        pass\n"),
+
+    ("a session given a key reads its plan from the hub's account",
+     "        subscription_plan=detect_subscription_plan(config_dir) if sub else None,\n",
+     "        subscription_plan=detect_subscription_plan() if sub else None,\n"),
 ]
 
 SESSIONKEY_CMD_MUTATIONS = [

@@ -88,6 +88,21 @@ def test_usage_for_a_key_session_explains_instead_of_fetching(hub, monkeypatch):
     assert "API key (ANTHROPIC_API_KEY)" in msgs[1]["note"]
 
 
+def test_usage_for_a_session_with_its_own_key_explains_before_any_turn(hub, monkeypatch):
+    # No init has named the key yet: the session's own key is taken at its word.
+    import dataclasses
+    from state import init_state_from_config
+
+    def no_fetch(_d):
+        raise AssertionError("fetched plan limits for a session with its own key")
+
+    monkeypatch.setattr(plan_usage, "usage_report", no_fetch)
+    hub.config = dataclasses.replace(hub.config, api_key="sk-ant-api03-not-a-real-key")
+    hub.state = init_state_from_config(hub.config)
+    msgs = _usage(_FakeWS())
+    assert "API key" in msgs[1]["note"]
+
+
 def test_usage_for_a_subscription_session_still_fetches(hub, monkeypatch):
     monkeypatch.setattr(plan_usage, "usage_report",
                         lambda d: {"usage": {}, "account": {}})

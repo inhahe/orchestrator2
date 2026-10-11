@@ -33,7 +33,9 @@ import btw                                       # noqa: E402
 import server                                    # noqa: E402
 from config import parse_args                    # noqa: E402
 from sdk_bridge import SDKBridge                 # noqa: E402
-from state import State, init_state_from_config  # noqa: E402
+import state as state_mod                        # noqa: E402
+from state import (State, apply_api_key_source,  # noqa: E402
+                   billed_to_api_key, init_state_from_config)
 
 KEY = "sk-ant-api03-not-a-real-key"
 OTHER = "sk-ant-api03-another-fake-key"
@@ -432,11 +434,52 @@ def test_apikey_reaches_the_hub_not_the_cli():
     assert commands.classify("/apikey") == ("apikey", "")
 
 
-def test_a_session_given_a_key_does_not_start_out_as_a_subscription():
-    # Until its CLI's init says, the guess is the key.
+def test_a_session_given_a_key_is_billed_to_it_from_the_start():
+    # Until its CLI's init says, the key is taken at its word: the status bar
+    # and /usage treat the session as billed to it.
     import dataclasses
     st = init_state_from_config(dataclasses.replace(parse_args([]), api_key=KEY))
     assert st.is_subscription is False
+    assert billed_to_api_key(st)
+
+
+def _subscribed(monkeypatch):
+    monkeypatch.setattr(state_mod, "detect_subscription", lambda: True)
+    monkeypatch.setattr(state_mod, "detect_subscription_plan", lambda _d=None: "Max 20x")
+
+
+def test_a_session_reads_its_plan_from_its_own_account(monkeypatch):
+    # The plan a key that goes away gives back is the session's account's.
+    import dataclasses
+    monkeypatch.setattr(state_mod, "detect_subscription", lambda: True)
+    monkeypatch.setattr(state_mod, "detect_subscription_plan",
+                        lambda d=None: f"the plan of {d}")
+    st = init_state_from_config(
+        dataclasses.replace(parse_args([]), config_dir="D:/accounts/b"))
+    assert st.subscription_plan == "the plan of D:/accounts/b"
+
+
+def test_apikey_off_before_any_turn_gives_back_the_accounts_login(monkeypatch):
+    _subscribed(monkeypatch)
+    rt = _open_session(monkeypatch, key=KEY)
+    rt.state = init_state_from_config(rt.config)     # opened with the key
+    _apikey(monkeypatch, rt, "off")
+    assert not billed_to_api_key(rt.state)
+    assert (rt.state.is_subscription, rt.state.subscription_plan) == (True, "Max 20x")
+    # ...and the first init, naming no key, leaves it so.
+    apply_api_key_source(rt.state, "none", None)
+    assert (rt.state.is_subscription, rt.state.subscription_plan) == (True, "Max 20x")
+
+
+def test_a_key_given_to_an_open_session_bills_it_at_once(monkeypatch):
+    _subscribed(monkeypatch)
+    rt = _open_session(monkeypatch)
+    rt.state = init_state_from_config(rt.config)
+    rt.state.session_id = "sid-live"
+    asyncio.run(server.api_session_launch(
+        {"cwd": "C:\\w", "resume": "sid-live", "api_key": KEY}))
+    assert billed_to_api_key(rt.state)
+    assert rt.state.is_subscription is False
 
 
 # --------------------------------------------------------------------------
