@@ -1674,6 +1674,7 @@ async def _create_runtime(
     resume_interrupted_turn: bool | None = None,
     api_key: str | None = None,
     compact_at: int | None = None,
+    auto_compact: bool | None = None,
 ) -> SessionRuntime:
     """Spin up a fresh live session runtime (config clone + state + bridge).
 
@@ -1700,8 +1701,10 @@ async def _create_runtime(
       ``ANTHROPIC_API_KEY``).  Without one, a session the hub remembers a
       key for (``_session_api_keys``) gets that; a launch without a key has
       made the hub forget it first.  Never inherited from the hub.
-    * ``compact_at`` — this session's auto-compact threshold (the launch's
-      ``--compact-at``); None keeps the hub's.
+    * ``compact_at`` / ``auto_compact`` — this session's auto-compact
+      threshold and switch (the launch's ``--compact-at`` and
+      ``--auto-compact``/``--no-compact``).  None: not given, so the switch
+      is the hub's and the threshold the default for this session's model.
     * otherwise — continue the most recent session in *cwd*.
 
     Registers the runtime, starts its bridge, and refreshes the lobby.
@@ -1757,9 +1760,14 @@ async def _create_runtime(
     # `stable`.
     if cli_path:
         overrides["cli_path"] = cli_path
-    # Per-session compaction: one session can compact earlier than the rest.
-    if compact_at:
-        overrides["compact_at"] = compact_at
+    # Per-session compaction, set every time like the name: the hub's
+    # --compact-at and --auto-compact were its own launch's, for its session.
+    # Not given, the threshold is the default for this session's model and
+    # the orchestrator does not compact it (Claude Code's own compaction, near
+    # the context limit, still does).
+    overrides["compact_at"] = compact_at or default_compact_at(model or config.model)
+    overrides["auto_compact"] = bool(auto_compact)
+    overrides["no_compact"] = not auto_compact
     # Set every time, never inherited.  ``config`` is the *hub's*, so a name
     # the hub was launched with belongs to the one session that launch opened;
     # copying it into every session opened afterwards gave them all one
@@ -3394,11 +3402,15 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     # HANDOVER_KEYS_ENV).
     api_key = body.get("api_key")
     api_key = (api_key.strip() if isinstance(api_key, str) else "") or None
-    # This session's auto-compact threshold, in context tokens; anything but
-    # a positive whole number is ignored, leaving the hub's.
+    # This session's auto-compact threshold, in context tokens, and whether
+    # the orchestrator compacts it at all; anything but a positive whole
+    # number, or a true or false, is ignored, leaving the hub's.
     compact_at = body.get("compact_at")
     if isinstance(compact_at, bool) or not isinstance(compact_at, int) or compact_at <= 0:
         compact_at = None
+    auto_compact = body.get("auto_compact")
+    if not isinstance(auto_compact, bool):
+        auto_compact = None
 
     # A title is resolved to its session's id first, as the hub's own startup
     # does -- left as the title, it became this runtime's session id until the
@@ -3440,14 +3452,18 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
                 if existing.state.effort != new_effort:
                     existing.state.effort = new_effort
                     need_reconnect = True
-            # The compaction threshold likewise; no reconnect, as the bridge
-            # reads it after every turn.  It overrides a /autocompact N too:
-            # the launch is the later word.
-            if compact_at and existing.state is not None:
-                _replace_runtime_config(existing, compact_at=compact_at)
-                existing.state._compact_at = compact_at  # type: ignore[attr-defined]
-                log.info("hub launch: auto-compact threshold for rid=%s -> %d",
-                         existing.rid, compact_at)
+            # Compaction likewise, on the session alone -- where /autocompact
+            # puts it, and what the bridge reads after every turn, so no
+            # reconnect; not its Config, which for the hub's own session is
+            # the hub's and would reach every session opened after.
+            if existing.state is not None:
+                if compact_at:
+                    existing.state._compact_at = compact_at  # type: ignore[attr-defined]
+                if auto_compact is not None:
+                    existing.state._auto_compact = auto_compact  # type: ignore[attr-defined]
+                if compact_at or auto_compact is not None:
+                    log.info("hub launch: auto-compact for rid=%s -> %s at %s",
+                             existing.rid, auto_compact, compact_at)
             # Same reasoning as model/effort: the launcher asked for a bell
             # set, so honour it on the session it actually lands on.  No
             # reconnect needed — bell_events is read at ring time.
@@ -3532,7 +3548,8 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
                                    agent_labels=agent_labels,
                                    initial_prompt=initial_prompt,
                                    resume_interrupted_turn=resume_interrupted_turn,
-                                   api_key=api_key, compact_at=compact_at)
+                                   api_key=api_key, compact_at=compact_at,
+                                   auto_compact=auto_compact)
     except Exception as exc:
         log.exception("hub session launch failed")
         return {"ok": False, "error": str(exc)}
@@ -4756,7 +4773,9 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
                 cwd=cwd, resume=sid, config_dir=src_cfg,
                 agent_name=carry["agent_name"],
                 agent_labels=carry["agent_labels"],
-                resume_interrupted_turn=True, api_key=carry["api_key"])
+                resume_interrupted_turn=True, api_key=carry["api_key"],
+                compact_at=carry["compact_at"],
+                auto_compact=carry["auto_compact"])
         except Exception:
             log.exception("move: could not reopen the original session")
             await send_to(ws, {"type": "move_error", "message": (
@@ -4836,7 +4855,8 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
             cwd=dest_cwd, resume=new_id, config_dir=target_cfg,
             session_note=note, agent_name=carry["agent_name"],
             agent_labels=carry["agent_labels"],
-            resume_interrupted_turn=True, api_key=carry["api_key"])
+            resume_interrupted_turn=True, api_key=carry["api_key"],
+            compact_at=carry["compact_at"], auto_compact=carry["auto_compact"])
     except Exception as exc:
         log.exception("move: failed to start runtime for copied session")
         await _move_failed(f"Couldn't start the moved session: {exc}")
@@ -4906,6 +4926,12 @@ def _move_carry(rt: SessionRuntime, cwd: str, sid: str) -> dict[str, Any]:
         # The session's own API key: the moved session is the same work, and
         # stays billed as it was.
         "api_key": getattr(rt.config, "api_key", None),
+        # And compacts as it did: a /autocompact or a launch's setting lives
+        # on the state, the setting it was opened with in its config.
+        "compact_at": getattr(st, "_compact_at",
+                              getattr(rt.config, "compact_at", None)),
+        "auto_compact": getattr(st, "_auto_compact",
+                                getattr(rt.config, "auto_compact", None)),
     }
 
 
@@ -6040,10 +6066,10 @@ def _hub_launch_kwargs(cfg: Config, config_dir: str | None) -> dict[str, Any]:
         "initial_prompt": cfg.initial_prompt,
         "resume_interrupted_turn": cfg.resume_interrupted_turn,
         "api_key": cfg.api_key,
-        # Only a --compact-at the launch was given: the model's default is the
-        # hub's to apply, and sending it would undo a session's own setting.
-        "compact_at": (cfg.compact_at
-                       if cfg.compact_at != default_compact_at(cfg.model) else None),
+        # What the launch was given, and only that: a value filled in from a
+        # default is not this session's to impose.
+        "compact_at": cfg.compact_at if cfg.compact_at_given else None,
+        "auto_compact": cfg.auto_compact if cfg.auto_compact_given else None,
     }
 
 
@@ -6148,6 +6174,7 @@ def _launch_into_hub(
     resume_interrupted_turn: bool = False,
     api_key: str | None = None,
     compact_at: int | None = None,
+    auto_compact: bool | None = None,
 ) -> str | None:
     """Ask a running hub to open a session; return its ``rid`` (or None).
 
@@ -6169,9 +6196,9 @@ def _launch_into_hub(
     And ``resume_interrupted_turn``: whether the session this launch opens
     finishes a turn that was cut off.  And ``api_key``, the launch's
     ``ANTHROPIC_API_KEY``, for that session alone; it goes only to the hub on
-    this machine, over loopback.  And ``compact_at``, the launch's
-    ``--compact-at``, so that one session can compact earlier than the rest
-    (None: the hub's default for the model).
+    this machine, over loopback.  And ``compact_at`` and ``auto_compact``,
+    the launch's ``--compact-at`` and ``--auto-compact``/``--no-compact``, so
+    that one session can compact earlier than the rest (None: not given).
     """
     import urllib.request
 
@@ -6190,6 +6217,7 @@ def _launch_into_hub(
         "resume_interrupted_turn": bool(resume_interrupted_turn),
         "api_key": api_key,
         "compact_at": compact_at,
+        "auto_compact": auto_compact,
     }).encode("utf-8")
     try:
         req = urllib.request.Request(

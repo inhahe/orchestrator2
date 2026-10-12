@@ -178,11 +178,15 @@ lands on a session the hub already has open applies `--model`, `--effort`,
 (live, §9a) to it, and queues its `--initial-prompt` there (§6, *A launch's
 `--initial-prompt`*). `--cli-path` is made absolute at parse
 time for the same hand-over: the hub would read a relative path against its own
-directory. `--compact-at` goes over too, but only when it differs from the
-model's default, which the hub applies itself; it sets the threshold of the
-session the launch opens or lands on, overriding a `/autocompact N` there, so
-one session can compact earlier than the others (added 2026-10-12, to measure
-what a shorter context costs and saves).
+directory. `--compact-at` and `--auto-compact`/`--no-compact` go over too, but
+only when given (`Config.compact_at_given`, `auto_compact_given`): they set the
+compaction of the session the launch opens or lands on, overriding a
+`/autocompact` there, so one session can compact earlier than the others. A
+session already open takes them on its state, where `/autocompact` puts them,
+never on its `Config`, which for the hub's own session is the hub's. Like the
+name, they are never inherited from the hub's launch: a session opened without
+them gets its own model's default threshold and no orchestrator compaction.
+`/move` carries them.
 
 **`--resume <title>` is resolved to a session id before anything keys on
 it**, by `session.resolve_session_ref`: the whole title, ignoring case, of

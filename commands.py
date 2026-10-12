@@ -726,7 +726,11 @@ def _cmd_collapse_threshold(payload: str, state: State, _config: Config) -> Comm
 def _cmd_autocompact(payload: str, state: State, config: Config) -> CommandResult:
     p = payload.strip().lower()
     if not p:
-        status = "OFF" if config.no_compact else f"ON (at ~{config.compact_at} tok)"
+        # The session's own values first: a launch or /autocompact N sets
+        # them on the session, over the hub's.
+        on = getattr(state, "_auto_compact", config.auto_compact)
+        at = getattr(state, "_compact_at", config.compact_at)
+        status = f"ON (at ~{at} tok)" if on else "OFF"
         return CommandResult(messages=[_msg(f"auto-compact: {status}")])
     if p in ("on", "true", "enable", "1"):
         state._auto_compact = True  # type: ignore[attr-defined]

@@ -220,6 +220,18 @@ def model_context_window(model: str | None) -> int | None:
     return None
 
 
+def _positive_int(text: str) -> int:
+    """An argparse type: a whole number above zero. 0 or less as a compaction
+    threshold would compact after every turn."""
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"must be above zero: {n}")
+    return n
+
+
 def default_compact_at(model: str | None) -> int:
     """Pick a sensible auto-compact trigger based on the selected model."""
     window = model_context_window(model)
@@ -495,6 +507,11 @@ class Config:
     compact_cooldown_turns: int = 3
     max_context_tokens: int = 0        # 0 = disabled
     auto_compact: bool = False
+    # Whether --compact-at, and --auto-compact or --no-compact, were given on
+    # the command line rather than filled in: a launch that joins a hub hands
+    # over only what it was given, for its own session (as ``cwd_given``).
+    compact_at_given: bool = False
+    auto_compact_given: bool = False
 
     # ScheduleWakeup / autonomous-loop heartbeat.  When True (default), the
     # bridge honours the model's ScheduleWakeup tool calls by re-injecting the
@@ -740,7 +757,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     # -- Context / compaction --
     ap.add_argument(
         "--compact-at",
-        type=int,
+        type=_positive_int,
         default=None,
         help=(
             f"Force /compact when context tokens exceed this. Default derived "
@@ -752,13 +769,18 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--auto-compact",
         dest="no_compact",
         action="store_false",
+        # None, not True: a launch must tell "--no-compact given" from "neither
+        # given" to hand over only what it was given. Resolved to True below.
+        # Set here, on the first action with this dest: argparse takes the
+        # default from that one.
+        default=None,
         help="Enable the orchestrator's auto-compact check (off by default).",
     )
     ap.add_argument(
         "--no-compact",
         dest="no_compact",
         action="store_true",
-        default=True,
+        default=None,
         help="(Default.) Disable the orchestrator's auto-compact entirely.",
     )
     ap.add_argument(
@@ -1185,6 +1207,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     compact_at = args.compact_at
     if compact_at is None:
         compact_at = default_compact_at(args.model)
+    no_compact = True if args.no_compact is None else args.no_compact
 
     return Config(
         initial_prompt=args.initial_prompt,
@@ -1203,8 +1226,10 @@ def parse_args(argv: list[str] | None = None) -> Config:
         allowed_tools=list(args.allowed_tool),
         disallowed_tools=list(args.disallowed_tool),
         compact_at=compact_at,
-        no_compact=args.no_compact,
-        auto_compact=not args.no_compact,
+        no_compact=no_compact,
+        auto_compact=not no_compact,
+        compact_at_given=args.compact_at is not None,
+        auto_compact_given=args.no_compact is not None,
         compact_cooldown_turns=args.compact_cooldown_turns,
         max_context_tokens=args.max_context_tokens,
         status_url=args.status_url,
