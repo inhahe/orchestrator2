@@ -36,6 +36,12 @@ launch opens (*"can you make ANTHROPIC_API_KEY only work for the session that
 was loaded with that key set?"*). The hub keeps it with that session in
 memory, and `/apikey off` drops it. design.md §6g.
 
+And a session relaunched without a key stayed on the key an earlier launch had
+brought, because the hub remembered it by session id (2026-10-12: a launcher
+that should have been subscription-only had carried a key once, and every
+later launch of those sessions kept billing it). Fixed: a launch without a key
+takes its session off the key, whether the session is open or closed.
+
 ## Five timing tests failed under heavy load — FIXED (2026-10-10)
 
 Full `pytest tests/` runs, made while a mutation sweep or a CLI probe ran on

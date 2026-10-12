@@ -258,11 +258,46 @@ def test_a_key_for_a_session_already_open_is_applied(monkeypatch):
     assert rt.bridge.event_queue.get_nowait() == ("connect", "")
 
 
-def test_a_launch_without_one_leaves_an_open_sessions_key_alone(monkeypatch):
+def test_a_launch_without_one_takes_an_open_session_off_its_key(monkeypatch):
+    # Reported 2026-10-12: a session relaunched from a launcher with no key
+    # stayed billed to the key an earlier launch had brought.
+    _subscribed(monkeypatch)
     rt = _open_session(monkeypatch, key=KEY)
+    rt.state = init_state_from_config(rt.config)
+    rt.state.session_id = "sid-live"
+    server._session_api_keys["sid-live"] = KEY
     asyncio.run(server.api_session_launch({"cwd": "C:\\w", "resume": "sid-live"}))
-    assert rt.config.api_key == KEY
+    assert rt.config.api_key is None
+    assert rt.bridge.config is rt.config
+    assert not billed_to_api_key(rt.state)
+    assert server._session_api_keys == {}
+    assert rt.bridge.event_queue.get_nowait() == ("connect", "")
+
+
+def test_a_launch_without_one_leaves_a_session_without_one_alone(monkeypatch):
+    rt = _open_session(monkeypatch)
+    asyncio.run(server.api_session_launch({"cwd": "C:\\w", "resume": "sid-live"}))
     assert rt.bridge.event_queue.empty()
+
+
+def test_a_launch_without_one_reopens_a_closed_session_without_its_key(
+        monkeypatch, tmp_path):
+    # Not _create_runtime faked: the key it gives the session is the point.
+    server._session_api_keys.update({"sid-1": KEY, "sid-2": OTHER})
+    monkeypatch.setattr(server, "runtimes", {})
+    monkeypatch.setattr(server, "config", parse_args([]))
+    monkeypatch.setattr(server, "resolve_session_ref", lambda ref, _c, _d: ref)
+    seen = {}
+
+    def stop(cfg):
+        seen["cfg"] = cfg
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(server, "init_state_from_config", stop)
+    res = asyncio.run(server.api_session_launch(
+        {"cwd": str(tmp_path), "resume": "sid-1"}))
+    assert not res["ok"] and seen["cfg"].api_key is None
+    assert server._session_api_keys == {"sid-2": OTHER}, "another session's key"
 
 
 # --------------------------------------------------------------------------

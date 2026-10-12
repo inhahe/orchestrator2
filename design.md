@@ -2234,8 +2234,18 @@ every account, so:
   session's key explicitly, never inheriting it, as it does the name.
 - **A launch that joins a running hub hands it over** in its request to
   `/api/session/launch`, over loopback. A session already open takes it and
-  reconnects, since the key is fixed when the CLI starts; a launch without
-  one leaves an open session's key alone.
+  reconnects, since the key is fixed when the CLI starts.
+- **A launch says what its session is billed to, so one without a key takes
+  the session off the key it had.** Asked 2026-10-12, after a launcher meant
+  for the subscription had once carried a key and every later launch of the
+  same sessions stayed on it: *"can you change it so that it doesn't remember
+  a key per session even when you don't launch it with a key?"*
+  `api_session_launch` drops the session's id from `_session_api_keys`, and a
+  session already open has the key taken out of its `Config` and reconnects.
+  Only a launch does this: the lobby, `/resume`, `/cwd` and ⟳ Restart name no
+  key of their own, and keep the session's. A hub's own first launch needs no
+  such step, since a hub that has just started remembers nothing but what a
+  restart handed it.
 - **The key is the session's, not the tab's, and the hub remembers it while
   it runs.** A session's key is recorded by its id in `_session_api_keys` the
   moment the session has one, and again as it leaves: every id a CLI gives

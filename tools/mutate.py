@@ -6242,12 +6242,25 @@ SESSIONKEY_SERVER_MUTATIONS = [
      "                                   api_key=None)"),
 
     ("a session already open ignores a launch's key",
-     '            if api_key and getattr(existing.config, "api_key", None) != api_key:\n',
+     '            if getattr(existing.config, "api_key", None) != api_key:\n',
      "            if False:\n"),
 
-    ("a launch without a key takes an open session's away",
-     '            if api_key and getattr(existing.config, "api_key", None) != api_key:\n',
-     '            if getattr(existing.config, "api_key", None) != api_key:\n'),
+    ("a launch without a key leaves an open session on the one it has",
+     '            if getattr(existing.config, "api_key", None) != api_key:\n',
+     '            if api_key and getattr(existing.config, "api_key", None) != api_key:\n'),
+
+    ("a launch that changes no key reconnects the open session anyway",
+     '            if getattr(existing.config, "api_key", None) != api_key:\n',
+     "            if True:\n"),
+
+    ("a launch without a key leaves the session's key remembered",
+     "    if target_sid and not api_key:\n"
+     "        _session_api_keys.pop(target_sid, None)\n",
+     ""),
+
+    ("a launch without a key forgets every session's",
+     "        _session_api_keys.pop(target_sid, None)\n",
+     "        _session_api_keys.clear()\n"),
 
     ("a launch's key for an open session waits for a reconnect that never comes",
      "                _replace_runtime_config(existing, api_key=api_key)\n"

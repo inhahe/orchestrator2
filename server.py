@@ -152,7 +152,9 @@ log = logging.getLogger("orchestrator2")
 # hub hands it over with its request.  The key belongs to the session, not to
 # the tab showing it: the hub remembers it by session id, so the session keeps
 # it when reopened from the lobby, resumed with /resume, or brought back by ⟳
-# Restart, and a tab that switches to another session leaves it behind.  Only
+# Restart, and a tab that switches to another session leaves it behind.  A
+# launch is the exception: it says what its session is billed to, so one
+# without a key takes the session off the key it had.  Only
 # in memory and in a restart's child's environment: never on disk, never on a
 # command line, never logged, never sent to a browser.
 
@@ -1694,8 +1696,8 @@ async def _create_runtime(
       passes True: the move itself cut that turn, and the copy carries on.
     * ``api_key`` — this session's own API key (the launch's
       ``ANTHROPIC_API_KEY``).  Without one, a session the hub remembers a
-      key for (``_session_api_keys``) gets that.  Never inherited from the
-      hub.
+      key for (``_session_api_keys``) gets that; a launch without a key has
+      made the hub forget it first.  Never inherited from the hub.
     * otherwise — continue the most recent session in *cwd*.
 
     Registers the runtime, starts its bridge, and refreshes the lobby.
@@ -3394,6 +3396,10 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     # second bridge against the same session file.
     target_sid = _session_to_open(resume, cwd or config.cwd, config_dir,
                                   continue_recent=not no_continue)
+    # The launch says what its session is billed to: without a key, that is
+    # the account's login, whatever key the session ran with before.
+    if target_sid and not api_key:
+        _session_api_keys.pop(target_sid, None)
     if target_sid:
         existing = next(
             (r for r in runtimes.values()
@@ -3433,10 +3439,13 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
                 _replace_runtime_config(existing, cli_path=cli_path)
                 need_reconnect = True
             # And its API key, likewise fixed at connect time.  A launch
-            # without one leaves the key the session has.
-            if api_key and getattr(existing.config, "api_key", None) != api_key:
+            # without one takes the session off the key it has.
+            if getattr(existing.config, "api_key", None) != api_key:
                 _replace_runtime_config(existing, api_key=api_key)
                 need_reconnect = True
+                log.info("hub launch: rid=%s now runs on %s", existing.rid,
+                         "the launch's API key" if api_key
+                         else "its account's login, its API key dropped")
             # And its labels and name: the launch described this session,
             # which happens to be open already.  Applied live, without the
             # reconnect -- see SDKBridge.adopt_agent_labels / adopt_agent_name.
