@@ -242,8 +242,14 @@ def _open_session(monkeypatch, *, key=None, sid="sid-live"):
     st = State()
     st.session_id = sid
     cfg = dataclasses.replace(parse_args([]), api_key=key)
+    told = []
+
+    async def broadcast(msg):
+        told.append(msg)
+
     rt = types.SimpleNamespace(rid="R1", state=st, config=cfg,
-                               bridge=_LiveBridge(cfg))
+                               bridge=_LiveBridge(cfg), broadcast=broadcast,
+                               told=told)
     monkeypatch.setattr(server, "runtimes", {"R1": rt})
     monkeypatch.setattr(server, "config", parse_args([]))
     return rt
@@ -258,9 +264,9 @@ def test_a_key_for_a_session_already_open_is_applied(monkeypatch):
     assert rt.bridge.event_queue.get_nowait() == ("connect", "")
 
 
-def test_a_launch_without_one_takes_an_open_session_off_its_key(monkeypatch):
-    # Reported 2026-10-12: a session relaunched from a launcher with no key
-    # stayed billed to the key an earlier launch had brought.
+def test_a_launch_without_one_takes_an_open_session_off_its_key(monkeypatch, caplog):
+    # A launch says what its session is billed to, a launch without a key too.
+    caplog.set_level("INFO")
     _subscribed(monkeypatch)
     rt = _open_session(monkeypatch, key=KEY)
     rt.state = init_state_from_config(rt.config)
@@ -272,17 +278,62 @@ def test_a_launch_without_one_takes_an_open_session_off_its_key(monkeypatch):
     assert not billed_to_api_key(rt.state)
     assert server._session_api_keys == {}
     assert rt.bridge.event_queue.get_nowait() == ("connect", "")
+    # The reconnect cuts the session's work: its tabs and the log say why.
+    assert rt.told[0]["data"]["message"].startswith(
+        "Reconnecting: this session now runs on its account's own login")
+    assert "sid-live now runs on its account's own login" in caplog.text
+    assert KEY not in caplog.text and KEY not in json.dumps(rt.told)
 
 
 def test_a_launch_without_one_leaves_a_session_without_one_alone(monkeypatch):
     rt = _open_session(monkeypatch)
     asyncio.run(server.api_session_launch({"cwd": "C:\\w", "resume": "sid-live"}))
-    assert rt.bridge.event_queue.empty()
+    assert rt.bridge.event_queue.empty() and not rt.told
+
+
+def test_a_launch_that_continues_the_most_recent_session_decides_for_it(monkeypatch):
+    # No --resume: the session the launch lands on is the directory's latest.
+    rt = _open_session(monkeypatch, key=KEY, sid="sid-recent")
+    server._session_api_keys["sid-recent"] = KEY
+    _recent_is(monkeypatch, "sid-recent")
+    asyncio.run(server.api_session_launch({"cwd": "C:\\w"}))
+    assert rt.config.api_key is None and server._session_api_keys == {}
+
+
+def test_a_session_still_stopping_does_not_remember_its_key_again(monkeypatch):
+    """Closed, then launched without a key while its bridge is still
+    stopping: the id that bridge's last result carries must not put the key
+    back."""
+    from session_runtime import SessionRuntime
+    st = State()
+    st.session_id = "sid-9"
+    cfg = dataclasses.replace(parse_args([]), api_key=KEY)
+    rt = SessionRuntime(config=cfg, state=st, rid="R9")
+
+    class _Stopping:
+        on_session_id = staticmethod(server._note_session_key)
+
+        async def stop(self):
+            # The launch, mid-stop; then the cut turn's result.
+            server._session_api_keys.pop("sid-9", None)
+            if self.on_session_id is not None:
+                self.on_session_id("sid-9", cfg)
+
+    rt.bridge = _Stopping()
+
+    async def nothing(*_a, **_k):
+        pass
+
+    monkeypatch.setattr(server, "runtimes", {"R9": rt})
+    monkeypatch.setattr(server, "_push_session_list", nothing)
+    asyncio.run(server._teardown_runtime(rt, force=True))
+    assert server._session_api_keys == {}
 
 
 def test_a_launch_without_one_reopens_a_closed_session_without_its_key(
-        monkeypatch, tmp_path):
+        monkeypatch, tmp_path, caplog):
     # Not _create_runtime faked: the key it gives the session is the point.
+    caplog.set_level("INFO")
     server._session_api_keys.update({"sid-1": KEY, "sid-2": OTHER})
     monkeypatch.setattr(server, "runtimes", {})
     monkeypatch.setattr(server, "config", parse_args([]))
@@ -297,6 +348,8 @@ def test_a_launch_without_one_reopens_a_closed_session_without_its_key(
     res = asyncio.run(server.api_session_launch(
         {"cwd": str(tmp_path), "resume": "sid-1"}))
     assert not res["ok"] and seen["cfg"].api_key is None
+    assert "session sid-1 is no longer remembered" in caplog.text
+    assert KEY not in caplog.text
     assert server._session_api_keys == {"sid-2": OTHER}, "another session's key"
 
 

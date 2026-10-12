@@ -2242,7 +2242,12 @@ every account, so:
   a key per session even when you don't launch it with a key?"*
   `api_session_launch` drops the session's id from `_session_api_keys`, and a
   session already open has the key taken out of its `Config` and reconnects.
-  Only a launch does this: the lobby, `/resume`, `/cwd` and ⟳ Restart name no
+  That reconnect cuts whatever the session was doing, so its tabs are told
+  why, and the hub's log says which session changed and to what, never the
+  key. A runtime being closed stops reporting session ids once its key is
+  remembered (`_teardown_runtime`): its bridge takes seconds to stop, and the
+  result of the turn that cut would otherwise record the key again after a
+  launch had dropped it. Only a launch does this: the lobby, `/resume`, `/cwd` and ⟳ Restart name no
   key of their own, and keep the session's. A hub's own first launch needs no
   such step, since a hub that has just started remembers nothing but what a
   restart handed it.

@@ -6254,13 +6254,24 @@ SESSIONKEY_SERVER_MUTATIONS = [
      "            if True:\n"),
 
     ("a launch without a key leaves the session's key remembered",
-     "    if target_sid and not api_key:\n"
-     "        _session_api_keys.pop(target_sid, None)\n",
-     ""),
+     "        if _session_api_keys.pop(target_sid, None):\n",
+     "        if _session_api_keys.get(target_sid):\n"),
 
     ("a launch without a key forgets every session's",
-     "        _session_api_keys.pop(target_sid, None)\n",
-     "        _session_api_keys.clear()\n"),
+     "        if _session_api_keys.pop(target_sid, None):\n",
+     "        if _session_api_keys.clear() or True:\n"),
+
+    ("an open session's tabs are not told why a launch reconnected it",
+     "                await existing.broadcast({\n"
+     '                    "type": "system_msg", "subtype": "info",\n'
+     '                    "data": {"message": f"Reconnecting: this session now "\n',
+     "                await existing.broadcast({\n"
+     '                    "type": "system_msg", "subtype": "info",\n'
+     '                    "data": {"message": f"Reconnecting. "\n'),
+
+    ("a session still stopping remembers its key again",
+     "    if rt.bridge is not None:\n        rt.bridge.on_session_id = None\n",
+     ""),
 
     ("a launch's key for an open session waits for a reconnect that never comes",
      "                _replace_runtime_config(existing, api_key=api_key)\n"

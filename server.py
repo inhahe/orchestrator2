@@ -1804,8 +1804,9 @@ async def _create_runtime(
         )
 
     await br.start()
-    log.info("runtime %s started (cwd=%s, resume=%s)",
-             rt.rid, resolved_cwd, seed_id)
+    log.info("runtime %s started (cwd=%s, resume=%s, %s)",
+             rt.rid, resolved_cwd, seed_id,
+             "on an API key of its own" if cfg.api_key else "no API key of its own")
     await _push_session_list()   # lobby tabs see the new session appear
     return rt
 
@@ -2072,6 +2073,11 @@ async def _teardown_runtime(rt: SessionRuntime, *, force: bool = False,
     # Opened again while the hub runs, the session keeps its key.
     _remember_session_key(rt)
     runtimes.pop(rt.rid, None)
+    # Remembered once, above.  A bridge still stopping would otherwise record
+    # the key again with the id its last result carries, after a launch
+    # without a key had made the hub forget it.
+    if rt.bridge is not None:
+        rt.bridge.on_session_id = None
     _cancel_idle_timer(rt)
     if rt is _default_runtime:
         _default_runtime = None
@@ -3399,7 +3405,9 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     # The launch says what its session is billed to: without a key, that is
     # the account's login, whatever key the session ran with before.
     if target_sid and not api_key:
-        _session_api_keys.pop(target_sid, None)
+        if _session_api_keys.pop(target_sid, None):
+            log.info("hub launch: session %s is no longer remembered with an "
+                     "API key (a launch without one)", target_sid)
     if target_sid:
         existing = next(
             (r for r in runtimes.values()
@@ -3443,9 +3451,18 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
             if getattr(existing.config, "api_key", None) != api_key:
                 _replace_runtime_config(existing, api_key=api_key)
                 need_reconnect = True
-                log.info("hub launch: rid=%s now runs on %s", existing.rid,
-                         "the launch's API key" if api_key
-                         else "its account's login, its API key dropped")
+                now_on = ("the API key of the launch that just opened it"
+                          if api_key else
+                          "its account's own login: the launch that just "
+                          "opened it had no API key")
+                log.info("hub launch: rid=%s session %s now runs on %s",
+                         existing.rid, target_sid, now_on)
+                # The reconnect cuts whatever the session was doing, so its
+                # tabs are told why.
+                await existing.broadcast({
+                    "type": "system_msg", "subtype": "info",
+                    "data": {"message": f"Reconnecting: this session now "
+                                        f"runs on {now_on}."}})
             # And its labels and name: the launch described this session,
             # which happens to be open already.  Applied live, without the
             # reconnect -- see SDKBridge.adopt_agent_labels / adopt_agent_name.
