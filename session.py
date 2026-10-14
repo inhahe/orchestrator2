@@ -1152,6 +1152,11 @@ def _saved_total(line: bytes, session_id: str) -> float | None:
 # would be lost with the hub.  So it is kept per session, in the session's
 # account, like its queued prompts.
 
+#: How often, and how far apart, a refused read of a cost record is tried.
+_COST_READ_TRIES = 5
+_COST_READ_WAIT_S = 0.05
+
+
 def session_cost_file(session_id: str, config_dir: str | None = None) -> Path:
     """Where the hub keeps what it knows of *session_id*'s cost."""
     return _orch2_state_dir(config_dir) / "costs" / f"{_sanitize_cwd(session_id)}.json"
@@ -1159,13 +1164,24 @@ def session_cost_file(session_id: str, config_dir: str | None = None) -> Path:
 
 def load_session_cost(session_id: str,
                       config_dir: str | None = None) -> dict[str, Any] | None:
-    """What ``save_session_cost`` kept for *session_id*; None if nothing usable."""
-    try:
-        with open(session_cost_file(session_id, config_dir), "r",
-                  encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return None
+    """What ``save_session_cost`` kept for *session_id*; None if nothing usable.
+
+    A read refused while another writer replaces the file (Windows refuses
+    access to a file being renamed over) is tried again: read as nothing, the
+    record would be saved over with the figures of a session starting afresh.
+    """
+    path = session_cost_file(session_id, config_dir)
+    for attempt in range(_COST_READ_TRIES):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            break
+        except PermissionError:
+            if attempt == _COST_READ_TRIES - 1:
+                return None
+            time.sleep(_COST_READ_WAIT_S)
+        except (OSError, ValueError):
+            return None
     if not isinstance(data, dict) or data.get("session_id") != session_id:
         return None
     return data

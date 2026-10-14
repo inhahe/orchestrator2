@@ -259,11 +259,11 @@ def test_a_first_cli_carries_nothing_and_reads_nothing(tmp_path):
     s.br._settle_cost_sync(NEW, SID)
     assert (s.st.cost_carried, s.st.cost_mark_saved) == (0.0, None)
     assert s.st.cost_mark_size == s.jsonl.stat().st_size
-    assert s.st.key_cost_mark is None
+    assert s.st.key_cost_base is None
 
 
 # --------------------------------------------------------------------------
-# What was spent on an API key
+# What was spent on an API key: what each CLI's own total rose by
 # --------------------------------------------------------------------------
 
 def test_a_key_clis_first_report_counts_only_what_it_spent(tmp_path):
@@ -294,27 +294,112 @@ def test_key_spend_goes_on_across_clis(tmp_path):
     assert s.st.key_cost_usd == pytest.approx(1.75)
 
 
+def test_a_cli_that_never_reported_leaves_the_next_measured_from_its_own_start(
+        tmp_path):
+    # A restoring CLI, then one that restores nothing and never reports (a
+    # /model at once), then a restoring one: that last one starts from the
+    # $1.00 the first saved, and spent $0.25.
+    s = _bridge(tmp_path)
+    s.st.cli_on_key = True
+    _cli(s, NEW, [0.5, 1.0], saves_on_exit=1.0)
+    _cli(s, OLD, [])
+    _cli(s, NEW, [1.25])
+    assert s.st.key_cost_usd == pytest.approx(1.25)
+    # The whole figure too: the $1.00 restored is not counted again.
+    assert s.st.total_cost_usd == pytest.approx(1.25)
+
+
+def test_a_first_restoring_cli_that_never_reported_ended_at_what_it_restored(
+        tmp_path):
+    # The figure is what the first CLI the hub saw counted: from the $0.50
+    # saved long ago.  The next one restores nothing.
+    s = _bridge(tmp_path)
+    _write(s.jsonl, [_record(0.5)], "a")
+    _cli(s, NEW, [])
+    assert s.st.cost_mark_saved is None, "looked for before anything needed it"
+    _cli(s, OLD, [0.25])
+    assert s.st.total_cost_usd == pytest.approx(0.75)
+
+
+def test_a_restoring_cli_that_never_reported_ended_where_it_started(tmp_path):
+    # Then one that restores nothing: it counts from $0, after $1.00.
+    s = _bridge(tmp_path)
+    _cli(s, NEW, [0.5, 1.0], saves_on_exit=1.0)
+    _cli(s, NEW, [])
+    _cli(s, OLD, [0.25])
+    assert s.st.total_cost_usd == pytest.approx(1.25)
+
+
+def test_what_a_cli_on_a_key_spent_after_its_last_report_is_counted(tmp_path):
+    # An interrupted turn: it saved $0.03 on its way out, having reported
+    # $0.02.  The CLI after it is not on the key.
+    s = _bridge(tmp_path)
+    s.st.cli_on_key = True
+    _cli(s, NEW, [0.02], saves_on_exit=0.03)
+    s.br._cost_prev_on_key = True
+    s.st.cli_on_key = False
+    _cli(s, NEW, [0.04])
+    assert s.st.key_cost_usd == pytest.approx(0.03)
+
+
+def test_nor_what_a_cli_on_no_key_spent_after_its_last_report(tmp_path):
+    s = _bridge(tmp_path)
+    _cli(s, NEW, [0.02], saves_on_exit=0.03)
+    s.br._cost_prev_on_key = False
+    s.st.cli_on_key = True
+    _cli(s, NEW, [0.04])
+    assert s.st.key_cost_usd == pytest.approx(0.01)
+
+
+def test_a_resumed_session_the_hub_cannot_find_is_not_counted_at_first(tmp_path):
+    # What the CLI restored is unknown, so its first report may be the
+    # session's whole cost.
+    s = _bridge(tmp_path)
+    s.jsonl.unlink()
+    s.st.cli_on_key = True
+    s.br._cost_resumes = True
+    _cli(s, NEW, [1997.4, 1997.9])
+    assert s.st.key_cost_usd == pytest.approx(0.5)
+
+
+def test_a_new_session_without_a_transcript_yet_counts_from_nothing(tmp_path):
+    s = _bridge(tmp_path)
+    s.jsonl.unlink()
+    s.st.cli_on_key = True
+    s.br._cost_resumes = False
+    _cli(s, NEW, [0.4])
+    assert s.st.key_cost_usd == pytest.approx(0.4)
+
+
 def test_key_spend_is_kept_across_the_hub(tmp_path):
     s = _bridge(tmp_path)
     save_session_cost(SID, {"reported": 0.75, "carried": 0.0, "mark_size": 0,
                             "mark_saved": None, "restores": False,
-                            "key_spent": 0.5, "key_mark": 0.75}, s.cfg_dir)
+                            "key_spent": 0.5}, s.cfg_dir)
     s.st.cli_on_key = True
     _cli(s, OLD, [0.25])
     assert s.st.key_cost_usd == pytest.approx(0.75)
     asyncio.run(s.br._keep_cost())
-    kept = load_session_cost(SID, s.cfg_dir)
-    assert kept["key_spent"] == pytest.approx(0.75)
-    assert kept["key_mark"] == pytest.approx(1.0)
+    assert load_session_cost(SID, s.cfg_dir)["key_spent"] == pytest.approx(0.75)
 
 
-def test_a_record_kept_before_key_spend_was_counts_from_its_total(tmp_path):
-    s = _bridge(tmp_path)
-    save_session_cost(SID, {"reported": 0.75, "carried": 0.0, "mark_size": 0,
-                            "mark_saved": None, "restores": False}, s.cfg_dir)
-    s.st.cli_on_key = True
-    _cli(s, OLD, [0.25])
-    assert s.st.key_cost_usd == pytest.approx(0.25)
+def test_a_cost_record_being_replaced_is_read_again(tmp_path, monkeypatch):
+    # Windows refuses a read while another writer renames over the file.
+    import builtins
+    import session as session_mod
+    save_session_cost(SID, {"key_spent": 37.2}, str(tmp_path))
+    monkeypatch.setattr(session_mod, "_COST_READ_WAIT_S", 0)
+    real_open, refused = builtins.open, []
+
+    def flaky_open(path, *a, **k):
+        if str(path).endswith(".json") and len(refused) < 2:
+            refused.append(path)
+            raise PermissionError(13, "in use")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", flaky_open)
+    kept = load_session_cost(SID, str(tmp_path))
+    assert len(refused) == 2 and kept["key_spent"] == 37.2
 
 
 # --------------------------------------------------------------------------
@@ -400,8 +485,9 @@ def test_a_settle_that_fails_carries_nothing_and_breaks_nothing(tmp_path, monkey
     s.st.cost_mark_size = 0
     asyncio.run(s.br._settle_cost(NEW, SID))
     assert s.st.cost_reported is None and s.st.cost_carried == 0.0
-    # The next report may jump to what the CLI restored: not spent on a key.
-    assert s.st.key_cost_mark is None
+    # What the new CLI starts from is not known: its first report may be
+    # what it restored, not what it spent.
+    assert s.st.key_cost_base is None
 
 
 # --------------------------------------------------------------------------
@@ -493,6 +579,22 @@ def test_a_connect_leaves_the_settle_to_the_new_clis_first_init(tmp_path, monkey
         await asyncio.gather(s.br._dispatcher_task, return_exceptions=True)
     asyncio.run(go())
     assert s.br._cost_settle_due is True
+
+
+def test_a_new_cli_is_on_no_key_until_its_init_says(tmp_path, monkeypatch):
+    # Else an init that does not say would leave it billed as the last CLI.
+    monkeypatch.setattr(sdk_bridge, "ClaudeSDKClient", _CLI)
+    s = _bridge(tmp_path)
+    s.st.cli_on_key = True
+
+    async def go():
+        await s.br.connect(SID)
+        s.br._dispatcher_task.cancel()
+        await asyncio.gather(s.br._dispatcher_task, return_exceptions=True)
+    asyncio.run(go())
+    assert s.st.cli_on_key is None
+    assert s.br._cost_prev_on_key is True
+    assert s.br._cost_resumes is True
 
 
 def test_clearing_the_session_forgets_its_cost(tmp_path, monkeypatch):

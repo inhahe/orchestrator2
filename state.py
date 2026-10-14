@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -325,18 +326,19 @@ def take_cost(state: State, msg: Any) -> None:
     ``total_cost_usd`` is the CLI's running total for the session, not the
     turn's: nothing resets it between turns.  So it replaces the figure
     rather than adding to it, plus what ``carry_cost`` kept of the CLIs
-    before this one.  What it rose by since the last figure is added to
-    ``key_cost_usd`` when the CLI said it runs on a key.
+    before this one.  What the CLI's total rose by since its last report, or
+    since it started, is added to ``key_cost_usd`` when the CLI runs on a key.
     """
     cost = getattr(msg, "total_cost_usd", None)
-    if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
+    if (isinstance(cost, (int, float)) and not isinstance(cost, bool)
+            and math.isfinite(cost) and cost >= 0):
         state.cost_reported = float(cost)
         state.total_cost_usd = state.cost_reported + state.cost_carried
         on_key = (state.cli_on_key if state.cli_on_key is not None
                   else billed_to_api_key(state))
-        if on_key and state.key_cost_mark is not None:
-            state.key_cost_usd += max(0.0, state.total_cost_usd - state.key_cost_mark)
-        state.key_cost_mark = state.total_cost_usd
+        if on_key and state.key_cost_base is not None:
+            state.key_cost_usd += max(0.0, state.cost_reported - state.key_cost_base)
+        state.key_cost_base = state.cost_reported
 
 
 def restores_saved_cost(version: Any) -> bool:
@@ -363,7 +365,7 @@ def forget_cost(state: State) -> None:
     state.cost_mark_saved = None
     state.cost_restores = None
     state.key_cost_usd = 0.0
-    state.key_cost_mark = None
+    state.key_cost_base = None
 
 
 def carry_cost(state: State, final: float, restored: float) -> None:
@@ -652,14 +654,15 @@ class State:
     cost_mark_size: int | None = None
     cost_mark_saved: float | None = None
     cost_restores: bool | None = None
-    # What the session's turns on an API key have cost: each rise of the
-    # figure while its CLI said it used one (take_cost).  key_cost_mark is
-    # the figure the next report is measured against; None while that is not
-    # known, so a figure that jumps to what a CLI restored is not counted as
-    # spent.  cli_on_key is whether the running CLI's last init named a key
-    # (None: not said), which a key added or dropped mid-turn does not change.
+    # What the session's turns on an API key have cost: what each CLI's own
+    # total rose by while its init named a key (take_cost).  key_cost_base is
+    # the running CLI's total at its last report, or what it started from
+    # (SDKBridge._settle_cost_sync); None while that is unknown, and then its
+    # next report is not counted.  cli_on_key is whether the running CLI's
+    # init named a key (None: not said), which a key the hub adds or drops
+    # mid-turn does not change.
     key_cost_usd: float = 0.0
-    key_cost_mark: float | None = None
+    key_cost_base: float | None = None
     cli_on_key: bool | None = None
     turns: int = 0
     last_usage: dict[str, Any] = field(default_factory=dict)
@@ -1012,18 +1015,19 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
                     entry["reset_in"] = fmt_countdown(float(delta))
                 rate_limits[label] = entry
     elif billed_to_api_key(state):
-        # What the key was charged, not the session's whole cost: that counts
-        # its subscription turns too, and read beside "API" it was taken for
-        # the key's balance, which nothing here can know.
+        # What the key was charged, not the session's whole cost, which counts
+        # its subscription turns too; and never called a balance, which
+        # nothing here can know.
         spent = f"${state.key_cost_usd:.2f}"
         plan_field = f"API {spent} spent"
         plan_title = (f"Billed per token to an API key "
                       f"({api_key_source_name(state.api_key_source)}). {spent} "
-                      f"is what this session's turns on an API key have cost, as "
-                      f"Claude Code estimates them, counted from "
-                      f"{KEY_COST_COUNTED_SINCE} on. It is not the key's "
-                      f"balance: only the Anthropic Console shows that. The "
-                      f"session's whole cost, subscription turns included: {cost}.")
+                      f"is what this session's turns on an API key have cost "
+                      f"since orchestrator2 began counting them (not before "
+                      f"{KEY_COST_COUNTED_SINCE}), as Claude Code estimates "
+                      f"them. It is not the key's balance: only the Anthropic "
+                      f"Console shows that. The session's whole cost, "
+                      f"subscription turns included: {cost}.")
     else:
         plan_field = cost
         plan_title = f"Cost: {cost_note}"

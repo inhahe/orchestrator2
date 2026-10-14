@@ -2136,17 +2136,22 @@ also has), so:
   cost. Asked 2026-10-14, *"orchestrator2 said my api balance was over $1900,
   but i started at $200"*: the whole cost counts every turn the session ever
   ran, on its subscription too, and read beside "API" it was taken for the
-  key's balance, which nothing in the hub can know. `take_cost` adds each
-  rise of the figure while the running CLI's init named a key
-  (`cli_on_key`, set only from an init: a key given or dropped mid-turn
-  leaves that turn billed where its CLI ran it). Each rise is measured from
-  `key_cost_mark`, the last figure; a CLI the hub has no figure for gets a
-  mark when it settles, if it is on a key: what it starts from, the
-  transcript's last saved total if it restores one, else nothing. Without a
-  mark the first report is not counted, since it may be a jump to a
-  restored total. The spend and the mark are kept with the rest of the cost
-  (`key_spent`, `key_mark`); a record from before has its total as the mark
-  if a CLI reported it. Turns before 2026-10-14 are not in the figure
+  key's balance, which nothing in the hub can know. It is measured on each
+  CLI's own total, never across CLIs: `take_cost` adds what the running
+  CLI's total rose by since its last report (`key_cost_base`) while that
+  CLI's init named a key (`cli_on_key`, set only from an init and cleared
+  by `connect()`, so a key the hub gives or drops mid-turn leaves that turn
+  billed where its CLI ran it). A new CLI's base is set when it settles:
+  what it starts from, the transcript's last saved total if it restores
+  one, else nothing; looked up only for a CLI on a key. Unknown -- a
+  settle that failed, or a resumed session whose transcript the hub cannot
+  find -- it is None and the first report is not counted, since it may be
+  the restored total. What a CLI on a key spent after its last report, and
+  saved on its way out, is added at the next settle, by that CLI's billing
+  (`_cost_prev_on_key`). Only the spend is kept (`key_spent`): the base
+  belongs to a CLI, which never outlives the hub. `/move` files it under the
+  copy's id, since the copy's CLI restores only the whole cost, from the
+  transcript. Turns before 2026-10-14 are not in the figure
   (`KEY_COST_COUNTED_SINCE`, which the tooltip names);
 - `/usage` sends a `note` that plan limits do not apply, instead of fetching
   the account's subscription limits (`plan_usage.api_key_report`);
@@ -2196,7 +2201,11 @@ before it spent that it will not count (`state.carry_cost`, into
 it saves totals and the transcript has one past the mark, else what it last
 reported) less what the new one starts from (`state.restores_saved_cost`: the
 transcript's last saved total, `session.saved_cost`, or nothing). That can be
-negative, when a restoring CLI picks up a total that was carried already. The
+negative, when a restoring CLI picks up a total that was carried already. A
+CLI that never reported -- replaced before its first turn ended -- ended where
+it started (nothing, or the total it restored) unless it saved more on its
+way out, and is carried like any other: left out, a total the next CLI
+restores again was counted twice, or one it does not restore was lost. The
 mark (`cost_mark_size`) is where in the transcript the running CLI started:
 the transcript is read only past it, and before it only once, when a CLI that
 restores follows ones that saved nothing. The figure is what the first CLI

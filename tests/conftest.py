@@ -22,8 +22,9 @@ suite found it, so the environment is the account, as for a tool.
 **No test writes the hub's files into a real account.**  That account is
 whichever one the shell running the suite is on, and a test whose bridge is
 told a session id saved that session's cost under its ``orchestrator2``
-folder, where the hub would read it back as a real session's.  A test that
-names an account of its own (a ``tmp_path``) still gets that one.
+folder, where the hub would read it back as a real session's -- and a
+wakeup filed there would be armed by the real hub.  A test that names an
+account of its own (a ``tmp_path``) still gets that one.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import account  # noqa: E402
 import session  # noqa: E402
+import wakeup_store  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -65,26 +67,42 @@ def _unadopted_account(monkeypatch):
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", _SUITE_ACCOUNT)
 
 
+#: The user's home, read before any test patches ``Path.home``.
+_HOME = Path.home().resolve()
+
+
 def _is_real_account(path: Path) -> bool:
     """Whether *path* is one of this user's accounts (``~/.claude*``)."""
     try:
         path = path.resolve()
     except OSError:
         return False
-    return path.parent == Path.home().resolve() and path.name.startswith(".claude")
+    return path.parent == _HOME and path.name.startswith(".claude")
 
 
 @pytest.fixture(autouse=True)
 def _no_hub_state_in_a_real_account(monkeypatch, tmp_path_factory):
-    real = session._orch2_state_dir
     spare: list[Path] = []
 
-    def private(config_dir: str | None = None) -> Path:
-        d = real(config_dir)
-        if not _is_real_account(d.parent):
-            return d
+    def spare_dir() -> Path:
         if not spare:
             spare.append(tmp_path_factory.mktemp("hub-state"))
         return spare[0]
 
-    monkeypatch.setattr(session, "_orch2_state_dir", private)
+    # Queues, background tasks and costs.
+    real_state = session._orch2_state_dir
+
+    def state_dir(config_dir: str | None = None) -> Path:
+        d = real_state(config_dir)
+        return spare_dir() if _is_real_account(d.parent) else d
+
+    monkeypatch.setattr(session, "_orch2_state_dir", state_dir)
+
+    # Wakeups, which a real hub would arm again at its start.
+    real_wakeups = wakeup_store._state_dir
+
+    def wakeups_dir() -> Path:
+        d = real_wakeups()
+        return spare_dir() / "wakeups" if _is_real_account(d.parent.parent) else d
+
+    monkeypatch.setattr(wakeup_store, "_state_dir", wakeups_dir)

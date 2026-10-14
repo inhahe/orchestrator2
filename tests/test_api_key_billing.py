@@ -169,8 +169,8 @@ def _status(st):
 
 
 def test_the_status_bar_says_what_a_key_session_spent_on_keys():
-    # Not its whole cost, which counts its subscription turns too and, beside
-    # "API", was read as the key's balance.
+    # Not its whole cost, which counts its subscription turns too, and never
+    # called a balance.
     st = State()
     apply_api_key_source(st, "/login managed key", None)
     st.total_cost_usd = 1997.3091
@@ -281,7 +281,7 @@ def _on(source):
 
 def test_what_a_cli_on_a_key_reports_is_spent_on_it():
     st = _on("ANTHROPIC_API_KEY")
-    st.key_cost_mark = 1997.0          # what the CLI started from
+    st.key_cost_base = 1997.0          # what the CLI started from
     take_cost(st, _result(1997.5))
     take_cost(st, _result(1998.25))
     assert st.key_cost_usd == pytest.approx(1.25)
@@ -328,7 +328,16 @@ def test_a_new_session_starts_its_key_spend_afresh():
     take_cost(st, _result(1.0))
     take_cost(st, _result(2.0))
     forget_cost(st)
-    assert (st.key_cost_usd, st.key_cost_mark) == (0.0, None)
+    assert (st.key_cost_usd, st.key_cost_base) == (0.0, None)
+
+
+@pytest.mark.parametrize("junk", [float("inf"), float("nan")])
+def test_a_cost_that_is_no_number_is_not_spent(junk):
+    # Spend adds up: one such report would stay in it for good.
+    st = _on("ANTHROPIC_API_KEY")
+    take_cost(st, _result(1.0))
+    take_cost(st, _result(junk))
+    assert st.key_cost_usd == 0.0 and st.total_cost_usd == 1.0
 
 
 def test_status_says_what_was_spent_on_keys():

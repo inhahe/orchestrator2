@@ -353,6 +353,25 @@ def test_the_sessions_own_api_key_comes_along(move, monkeypatch):
     assert kw["api_key"] == KEY
 
 
+def test_what_it_spent_on_keys_comes_along(move, monkeypatch):
+    # The copy's CLI restores the whole cost from the transcript; this is the
+    # hub's alone, kept where the copy's state will look for it.
+    from session import load_session_cost
+    _keyed(move, monkeypatch)
+    move["state"].key_cost_usd = 41.5
+
+    move["run"]()
+
+    kept = load_session_cost(_new_id(move), move["dst_cfg"])
+    assert kept is not None and kept["key_spent"] == 41.5
+
+
+def test_a_session_that_spent_nothing_on_keys_files_no_record(move):
+    from session import load_session_cost
+    move["run"]()
+    assert load_session_cost(_new_id(move), move["dst_cfg"]) is None
+
+
 def test_an_original_put_back_after_a_failed_move_keeps_its_key(move, monkeypatch):
     _keyed(move, monkeypatch)
     move["fail"]["copy_runtime"] = True

@@ -49,6 +49,11 @@ it had run on its subscription included, and read as the key's balance
 whole cost and a word on the balance in its tooltip. Turns before 2026-10-14
 are not counted. design.md §6g.
 
+And the whole cost figure itself went wrong when a CLI was replaced before it
+ever reported: nothing carried it, so a total the next CLI restored was
+counted twice, or one it did not restore was lost. Found by the review of the
+key figure; fixed in `SDKBridge._settle_cost_sync`. design.md §6g.
+
 ## Tests saved session costs into a real account — FIXED (2026-10-14)
 
 A test whose bridge was told a session id saved that session's cost into the

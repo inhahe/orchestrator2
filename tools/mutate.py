@@ -5578,13 +5578,13 @@ CUTOFF_SERVER_MUTATIONS = [
 
     ("a moved session abandons the turn the move cut",
      "            agent_labels=carry[\"agent_labels\"],\n"
-     "            resume_interrupted_turn=True, api_key=carry[\"api_key\"])",
-     "            agent_labels=carry[\"agent_labels\"], api_key=carry[\"api_key\"])"),
+     "            resume_interrupted_turn=True, api_key=carry[\"api_key\"],\n",
+     "            agent_labels=carry[\"agent_labels\"], api_key=carry[\"api_key\"],\n"),
 
     ("an original reopened after a failed move abandons it",
      "                agent_labels=carry[\"agent_labels\"],\n"
-     "                resume_interrupted_turn=True, api_key=carry[\"api_key\"])",
-     "                agent_labels=carry[\"agent_labels\"], api_key=carry[\"api_key\"])"),
+     "                resume_interrupted_turn=True, api_key=carry[\"api_key\"],\n",
+     "                agent_labels=carry[\"agent_labels\"], api_key=carry[\"api_key\"],\n"),
 ]
 
 CUTOFF_CONFIG_MUTATIONS = [
@@ -5882,8 +5882,10 @@ APIKEY_STATE_MUTATIONS = [
      "        state.cost_reported = (state.cost_reported or 0.0) + float(cost)\n"),
 
     ("a negative or boolean cost is taken",
-     "isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0",
-     "isinstance(cost, (int, float))"),
+     "    if (isinstance(cost, (int, float)) and not isinstance(cost, bool)\n"
+     "            and math.isfinite(cost) and cost >= 0):\n",
+     "    if (isinstance(cost, (int, float))\n"
+     "            and math.isfinite(cost)):\n"),
 
     ("a subscription rate limit makes a key session a subscription again",
      "    if rl_type in SUBSCRIPTION_RL_TYPES and not billed_to_api_key(state):\n",
@@ -5900,7 +5902,7 @@ APIKEY_STATE_MUTATIONS = [
      'spent = f"${state.total_cost_usd:.2f}"'),
 
     ("what a CLI on a key spends is not counted",
-     "            state.key_cost_usd += max(0.0, state.total_cost_usd - state.key_cost_mark)\n",
+     "            state.key_cost_usd += max(0.0, state.cost_reported - state.key_cost_base)\n",
      "            pass\n"),
 
     ("a turn is counted where the hub expects the next CLI, not where it ran",
@@ -5908,23 +5910,27 @@ APIKEY_STATE_MUTATIONS = [
      "                  else billed_to_api_key(state))\n",
      "        on_key = billed_to_api_key(state)\n"),
 
-    ("a figure with nothing to measure it against is counted as spent",
-     "        if on_key and state.key_cost_mark is not None:\n"
-     "            state.key_cost_usd += max(0.0, state.total_cost_usd - state.key_cost_mark)\n",
+    ("a report with nothing to measure it from is counted as spent",
+     "        if on_key and state.key_cost_base is not None:\n"
+     "            state.key_cost_usd += max(0.0, state.cost_reported - state.key_cost_base)\n",
      "        if on_key:\n"
-     "            state.key_cost_usd += max(0.0, state.total_cost_usd - (state.key_cost_mark or 0.0))\n"),
+     "            state.key_cost_usd += max(0.0, state.cost_reported - (state.key_cost_base or 0.0))\n"),
 
-    ("every report is measured against the first",
-     "        state.key_cost_mark = state.total_cost_usd\n",
-     "        if state.key_cost_mark is None:\n"
-     "            state.key_cost_mark = state.total_cost_usd\n"),
+    ("every report is measured from where the CLI started",
+     "        state.key_cost_base = state.cost_reported\n",
+     "        if state.key_cost_base is None:\n"
+     "            state.key_cost_base = state.cost_reported\n"),
+
+    ("a cost that is no number is taken, and stays in the spend",
+     "            and math.isfinite(cost) and cost >= 0):\n",
+     "            and cost >= 0):\n"),
 
     ("an init does not record what the running CLI is on",
      '    if from_cli:\n        state.cli_on_key = source != "none"\n',
      ""),
 
     ("a new session keeps the old one's key spend",
-     "    state.key_cost_usd = 0.0\n    state.key_cost_mark = None\n",
+     "    state.key_cost_usd = 0.0\n    state.key_cost_base = None\n",
      ""),
 
     ("the plan field's explanation is not sent",
@@ -6272,16 +6278,16 @@ SESSIONKEY_SERVER_MUTATIONS = [
      ""),
 
     ("the key is not put on the wire",
-     '        "api_key": api_key,\n    }).encode("utf-8")',
-     '    }).encode("utf-8")'),
+     '        "api_key": api_key,\n        "compact_at": compact_at,\n',
+     '        "compact_at": compact_at,\n'),
 
     ("the hub ignores the key a launch sent",
      '    api_key = (api_key.strip() if isinstance(api_key, str) else "") or None\n',
      "    api_key = None\n"),
 
     ("a new session is not given the key its launch sent",
-     "                                   api_key=api_key)",
-     "                                   api_key=None)"),
+     "                                   api_key=api_key, compact_at=compact_at,\n",
+     "                                   api_key=None, compact_at=compact_at,\n"),
 
     ("a session already open ignores a launch's key",
      '            if getattr(existing.config, "api_key", None) != api_key:\n',
@@ -6419,17 +6425,29 @@ SESSIONKEY_MOVE_MUTATIONS = [
      '        "api_key": getattr(rt.config, "api_key", None),\n',
      ""),
 
+    ("a moved session's spend on keys starts over",
+     "    if carry[\"key_spent\"]:\n"
+     "        await asyncio.to_thread(save_session_cost, new_id,\n",
+     "    if False:\n"
+     "        await asyncio.to_thread(save_session_cost, new_id,\n"),
+
+    ("a move files a cost record for a session that spent nothing on keys",
+     "    if carry[\"key_spent\"]:\n"
+     "        await asyncio.to_thread(save_session_cost, new_id,\n",
+     "    if True:\n"
+     "        await asyncio.to_thread(save_session_cost, new_id,\n"),
+
     ("the copy starts without the session's key",
      '            agent_labels=carry["agent_labels"],\n'
-     '            resume_interrupted_turn=True, api_key=carry["api_key"])',
+     '            resume_interrupted_turn=True, api_key=carry["api_key"],\n',
      '            agent_labels=carry["agent_labels"],\n'
-     '            resume_interrupted_turn=True)'),
+     '            resume_interrupted_turn=True,\n'),
 
     ("an original put back after a failed move loses its key",
      '                agent_labels=carry["agent_labels"],\n'
-     '                resume_interrupted_turn=True, api_key=carry["api_key"])',
+     '                resume_interrupted_turn=True, api_key=carry["api_key"],\n',
      '                agent_labels=carry["agent_labels"],\n'
-     '                resume_interrupted_turn=True)'),
+     '                resume_interrupted_turn=True,\n'),
 ]
 
 SESSIONKEY_BRIDGE_MUTATIONS = [
@@ -6561,6 +6579,13 @@ EFFORT_SERVER_MUTATIONS = [
 # What each CLI spent counts once across the session's CLIs and hubs, by
 # what each version restores.  tests/test_session_cost.py.
 COST_SESSION_MUTATIONS = [
+    ("a record being replaced is read as none, and saved over",
+     "        except PermissionError:\n"
+     "            if attempt == _COST_READ_TRIES - 1:\n"
+     "                return None\n"
+     "            time.sleep(_COST_READ_WAIT_S)\n",
+     ""),
+
     ("two writes at once share one temporary file",
      '    tmp = path.with_name(f"{path.name}.{uuid_mod.uuid4().hex}.tmp")\n',
      '    tmp = path.with_name(path.name + ".tmp")\n'),
@@ -6618,37 +6643,72 @@ COST_STATE_MUTATIONS = [
 ]
 
 COST_BRIDGE_MUTATIONS = [
-    ("a key CLI the hub has no figure for has nothing to measure against",
-     "        elif st.key_cost_mark is None and st.cli_on_key:\n",
-     "        elif False:\n"),
+    # What a session spent on API keys: each CLI's own total, measured from
+    # where it started.  tests/test_session_cost.py; design.md §6g.
+    ("the transcript is read for a CLI on no key too",
+     "        if not st.cli_on_key:\n            st.key_cost_base = None\n"
+     "        elif not restores:\n",
+     "        if False:\n            st.key_cost_base = None\n"
+     "        elif not restores:\n"),
 
-    ("the transcript is read for a session on no key too",
-     "        elif st.key_cost_mark is None and st.cli_on_key:\n",
-     "        elif st.key_cost_mark is None:\n"),
+    ("a CLI that restores nothing is measured from what was saved",
+     "        elif not restores:\n            st.key_cost_base = 0.0\n",
+     "        elif False:\n            st.key_cost_base = 0.0\n"),
 
     ("what a key CLI restores is counted as spent on the key",
-     "                last_saved = saved_cost(jsonl, sid, 0, size)\n"
-     "                starts_from = last_saved or 0.0\n",
-     "                last_saved = saved_cost(jsonl, sid, 0, size)\n"),
+     "            st.key_cost_base = last_saved\n",
+     "            st.key_cost_base = 0.0\n"),
+
+    ("a resumed session the hub cannot find is measured from nothing",
+     "            st.key_cost_base = None if self._cost_resumes else 0.0\n",
+     "            st.key_cost_base = 0.0\n"),
+
+    ("a new session without a transcript yet is not counted at first",
+     "            st.key_cost_base = None if self._cost_resumes else 0.0\n",
+     "            st.key_cost_base = None\n"),
+
+    ("what a CLI on a key spent after its last report is not counted",
+     "                st.key_cost_usd += max(0.0, final - reported)\n",
+     "                pass\n"),
+
+    ("what a CLI spent after its last report goes where the next one runs",
+     "            if self._cost_prev_on_key:\n",
+     "            if st.cli_on_key:\n"),
+
+    ("a new CLI keeps the last one's billing until its init says",
+     "        self.state.cli_on_key = None\n",
+     ""),
+
+    ("the CLI before the new one is forgotten",
+     "        self._cost_prev_on_key = self.state.cli_on_key\n",
+     "        self._cost_prev_on_key = None\n"),
+
+    ("a CLI that resumes is taken for a new session",
+     "        self._cost_resumes = target is not None\n",
+     "        self._cost_resumes = False\n"),
+
+    ("a CLI that never reported is not carried -- a total counted twice",
+     "        if reported is None and mark is not None and st.cost_restores is not None:\n",
+     "        if False:\n"),
+
+    ("a restoring CLI that never reported is taken to have started from nothing",
+     "                reported = st.cost_mark_saved\n",
+     "                reported = 0.0\n"),
+
+    ("nor when where it started was not looked up",
+     "                reported = saved_cost(jsonl, sid, 0, mark) or 0.0\n",
+     "                reported = 0.0\n"),
 
     ("key spend is not kept",
-     '                "key_spent": st.key_cost_usd, "key_mark": st.key_cost_mark,\n',
+     '                "key_spent": st.key_cost_usd,\n',
      ""),
 
     ("kept key spend is not taken back",
      '        st.key_cost_usd = max(0.0, number("key_spent") or 0.0)\n',
      ""),
 
-    ("a kept mark is not taken back",
-     '        st.key_cost_mark = (number("key_mark") if "key_mark" in kept\n',
-     '        st.key_cost_mark = (None if "key_mark" in kept\n'),
-
-    ("a record from before key spend was kept is not measured against",
-     "                            else st.total_cost_usd if reported is not None\n",
-     "                            else None if reported is not None\n"),
-
-    ("a failed settle keeps measuring against the old figure",
-     "            self.state.key_cost_mark = None\n",
+    ("a failed settle measures the new CLI from where the old one was",
+     "            self.state.key_cost_base = None\n",
      ""),
 
     ("a new CLI never settles -- the gap",
