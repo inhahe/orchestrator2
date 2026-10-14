@@ -18,18 +18,26 @@ session running this suite from its Bash tool carries the second.
 makes the process's account module state and takes ``CLAUDE_CONFIG_DIR`` out
 of the environment; each test starts un-adopted, with the variable as the
 suite found it, so the environment is the account, as for a tool.
+
+**No test writes the hub's files into a real account.**  That account is
+whichever one the shell running the suite is on, and a test whose bridge is
+told a session id saved that session's cost under its ``orchestrator2``
+folder, where the hub would read it back as a real session's.  A test that
+names an account of its own (a ``tmp_path``) still gets that one.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import account  # noqa: E402
+import session  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -55,3 +63,28 @@ def _unadopted_account(monkeypatch):
         monkeypatch.delenv("CLAUDE_CONFIG_DIR")
     else:
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", _SUITE_ACCOUNT)
+
+
+def _is_real_account(path: Path) -> bool:
+    """Whether *path* is one of this user's accounts (``~/.claude*``)."""
+    try:
+        path = path.resolve()
+    except OSError:
+        return False
+    return path.parent == Path.home().resolve() and path.name.startswith(".claude")
+
+
+@pytest.fixture(autouse=True)
+def _no_hub_state_in_a_real_account(monkeypatch, tmp_path_factory):
+    real = session._orch2_state_dir
+    spare: list[Path] = []
+
+    def private(config_dir: str | None = None) -> Path:
+        d = real(config_dir)
+        if not _is_real_account(d.parent):
+            return d
+        if not spare:
+            spare.append(tmp_path_factory.mktemp("hub-state"))
+        return spare[0]
+
+    monkeypatch.setattr(session, "_orch2_state_dir", private)
