@@ -2125,6 +2125,8 @@ class SDKBridge:
         except Exception:
             log.warning("could not settle the session's cost", exc_info=True)
             self.state.cost_reported = None
+            # Nor is the figure the new CLI reports measured against the old.
+            self.state.key_cost_mark = None
         await self._keep_cost()
 
     def _settle_cost_sync(self, version: Any, sid: str) -> None:
@@ -2165,6 +2167,16 @@ class SDKBridge:
                 last_saved = (saved_cost(jsonl, sid, 0, size) or 0.0
                               if jsonl is not None else 0.0)
             carry_cost(st, final, last_saved if restores else 0.0)
+        elif st.key_cost_mark is None and st.cli_on_key:
+            # A figure the hub has nothing of, for a CLI on a key: its first
+            # report is what it starts from -- the total it restores, or
+            # nothing -- plus what it spent, and only that was spent on the
+            # key.  Looked up only for a key: nothing else needs it.
+            starts_from = 0.0
+            if restores and jsonl is not None:
+                last_saved = saved_cost(jsonl, sid, 0, size)
+                starts_from = last_saved or 0.0
+            st.key_cost_mark = st.cost_carried + starts_from
         st.cost_mark_size = size
         st.cost_mark_saved = last_saved
         st.cost_restores = restores
@@ -2190,6 +2202,12 @@ class SDKBridge:
         restores = kept.get("restores")
         st.cost_restores = restores if isinstance(restores, bool) else None
         st.total_cost_usd = (st.cost_reported or 0.0) + st.cost_carried
+        st.key_cost_usd = max(0.0, number("key_spent") or 0.0)
+        # A record from before the key figure was kept has no mark; its total
+        # is one the next report can be measured against if a CLI reported it.
+        st.key_cost_mark = (number("key_mark") if "key_mark" in kept
+                            else st.total_cost_usd if reported is not None
+                            else None)
 
     async def _keep_cost(self) -> None:
         """Keep what the hub knows of the session's cost, for when its state
@@ -2208,6 +2226,7 @@ class SDKBridge:
                 "reported": st.cost_reported, "carried": st.cost_carried,
                 "mark_size": st.cost_mark_size, "mark_saved": st.cost_mark_saved,
                 "restores": st.cost_restores,
+                "key_spent": st.key_cost_usd, "key_mark": st.key_cost_mark,
             }, getattr(self.config, "config_dir", None))
 
     def _warn_if_foreign_task(self, what: str) -> None:
@@ -4260,7 +4279,8 @@ class SDKBridge:
             # in use from the next CLI.
             if isinstance(data_dict, dict):
                 apply_api_key_source(state, data_dict.get("apiKeySource"),
-                                     getattr(self.config, "config_dir", None))
+                                     getattr(self.config, "config_dir", None),
+                                     from_cli=True)
             old_sid = state.session_id
             if self._cost_settle_due and sid and old_sid and sid != old_sid:
                 # A new CLI on another session than the one this state ran

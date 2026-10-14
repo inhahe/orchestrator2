@@ -2130,8 +2130,24 @@ only the first: a key can appear between turns. While a key is in use the
 session is not a subscription (`is_subscription` False, whatever the account
 also has), so:
 
-- the status bar's plan field reads `API $<cost>`, its tooltip naming the
-  key's source (`plan_title`);
+- the status bar's plan field reads `API $<spent> spent`, its tooltip naming
+  the key's source and the session's whole cost (`plan_title`): what the
+  session's turns on a key have cost, `State.key_cost_usd`, not the whole
+  cost. Asked 2026-10-14, *"orchestrator2 said my api balance was over $1900,
+  but i started at $200"*: the whole cost counts every turn the session ever
+  ran, on its subscription too, and read beside "API" it was taken for the
+  key's balance, which nothing in the hub can know. `take_cost` adds each
+  rise of the figure while the running CLI's init named a key
+  (`cli_on_key`, set only from an init: a key given or dropped mid-turn
+  leaves that turn billed where its CLI ran it). Each rise is measured from
+  `key_cost_mark`, the last figure; a CLI the hub has no figure for gets a
+  mark when it settles, if it is on a key: what it starts from, the
+  transcript's last saved total if it restores one, else nothing. Without a
+  mark the first report is not counted, since it may be a jump to a
+  restored total. The spend and the mark are kept with the rest of the cost
+  (`key_spent`, `key_mark`); a record from before has its total as the mark
+  if a CLI reported it. Turns before 2026-10-14 are not in the figure
+  (`KEY_COST_COUNTED_SINCE`, which the tooltip names);
 - `/usage` sends a `note` that plan limits do not apply, instead of fetching
   the account's subscription limits (`plan_usage.api_key_report`);
 - `/status` has a `billing` line;

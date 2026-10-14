@@ -259,6 +259,62 @@ def test_a_first_cli_carries_nothing_and_reads_nothing(tmp_path):
     s.br._settle_cost_sync(NEW, SID)
     assert (s.st.cost_carried, s.st.cost_mark_saved) == (0.0, None)
     assert s.st.cost_mark_size == s.jsonl.stat().st_size
+    assert s.st.key_cost_mark is None
+
+
+# --------------------------------------------------------------------------
+# What was spent on an API key
+# --------------------------------------------------------------------------
+
+def test_a_key_clis_first_report_counts_only_what_it_spent(tmp_path):
+    # The session had cost $1997 before; the CLI restores that and adds $0.50.
+    s = _bridge(tmp_path)
+    _write(s.jsonl, [_record(1997.0)], "a")
+    s.st.cli_on_key = True
+    _cli(s, NEW, [1997.5])
+    assert s.st.total_cost_usd == pytest.approx(1997.5)
+    assert s.st.key_cost_usd == pytest.approx(0.5)
+
+
+def test_a_key_cli_that_restores_nothing_spent_all_it_reports(tmp_path):
+    s = _bridge(tmp_path)
+    _write(s.jsonl, [_record(1997.0)], "a")
+    s.st.cli_on_key = True
+    _cli(s, OLD, [0.25])
+    assert s.st.key_cost_usd == pytest.approx(0.25)
+
+
+def test_key_spend_goes_on_across_clis(tmp_path):
+    s = _bridge(tmp_path)
+    s.st.cli_on_key = True
+    _cli(s, NEW, [0.5, 1.0], saves_on_exit=1.0)
+    _cli(s, NEW, [1.25])                         # restored $1.00
+    _cli(s, OLD, [0.5])                          # restored nothing
+    assert s.st.total_cost_usd == pytest.approx(1.75)
+    assert s.st.key_cost_usd == pytest.approx(1.75)
+
+
+def test_key_spend_is_kept_across_the_hub(tmp_path):
+    s = _bridge(tmp_path)
+    save_session_cost(SID, {"reported": 0.75, "carried": 0.0, "mark_size": 0,
+                            "mark_saved": None, "restores": False,
+                            "key_spent": 0.5, "key_mark": 0.75}, s.cfg_dir)
+    s.st.cli_on_key = True
+    _cli(s, OLD, [0.25])
+    assert s.st.key_cost_usd == pytest.approx(0.75)
+    asyncio.run(s.br._keep_cost())
+    kept = load_session_cost(SID, s.cfg_dir)
+    assert kept["key_spent"] == pytest.approx(0.75)
+    assert kept["key_mark"] == pytest.approx(1.0)
+
+
+def test_a_record_kept_before_key_spend_was_counts_from_its_total(tmp_path):
+    s = _bridge(tmp_path)
+    save_session_cost(SID, {"reported": 0.75, "carried": 0.0, "mark_size": 0,
+                            "mark_saved": None, "restores": False}, s.cfg_dir)
+    s.st.cli_on_key = True
+    _cli(s, OLD, [0.25])
+    assert s.st.key_cost_usd == pytest.approx(0.25)
 
 
 # --------------------------------------------------------------------------
@@ -344,6 +400,8 @@ def test_a_settle_that_fails_carries_nothing_and_breaks_nothing(tmp_path, monkey
     s.st.cost_mark_size = 0
     asyncio.run(s.br._settle_cost(NEW, SID))
     assert s.st.cost_reported is None and s.st.cost_carried == 0.0
+    # The next report may jump to what the CLI restored: not spent on a key.
+    assert s.st.key_cost_mark is None
 
 
 # --------------------------------------------------------------------------

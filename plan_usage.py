@@ -169,7 +169,8 @@ def api_key_report(config_dir: str | None, source: str | None) -> dict[str, Any]
         "note": (f"This session is billed per token to an API key "
                  f"({api_key_source_name(source)}), not to a Claude "
                  f"subscription, so plan limits do not apply to it. The status "
-                 f"bar shows what it has cost."),
+                 f"bar shows what it has spent on API keys. The key's balance "
+                 f"is only in the Anthropic Console."),
         "account": _account(config_dir),
     }
 

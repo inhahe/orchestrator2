@@ -5890,8 +5890,42 @@ APIKEY_STATE_MUTATIONS = [
      "    if rl_type in SUBSCRIPTION_RL_TYPES:\n"),
 
     ("a key session's plan field shows a bare cost",
-     '    elif billed_to_api_key(state):\n        plan_field = f"API {cost}"',
-     '    elif False:\n        plan_field = f"API {cost}"'),
+     "    elif billed_to_api_key(state):\n        # What the key was charged",
+     "    elif False:\n        # What the key was charged"),
+
+    # What was spent on API keys, not the session's whole cost (2026-10-14:
+    # "it said my api balance was over $1900").
+    ("a key session's plan field shows its whole cost as spent -- the report",
+     'spent = f"${state.key_cost_usd:.2f}"',
+     'spent = f"${state.total_cost_usd:.2f}"'),
+
+    ("what a CLI on a key spends is not counted",
+     "            state.key_cost_usd += max(0.0, state.total_cost_usd - state.key_cost_mark)\n",
+     "            pass\n"),
+
+    ("a turn is counted where the hub expects the next CLI, not where it ran",
+     "        on_key = (state.cli_on_key if state.cli_on_key is not None\n"
+     "                  else billed_to_api_key(state))\n",
+     "        on_key = billed_to_api_key(state)\n"),
+
+    ("a figure with nothing to measure it against is counted as spent",
+     "        if on_key and state.key_cost_mark is not None:\n"
+     "            state.key_cost_usd += max(0.0, state.total_cost_usd - state.key_cost_mark)\n",
+     "        if on_key:\n"
+     "            state.key_cost_usd += max(0.0, state.total_cost_usd - (state.key_cost_mark or 0.0))\n"),
+
+    ("every report is measured against the first",
+     "        state.key_cost_mark = state.total_cost_usd\n",
+     "        if state.key_cost_mark is None:\n"
+     "            state.key_cost_mark = state.total_cost_usd\n"),
+
+    ("an init does not record what the running CLI is on",
+     '    if from_cli:\n        state.cli_on_key = source != "none"\n',
+     ""),
+
+    ("a new session keeps the old one's key spend",
+     "    state.key_cost_usd = 0.0\n    state.key_cost_mark = None\n",
+     ""),
 
     ("the plan field's explanation is not sent",
      '        "plan_title": plan_title,\n',
@@ -5899,6 +5933,10 @@ APIKEY_STATE_MUTATIONS = [
 ]
 
 APIKEY_BRIDGE_MUTATIONS = [
+    ("an init's apiKeySource is taken as the hub's expectation, not the CLI's",
+     "                                     from_cli=True)\n",
+     "                                     from_cli=False)\n"),
+
     ("the init message's apiKeySource is not read -- the gap",
      "            if isinstance(data_dict, dict):\n                apply_api_key_source(",
      "            if False:\n                apply_api_key_source("),
@@ -6066,6 +6104,10 @@ APIKEY_RESOLVER_SERVER_MUTATIONS = [
 ]
 
 APIKEY_CMD_MUTATIONS = [
+    ("/status does not say what was spent on API keys",
+     '        "spent_on_api_keys": f"${state.key_cost_usd:.4f}",\n',
+     ""),
+
     ("/login console does nothing when signed in -- the gap",
      '    needs_reauth = force or state.auth_error or method == "console"\n',
      '    needs_reauth = force or state.auth_error\n'),
@@ -6576,6 +6618,39 @@ COST_STATE_MUTATIONS = [
 ]
 
 COST_BRIDGE_MUTATIONS = [
+    ("a key CLI the hub has no figure for has nothing to measure against",
+     "        elif st.key_cost_mark is None and st.cli_on_key:\n",
+     "        elif False:\n"),
+
+    ("the transcript is read for a session on no key too",
+     "        elif st.key_cost_mark is None and st.cli_on_key:\n",
+     "        elif st.key_cost_mark is None:\n"),
+
+    ("what a key CLI restores is counted as spent on the key",
+     "                last_saved = saved_cost(jsonl, sid, 0, size)\n"
+     "                starts_from = last_saved or 0.0\n",
+     "                last_saved = saved_cost(jsonl, sid, 0, size)\n"),
+
+    ("key spend is not kept",
+     '                "key_spent": st.key_cost_usd, "key_mark": st.key_cost_mark,\n',
+     ""),
+
+    ("kept key spend is not taken back",
+     '        st.key_cost_usd = max(0.0, number("key_spent") or 0.0)\n',
+     ""),
+
+    ("a kept mark is not taken back",
+     '        st.key_cost_mark = (number("key_mark") if "key_mark" in kept\n',
+     '        st.key_cost_mark = (None if "key_mark" in kept\n'),
+
+    ("a record from before key spend was kept is not measured against",
+     "                            else st.total_cost_usd if reported is not None\n",
+     "                            else None if reported is not None\n"),
+
+    ("a failed settle keeps measuring against the old figure",
+     "            self.state.key_cost_mark = None\n",
+     ""),
+
     ("a new CLI never settles -- the gap",
      "        self._cost_settle_due = True\n",
      ""),

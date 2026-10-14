@@ -340,7 +340,7 @@ That works whether the launch starts the hub or joins one already running; a joi
 
 A session picks up an account's new key when its CLI starts: run `/connect` in one that was already open. To start sessions on a new account, launch with `--config-dir <dir>`; once it has sessions, `/move` can move others there.
 
-You can see which a session uses. The status bar's plan field reads **`API $0.1234`** instead of the plan name (hover for the key's source). The figure is Claude Code's running total for the session: it starts again when the session's CLI is replaced and Claude Code can't restore it, so the Anthropic Console is the place for the actual bill. `/status` says what the session is billed to, and `/usage` explains that plan limits don't apply to a session billed to a key.
+You can see which a session uses. The status bar's plan field reads **`API $1.23 spent`** instead of the plan name: what the session's turns on an API key have cost, as Claude Code estimates them, counted from 2026-10-14 on. It is not the key's balance, which orchestrator2 can't see: the Anthropic Console is the place for that, and for the actual bill. Hover for the key's source and the session's whole cost, subscription turns included; `/status` shows both figures too. `/status` says what the session is billed to, and `/usage` explains that plan limits don't apply to a session billed to a key.
 
 ## Features
 

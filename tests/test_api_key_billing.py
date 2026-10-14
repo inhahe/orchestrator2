@@ -168,13 +168,18 @@ def _status(st):
     return state_to_status_dict(st, parse_args([]))
 
 
-def test_the_status_bar_says_api_and_the_cost_for_a_key_session():
+def test_the_status_bar_says_what_a_key_session_spent_on_keys():
+    # Not its whole cost, which counts its subscription turns too and, beside
+    # "API", was read as the key's balance.
     st = State()
     apply_api_key_source(st, "/login managed key", None)
-    st.total_cost_usd = 0.0123
+    st.total_cost_usd = 1997.3091
+    st.key_cost_usd = 12.345
     s = _status(st)
-    assert s["plan_field"] == "API $0.0123"
+    assert s["plan_field"] == "API $12.35 spent"
     assert "API key (Anthropic Console sign-in)" in s["plan_title"]
+    assert "not the key's balance" in s["plan_title"]
+    assert "$1997.3091" in s["plan_title"]
     assert s["rate_field"] is None
 
 
@@ -234,6 +239,7 @@ def test_the_init_message_sets_what_the_session_bills_to():
                                           during_turn=False))
     assert st.api_key_source == "ANTHROPIC_API_KEY"
     assert st.is_subscription is False
+    assert st.cli_on_key is True, "what the CLI said, not what the hub expects"
 
 
 def test_every_init_is_read_not_only_the_first():
@@ -264,6 +270,72 @@ def test_a_result_without_a_usable_cost_keeps_the_last(junk):
     take_cost(st, _result(2.0))
     take_cost(st, _result(junk))
     assert st.total_cost_usd == 2.0
+
+
+def _on(source):
+    """A state whose CLI's init named *source*."""
+    st = State()
+    apply_api_key_source(st, source, None, from_cli=True)
+    return st
+
+
+def test_what_a_cli_on_a_key_reports_is_spent_on_it():
+    st = _on("ANTHROPIC_API_KEY")
+    st.key_cost_mark = 1997.0          # what the CLI started from
+    take_cost(st, _result(1997.5))
+    take_cost(st, _result(1998.25))
+    assert st.key_cost_usd == pytest.approx(1.25)
+
+
+def test_a_figure_with_nothing_to_measure_it_against_is_not_spent():
+    # The first report of a CLI the hub has no figure for: it restored the
+    # session's whole cost, which was not spent now.
+    st = _on("ANTHROPIC_API_KEY")
+    take_cost(st, _result(1997.5))
+    assert st.key_cost_usd == 0.0
+    take_cost(st, _result(1998.0))
+    assert st.key_cost_usd == pytest.approx(0.5)
+
+
+def test_subscription_turns_are_not_spent_on_a_key():
+    st = _on("none")
+    take_cost(st, _result(1.0))
+    take_cost(st, _result(3.0))
+    assert st.key_cost_usd == 0.0
+    apply_api_key_source(st, "ANTHROPIC_API_KEY", None, from_cli=True)
+    take_cost(st, _result(3.5))
+    assert st.key_cost_usd == pytest.approx(0.5)
+
+
+def test_a_turn_counts_where_its_cli_ran_it_not_where_the_hub_moved_it():
+    # A launch drops the key mid-turn: the hub expects the next CLI to run
+    # without one, but this turn's CLI was on the key.
+    st = _on("ANTHROPIC_API_KEY")
+    take_cost(st, _result(10.0))
+    apply_api_key_source(st, "none", None)
+    take_cost(st, _result(10.5))
+    assert st.key_cost_usd == pytest.approx(0.5)
+    st2 = _on("none")
+    take_cost(st2, _result(10.0))
+    apply_api_key_source(st2, "ANTHROPIC_API_KEY", None)
+    take_cost(st2, _result(10.5))
+    assert st2.key_cost_usd == 0.0
+
+
+def test_a_new_session_starts_its_key_spend_afresh():
+    from state import forget_cost
+    st = _on("ANTHROPIC_API_KEY")
+    take_cost(st, _result(1.0))
+    take_cost(st, _result(2.0))
+    forget_cost(st)
+    assert (st.key_cost_usd, st.key_cost_mark) == (0.0, None)
+
+
+def test_status_says_what_was_spent_on_keys():
+    st = _on("ANTHROPIC_API_KEY")
+    st.key_cost_usd = 0.5
+    res = commands._cmd_status("", st, parse_args([]))
+    assert res.messages[0]["data"]["spent_on_api_keys"] == "$0.5000"
 
 
 def test_results_between_turns_take_the_running_total():

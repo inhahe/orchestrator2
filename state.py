@@ -266,6 +266,10 @@ def detect_account_info(config_dir: str | None = None) -> dict[str, Any]:
 #: session's own key (``Config.api_key``) goes.
 OWN_KEY_SOURCE = "ANTHROPIC_API_KEY"
 
+#: When the hub began counting what sessions spend on API keys
+#: (``State.key_cost_usd``): turns before it are not in the figure.
+KEY_COST_COUNTED_SINCE = "2026-10-14"
+
 # How each ``apiKeySource`` is named to the user.
 _API_KEY_SOURCE_NAMES = {
     "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY",
@@ -284,19 +288,25 @@ def api_key_source_name(source: str | None) -> str:
     return _API_KEY_SOURCE_NAMES.get(source or "", source or "unknown")
 
 
-def apply_api_key_source(state: State, source: Any, config_dir: str | None) -> None:
+def apply_api_key_source(state: State, source: Any, config_dir: str | None, *,
+                         from_cli: bool = False) -> None:
     """Record what the session's CLI calls the API with: init's ``apiKeySource``.
 
     Only the CLI can say.  An API key outranks a subscription login: where the
     SDK runs it, the CLI uses a key from its environment or from the account's
     settings.json even while the account is signed in to a subscription, and
     it never asks.  ``config_dir`` is the session's account, whose plan is read
-    back when a key the session had is gone.
+    back when a key the session had is gone.  *from_cli* is True for what an
+    init said, False for the hub's own expectation of what the next CLI will
+    say (a key given or dropped): only the first says what the running CLI's
+    turns are billed to.
     """
     if not isinstance(source, str) or not source:
         return
     had_key = billed_to_api_key(state)
     state.api_key_source = source
+    if from_cli:
+        state.cli_on_key = source != "none"
     if source != "none":
         if not had_key:
             # The subscription's limits no longer describe this session.
@@ -315,12 +325,18 @@ def take_cost(state: State, msg: Any) -> None:
     ``total_cost_usd`` is the CLI's running total for the session, not the
     turn's: nothing resets it between turns.  So it replaces the figure
     rather than adding to it, plus what ``carry_cost`` kept of the CLIs
-    before this one.
+    before this one.  What it rose by since the last figure is added to
+    ``key_cost_usd`` when the CLI said it runs on a key.
     """
     cost = getattr(msg, "total_cost_usd", None)
     if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
         state.cost_reported = float(cost)
         state.total_cost_usd = state.cost_reported + state.cost_carried
+        on_key = (state.cli_on_key if state.cli_on_key is not None
+                  else billed_to_api_key(state))
+        if on_key and state.key_cost_mark is not None:
+            state.key_cost_usd += max(0.0, state.total_cost_usd - state.key_cost_mark)
+        state.key_cost_mark = state.total_cost_usd
 
 
 def restores_saved_cost(version: Any) -> bool:
@@ -346,6 +362,8 @@ def forget_cost(state: State) -> None:
     state.cost_mark_size = None
     state.cost_mark_saved = None
     state.cost_restores = None
+    state.key_cost_usd = 0.0
+    state.key_cost_mark = None
 
 
 def carry_cost(state: State, final: float, restored: float) -> None:
@@ -634,6 +652,15 @@ class State:
     cost_mark_size: int | None = None
     cost_mark_saved: float | None = None
     cost_restores: bool | None = None
+    # What the session's turns on an API key have cost: each rise of the
+    # figure while its CLI said it used one (take_cost).  key_cost_mark is
+    # the figure the next report is measured against; None while that is not
+    # known, so a figure that jumps to what a CLI restored is not counted as
+    # spent.  cli_on_key is whether the running CLI's last init named a key
+    # (None: not said), which a key added or dropped mid-turn does not change.
+    key_cost_usd: float = 0.0
+    key_cost_mark: float | None = None
+    cli_on_key: bool | None = None
     turns: int = 0
     last_usage: dict[str, Any] = field(default_factory=dict)
 
@@ -985,10 +1012,18 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
                     entry["reset_in"] = fmt_countdown(float(delta))
                 rate_limits[label] = entry
     elif billed_to_api_key(state):
-        plan_field = f"API {cost}"
+        # What the key was charged, not the session's whole cost: that counts
+        # its subscription turns too, and read beside "API" it was taken for
+        # the key's balance, which nothing here can know.
+        spent = f"${state.key_cost_usd:.2f}"
+        plan_field = f"API {spent} spent"
         plan_title = (f"Billed per token to an API key "
-                      f"({api_key_source_name(state.api_key_source)}). "
-                      f"{cost}: {cost_note}")
+                      f"({api_key_source_name(state.api_key_source)}). {spent} "
+                      f"is what this session's turns on an API key have cost, as "
+                      f"Claude Code estimates them, counted from "
+                      f"{KEY_COST_COUNTED_SINCE} on. It is not the key's "
+                      f"balance: only the Anthropic Console shows that. The "
+                      f"session's whole cost, subscription turns included: {cost}.")
     else:
         plan_field = cost
         plan_title = f"Cost: {cost_note}"

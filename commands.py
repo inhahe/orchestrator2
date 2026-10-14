@@ -340,6 +340,7 @@ def _cmd_status(_payload: str, state: State, config: Config) -> CommandResult:
         "turns": state.turns,
         "context_tokens": state.context_tokens,
         "cost": f"${state.total_cost_usd:.4f}",
+        "spent_on_api_keys": f"${state.key_cost_usd:.4f}",
         "billing": _billing_summary(state),
         "effort": state.effort or "auto",
         "model": state.model or state.active_model or "(auto)",

@@ -42,6 +42,20 @@ that should have been subscription-only had carried a key once, and every
 later launch of those sessions kept billing it). Fixed: a launch without a key
 takes its session off the key, whether the session is open or closed.
 
+And the plan field's `API $<cost>` was the session's whole cost, every turn
+it had run on its subscription included, and read as the key's balance
+(2026-10-14: "API $1997" on a key that had held $200). Fixed: it reads
+`API $<spent> spent`, what the session's turns on a key have cost, with the
+whole cost and a word on the balance in its tooltip. Turns before 2026-10-14
+are not counted. design.md §6g.
+
+## Tests saved session costs into a real account — FIXED (2026-10-14)
+
+A test whose bridge was told a session id saved that session's cost into the
+`orchestrator2/costs` folder of whichever account ran the suite; `sid-1`,
+`5e55-0000-rename` and `a11-0000-key` were found in two real accounts.
+`tests/conftest.py` now sends those files to a temporary folder.
+
 ## Five timing tests failed under heavy load — FIXED (2026-10-10)
 
 Full `pytest tests/` runs, made while a mutation sweep or a CLI probe ran on
