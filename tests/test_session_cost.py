@@ -36,8 +36,8 @@ import sdk_bridge                                        # noqa: E402
 from config import parse_args                            # noqa: E402
 from session import (_sanitize_cwd, load_session_cost,   # noqa: E402
                      save_session_cost, saved_cost)
-from state import (State, carry_cost, init_state_from_config,  # noqa: E402
-                   restores_saved_cost, take_cost)
+from state import (State, apply_api_key_source, carry_cost,  # noqa: E402
+                   init_state_from_config, restores_saved_cost, take_cost)
 
 SID = "c0570000-0000-0000-0000-000000000001"
 OLD, NEW = "2.1.259", "2.1.280"
@@ -357,7 +357,7 @@ def test_a_resumed_session_the_hub_cannot_find_is_not_counted_at_first(tmp_path)
     s = _bridge(tmp_path)
     s.jsonl.unlink()
     s.st.cli_on_key = True
-    s.br._cost_resumes = True
+    s.br._cost_resume_target = SID
     _cli(s, NEW, [1997.4, 1997.9])
     assert s.st.key_cost_usd == pytest.approx(0.5)
 
@@ -366,9 +366,76 @@ def test_a_new_session_without_a_transcript_yet_counts_from_nothing(tmp_path):
     s = _bridge(tmp_path)
     s.jsonl.unlink()
     s.st.cli_on_key = True
-    s.br._cost_resumes = False
+    s.br._cost_resume_target = None
     _cli(s, NEW, [0.4])
     assert s.st.key_cost_usd == pytest.approx(0.4)
+
+
+def test_a_session_the_sdk_started_instead_of_the_one_asked_counts_from_nothing(
+        tmp_path):
+    # Asked to resume another session, the CLI started this one, new.
+    s = _bridge(tmp_path)
+    s.jsonl.unlink()
+    s.st.cli_on_key = True
+    s.br._cost_resume_target = "c0570000-0000-0000-0000-00000000000f"
+    _cli(s, NEW, [0.4])
+    assert s.st.key_cost_usd == pytest.approx(0.4)
+
+
+def test_an_init_that_names_no_key_is_billed_as_the_hub_expects(tmp_path):
+    # The settle and each report agree on it: the hub gave the session a key.
+    s = _bridge(tmp_path)
+    apply_api_key_source(s.st, "ANTHROPIC_API_KEY", None)
+    s.st.cli_on_key = None
+    _cli(s, OLD, [0.3])
+    assert s.st.key_cost_usd == pytest.approx(0.3)
+
+
+def test_after_a_hub_restart_the_last_clis_late_spend_goes_where_it_ran(tmp_path):
+    # Killed mid-turn by the restart: it reported $5.00 and saved $5.30.
+    s = _bridge(tmp_path)
+    save_session_cost(SID, {"reported": 5.0, "carried": 0.0, "mark_size": 0,
+                            "mark_saved": None, "restores": True,
+                            "key_spent": 1.0, "cli_on_key": True}, s.cfg_dir)
+    _write(s.jsonl, [_record(5.3)], "a")
+    s.st.cli_on_key = True
+    _cli(s, NEW, [5.5])
+    assert s.st.key_cost_usd == pytest.approx(1.5)
+
+
+def test_a_restoring_cli_that_never_reported_is_looked_up_once(tmp_path, monkeypatch):
+    s = _bridge(tmp_path)
+    _write(s.jsonl, [_record(0.5)], "a")
+    _cli(s, NEW, [])
+    real, from_start = sdk_bridge.saved_cost, []
+
+    def counting(jsonl, sid, start=0, end=None, **k):
+        if start == 0:
+            from_start.append(end)
+        return real(jsonl, sid, start, end, **k)
+
+    monkeypatch.setattr(sdk_bridge, "saved_cost", counting)
+    _cli(s, NEW, [0.75])
+    assert len(from_start) == 1
+    assert s.st.total_cost_usd == pytest.approx(0.75)
+
+
+def test_a_cost_record_is_renamed_into_place_again_when_refused(tmp_path, monkeypatch):
+    # Windows refuses the rename while a reader has the file open.
+    import session as session_mod
+    monkeypatch.setattr(session_mod, "_COST_READ_WAIT_S", 0)
+    real, refused = os.replace, []
+
+    def flaky(src, dst):
+        if len(refused) < 2:
+            refused.append(dst)
+            raise PermissionError(13, "in use")
+        return real(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    save_session_cost(SID, {"key_spent": 2.5}, str(tmp_path))
+    assert len(refused) == 2
+    assert load_session_cost(SID, str(tmp_path))["key_spent"] == 2.5
 
 
 def test_key_spend_is_kept_across_the_hub(tmp_path):
@@ -380,7 +447,9 @@ def test_key_spend_is_kept_across_the_hub(tmp_path):
     _cli(s, OLD, [0.25])
     assert s.st.key_cost_usd == pytest.approx(0.75)
     asyncio.run(s.br._keep_cost())
-    assert load_session_cost(SID, s.cfg_dir)["key_spent"] == pytest.approx(0.75)
+    kept = load_session_cost(SID, s.cfg_dir)
+    assert kept["key_spent"] == pytest.approx(0.75)
+    assert kept["cli_on_key"] is True
 
 
 def test_a_cost_record_being_replaced_is_read_again(tmp_path, monkeypatch):
@@ -594,7 +663,24 @@ def test_a_new_cli_is_on_no_key_until_its_init_says(tmp_path, monkeypatch):
     asyncio.run(go())
     assert s.st.cli_on_key is None
     assert s.br._cost_prev_on_key is True
-    assert s.br._cost_resumes is True
+    assert s.br._cost_resume_target == SID
+
+
+def test_a_second_connect_before_any_init_keeps_the_billing_of_the_last_turn(
+        tmp_path, monkeypatch):
+    # /model then /effort with no turn between: the CLI whose late spend the
+    # settle charges is still the one that ran the last turn.
+    monkeypatch.setattr(sdk_bridge, "ClaudeSDKClient", _CLI)
+    s = _bridge(tmp_path)
+    s.st.cli_on_key = True
+
+    async def go():
+        for _ in range(2):
+            await s.br.connect(SID)
+            s.br._dispatcher_task.cancel()
+            await asyncio.gather(s.br._dispatcher_task, return_exceptions=True)
+    asyncio.run(go())
+    assert s.br._cost_prev_on_key is True
 
 
 def test_clearing_the_session_forgets_its_cost(tmp_path, monkeypatch):

@@ -1152,7 +1152,8 @@ def _saved_total(line: bytes, session_id: str) -> float | None:
 # would be lost with the hub.  So it is kept per session, in the session's
 # account, like its queued prompts.
 
-#: How often, and how far apart, a refused read of a cost record is tried.
+#: How often, and how far apart, a refused read or rename of a cost record is
+#: tried.
 _COST_READ_TRIES = 5
 _COST_READ_WAIT_S = 0.05
 
@@ -1194,8 +1195,9 @@ def save_session_cost(session_id: str, record: dict[str, Any],
     Written whole and replaced atomically, through a temporary file of the
     writer's own: two writes at once (threads, or two hubs on one session)
     must not write into one file, or one can rename the other's half-written
-    one into place.  Failures are swallowed: keeping the figure must never
-    break a turn.
+    one into place.  A rename refused while a reader has the file open
+    (Windows) is tried again, as a refused read is (``load_session_cost``).
+    Failures are swallowed: keeping the figure must never break a turn.
     """
     path = session_cost_file(session_id, config_dir)
     tmp = path.with_name(f"{path.name}.{uuid_mod.uuid4().hex}.tmp")
@@ -1204,7 +1206,14 @@ def save_session_cost(session_id: str, record: dict[str, Any],
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({**record, "session_id": session_id,
                        "saved_at": time.time()}, f)
-        os.replace(tmp, path)
+        for attempt in range(_COST_READ_TRIES):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == _COST_READ_TRIES - 1:
+                    raise
+                time.sleep(_COST_READ_WAIT_S)
     except OSError:
         try:
             tmp.unlink(missing_ok=True)

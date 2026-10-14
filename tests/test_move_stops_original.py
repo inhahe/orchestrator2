@@ -366,6 +366,24 @@ def test_what_it_spent_on_keys_comes_along(move, monkeypatch):
     assert kept is not None and kept["key_spent"] == 41.5
 
 
+def test_what_its_cut_turn_spent_on_keys_comes_along_too(move, monkeypatch):
+    # The stop delivers the cut turn's result: read after it, not before.
+    from session import load_session_cost
+    _keyed(move, monkeypatch)
+    move["state"].key_cost_usd = 41.5
+    stop = move["orig"].bridge.stop
+
+    async def stop_with_a_last_result(*a, **k):
+        move["state"].key_cost_usd += 0.5
+        return await stop(*a, **k)
+
+    monkeypatch.setattr(move["orig"].bridge, "stop", stop_with_a_last_result)
+
+    move["run"]()
+
+    assert load_session_cost(_new_id(move), move["dst_cfg"])["key_spent"] == 42.0
+
+
 def test_a_session_that_spent_nothing_on_keys_files_no_record(move):
     from session import load_session_cost
     move["run"]()

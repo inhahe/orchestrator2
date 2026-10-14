@@ -2139,19 +2139,28 @@ also has), so:
   key's balance, which nothing in the hub can know. It is measured on each
   CLI's own total, never across CLIs: `take_cost` adds what the running
   CLI's total rose by since its last report (`key_cost_base`) while that
-  CLI's init named a key (`cli_on_key`, set only from an init and cleared
-  by `connect()`, so a key the hub gives or drops mid-turn leaves that turn
-  billed where its CLI ran it). A new CLI's base is set when it settles:
+  CLI is billed to a key (`state.cli_bills_key`: what its init said,
+  `cli_on_key`, else what the hub expects -- one rule for the settle and for
+  each report). `cli_on_key` is set only from an init and cleared by
+  `connect()`, so a key the hub gives or drops mid-turn leaves that turn
+  billed where its CLI ran it. A new CLI's base is set when it settles:
   what it starts from, the transcript's last saved total if it restores
   one, else nothing; looked up only for a CLI on a key. Unknown -- a
-  settle that failed, or a resumed session whose transcript the hub cannot
-  find -- it is None and the first report is not counted, since it may be
-  the restored total. What a CLI on a key spent after its last report, and
-  saved on its way out, is added at the next settle, by that CLI's billing
-  (`_cost_prev_on_key`). Only the spend is kept (`key_spent`): the base
-  belongs to a CLI, which never outlives the hub. `/move` files it under the
-  copy's id, since the copy's CLI restores only the whole cost, from the
-  transcript. Turns before 2026-10-14 are not in the figure
+  settle that failed, or the session `connect()` asked to resume
+  (`_cost_resume_target`) when the hub cannot find its transcript -- it is
+  None and the first report is not counted, since it may be the restored
+  total. What a CLI on a key spent after its last report, and saved on its
+  way out, is added at the next settle, by that CLI's billing
+  (`_cost_prev_on_key`): taken at a connect only when no settle is
+  pending, so connects that never reach an init keep the CLI that ran the
+  last turn, and kept in the record (`cli_on_key`) for a settle a later
+  hub makes. The record keeps the spend (`key_spent`) but not the base,
+  which belongs to a CLI. `/move` files the spend under the copy's id,
+  read once the original has stopped so a result its cut turn sends is
+  in it; the copy's CLI restores only the whole cost, from the transcript.
+  The cost record is read and renamed into place again when Windows
+  refuses either while another hub or thread has it. Turns before
+  2026-10-14 are not in the figure
   (`KEY_COST_COUNTED_SINCE`, which the tooltip names);
 - `/usage` sends a `note` that plan limits do not apply, instead of fetching
   the account's subscription limits (`plan_usage.api_key_report`);

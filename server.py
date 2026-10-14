@@ -4848,9 +4848,11 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
             target_cfg)
     # What it spent on API keys, which only the hub keeps: the copy's CLI
     # restores its whole cost from the transcript, which does not hold this.
-    if carry["key_spent"]:
+    # Read now the original has stopped: a result its cut turn sent is in it.
+    key_spent = getattr(rt.state, "key_cost_usd", 0.0)
+    if key_spent:
         await asyncio.to_thread(save_session_cost, new_id,
-                                {"key_spent": carry["key_spent"]}, target_cfg)
+                                {"key_spent": key_spent}, target_cfg)
 
     # Spin up a runtime bound to the target account *and directory*, resuming
     # the copy.  `dest_cwd` is `cwd` unless the move moved it.
@@ -4930,9 +4932,8 @@ def _move_carry(rt: SessionRuntime, cwd: str, sid: str) -> dict[str, Any]:
         "agent_name": getattr(st, "agent_name", None),
         "agent_labels": dict(getattr(st, "agent_labels", None) or {}),
         # The session's own API key: the moved session is the same work, and
-        # stays billed as it was.  And what it has spent on keys so far.
+        # stays billed as it was.
         "api_key": getattr(rt.config, "api_key", None),
-        "key_spent": getattr(st, "key_cost_usd", 0.0),
         # And compacts as it did: a /autocompact or a launch's setting lives
         # on the state, the setting it was opened with in its config.
         "compact_at": getattr(st, "_compact_at",

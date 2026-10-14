@@ -320,6 +320,14 @@ def apply_api_key_source(state: State, source: Any, config_dir: str | None, *,
                                    if state.is_subscription else None)
 
 
+def cli_bills_key(state: State) -> bool:
+    """Whether the running CLI's turns are billed to an API key: what its init
+    said, else -- an init that named nothing -- what the hub expects."""
+    if state.cli_on_key is not None:
+        return state.cli_on_key
+    return billed_to_api_key(state)
+
+
 def take_cost(state: State, msg: Any) -> None:
     """Record the cost a ResultMessage reports.
 
@@ -334,9 +342,7 @@ def take_cost(state: State, msg: Any) -> None:
             and math.isfinite(cost) and cost >= 0):
         state.cost_reported = float(cost)
         state.total_cost_usd = state.cost_reported + state.cost_carried
-        on_key = (state.cli_on_key if state.cli_on_key is not None
-                  else billed_to_api_key(state))
-        if on_key and state.key_cost_base is not None:
+        if cli_bills_key(state) and state.key_cost_base is not None:
             state.key_cost_usd += max(0.0, state.cost_reported - state.key_cost_base)
         state.key_cost_base = state.cost_reported
 
@@ -659,8 +665,8 @@ class State:
     # the running CLI's total at its last report, or what it started from
     # (SDKBridge._settle_cost_sync); None while that is unknown, and then its
     # next report is not counted.  cli_on_key is whether the running CLI's
-    # init named a key (None: not said), which a key the hub adds or drops
-    # mid-turn does not change.
+    # init named a key (None: not said; cli_bills_key), which a key the hub
+    # adds or drops mid-turn does not change.
     key_cost_usd: float = 0.0
     key_cost_base: float | None = None
     cli_on_key: bool | None = None

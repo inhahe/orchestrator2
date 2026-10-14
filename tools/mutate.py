@@ -5906,14 +5906,14 @@ APIKEY_STATE_MUTATIONS = [
      "            pass\n"),
 
     ("a turn is counted where the hub expects the next CLI, not where it ran",
-     "        on_key = (state.cli_on_key if state.cli_on_key is not None\n"
-     "                  else billed_to_api_key(state))\n",
-     "        on_key = billed_to_api_key(state)\n"),
+     "    if state.cli_on_key is not None:\n        return state.cli_on_key\n"
+     "    return billed_to_api_key(state)\n",
+     "    return billed_to_api_key(state)\n"),
 
     ("a report with nothing to measure it from is counted as spent",
-     "        if on_key and state.key_cost_base is not None:\n"
+     "        if cli_bills_key(state) and state.key_cost_base is not None:\n"
      "            state.key_cost_usd += max(0.0, state.cost_reported - state.key_cost_base)\n",
-     "        if on_key:\n"
+     "        if cli_bills_key(state):\n"
      "            state.key_cost_usd += max(0.0, state.cost_reported - (state.key_cost_base or 0.0))\n"),
 
     ("every report is measured from where the CLI started",
@@ -6426,13 +6426,13 @@ SESSIONKEY_MOVE_MUTATIONS = [
      ""),
 
     ("a moved session's spend on keys starts over",
-     "    if carry[\"key_spent\"]:\n"
+     "    if key_spent:\n"
      "        await asyncio.to_thread(save_session_cost, new_id,\n",
      "    if False:\n"
      "        await asyncio.to_thread(save_session_cost, new_id,\n"),
 
     ("a move files a cost record for a session that spent nothing on keys",
-     "    if carry[\"key_spent\"]:\n"
+     "    if key_spent:\n"
      "        await asyncio.to_thread(save_session_cost, new_id,\n",
      "    if True:\n"
      "        await asyncio.to_thread(save_session_cost, new_id,\n"),
@@ -6579,6 +6579,13 @@ EFFORT_SERVER_MUTATIONS = [
 # What each CLI spent counts once across the session's CLIs and hubs, by
 # what each version restores.  tests/test_session_cost.py.
 COST_SESSION_MUTATIONS = [
+    ("a rename refused while a reader has the file drops the write",
+     "            except PermissionError:\n"
+     "                if attempt == _COST_READ_TRIES - 1:\n"
+     "                    raise\n"
+     "                time.sleep(_COST_READ_WAIT_S)\n",
+     ""),
+
     ("a record being replaced is read as none, and saved over",
      "        except PermissionError:\n"
      "            if attempt == _COST_READ_TRIES - 1:\n"
@@ -6646,7 +6653,7 @@ COST_BRIDGE_MUTATIONS = [
     # What a session spent on API keys: each CLI's own total, measured from
     # where it started.  tests/test_session_cost.py; design.md §6g.
     ("the transcript is read for a CLI on no key too",
-     "        if not st.cli_on_key:\n            st.key_cost_base = None\n"
+     "        if not cli_bills_key(st):\n            st.key_cost_base = None\n"
      "        elif not restores:\n",
      "        if False:\n            st.key_cost_base = None\n"
      "        elif not restores:\n"),
@@ -6660,12 +6667,20 @@ COST_BRIDGE_MUTATIONS = [
      "            st.key_cost_base = 0.0\n"),
 
     ("a resumed session the hub cannot find is measured from nothing",
-     "            st.key_cost_base = None if self._cost_resumes else 0.0\n",
+     "            st.key_cost_base = None if self._cost_resume_target == sid else 0.0\n",
      "            st.key_cost_base = 0.0\n"),
 
     ("a new session without a transcript yet is not counted at first",
-     "            st.key_cost_base = None if self._cost_resumes else 0.0\n",
+     "            st.key_cost_base = None if self._cost_resume_target == sid else 0.0\n",
      "            st.key_cost_base = None\n"),
+
+    ("a session the SDK started instead is taken for the one asked",
+     "            st.key_cost_base = None if self._cost_resume_target == sid else 0.0\n",
+     "            st.key_cost_base = None if self._cost_resume_target else 0.0\n"),
+
+    ("the settle and each report disagree on an init that names no key",
+     "        if not cli_bills_key(st):\n            st.key_cost_base = None\n",
+     "        if not st.cli_on_key:\n            st.key_cost_base = None\n"),
 
     ("what a CLI on a key spent after its last report is not counted",
      "                st.key_cost_usd += max(0.0, final - reported)\n",
@@ -6680,12 +6695,32 @@ COST_BRIDGE_MUTATIONS = [
      ""),
 
     ("the CLI before the new one is forgotten",
-     "        self._cost_prev_on_key = self.state.cli_on_key\n",
-     "        self._cost_prev_on_key = None\n"),
+     "            self._cost_prev_on_key = cli_bills_key(self.state)\n",
+     "            self._cost_prev_on_key = None\n"),
+
+    ("a second connect forgets the CLI that ran the last turn",
+     "        if not self._cost_settle_due:\n"
+     "            self._cost_prev_on_key = cli_bills_key(self.state)\n",
+     "        if True:\n"
+     "            self._cost_prev_on_key = cli_bills_key(self.state)\n"),
 
     ("a CLI that resumes is taken for a new session",
-     "        self._cost_resumes = target is not None\n",
-     "        self._cost_resumes = False\n"),
+     "        self._cost_resume_target = target\n",
+     "        self._cost_resume_target = None\n"),
+
+    ("a kept record does not say what its CLI ran on",
+     '"key_spent": st.key_cost_usd, "cli_on_key": cli_bills_key(st),',
+     '"key_spent": st.key_cost_usd,'),
+
+    ("the billing of the CLI another hub ran is not taken back",
+     "        self._cost_prev_on_key = on_key if isinstance(on_key, bool) else None\n",
+     ""),
+
+    ("the transcript is read again for where a never-reporting CLI started",
+     "                if saved_on_exit is None:\n"
+     "                    # Nothing saved since: that is also the transcript's last.\n"
+     "                    last_saved = reported\n",
+     ""),
 
     ("a CLI that never reported is not carried -- a total counted twice",
      "        if reported is None and mark is not None and st.cost_restores is not None:\n",
@@ -6700,8 +6735,8 @@ COST_BRIDGE_MUTATIONS = [
      "                reported = 0.0\n"),
 
     ("key spend is not kept",
-     '                "key_spent": st.key_cost_usd,\n',
-     ""),
+     '                "key_spent": st.key_cost_usd, "cli_on_key"',
+     '                "cli_on_key"'),
 
     ("kept key spend is not taken back",
      '        st.key_cost_usd = max(0.0, number("key_spent") or 0.0)\n',
