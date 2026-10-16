@@ -89,7 +89,7 @@ def _no_hub_state_in_a_real_account(monkeypatch, tmp_path_factory):
             spare.append(tmp_path_factory.mktemp("hub-state"))
         return spare[0]
 
-    # Queues, background tasks and costs.
+    # Queues, background tasks, costs and compaction.
     real_state = session._orch2_state_dir
 
     def state_dir(config_dir: str | None = None) -> Path:

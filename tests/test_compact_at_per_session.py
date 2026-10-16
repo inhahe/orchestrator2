@@ -256,3 +256,77 @@ def test_a_move_carries_what_the_session_was_opened_with(monkeypatch):
 
     assert carry["compact_at"] == 300000
     assert carry["auto_compact"] is True
+
+
+# -- Remembered by session id ------------------------------------------------
+#
+# A session reopened without the launch that set its compaction -- from the
+# session list, revived by a hub restart, after a reboot -- keeps it.
+
+from session import load_session_compaction, save_session_compaction  # noqa: E402
+
+
+def test_the_record_round_trips_and_a_none_keeps_the_old_value():
+    save_session_compaction("S9", 300000, True)
+    save_session_compaction("S9", None, False)
+
+    assert load_session_compaction("S9") == (300000, False)
+    assert load_session_compaction("never-seen") == (None, None)
+
+
+def test_a_session_reopened_without_its_launch_keeps_its_compaction(monkeypatch, tmp_path):
+    save_session_compaction("S1", 300000, True)
+
+    cfg = _config_of_new_runtime(monkeypatch, tmp_path, ["--model", MODEL], resume="S1")
+
+    assert cfg.compact_at == 300000
+    assert cfg.auto_compact is True
+
+
+def test_what_a_launch_gives_beats_what_was_remembered_and_is_remembered(monkeypatch, tmp_path):
+    save_session_compaction("S1", 300000, True)
+
+    cfg = _config_of_new_runtime(monkeypatch, tmp_path, ["--model", MODEL],
+                                 resume="S1", auto_compact=False)
+
+    assert cfg.auto_compact is False
+    assert cfg.compact_at == 300000
+    assert load_session_compaction("S1") == (300000, False)
+
+
+def test_a_new_session_is_remembered_once_it_has_an_id(monkeypatch, tmp_path):
+    cfg = _config_of_new_runtime(monkeypatch, tmp_path, ["--model", MODEL],
+                                 compact_at=300000, auto_compact=True)
+
+    server._on_session_id("S7", cfg)
+
+    assert load_session_compaction("S7") == (300000, True)
+
+
+def test_a_session_that_never_set_it_leaves_no_record(monkeypatch, tmp_path):
+    cfg = _config_of_new_runtime(monkeypatch, tmp_path, ["--model", MODEL])
+
+    server._on_session_id("S8", cfg)
+
+    assert load_session_compaction("S8") == (None, None)
+
+
+def test_a_launch_onto_an_open_session_is_remembered(monkeypatch, tmp_path):
+    _land_on_open_session(monkeypatch, tmp_path, {"compact_at": 300000, "auto_compact": True})
+
+    assert load_session_compaction("S1") == (300000, True)
+
+
+def test_autocompact_is_remembered_and_reports_the_sessions_threshold():
+    import commands
+    hub = parse_args(["--model", MODEL])
+    st = types.SimpleNamespace(session_id="S5")
+
+    commands._cmd_autocompact("300000", st, hub)
+    assert load_session_compaction("S5") == (300000, True)
+
+    commands._cmd_autocompact("off", st, hub)
+    assert load_session_compaction("S5") == (300000, False)
+
+    res = commands._cmd_autocompact("on", st, hub)
+    assert res.messages[0]["data"]["message"] == "auto-compact ON (at ~300000 tok)"

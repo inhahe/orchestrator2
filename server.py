@@ -112,6 +112,7 @@ from session import (
     list_projects,
     list_sessions_for_project,
     load_persisted_queue,
+    load_session_compaction,
     normalize_path_for_compare,
     read_session_title,
     render_session_history,
@@ -119,6 +120,7 @@ from session import (
     resumable_sessions,
     save_persisted_bg_tasks,
     save_persisted_queue,
+    save_session_compaction,
     save_session_cost,
     sessions_anywhere,
     sessions_titled,
@@ -222,7 +224,7 @@ def _take_handed_over_keys() -> dict[str, str]:
 def _note_session_key(sid: str, cfg: Config) -> None:
     """Remember that session *sid* runs with *cfg*'s key, if it has one.
 
-    Every bridge's ``on_session_id``: called the moment the CLI gives a
+    From every bridge's ``on_session_id``: called the moment the CLI gives a
     session its id, so an id the runtime later leaves -- closed, ``/clear``,
     ``/resume`` elsewhere -- keeps the key it ran with.
     """
@@ -231,16 +233,31 @@ def _note_session_key(sid: str, cfg: Config) -> None:
         _session_api_keys[sid] = key
 
 
+def _note_session_compaction(sid: str, cfg: Config) -> None:
+    """Remember the compaction session *sid* was given (by its launch, or kept
+    from before), so that it has it when reopened without the launch."""
+    at = cfg.compact_at if getattr(cfg, "compact_at_given", False) else None
+    on = cfg.auto_compact if getattr(cfg, "auto_compact_given", False) else None
+    save_session_compaction(sid, at, on, getattr(cfg, "config_dir", None))
+
+
+def _on_session_id(sid: str, cfg: Config) -> None:
+    """Every bridge's ``on_session_id``: what the hub remembers of a session
+    by its id, the moment the CLI gives it one."""
+    _note_session_key(sid, cfg)
+    _note_session_compaction(sid, cfg)
+
+
 def _new_bridge(cfg: Config, st: State, broadcaster: Any) -> "SDKBridge":
     """An SDKBridge for one of the hub's runtimes, which remembers its
-    sessions' keys (``_note_session_key``).
+    sessions' keys and compaction (``_on_session_id``).
 
     Imports sdk_bridge, which pulls in claude_agent_sdk and mcp: the first
     call, from ``_deferred_bridge_startup``, is kept off the hot path.
     """
     from sdk_bridge import SDKBridge
     br = SDKBridge(config=cfg, state=st, broadcaster=broadcaster)
-    br.on_session_id = _note_session_key
+    br.on_session_id = _on_session_id
     br.on_effort_refused = lambda level: _drop_refused_effort(br, level)
     return br
 
@@ -1761,14 +1778,6 @@ async def _create_runtime(
     # `stable`.
     if cli_path:
         overrides["cli_path"] = cli_path
-    # Per-session compaction, set every time like the name: the hub's
-    # --compact-at and --auto-compact were its own launch's, for its session.
-    # Not given, the threshold is the default for this session's model and
-    # the orchestrator does not compact it (Claude Code's own compaction, near
-    # the context limit, still does).
-    overrides["compact_at"] = compact_at or default_compact_at(model or config.model)
-    overrides["auto_compact"] = bool(auto_compact)
-    overrides["no_compact"] = not auto_compact
     # Set every time, never inherited.  ``config`` is the *hub's*, so a name
     # the hub was launched with belongs to the one session that launch opened;
     # copying it into every session opened afterwards gave them all one
@@ -1786,6 +1795,27 @@ async def _create_runtime(
     # Set every time, never inherited, like the name: the hub's config is its
     # launch's session's, and that launch's key is that session's alone.
     overrides["api_key"] = _session_key(seed_id, api_key)
+    # Per-session compaction, set every time like the name: the hub's
+    # --compact-at and --auto-compact were its own launch's, for its session.
+    # What this launch does not give, a session reopened keeps from before (a
+    # launch's or /autocompact's, remembered by its id), and what it gives is
+    # remembered.  Never given at all, the threshold is the default for the
+    # session's model and the orchestrator does not compact it (Claude Code's
+    # own compaction, near the context limit, still does).
+    if seed_id:
+        kept_at, kept_on = await asyncio.to_thread(
+            load_session_compaction, seed_id, config_dir)
+        await asyncio.to_thread(
+            save_session_compaction, seed_id, compact_at, auto_compact, config_dir)
+        compact_at = compact_at or kept_at
+        auto_compact = kept_on if auto_compact is None else auto_compact
+    overrides["compact_at"] = compact_at or default_compact_at(model or config.model)
+    overrides["auto_compact"] = bool(auto_compact)
+    overrides["no_compact"] = not auto_compact
+    # The session's own, to be remembered once a new session has an id
+    # (``_note_session_compaction``).
+    overrides["compact_at_given"] = compact_at is not None
+    overrides["auto_compact_given"] = auto_compact is not None
     cfg = dataclasses.replace(config, **overrides)
     # The state reads the account details from the session's own config dir
     # (cfg.config_dir), not the hub's: a cross-account session shows its own
@@ -3465,6 +3495,11 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
                 if compact_at or auto_compact is not None:
                     log.info("hub launch: auto-compact for rid=%s -> %s at %s",
                              existing.rid, auto_compact, compact_at)
+                    sid = getattr(existing.state, "session_id", None)
+                    if sid:
+                        await asyncio.to_thread(
+                            save_session_compaction, sid, compact_at, auto_compact,
+                            getattr(existing.config, "config_dir", None))
             # Same reasoning as model/effort: the launcher asked for a bell
             # set, so honour it on the session it actually lands on.  No
             # reconnect needed — bell_events is read at ring time.

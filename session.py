@@ -1158,20 +1158,33 @@ _COST_READ_TRIES = 5
 _COST_READ_WAIT_S = 0.05
 
 
+def _session_record_file(kind: str, session_id: str, config_dir: str | None) -> Path:
+    """Where the hub keeps its *kind* record (``costs``, ``compaction``) of
+    *session_id*, in the session's account."""
+    return _orch2_state_dir(config_dir) / kind / f"{_sanitize_cwd(session_id)}.json"
+
+
 def session_cost_file(session_id: str, config_dir: str | None = None) -> Path:
     """Where the hub keeps what it knows of *session_id*'s cost."""
-    return _orch2_state_dir(config_dir) / "costs" / f"{_sanitize_cwd(session_id)}.json"
+    return _session_record_file("costs", session_id, config_dir)
 
 
 def load_session_cost(session_id: str,
                       config_dir: str | None = None) -> dict[str, Any] | None:
-    """What ``save_session_cost`` kept for *session_id*; None if nothing usable.
+    """What ``save_session_cost`` kept for *session_id*; None if nothing usable."""
+    return _load_session_record("costs", session_id, config_dir)
+
+
+def _load_session_record(kind: str, session_id: str,
+                         config_dir: str | None) -> dict[str, Any] | None:
+    """The *kind* record ``_save_session_record`` kept for *session_id*; None
+    if nothing usable.
 
     A read refused while another writer replaces the file (Windows refuses
     access to a file being renamed over) is tried again: read as nothing, the
     record would be saved over with the figures of a session starting afresh.
     """
-    path = session_cost_file(session_id, config_dir)
+    path = _session_record_file(kind, session_id, config_dir)
     for attempt in range(_COST_READ_TRIES):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -1190,16 +1203,49 @@ def load_session_cost(session_id: str,
 
 def save_session_cost(session_id: str, record: dict[str, Any],
                       config_dir: str | None = None) -> None:
-    """Keep *record* as what the hub knows of *session_id*'s cost.
+    """Keep *record* as what the hub knows of *session_id*'s cost."""
+    _save_session_record("costs", session_id, record, config_dir)
+
+
+#: How a session compacts, kept by session id so that it survives the session
+#: being reopened without the launch that set it: from the session list, by a
+#: hub restart that revives it, after a reboot.  ``compact_at`` (tokens) and
+#: ``auto_compact``; a field the session never set is absent.
+def load_session_compaction(session_id: str, config_dir: str | None = None
+                            ) -> tuple[int | None, bool | None]:
+    """(compact_at, auto_compact) *session_id* was given by a launch or by
+    ``/autocompact``; None for what it never was."""
+    rec = _load_session_record("compaction", session_id, config_dir) or {}
+    at, on = rec.get("compact_at"), rec.get("auto_compact")
+    return (at if isinstance(at, int) and not isinstance(at, bool) and at > 0 else None,
+            on if isinstance(on, bool) else None)
+
+
+def save_session_compaction(session_id: str, compact_at: int | None,
+                            auto_compact: bool | None,
+                            config_dir: str | None = None) -> None:
+    """Remember what *session_id* was given; a None leaves what it had."""
+    if compact_at is None and auto_compact is None:
+        return
+    old_at, old_on = load_session_compaction(session_id, config_dir)
+    _save_session_record("compaction", session_id, {
+        "compact_at": compact_at if compact_at is not None else old_at,
+        "auto_compact": auto_compact if auto_compact is not None else old_on,
+    }, config_dir)
+
+
+def _save_session_record(kind: str, session_id: str, record: dict[str, Any],
+                         config_dir: str | None) -> None:
+    """Keep *record* as the hub's *kind* record of *session_id*.
 
     Written whole and replaced atomically, through a temporary file of the
     writer's own: two writes at once (threads, or two hubs on one session)
     must not write into one file, or one can rename the other's half-written
     one into place.  A rename refused while a reader has the file open
-    (Windows) is tried again, as a refused read is (``load_session_cost``).
-    Failures are swallowed: keeping the figure must never break a turn.
+    (Windows) is tried again, as a refused read is (``_load_session_record``).
+    Failures are swallowed: keeping a record must never break a turn.
     """
-    path = session_cost_file(session_id, config_dir)
+    path = _session_record_file(kind, session_id, config_dir)
     tmp = path.with_name(f"{path.name}.{uuid_mod.uuid4().hex}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

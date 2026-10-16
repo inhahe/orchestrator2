@@ -186,7 +186,13 @@ session already open takes them on its state, where `/autocompact` puts them,
 never on its `Config`, which for the hub's own session is the hub's. Like the
 name, they are never inherited from the hub's launch: a session opened without
 them gets its own model's default threshold and no orchestrator compaction.
-`/move` carries them.
+`/move` carries them. And they are remembered by session id, as are a
+`/autocompact`'s, in `<account>/orchestrator2/compaction/<id>.json`
+(`session.save_session_compaction`), so a session reopened without its launch
+-- from the session list, revived by a hub restart, after a reboot -- keeps
+them; a launch that gives them overrides what was remembered. Ending a
+session's earlier compaction therefore takes `--no-compact` (or
+`/autocompact off`), not just dropping the flags.
 
 **`--resume <title>` is resolved to a session id before anything keys on
 it**, by `session.resolve_session_ref`: the whole title, ignoring case, of

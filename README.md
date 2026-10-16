@@ -414,7 +414,7 @@ You can see which a session uses. The status bar's plan field reads **`API $1.23
 |------|---------|-------------|
 | `--auto-compact` | off | Enable auto-compact when context gets large. Per session, like `--compact-at` |
 | `--no-compact` | on | Disable auto-compact (default) |
-| `--compact-at N` | auto | Token threshold for auto-compact (default: 950k for 1M-context models, 160k otherwise). Does nothing without `--auto-compact`. Per session: a launch that joins a running hub sets it, and `--auto-compact`, for the session it opens or lands on, so one session can compact earlier than the rest; sessions opened without them never take the hub's |
+| `--compact-at N` | auto | Token threshold for auto-compact (default: 950k for 1M-context models, 160k otherwise). Does nothing without `--auto-compact`. Per session: a launch that joins a running hub sets it, and `--auto-compact`, for the session it opens or lands on, so one session can compact earlier than the rest; sessions opened without them never take the hub's. Remembered by session id, with `/autocompact`'s: the session keeps them when reopened without its launch, so turning them off takes `--no-compact` |
 | `--compact-cooldown-turns N` | 3 | Skip compact check for N turns after compacting |
 | `--max-context-tokens N` | 0 | Cap context via rolling-window trim (0 = disabled) |
 
