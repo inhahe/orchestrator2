@@ -186,13 +186,22 @@ session already open takes them on its state, where `/autocompact` puts them,
 never on its `Config`, which for the hub's own session is the hub's. Like the
 name, they are never inherited from the hub's launch: a session opened without
 them gets its own model's default threshold and no orchestrator compaction.
-`/move` carries them. And they are remembered by session id, as are a
-`/autocompact`'s, in `<account>/orchestrator2/compaction/<id>.json`
-(`session.save_session_compaction`), so a session reopened without its launch
--- from the session list, revived by a hub restart, after a reboot -- keeps
-them; a launch that gives them overrides what was remembered. Ending a
-session's earlier compaction therefore takes `--no-compact` (or
-`/autocompact off`), not just dropping the flags.
+`/move` carries them. A session's own settings -- a launch's or a
+`/autocompact`'s -- live on its State (`_compact_at`, `_auto_compact`), over
+its Config's defaults, and are kept by session id in
+`<account>/orchestrator2/compaction/<id>.json` (`session.save_session_compaction`).
+The first time a State is given an id, `_sync_session_compaction` merges the two
+(the State's winning) onto the State and into the record, off the event loop;
+the bridge reports the id every turn, so it is once per id, not per turn. After
+that, a launch onto the session or `/autocompact` rewrites the record from the
+State. So a session reopened without its launch -- from the session list,
+revived by a hub restart, after a reboot -- keeps them; a launch that gives
+them overrides what was kept; a trim's or `/clear`'s new id carries them; and
+⟳ Restart drops the launch's compaction flags when it resumes a session, whose
+record speaks for it. The hub's own launch is its own session's: `/resume` and
+`/cwd` in its tab put the next session on that session's record, else the
+defaults. Ending a session's earlier compaction therefore takes `--no-compact`
+(or `/autocompact off`), not just dropping the flags.
 
 **`--resume <title>` is resolved to a session id before anything keys on
 it**, by `session.resolve_session_ref`: the whole title, ignoring case, of

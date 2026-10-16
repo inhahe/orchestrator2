@@ -233,19 +233,76 @@ def _note_session_key(sid: str, cfg: Config) -> None:
         _session_api_keys[sid] = key
 
 
-def _note_session_compaction(sid: str, cfg: Config) -> None:
-    """Remember the compaction session *sid* was given (by its launch, or kept
-    from before), so that it has it when reopened without the launch."""
-    at = cfg.compact_at if getattr(cfg, "compact_at_given", False) else None
-    on = cfg.auto_compact if getattr(cfg, "auto_compact_given", False) else None
-    save_session_compaction(sid, at, on, getattr(cfg, "config_dir", None))
+# A session's own compaction -- what a launch or /autocompact set on it --
+# lives on its State (``_compact_at``, ``_auto_compact``), which is where the
+# bridge's check reads it, over the Config's defaults.  The record on disk
+# (``session.save_session_compaction``) follows the State: merged with it once
+# per session id, and rewritten when a launch or /autocompact changes it.
 
 
-def _on_session_id(sid: str, cfg: Config) -> None:
+def own_compaction(st: Any) -> tuple[int | None, bool | None]:
+    """(compact_at, auto_compact) set on *st*; None for what was not."""
+    return getattr(st, "_compact_at", None), getattr(st, "_auto_compact", None)
+
+
+def _sync_session_compaction(sid: str, cfg: Config, st: Any) -> None:
+    """Session *sid* has just become *st*'s: merge what *st* has set with what
+    the hub kept for *sid*, the State's winning, onto the State and into the
+    record.  Once per id: the bridge reports an id on every turn.
+
+    A session reopened without its launch gets back what it had; one given
+    settings before it had an id (a new session, a trim's or /clear's new
+    transcript, a /move's copy) has them kept under the id it gets.  The disk
+    is read and written off the event loop; the State takes the kept values
+    when the read returns, except where something set them meanwhile."""
+    if getattr(st, "_compaction_sid", None) == sid:
+        return
+    st._compaction_sid = sid
+    own = own_compaction(st)
+    config_dir = getattr(cfg, "config_dir", None)
+
+    def merge() -> tuple[int | None, bool | None]:
+        kept = load_session_compaction(sid, config_dir)
+        merged = (own[0] if own[0] is not None else kept[0],
+                  own[1] if own[1] is not None else kept[1])
+        if merged != kept:
+            save_session_compaction(sid, *merged, config_dir)
+        return merged
+
+    def apply(merged: tuple[int | None, bool | None]) -> None:
+        if getattr(st, "session_id", None) != sid or own_compaction(st) != own:
+            return  # left for another session, or set again since
+        if merged[0] is not None:
+            st._compact_at = merged[0]
+        if merged[1] is not None:
+            st._auto_compact = merged[1]
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        apply(merge())
+        return
+    fut = loop.run_in_executor(None, merge)
+    fut.add_done_callback(
+        lambda f: apply(f.result()) if not f.cancelled() and f.exception() is None else None)
+
+
+def _launch_compaction_to_state(cfg: Config, st: Any) -> None:
+    """Make what the hub's own launch gave (*cfg*, parsed from its command
+    line) the own compaction of the session that launch opens (*st*)."""
+    if getattr(cfg, "compact_at_given", False):
+        st._compact_at = cfg.compact_at
+    if getattr(cfg, "auto_compact_given", False):
+        st._auto_compact = cfg.auto_compact
+
+
+def _on_session_id(sid: str, cfg: Config, st: Any = None) -> None:
     """Every bridge's ``on_session_id``: what the hub remembers of a session
-    by its id, the moment the CLI gives it one."""
+    by its id, the moment the CLI gives it one -- its key, and with its State
+    *st*, its compaction."""
     _note_session_key(sid, cfg)
-    _note_session_compaction(sid, cfg)
+    if st is not None:
+        _sync_session_compaction(sid, cfg, st)
 
 
 def _new_bridge(cfg: Config, st: State, broadcaster: Any) -> "SDKBridge":
@@ -257,7 +314,7 @@ def _new_bridge(cfg: Config, st: State, broadcaster: Any) -> "SDKBridge":
     """
     from sdk_bridge import SDKBridge
     br = SDKBridge(config=cfg, state=st, broadcaster=broadcaster)
-    br.on_session_id = _on_session_id
+    br.on_session_id = lambda sid, id_cfg: _on_session_id(sid, id_cfg, st)
     br.on_effort_refused = lambda level: _drop_refused_effort(br, level)
     return br
 
@@ -1556,6 +1613,7 @@ async def lifespan(app: FastAPI):
     global _pending_resume_id
     config, _pending_resume_id, seeded_title = _seed_primary_session(config)
     state = init_state_from_config(config)
+    _launch_compaction_to_state(config, state)
     state.session_id = _pending_resume_id
     state.session_title = seeded_title
     theme = load_theme()
@@ -1719,10 +1777,11 @@ async def _create_runtime(
       ``ANTHROPIC_API_KEY``).  Without one, a session the hub remembers a
       key for (``_session_api_keys``) gets that; a launch without a key has
       made the hub forget it first.  Never inherited from the hub.
-    * ``compact_at`` / ``auto_compact`` — this session's auto-compact
-      threshold and switch (the launch's ``--compact-at`` and
-      ``--auto-compact``/``--no-compact``).  None: not given, so the switch
-      is the hub's and the threshold the default for this session's model.
+    * ``compact_at`` / ``auto_compact`` — the auto-compact threshold and
+      switch the launch gave this session (``--compact-at``,
+      ``--auto-compact``/``--no-compact``), set on its State.  None: not
+      given, so what the session kept from before (``_sync_session_compaction``),
+      else no orchestrator compaction at the default for its model.
     * otherwise — continue the most recent session in *cwd*.
 
     Registers the runtime, starts its bridge, and refreshes the lobby.
@@ -1795,32 +1854,26 @@ async def _create_runtime(
     # Set every time, never inherited, like the name: the hub's config is its
     # launch's session's, and that launch's key is that session's alone.
     overrides["api_key"] = _session_key(seed_id, api_key)
-    # Per-session compaction, set every time like the name: the hub's
-    # --compact-at and --auto-compact were its own launch's, for its session.
-    # What this launch does not give, a session reopened keeps from before (a
-    # launch's or /autocompact's, remembered by its id), and what it gives is
-    # remembered.  Never given at all, the threshold is the default for the
-    # session's model and the orchestrator does not compact it (Claude Code's
-    # own compaction, near the context limit, still does).
-    if seed_id:
-        kept_at, kept_on = await asyncio.to_thread(
-            load_session_compaction, seed_id, config_dir)
-        await asyncio.to_thread(
-            save_session_compaction, seed_id, compact_at, auto_compact, config_dir)
-        compact_at = compact_at or kept_at
-        auto_compact = kept_on if auto_compact is None else auto_compact
-    overrides["compact_at"] = compact_at or default_compact_at(model or config.model)
-    overrides["auto_compact"] = bool(auto_compact)
-    overrides["no_compact"] = not auto_compact
-    # The session's own, to be remembered once a new session has an id
-    # (``_note_session_compaction``).
-    overrides["compact_at_given"] = compact_at is not None
-    overrides["auto_compact_given"] = auto_compact is not None
+    # Compaction: the Config's is the default, set every time like the name --
+    # the hub's --compact-at and --auto-compact were its own launch's, for its
+    # session: the threshold for this session's model, and no orchestrator
+    # compaction (Claude Code's own, near the context limit, still happens).
+    # What this launch gives goes on the State below, as the session's own,
+    # and what the session kept from before joins it when it gets its id
+    # (``_sync_session_compaction``).
+    overrides["compact_at"] = default_compact_at(model or config.model)
+    overrides["auto_compact"] = False
+    overrides["no_compact"] = True
+    overrides["compact_at_given"] = overrides["auto_compact_given"] = False
     cfg = dataclasses.replace(config, **overrides)
     # The state reads the account details from the session's own config dir
     # (cfg.config_dir), not the hub's: a cross-account session shows its own
     # account's email and plan.
     st = init_state_from_config(cfg)
+    if compact_at:
+        st._compact_at = compact_at  # type: ignore[attr-defined]
+    if auto_compact is not None:
+        st._auto_compact = auto_compact  # type: ignore[attr-defined]
     rt = SessionRuntime(config=cfg, state=st)
     runtimes[rt.rid] = rt
 
@@ -3007,10 +3060,17 @@ async def _reconfigure(
     else:
         launch_key = None
     overrides["api_key"] = _session_key(target, launch_key)
+    # And its compaction: the launch's is for the session it opens -- in
+    # picker mode, the one being picked -- and any other session runs on its
+    # own, kept by its id, else at the defaults.
+    if not _picker_mode:
+        overrides.update(compact_at=default_compact_at(config.model), auto_compact=False,
+                         no_compact=True, compact_at_given=False, auto_compact_given=False)
     config = dataclasses.replace(config, **overrides)
 
     # --- Reinitialise state + bridge ---
     state = init_state_from_config(config)
+    _launch_compaction_to_state(config, state)
     _bcast = _default_runtime.broadcast if _default_runtime is not None else broadcast
     bridge = _new_bridge(config, state, _bcast)
     _bridge_ready.set()
@@ -3143,6 +3203,18 @@ async def api_restart() -> dict[str, Any]:
             i += 2
             continue
         if (sid or fresh) and a.startswith("--cwd="):
+            i += 1
+            continue
+        # The launch's compaction is the resumed session's own by now, kept
+        # by its id (_sync_session_compaction) with any /autocompact since;
+        # passed again, the launch's would undo that.
+        if sid and a in ("--auto-compact", "--no-compact"):
+            i += 1
+            continue
+        if sid and a == "--compact-at":
+            i += 2
+            continue
+        if sid and a.startswith("--compact-at="):
             i += 1
             continue
         if a in ("--detach", "--open", "--copy", "--wait-port", "--start-fresh",
@@ -3495,10 +3567,12 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
                 if compact_at or auto_compact is not None:
                     log.info("hub launch: auto-compact for rid=%s -> %s at %s",
                              existing.rid, auto_compact, compact_at)
+                    # Kept now if the session's record has been merged in;
+                    # otherwise the merge, when its id comes, keeps it.
                     sid = getattr(existing.state, "session_id", None)
-                    if sid:
+                    if sid and getattr(existing.state, "_compaction_sid", None) == sid:
                         await asyncio.to_thread(
-                            save_session_compaction, sid, compact_at, auto_compact,
+                            save_session_compaction, sid, *own_compaction(existing.state),
                             getattr(existing.config, "config_dir", None))
             # Same reasoning as model/effort: the launcher asked for a bell
             # set, so honour it on the session it actually lands on.  No
@@ -4969,12 +5043,10 @@ def _move_carry(rt: SessionRuntime, cwd: str, sid: str) -> dict[str, Any]:
         # The session's own API key: the moved session is the same work, and
         # stays billed as it was.
         "api_key": getattr(rt.config, "api_key", None),
-        # And compacts as it did: a /autocompact or a launch's setting lives
-        # on the state, the setting it was opened with in its config.
-        "compact_at": getattr(st, "_compact_at",
-                              getattr(rt.config, "compact_at", None)),
-        "auto_compact": getattr(st, "_auto_compact",
-                                getattr(rt.config, "auto_compact", None)),
+        # And compacts as it did: what a launch or /autocompact set on it,
+        # which is on its state; what it did not set stays the default.
+        "compact_at": own_compaction(st)[0],
+        "auto_compact": own_compaction(st)[1],
     }
 
 

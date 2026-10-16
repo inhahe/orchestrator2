@@ -36,7 +36,7 @@ from session import (
     read_session_title,
     render_session_history,
     render_session_markdown,
-    save_session_compaction,
+    save_session_compaction_soon,
     write_session_title,
 )
 import auth
@@ -725,15 +725,16 @@ def _cmd_collapse_threshold(payload: str, state: State, _config: Config) -> Comm
     )
 
 
-def _remember_compaction(state: State, config: Config, compact_at: int | None,
-                         auto_compact: bool | None) -> None:
-    """Keep what /autocompact set on this session by its id, so that the
-    session has it again when reopened (``session.save_session_compaction``).
-    A new session before its first turn has no id, and so is not remembered."""
+def _remember_compaction(state: State, config: Config) -> None:
+    """Keep what this session now has set by its id, so that it has it again
+    when reopened (``session.save_session_compaction``).  Only once its record
+    has been merged into it (the hub's ``_sync_session_compaction``): until
+    then, that merge keeps what was just set, under the id the session gets."""
     sid = getattr(state, "session_id", None)
-    if sid:
-        save_session_compaction(sid, compact_at, auto_compact,
-                                getattr(config, "config_dir", None))
+    if sid and getattr(state, "_compaction_sid", None) == sid:
+        save_session_compaction_soon(sid, getattr(state, "_compact_at", None),
+                                     getattr(state, "_auto_compact", None),
+                                     getattr(config, "config_dir", None))
 
 
 def _cmd_autocompact(payload: str, state: State, config: Config) -> CommandResult:
@@ -747,7 +748,7 @@ def _cmd_autocompact(payload: str, state: State, config: Config) -> CommandResul
         return CommandResult(messages=[_msg(f"auto-compact: {status}")])
     if p in ("on", "true", "enable", "1"):
         state._auto_compact = True  # type: ignore[attr-defined]
-        _remember_compaction(state, config, None, True)
+        _remember_compaction(state, config)
         at = getattr(state, "_compact_at", config.compact_at)
         return CommandResult(
             messages=[_msg(f"auto-compact ON (at ~{at} tok)")],
@@ -755,7 +756,7 @@ def _cmd_autocompact(payload: str, state: State, config: Config) -> CommandResul
         )
     if p in ("off", "false", "disable", "0"):
         state._auto_compact = False  # type: ignore[attr-defined]
-        _remember_compaction(state, config, None, False)
+        _remember_compaction(state, config)
         return CommandResult(
             messages=[_msg("auto-compact OFF")],
             state_updates={"auto_compact": False},
@@ -768,7 +769,7 @@ def _cmd_autocompact(payload: str, state: State, config: Config) -> CommandResul
         return CommandResult(messages=[_msg("/autocompact N must be positive", level="error")])
     state._compact_at = n  # type: ignore[attr-defined]
     state._auto_compact = True  # type: ignore[attr-defined]
-    _remember_compaction(state, config, n, True)
+    _remember_compaction(state, config)
     return CommandResult(
         messages=[_msg(f"auto-compact threshold → ~{n} tok (ON)")],
         state_updates={"auto_compact": True, "compact_at": n},

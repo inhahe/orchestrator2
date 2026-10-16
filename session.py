@@ -7,6 +7,7 @@ window trim, and markdown export.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -1207,10 +1208,12 @@ def save_session_cost(session_id: str, record: dict[str, Any],
     _save_session_record("costs", session_id, record, config_dir)
 
 
-#: How a session compacts, kept by session id so that it survives the session
-#: being reopened without the launch that set it: from the session list, by a
-#: hub restart that revives it, after a reboot.  ``compact_at`` (tokens) and
-#: ``auto_compact``; a field the session never set is absent.
+# How a session compacts is kept by session id, so that it survives the session
+# being reopened without the launch that set it: from the session list, by a
+# hub restart that revives it, after a reboot.  The record holds
+# ``compact_at`` (tokens) and ``auto_compact``, each only if the session set it.
+
+
 def load_session_compaction(session_id: str, config_dir: str | None = None
                             ) -> tuple[int | None, bool | None]:
     """(compact_at, auto_compact) *session_id* was given by a launch or by
@@ -1224,14 +1227,30 @@ def load_session_compaction(session_id: str, config_dir: str | None = None
 def save_session_compaction(session_id: str, compact_at: int | None,
                             auto_compact: bool | None,
                             config_dir: str | None = None) -> None:
-    """Remember what *session_id* was given; a None leaves what it had."""
-    if compact_at is None and auto_compact is None:
+    """Keep *compact_at* and *auto_compact* -- the whole of what *session_id*
+    has set, None for what it has not -- as its record.  The caller holds the
+    whole of it (the session's state, merged with the record when the
+    session got its id), so nothing is read back and merged here."""
+    rec: dict[str, Any] = {}
+    if compact_at is not None:
+        rec["compact_at"] = compact_at
+    if auto_compact is not None:
+        rec["auto_compact"] = auto_compact
+    _save_session_record("compaction", session_id, rec, config_dir)
+
+
+def save_session_compaction_soon(session_id: str, compact_at: int | None,
+                                 auto_compact: bool | None,
+                                 config_dir: str | None = None) -> None:
+    """``save_session_compaction``, off the event loop when one is running:
+    a refused rename sleeps between tries, and the loop serves every tab."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        save_session_compaction(session_id, compact_at, auto_compact, config_dir)
         return
-    old_at, old_on = load_session_compaction(session_id, config_dir)
-    _save_session_record("compaction", session_id, {
-        "compact_at": compact_at if compact_at is not None else old_at,
-        "auto_compact": auto_compact if auto_compact is not None else old_on,
-    }, config_dir)
+    loop.run_in_executor(None, save_session_compaction, session_id, compact_at,
+                         auto_compact, config_dir)
 
 
 def _save_session_record(kind: str, session_id: str, record: dict[str, Any],

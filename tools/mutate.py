@@ -6199,6 +6199,36 @@ APIKEY_SERVER_MUTATIONS = [
 
 ]
 
+# A session's compaction -- a launch's --compact-at and --auto-compact, or a
+# /autocompact -- is its own, kept by its id, and survives its being reopened
+# without the launch. tests/test_compact_at_per_session.py; design.md, "A
+# launch's --compact-at".
+COMPACTION_SERVER_MUTATIONS = [
+    ("a session's compaction is not merged with what was kept for its id",
+     "    if st is not None:\n        _sync_session_compaction(sid, cfg, st)\n",
+     ""),
+
+    ("the record a session kept is not applied to it",
+     "        apply(merge())\n        return\n",
+     "        merge()\n        return\n"),
+
+    ("a merged record is not written back",
+     "        if merged != kept:\n            save_session_compaction(sid, *merged, config_dir)\n",
+     ""),
+
+    ("a restart passes the launch's compaction again",
+     "        if sid and a in (\"--auto-compact\", \"--no-compact\"):\n",
+     "        if False:\n"),
+
+    ("another session in the hub's tab runs on its launch's compaction",
+     "    if not _picker_mode:\n        overrides.update(compact_at=default_compact_at(config.model), auto_compact=False,\n",
+     "    if False:\n        overrides.update(compact_at=default_compact_at(config.model), auto_compact=False,\n"),
+
+    ("a move carries the defaults as the session's own",
+     "        \"compact_at\": own_compaction(st)[0],\n",
+     "        \"compact_at\": getattr(rt.config, \"compact_at\", None),\n"),
+]
+
 # A launch's ANTHROPIC_API_KEY bills the session that launch opens and no other
 # (2026-10-10: "can you make ANTHROPIC_API_KEY only work for the session that
 # was loaded with that key set?"), as --agent-name already named one.
@@ -6229,7 +6259,7 @@ SESSIONKEY_SERVER_MUTATIONS = [
      "    return (_session_api_keys.get(sid) if sid else None) or launch_key\n"),
 
     ("a hub bridge does not report the session ids its CLI gives",
-     "    br.on_session_id = _note_session_key\n",
+     "    br.on_session_id = lambda sid, id_cfg: _on_session_id(sid, id_cfg, st)\n",
      ""),
 
     ("a session named with a key is not remembered with it",
@@ -7173,6 +7203,8 @@ TARGETS = {
                          SESSIONKEY_STATE_MUTATIONS, "pytest"),
     "sessionkey-cmd": ("commands.py", "tests/test_session_api_key.py",
                        SESSIONKEY_CMD_MUTATIONS, "pytest"),
+    "compaction-server": ("server.py", "tests/test_compact_at_per_session.py",
+                          COMPACTION_SERVER_MUTATIONS, "pytest"),
     "account-server": ("server.py", "tests/test_session_account.py",
                        ACCOUNT_SERVER_MUTATIONS, "pytest"),
     "account-move": ("server.py", "tests/test_move_stops_original.py",
