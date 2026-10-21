@@ -452,6 +452,27 @@ def test_a_failed_refresh_still_answers_from_the_cache(hub, monkeypatch):
     assert data["live"] is False
 
 
+def test_a_fetch_that_raises_still_answers_from_the_cache(hub, monkeypatch):
+    """The fetch is meant to report failure as None, but a bug in it must
+    still leave `/model` answering from the previous list."""
+    _reset_cache()
+    config._model_cache = [("claude-opus-5", "Opus 5")]
+    config._model_cache_at = config.time.monotonic() - 1800
+
+    def fake_fetch(timeout=6.0, api_key=None):
+        raise ValueError("unexpected response shape")
+
+    monkeypatch.setattr(server, "fetch_available_models", fake_fetch)
+    ws = _FakeWS()
+
+    asyncio.run(_slash_model(ws))
+
+    data = _picker(ws)
+    assert data is not None, "no list was rendered at all"
+    assert [m["id"] for m in data["models"]] == ["claude-opus-5"]
+    assert data["live"] is False
+
+
 def test_a_hanging_api_does_not_hang_the_command(hub, monkeypatch):
     """A fetch that never returns must cost the budget, not the session.
 

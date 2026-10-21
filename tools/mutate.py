@@ -2456,8 +2456,12 @@ WAKEREVIVE_MUTATIONS = [
 
     ("the session never says why it woke up, so a turn starts by itself with "
      "no explanation",
-     "    asyncio.create_task(rt.broadcast({",
-     "    asyncio.create_task(_noop_broadcast({"),
+     "    asyncio.create_task(rt.broadcast({\n"
+     '        "type": "system_msg",\n'
+     '        "subtype": "info",\n'
+     '        "data": {"message": message},\n'
+     '    }), name=f"wakeup-restore-notice-{rt.rid}")\n',
+     ""),
 ]
 
 
@@ -2507,10 +2511,19 @@ MODELLIVE_MUTATIONS = [
      "                                    MODEL_SHOW_FETCH_BUDGET,\n"
      "                                    api_key=_model_list_key())"),
 
-    ("a failed refresh propagates instead of falling back to the list we "
-     "already have",
-     "        except asyncio.TimeoutError:",
-     "        except _NeverRaised:"),
+    ("a refresh that times out propagates instead of falling back to the "
+     "list we already have",
+     "        except asyncio.TimeoutError:\n",
+     "        except asyncio.TimeoutError:\n"
+     "            raise\n"),
+
+    ("a refresh that raises propagates instead of falling back to the list "
+     "we already have",
+     "        except Exception:\n"
+     '            log.warning("model list: live refresh for /model failed",\n',
+     "        except Exception:\n"
+     "            raise\n"
+     '            log.warning("model list: live refresh for /model failed",\n'),
 
     ("concurrent /model from several tabs each fetch, so the lock only makes "
      "three requests sequential instead of parallel",
