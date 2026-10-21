@@ -255,16 +255,22 @@ CLI_SUMMARY_RESERVE = 20_000
 CLI_COMPACT_BUFFER = 13_000
 CLI_WINDOW_MIN = 100_000
 CLI_WINDOW_MAX = 1_000_000
-# The variables compaction_env sets.  A session that does not set them must
-# not inherit them either: see SDKBridge._make_options.
+# The threshold variables compaction_env sets.  A session that does not set
+# them must not inherit them either: see SDKBridge._make_options.
 CLI_COMPACTION_VARS = ("CLAUDE_CODE_AUTO_COMPACT_WINDOW",
                        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")
+# The CLI does not auto-compact at all while either of these is true, or
+# while the ``autoCompactEnabled`` setting is false.  A session that asked
+# for auto-compact sets them empty, and the setting true as a flag setting,
+# which outranks the user's, project's and local ones (SDKBridge).
+CLI_COMPACTION_DISABLERS = ("DISABLE_AUTO_COMPACT", "DISABLE_COMPACT")
 
 
 def compaction_env(compact_at: int, auto_compact: bool) -> dict[str, str]:
     """The environment that makes a session's CLI compact at *compact_at*
-    context tokens, or, with *auto_compact* False, nothing: the CLI then
-    compacts at its own default, near the end of the model's window.
+    context tokens, whatever turned the CLI's auto-compact off elsewhere;
+    or, with *auto_compact* False, nothing: the CLI then compacts at its
+    own default, near the end of the model's window, if at all.
 
     Exact up to ``CLI_WINDOW_MAX - CLI_SUMMARY_RESERVE - CLI_COMPACT_BUFFER``
     (967k); above it, the CLI fires at 967k.  Below ``CLI_WINDOW_MIN`` less
@@ -278,6 +284,7 @@ def compaction_env(compact_at: int, auto_compact: bool) -> dict[str, str]:
     window = compact_at + CLI_SUMMARY_RESERVE + CLI_COMPACT_BUFFER
     window = max(CLI_WINDOW_MIN, min(window, CLI_WINDOW_MAX))
     env = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(window)}
+    env.update(dict.fromkeys(CLI_COMPACTION_DISABLERS, ""))
     if window - CLI_SUMMARY_RESERVE - CLI_COMPACT_BUFFER > compact_at:
         # The CLI takes floor(effective * pct / 100): half a token over, so
         # that the rounding of the percentage cannot land it one below.

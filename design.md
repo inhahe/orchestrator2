@@ -216,12 +216,31 @@ Claude Code 2.1.280's). A session with it off gets neither variable, and
 `_make_options` removes them from the hub's own environment, as it does the
 session name, so none is inherited from whatever started the hub. The CLI
 counts the context from each API response, before every call, so it compacts
-mid-turn too. The CLI reads the variables only when it starts, so a change
-reaches it as a new CLI: `/autocompact` (in `server.py`, after
-`try_immediate_command`) and a launch onto an open session put
-`("compaction", "")` on the bridge's event queue. The worker reconnects through
-`_reconnect_or_defer`, only if `_compaction_changed`: the variables differ from
-`_cli_compaction_env`, which is what `connect` started the CLI with.
+mid-turn too. A session with auto-compact on also overrides whatever turned the
+CLI's own auto-compact off: `DISABLE_AUTO_COMPACT` and `DISABLE_COMPACT` are
+set empty in its environment, and `autoCompactEnabled: true` is passed as a flag
+setting (`--settings`), which outranks the user's, project's and local settings
+files. Both were checked against the real CLI.
+
+The CLI reads the variables only when it starts, so a change reaches it as a new
+CLI. `_make_options` records what it gave the CLI (`_cli_compaction_env`), and
+`_compaction_changed` compares that with the session's. `/autocompact` (in
+`server.py`, after `try_immediate_command`) and a launch onto an open session
+put `("compaction", "")` on the bridge's event queue. Either way, the restart
+happens in `_apply_compaction_if_quiet`, and only when nothing would be cut
+short. That means no turn of ours and no ghost turn: neither `state.busy` with
+the worker parked, nor the CLI having said `running` before that turn's first
+output. It also means no turn that the CLI's compaction closed and the CLI is
+continuing (`pending_compact_turn_end`), no background task, and no connect.
+That is `_run_pending_cli_command`'s idle test, plus the tasks. Otherwise the
+restart waits for the next quiet point: the end of a turn (`_between_turns`),
+or a wakeup in `_await_next_prompt`. The wakeup is `bg-all-done`, or the
+`("wakeup", "compaction")` that `_end_ghost_turn` and
+`_flush_pending_compact_turn_end` send when the CLI is behind. Nothing is held for later, unlike `_reconnect_or_defer`:
+each quiet point compares the State with the CLI again, so a change undone in
+the meantime costs nothing. A parked worker is not a quiet one, so the
+`"compaction"` event does not drain the prompt queue unless it restarted the
+CLI.
 
 Until 2026-10-21 orchestrator2 compacted by itself, sending `/compact` between
 turns when `state.context_tokens` passed the threshold. That count was the
@@ -231,7 +250,10 @@ It reached 110 million on a 1M-token model, so a session with
 `state.context_tokens` is now the input of the main thread's latest API call
 (`state.call_context_tokens`, taken in `_message_dispatcher` from each
 `AssistantMessage` without a `parent_tool_use_id`); the status bar and the
-`--max-context-tokens` trim read it.
+`--max-context-tokens` trim read it. A compaction's boundary empties it in the
+dispatcher too, not where the boundary is rendered, because the dispatcher
+sees messages in the order the CLI sent them, and the rendering can lag behind
+the next call.
 
 **The hub can refuse a launch** (`"refused": true` in its answer, raised as
 `LaunchRefused` by `_launch_into_hub`), and that stops the launch with an

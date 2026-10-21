@@ -416,18 +416,19 @@ def test_the_bridge_gate_helper_drops_a_stalled_task():
 
 
 def test_every_gate_asks_the_filtered_set():
-    """Six places let background work defer something: an idle teardown, a
-    deferred /model, its flush, the bg-all-done wakeup, the context trim and
-    bg-wait parking. A seventh reading the raw registry would re-pin the
-    session on a task proven to be doing nothing, so the count is pinned."""
+    """Seven places let background work defer something: an idle teardown, a
+    deferred /model, its flush, the bg-all-done wakeup, the context trim,
+    bg-wait parking and the CLI restart for a new compaction. An eighth
+    reading the raw registry would re-pin the session on a task proven to be
+    doing nothing, so the count is pinned."""
     import inspect
     import sdk_bridge
     src = inspect.getsource(sdk_bridge.SDKBridge)
     gates = [l for l in src.splitlines() if "_active_bg_tasks()" in l
              and "def " not in l]
 
-    assert len(gates) == 6, (
-        f"expected 6 gate sites through _active_bg_tasks(); found {len(gates)}"
+    assert len(gates) == 7, (
+        f"expected 7 gate sites through _active_bg_tasks(); found {len(gates)}"
     )
 
 def test_cpu_counts_the_children_doing_the_work():

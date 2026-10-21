@@ -113,14 +113,24 @@ def call_context_tokens(usage: dict[str, Any] | None) -> int:
     0 for a message no call produced (the CLI's own, which carry zeros).
 
     Not a ``ResultMessage``'s: the CLI adds every call of the turn into that
-    one, so it grows with the number of calls, not with the context.  It is
-    also the count the CLI compacts by.
+    one, so it grows with the number of calls, not with the context.  The
+    count the CLI compacts by starts from this one, and adds the call's
+    output and whatever has been appended since.
     """
     if not usage:
         return 0
     return (_get(usage, "input_tokens")
             + _get(usage, "cache_read_input_tokens")
             + _get(usage, "cache_creation_input_tokens"))
+
+
+def session_compaction(state: Any, config: Any) -> tuple[int, bool]:
+    """(threshold, on): a session's compaction.  What a launch or
+    ``/autocompact`` set on its *state* (``_compact_at``, ``_auto_compact``),
+    else its *config*'s defaults.  The one rule for what the CLI is started
+    with (``SDKBridge._compaction_env``) and what ``/autocompact`` reports."""
+    return (getattr(state, "_compact_at", config.compact_at),
+            getattr(state, "_auto_compact", config.auto_compact))
 
 
 def humanize_size(text: str) -> str:

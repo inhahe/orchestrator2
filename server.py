@@ -248,7 +248,7 @@ def own_compaction(st: Any) -> tuple[int | None, bool | None]:
     return getattr(st, "_compact_at", None), getattr(st, "_auto_compact", None)
 
 
-def _sync_session_compaction(sid: str, cfg: Config, st: Any) -> "asyncio.Task | None":
+def _sync_session_compaction(sid: str, cfg: Config, st: Any) -> None:
     """Session *sid* has become, or is about to become, *st*'s: merge what *st*
     has set with what the hub kept for *sid*, the State's winning, onto the
     State and into the record.  Once per id: the bridge reports an id on every
@@ -258,12 +258,11 @@ def _sync_session_compaction(sid: str, cfg: Config, st: Any) -> "asyncio.Task | 
     settings before it had an id (a new session, a trim's or /clear's new
     transcript, a /move's copy) has them kept under the id it gets.  The disk
     is read and written off the event loop; the State takes the kept values
-    when the read returns, except where something set them meanwhile.
-
-    Returns the task doing that on the loop, also kept on *st* for whoever
-    must wait for it; None where there is no loop, and it is done."""
+    when the read returns, except where something set them meanwhile.  On
+    the loop, the task doing it is kept on *st* (``_compaction_merge``) for
+    whoever must wait for it; with no loop, it is done on return."""
     if getattr(st, "_compaction_sid", None) == sid:
-        return None
+        return
     st._compaction_sid = sid
     own = own_compaction(st)
     config_dir = getattr(cfg, "config_dir", None)
@@ -299,19 +298,20 @@ def _sync_session_compaction(sid: str, cfg: Config, st: Any) -> "asyncio.Task | 
             log.warning("session %s: its kept compaction could not be merged",
                         sid[:8], exc_info=True)
 
-    task = loop.create_task(merge_off_the_loop())
-    st._compaction_merge = task
-    return task
+    st._compaction_merge = loop.create_task(merge_off_the_loop())
 
 
 async def _await_session_compaction(sid: str, cfg: Config, st: Any) -> None:
     """Every bridge's ``sync_compaction``: return once *st* holds what the hub
     kept for session *sid*, which its next CLI is about to resume.  The CLI
-    takes its compaction from its environment, when it starts.
+    takes its compaction from its environment, when it starts.  A merge
+    already under way for it (the CLI named the session just before) is
+    waited for too.
 
     Waits without cancelling the merge if the connect is cancelled: the
     merge's result is still the session's."""
-    task = _sync_session_compaction(sid, cfg, st) or getattr(st, "_compaction_merge", None)
+    _sync_session_compaction(sid, cfg, st)
+    task = getattr(st, "_compaction_merge", None)
     if task is not None and not task.done():
         await asyncio.wait({task})
 

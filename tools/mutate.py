@@ -6320,18 +6320,22 @@ COMPACTION_SERVER_MUTATIONS = [
      "        if getattr(st, \"_compaction_sid\", None) != sid or own_compaction(st) != own:\n",
      "        if getattr(st, \"session_id\", None) != sid or own_compaction(st) != own:\n"),
 
-    ("a merge already under way is not waited for",
-     "    task = _sync_session_compaction(sid, cfg, st) or getattr(st, \"_compaction_merge\", None)\n",
-     "    task = _sync_session_compaction(sid, cfg, st)\n"),
+    ("the merge is not waited for before the CLI starts",
+     "    task = getattr(st, \"_compaction_merge\", None)\n",
+     "    task = None\n"),
 ]
 
 # The CLI compacts, at the session's threshold, which it reads from its
-# environment when it starts (2026-10-21: orchestrator2's own compaction ran
-# on a count that was the sum of a turn's API calls).
+# environment when it starts; a change restarts it only when the session is
+# quiet; the count shown is the latest main-thread call's.
 # tests/test_cli_compaction.py; design.md, "The CLI does the compacting".
 COMPACTION_CONFIG_MUTATIONS = [
     ("auto-compact off still sets the threshold",
      "    if not auto_compact:\n        return {}\n",
+     ""),
+
+    ("an inherited DISABLE_AUTO_COMPACT silently turns it off",
+     "    env.update(dict.fromkeys(CLI_COMPACTION_DISABLERS, \"\"))\n",
      ""),
 
     ("a window outside what the CLI accepts",
@@ -6349,21 +6353,25 @@ COMPACTION_CONFIG_MUTATIONS = [
 
 COMPACTION_BRIDGE_MUTATIONS = [
     ("the CLI is not given the session's threshold",
-     "        kwargs[\"env\"].update(self._compaction_env())\n",
+     "        kwargs[\"env\"].update(self._cli_compaction_env)\n",
      ""),
 
     ("a threshold the hub inherited reaches a session without one",
      "        for var in CLI_COMPACTION_VARS:\n            os.environ.pop(var, None)\n",
      ""),
 
+    ("a settings file can silently turn the session's auto-compact off",
+     "            kwargs[\"settings\"] = json.dumps({\"autoCompactEnabled\": True})\n",
+     "            pass\n"),
+
     ("the CLI starts before the session's kept threshold is known",
      "        if target and self.sync_compaction is not None:\n",
      "        if False:\n"),
 
     ("what the CLI started with is not recorded",
-     "        self._cli_compaction_env = {\n"
-     "            k: v for k, v in options.env.items() if k in CLI_COMPACTION_VARS}\n",
-     "        self._cli_compaction_env = {}\n"),
+     "        self._cli_compaction_env = self._compaction_env()\n"
+     "        kwargs[\"env\"].update(self._cli_compaction_env)\n",
+     "        kwargs[\"env\"].update(self._compaction_env())\n"),
 
     ("an unchanged threshold restarts the CLI",
      "        return (self._cli_compaction_env is not None\n"
@@ -6374,24 +6382,65 @@ COMPACTION_BRIDGE_MUTATIONS = [
      "        return (self._cli_compaction_env is not None\n                and ",
      "        return (True\n                and "),
 
-    ("a change made during a turn is not applied",
-     "                if self._compaction_changed():\n                    reconnect_needed = True\n",
-     "                if False:\n                    reconnect_needed = True\n"),
+    ("a change made during a turn is not applied after it",
+     "        await self._apply_compaction_if_quiet(asked=compaction_asked)\n",
+     ""),
 
     ("a change made while idle is not applied",
-     "            if self._compaction_changed():\n"
-     "                await self._reconnect_or_defer(self._compaction_label())\n",
-     "            if False:\n"
-     "                await self._reconnect_or_defer(self._compaction_label())\n"),
+     "                if await self._apply_compaction_if_quiet(asked=True):\n",
+     "                if False:\n"),
 
-    ("a change restarts the CLI under running background tasks",
-     "                await self._reconnect_or_defer(self._compaction_label())\n",
-     "                await self.reconnect()\n"),
+    ("a compaction event sends a queued prompt into a ghost turn",
+     "                if await self._apply_compaction_if_quiet(asked=True):\n"
+     "                    prompt = await self._pop_queued_prompt()\n",
+     "                await self._apply_compaction_if_quiet(asked=True)\n"
+     "                if True:\n"
+     "                    prompt = await self._pop_queued_prompt()\n"),
+
+    ("a change restarts the CLI under running work",
+     "        if (self._active_bg_tasks() or self.turn_active.is_set()\n"
+     "                or self.state.busy or self.state.connecting\n",
+     "        if (False\n"
+     "                or self.state.busy or self.state.connecting\n"),
+
+    ("a change cuts off a ghost turn",
+     "                or self.state.busy or self.state.connecting\n",
+     "                or self.state.connecting\n"),
+
+    ("a change cuts off a turn the CLI has begun by itself",
+     "                or self._cli_state == \"running\"\n",
+     ""),
+
+    ("a change cuts off what the CLI does after compacting",
+     "                or self.state.pending_compact_turn_end is not None):\n",
+     "                or False):\n"),
+
+    ("a compaction-closed turn that ends does not wake the worker for it",
+     "        if self._compaction_changed():\n"
+     "            self.event_queue.put_nowait((\"wakeup\", \"compaction\"))\n",
+     "        if False:\n"
+     "            self.event_queue.put_nowait((\"wakeup\", \"compaction\"))\n"),
+
+    ("a waiting change is not applied when the tasks finish",
+     "                await self._apply_compaction_if_quiet()\n",
+     ""),
+
+    ("the end of a ghost turn does not wake the worker for it",
+     "        if self._compaction_changed():\n            try:\n"
+     "                self.event_queue.put_nowait((\"wakeup\", \"compaction\"))\n",
+     "        if False:\n            try:\n"
+     "                self.event_queue.put_nowait((\"wakeup\", \"compaction\"))\n"),
 
     ("the context is never counted",
-     "                if isinstance(msg, AssistantMessage):\n"
+     "                if isinstance(msg, (AssistantMessage, SystemMessage)):\n"
      "                    self._note_context(msg)\n",
      ""),
+
+    ("a compaction leaves the old count standing",
+     "            if msg.subtype == \"compact_boundary\":\n"
+     "                self.state.context_tokens = 0\n",
+     "            if False:\n"
+     "                self.state.context_tokens = 0\n"),
 
     ("the calls of a turn are added up again",
      "            self.state.context_tokens = tokens\n",
