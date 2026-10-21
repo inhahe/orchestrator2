@@ -146,3 +146,12 @@ def hub_answers(monkeypatch):
                             lambda req, timeout=None: _Resp())
 
     return answer_with
+
+
+@pytest.fixture
+def hub():
+    """A hub with one session, its default (``hubkit.one_session_hub``).
+    Some test files define a ``hub`` of their own, which takes precedence."""
+    import hubkit
+    with hubkit.one_session_hub() as rt:
+        yield rt

@@ -289,60 +289,20 @@ def test_the_picker_lists_whatever_the_api_returned(monkeypatch):
 # ---------------------------------------------------------------------------
 
 import asyncio                                   # noqa: E402
-import json                                      # noqa: E402
 import time                                      # noqa: E402
 
 import pytest                                    # noqa: E402
 
 import server                                    # noqa: E402
-from session_runtime import SessionRuntime       # noqa: E402
-
-
-class _FakeWS:
-    def __init__(self):
-        self.sent = []
-
-    async def send_text(self, data):
-        self.sent.append(json.loads(data))
-
-
-class _FakeBridge:
-    def __init__(self):
-        self.event_queue = asyncio.Queue()
-
-    async def flush_pending_turn_end(self):
-        pass
-
-    async def stop(self, **_kw):
-        pass
+from hubkit import FakeWS                         # noqa: E402
 
 
 @pytest.fixture
-def hub():
-    from config import parse_args
-    from state import State
-    cfg = parse_args([])
-    st = State()
-    rt = SessionRuntime(config=cfg, state=st, rid="R1")
-    rt.bridge = _FakeBridge()
-    saved = (dict(server.runtimes), server._default_runtime, server.config,
-             server.state, server.bridge, dict(server._ws_runtime))
-    server.runtimes.clear()
-    server.runtimes[rt.rid] = rt
-    server._default_runtime = rt
-    server.config = cfg
-    server.state = st
-    server.bridge = rt.bridge
+def hub(hub):
+    """The shared hub, with ``/model``'s refresh lock unmade: one made by an
+    earlier test is bound to that test's event loop."""
     server._model_refresh_lock = None
-    yield rt
-    server.runtimes.clear()
-    server.runtimes.update(saved[0])
-    server._default_runtime = saved[1]
-    server.config = saved[2]
-    server.state = saved[3]
-    server.bridge = saved[4]
-    server._ws_runtime.clear()
-    server._ws_runtime.update(saved[5])
+    return hub
 
 
 def _picker(ws):
@@ -397,7 +357,7 @@ def test_slash_model_fetches_before_answering(hub, monkeypatch):
         return config._model_cache
 
     monkeypatch.setattr(server, "fetch_available_models", fake_fetch)
-    ws = _FakeWS()
+    ws = FakeWS()
 
     asyncio.run(_slash_model(ws))
 
@@ -423,7 +383,7 @@ def test_a_model_released_mid_hour_shows_up(hub, monkeypatch):
         return config._model_cache
 
     monkeypatch.setattr(server, "fetch_available_models", fake_fetch)
-    ws = _FakeWS()
+    ws = FakeWS()
 
     asyncio.run(_slash_model(ws))
 
@@ -448,7 +408,7 @@ def test_a_failed_refresh_still_answers_from_the_cache(hub, monkeypatch, fetch):
     config._model_cache = [("claude-opus-5", "Opus 5")]
     config._model_cache_at = config.time.monotonic() - 1800
     monkeypatch.setattr(server, "fetch_available_models", fetch)
-    ws = _FakeWS()
+    ws = FakeWS()
 
     asyncio.run(_slash_model(ws))
 
@@ -479,7 +439,7 @@ def test_a_hanging_api_does_not_hang_the_command(hub, monkeypatch):
 
     monkeypatch.setattr(server, "fetch_available_models", fake_fetch)
     monkeypatch.setattr(server, "MODEL_SHOW_FETCH_BUDGET", 0.05)
-    ws = _FakeWS()
+    ws = FakeWS()
 
     async def go():
         started = time.monotonic()
@@ -512,8 +472,8 @@ def test_a_second_show_moments_later_does_not_refetch(hub, monkeypatch):
     monkeypatch.setattr(server, "fetch_available_models", fake_fetch)
 
     async def go():
-        await _slash_model(_FakeWS())
-        await _slash_model(_FakeWS())
+        await _slash_model(FakeWS())
+        await _slash_model(FakeWS())
 
     asyncio.run(go())
 
@@ -545,7 +505,7 @@ def test_concurrent_shows_share_one_fetch(hub, monkeypatch):
     monkeypatch.setattr(server, "fetch_available_models", fake_fetch)
 
     async def go():
-        await asyncio.gather(*(_slash_model(_FakeWS()) for _ in range(3)))
+        await asyncio.gather(*(_slash_model(FakeWS()) for _ in range(3)))
 
     asyncio.run(go())
 

@@ -13,60 +13,12 @@ import json
 import os
 import sys
 
-import pytest
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import auth                                      # noqa: E402
 import plan_usage                                # noqa: E402
 import server                                    # noqa: E402
-from session_runtime import SessionRuntime       # noqa: E402
-
-
-class _FakeWS:
-    def __init__(self):
-        self.sent = []
-
-    async def send_text(self, data):
-        self.sent.append(json.loads(data))
-
-
-class _FakeBridge:
-    def __init__(self):
-        self.event_queue = asyncio.Queue()
-
-    async def flush_pending_turn_end(self):
-        pass
-
-    async def stop(self, **_kw):
-        pass
-
-
-@pytest.fixture
-def hub():
-    from config import parse_args
-    from state import State
-    cfg = parse_args([])
-    st = State()
-    rt = SessionRuntime(config=cfg, state=st, rid="R1")
-    rt.bridge = _FakeBridge()
-    saved = (dict(server.runtimes), server._default_runtime, server.config,
-             server.state, server.bridge, dict(server._ws_runtime))
-    server.runtimes.clear()
-    server.runtimes[rt.rid] = rt
-    server._default_runtime = rt
-    server.config = cfg
-    server.state = st
-    server.bridge = rt.bridge
-    yield rt
-    server.runtimes.clear()
-    server.runtimes.update(saved[0])
-    server._default_runtime = saved[1]
-    server.config = saved[2]
-    server.state = saved[3]
-    server.bridge = saved[4]
-    server._ws_runtime.clear()
-    server._ws_runtime.update(saved[5])
+from hubkit import FakeWS                         # noqa: E402
 
 
 def _usage(ws):
@@ -83,7 +35,7 @@ def test_usage_for_a_key_session_explains_instead_of_fetching(hub, monkeypatch):
 
     monkeypatch.setattr(plan_usage, "usage_report", no_fetch)
     hub.state.api_key_source = "ANTHROPIC_API_KEY"
-    msgs = _usage(_FakeWS())
+    msgs = _usage(FakeWS())
     assert msgs[0] == {"loading": True}
     assert "API key (ANTHROPIC_API_KEY)" in msgs[1]["note"]
 
@@ -99,7 +51,7 @@ def test_usage_for_a_session_with_its_own_key_explains_before_any_turn(hub, monk
     monkeypatch.setattr(plan_usage, "usage_report", no_fetch)
     hub.config = dataclasses.replace(hub.config, api_key="sk-ant-api03-not-a-real-key")
     hub.state = init_state_from_config(hub.config)
-    msgs = _usage(_FakeWS())
+    msgs = _usage(FakeWS())
     assert "API key" in msgs[1]["note"]
 
 
@@ -107,7 +59,7 @@ def test_usage_for_a_subscription_session_still_fetches(hub, monkeypatch):
     monkeypatch.setattr(plan_usage, "usage_report",
                         lambda d: {"usage": {}, "account": {}})
     hub.state.api_key_source = "none"
-    msgs = _usage(_FakeWS())
+    msgs = _usage(FakeWS())
     assert "usage" in msgs[1] and "note" not in msgs[1]
 
 
@@ -189,7 +141,7 @@ def test_typing_login_console_watches_for_a_console_sign_in(hub, monkeypatch):
 
     monkeypatch.setattr(server, "_watch_login", watch)
     asyncio.run(server._handle_ws_message(
-        _FakeWS(), {"type": "message", "text": "/login console"}))
+        FakeWS(), {"type": "message", "text": "/login console"}))
     assert watched == ["console"]
 
 
