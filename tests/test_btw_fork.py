@@ -37,7 +37,6 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from btw import (                                          # noqa: E402
-    BTW_DISALLOWED_TOOLS,
     btw_prompt,
     build_btw_options,
     can_fork,

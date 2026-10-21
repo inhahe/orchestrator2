@@ -28,7 +28,6 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import config as config_mod  # noqa: E402
 from config import DEFAULT_BELL_EVENTS, parse_args, parse_bell_events  # noqa: E402
 from state import init_state_from_config, ring_bell  # noqa: E402
 

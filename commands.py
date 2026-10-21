@@ -22,14 +22,11 @@ from config import (
     get_known_models,
     model_cache_age,
     model_list_source,
-    parse_bell_events,
 )
 from state import (
     State,
     api_key_source_name,
     billed_to_api_key,
-    fmt_duration,
-    fmt_tok,
     session_compaction,
     state_to_status_dict,
 )
@@ -481,7 +478,6 @@ def _cmd_logout(_payload: str, _state: State, config: Config) -> CommandResult:
     try:
         subprocess.run([cli, "auth", "logout"], capture_output=True,
                        text=True, timeout=20, env=env)
-        ok = True
     except (OSError, subprocess.SubprocessError) as exc:
         return CommandResult(messages=[{
             "type": "system_msg", "subtype": "error",
@@ -527,7 +523,7 @@ def _cmd_history(payload: str, state: State, config: Config) -> CommandResult:
         return CommandResult(messages=[_msg(f"Session {sid[:8]} not found on disk.", level="error")])
     jsonl = session_dir / f"{sid}.jsonl"
     if not jsonl.exists():
-        return CommandResult(messages=[_msg(f"Session file not found.", level="error")])
+        return CommandResult(messages=[_msg("Session file not found.", level="error")])
 
     # Parse optional record limit.
     limit = 2000

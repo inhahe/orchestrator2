@@ -12,7 +12,6 @@ import logging
 import math
 import os
 import re
-import sys
 import time
 
 import bg_stall

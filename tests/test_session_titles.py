@@ -21,7 +21,6 @@ failed or wrote to the wrong place, and the lobby showed stale AI summaries.
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 

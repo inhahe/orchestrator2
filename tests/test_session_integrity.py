@@ -394,7 +394,6 @@ def test_an_empty_file_does_not_explode(tmp_path):
 # --------------------------------------------------------------------------
 
 def _bridge():
-    import asyncio  # noqa: F401
     from config import parse_args
     from sdk_bridge import SDKBridge
     from state import init_state_from_config

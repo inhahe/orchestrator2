@@ -36,7 +36,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import session as sess_mod                                   # noqa: E402
 from session import (                                        # noqa: E402
-    QUEUE_MAX_AGE_S,
     load_persisted_queue,
     queue_file_for_cwd,
     save_persisted_queue,

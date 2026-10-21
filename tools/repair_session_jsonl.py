@@ -562,7 +562,7 @@ def run_relink(path: Path, apply: bool, backup_dir: Path) -> int:
         tmp.unlink(missing_ok=True)
         return 1
     os.replace(tmp, path)
-    print(f"  verified; replaced.")
+    print("  verified; replaced.")
     print(f"  CLI now resumes at {result['leaf'][:8]} with a chain of "
           f"{result['chain_after']:,} records "
           f"(was {plan['chain_before']:,}), rooted at the "

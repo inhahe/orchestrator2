@@ -9,7 +9,6 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from config import SHORT_OUTPUT_TOOLS
 from state import State, fmt_duration, humanize_size
 
 

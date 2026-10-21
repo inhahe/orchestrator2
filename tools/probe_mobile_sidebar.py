@@ -84,7 +84,6 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
-    html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
     # Serve from a file:// dir so the /static/ links resolve.
     with sync_playwright() as pw:
         browser = pw.chromium.launch()

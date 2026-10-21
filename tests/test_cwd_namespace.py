@@ -113,7 +113,6 @@ def _fake_probe(monkeypatch, whoami: dict):
     """Make ``_probe_hub`` see a hub returning *whoami*, without a real server."""
     import io
     import json as _json
-    import socket as _s
 
     class _Sock:
         def settimeout(self, *_a): pass

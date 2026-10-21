@@ -5413,7 +5413,6 @@ class SDKBridge:
         Returns ``(assistant_text, was_interrupted)``.
         """
         state = self.state
-        config = self.config
 
         # Whatever streams from here on was asked for.
         self._unprompted_resume_pending = False
@@ -7330,10 +7329,8 @@ class SDKBridge:
         state.current_turn_bg.clear()
         state.next_bg_seq = 1
         self._initial_resume_id = None
-        # Reconnect without resume/continue.
-        # Temporarily override config behavior.
-        original_no_continue = self.config.no_continue
-        # Since Config is frozen, we use a flag.
+        # Reconnect to a new session, not this one or the most recent: Config
+        # is frozen, so a flag says so for the length of the connect.
         self._force_no_continue = True
         await self.connect()
         self._force_no_continue = False

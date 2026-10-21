@@ -66,7 +66,7 @@ import webbrowser
 # paying the runtime import cost.
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # pragma: no cover
-    from fastapi import Request, WebSocket, WebSocketDisconnect  # noqa: F401
+    from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect  # noqa: F401
     from fastapi.responses import (  # noqa: F401
         FileResponse, HTMLResponse, RedirectResponse, Response,
     )
@@ -86,7 +86,6 @@ from config import (
     WAKEUP_MAX_DELAY,
     WAKEUP_MIN_DELAY,
     Config,
-    DEFAULT_PORT,
     MODEL_CACHE_TTL,
     _PICKER_SENTINEL,
     default_compact_at,
@@ -1707,7 +1706,7 @@ def _seed_primary_session(cfg: Config) -> tuple[Config, str | None, str | None]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start background tasks on startup, clean up on shutdown."""
-    global config, state, bridge, theme, _ticker_task, _model_task, _picker_mode
+    global config, state, theme, _ticker_task, _model_task, _picker_mode
     global _default_runtime
 
     # --- Startup ---

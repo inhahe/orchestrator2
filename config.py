@@ -77,12 +77,6 @@ WAKEUP_RESOLVED_PROMPT = (
     "ScheduleWakeup again at the end of this turn."
 )
 
-# Tools whose output is typically short and can be shown inline without
-# drowning the user's scrollback.
-SHORT_OUTPUT_TOOLS = frozenset({
-    "Edit", "Write", "NotebookEdit", "TodoWrite", "KillShell",
-})
-
 # All recognised slash commands — used for frontend tab-completion.
 SLASH_COMMANDS = [
     "/help", "/history", "/status", "/debug", "/cost", "/usage", "/cwd", "/clear", "/cls",

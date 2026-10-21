@@ -58,7 +58,6 @@ import sys
 from contextlib import suppress
 
 import anyio
-import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

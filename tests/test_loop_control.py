@@ -39,10 +39,8 @@ it is.
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest

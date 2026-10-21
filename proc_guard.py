@@ -53,7 +53,7 @@ import ctypes
 import logging
 import os
 import sys
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 log = logging.getLogger(__name__)
 

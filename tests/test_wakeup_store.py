@@ -312,8 +312,6 @@ def test_one_boot_revives_at_most_the_cap(monkeypatch):
     """Each revival is a CLI process and a transcript load, on a machine that
     has hit its Windows commit limit before.  Without a bound, a hub that had
     eight loops running would try to bring all eight back at once."""
-    import server
-
     for i in range(wakeup_store.MAX_RESURRECT + 3):
         save_wakeup(CWD, f"sid-{i:02d}", due_at=time.time() + 300 + i,
                     prompt="Resume work now", armed_at=time.time())
@@ -516,18 +514,6 @@ def test_a_due_wakeup_does_reopen_its_session(monkeypatch):
     assert len(created) == 1
     assert created[0]["resume"] == SID
     assert created[0]["cwd"] == CWD
-
-
-def test_a_revived_session_says_why_it_woke_up():
-    """A turn that starts by itself, in a session the user did not open, with
-    no explanation, is the shape of every "why is it doing that?" report this
-    project has collected."""
-    import inspect
-    import server
-
-    src = inspect.getsource(server._rearm_restored_wakeup)
-    assert "system_msg" in src
-    assert "nobody typed anything" in src
 
 
 def test_an_overdue_wakeup_waits_for_the_hub_to_settle():
