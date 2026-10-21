@@ -1648,6 +1648,12 @@ def heal_tail_before_append(jsonl: Path) -> dict[str, int]:
     return removed
 
 
+#: One title write at a time.  ``/rename`` runs in a worker thread, so two can
+#: overlap; ``heal_tail_before_append`` may truncate the file, which would cut
+#: off a record the other had just appended.
+_title_write_lock = threading.Lock()
+
+
 def write_session_title(
     session_id: str, title: str, config_dir: str | None = None
 ) -> None:
@@ -1663,6 +1669,12 @@ def write_session_title(
     appending to the JSONL alone does not make a rename stick — see the long
     note above ``_RENAME_PIN_PATH``.
     """
+    with _title_write_lock:
+        _write_session_title(session_id, title, config_dir)
+
+
+def _write_session_title(session_id: str, title: str,
+                         config_dir: str | None) -> None:
     project = find_session_dir(session_id, config_dir)
     jsonl = (project / f"{session_id}.jsonl") if project is not None else None
     # Snapshot what the file says *before* we append.  That's the value the CLI

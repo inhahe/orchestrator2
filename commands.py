@@ -35,7 +35,6 @@ from state import (
 from session import (
     find_session_dir,
     read_session_title,
-    render_session_history,
     render_session_markdown,
     save_session_compaction_soon,
     write_session_title,
@@ -67,6 +66,11 @@ class CommandResult:
     # watches for its async completion, then refreshes the account info /
     # status bar.  Set by ``_cmd_login``.
     login_launched: str | None = None
+
+    # State attributes to set, and to what: how a handler that runs off the
+    # event loop (``_off_loop``) changes state, since it may not write it
+    # itself.  Applied on the loop once the handler has returned.
+    state_writes: dict[str, Any] = field(default_factory=dict)
 
 
 def _msg(text: str, *, level: str = "info") -> dict[str, Any]:
@@ -243,7 +247,6 @@ _IMMEDIATE_HANDLERS: dict[str, str] = {
     "recycle-show":    "_cmd_recycle_show",
     "bell":            "_cmd_bell",
     "queue":           "_cmd_queue",
-    "history":         "_cmd_history",
     "effort-show":     "_cmd_effort_show",
     "model-show":      "_cmd_model_show",
     "login":           "_cmd_login",
@@ -262,19 +265,10 @@ def try_immediate_command(
     Returns ``None`` if this is not an immediate command (should be
     queued for the SDK worker instead).
     """
-    handler_name = _IMMEDIATE_HANDLERS.get(kind)
-    if handler_name is None:
+    handler = _handler_for(kind)
+    if handler is None:
         return None
-    handler = globals()[handler_name]
-    return handler(payload, state, config)
-
-
-#: Commands whose handlers wait on a ``claude auth`` subprocess or read a whole
-#: transcript, for seconds on a large one.  Run on the event loop, they would
-#: stall every session on the hub meanwhile, so ``run_immediate_command`` runs
-#: them in a worker thread.  That is safe only because they read ``state`` and
-#: never write it: a handler added here must keep to that.
-OFF_LOOP_COMMANDS = frozenset({"history", "export", "login", "logout"})
+    return _apply_writes(handler(payload, state, config), state)
 
 
 async def run_immediate_command(
@@ -283,11 +277,45 @@ async def run_immediate_command(
     state: State,
     config: Config,
 ) -> CommandResult | None:
-    """``try_immediate_command``, with the slow handlers off the event loop."""
-    if kind in OFF_LOOP_COMMANDS:
-        return await asyncio.to_thread(try_immediate_command, kind, payload,
-                                       state, config)
-    return try_immediate_command(kind, payload, state, config)
+    """``try_immediate_command``, with the ``_off_loop`` handlers run in a
+    worker thread so the hub's other sessions keep running meanwhile."""
+    handler = _handler_for(kind)
+    if handler is None or not getattr(handler, "off_loop", False):
+        return try_immediate_command(kind, payload, state, config)
+    sid = state.session_id
+    result = await asyncio.to_thread(handler, payload, state, config)
+    if result is not None and sid is not None and state.session_id != sid:
+        # The session changed while it ran (a /clear or /resume from another
+        # tab): what it would change, or tell the CLI, was for the old one.
+        result.state_writes = {}
+        result.forward_to_sdk = False
+        result.forward_payload = None
+    return _apply_writes(result, state)
+
+
+def _handler_for(kind: str):
+    """The handler of immediate command *kind*, or None if it is not one."""
+    name = _IMMEDIATE_HANDLERS.get(kind)
+    return None if name is None else globals()[name]
+
+
+def _apply_writes(result: CommandResult | None,
+                  state: State) -> CommandResult | None:
+    """Make *result*'s ``state_writes``; returns *result*."""
+    if result is not None:
+        for name, value in result.state_writes.items():
+            setattr(state, name, value)
+    return result
+
+
+def _off_loop(handler):
+    """Mark *handler* as one that waits on I/O: a ``claude auth`` subprocess,
+    or a scan of a whole transcript, seconds on a large one.  On the event
+    loop it would stall every session on the hub meanwhile, so
+    ``run_immediate_command`` runs it in a worker thread.  It may read state
+    but never write it: what it changes goes in its ``state_writes``."""
+    handler.off_loop = True
+    return handler
 
 
 def get_command_completions() -> list[str]:
@@ -415,6 +443,7 @@ _LOGIN_FORCE_WORDS = frozenset({"force", "relogin", "-f", "--force"})
 _LOGIN_CONSOLE_WORDS = frozenset({"console", "--console", "api"})
 
 
+@_off_loop
 def _cmd_login(payload: str, state: State, config: Config) -> CommandResult:
     """Show login status, and start a Claude login flow when needed.
 
@@ -480,13 +509,14 @@ def _cmd_login(payload: str, state: State, config: Config) -> CommandResult:
                 "here, then run /connect." if ok else "")},
         }],
         # Tell the caller to watch for the async browser-OAuth completion and
-        # then refresh the account info / status bar.  The caller also clears
-        # state.auth_error on seeing it: this handler runs off the event loop
-        # (OFF_LOOP_COMMANDS), so it must not write state itself.
+        # then refresh the account info / status bar.
         login_launched=method if ok else None,
+        # Optimistic: a fresh 401 sets it again.
+        state_writes={"auth_error": False} if ok else {},
     )
 
 
+@_off_loop
 def _cmd_logout(_payload: str, _state: State, config: Config) -> CommandResult:
     """Sign this runtime's account out of Claude (scoped to its config dir)."""
     cli = auth.find_claude_cli()
@@ -530,47 +560,6 @@ def _cmd_clear_screen(_payload: str, _state: State, _config: Config) -> CommandR
     return CommandResult(messages=[{"type": "clear_screen"}])
 
 
-def _cmd_history(payload: str, state: State, config: Config) -> CommandResult:
-    sid = state.session_id
-    if not sid:
-        return CommandResult(messages=[_msg("No active session.", level="warning")])
-    # Scope the lookup to *this* session's account — a cross-account hub runtime
-    # stores its session under its own CLAUDE_CONFIG_DIR, which is not the hub
-    # process's env account.  Without this the file is searched in the wrong
-    # projects tree and reported "not found on disk".
-    cfg_dir = getattr(config, "config_dir", None)
-    session_dir = find_session_dir(sid, cfg_dir)
-    if session_dir is None:
-        return CommandResult(messages=[_msg(f"Session {sid[:8]} not found on disk.", level="error")])
-    jsonl = session_dir / f"{sid}.jsonl"
-    if not jsonl.exists():
-        return CommandResult(messages=[_msg("Session file not found.", level="error")])
-
-    # Parse optional record limit.
-    limit = 2000
-    p = payload.strip()
-    if p:
-        try:
-            limit = int(p)
-        except ValueError:
-            return CommandResult(messages=[_msg("Usage: /history [N]", level="error")])
-        if limit <= 0:
-            return CommandResult(messages=[_msg("N must be positive.", level="error")])
-
-    try:
-        _count, history_msgs, _orphans, _todos = render_session_history(
-            jsonl, max_history=limit)
-    except Exception as e:
-        return CommandResult(messages=[_msg(f"History load failed: {e}", level="error")])
-
-    msgs: list[dict[str, Any]] = [{"type": "clear_screen"}]
-    if history_msgs:
-        msgs.append({"type": "history", "messages": history_msgs})
-    else:
-        msgs.append(_msg("No history to display."))
-    return CommandResult(messages=msgs)
-
-
 def _title_only(title: str, agent_name: str, what: str) -> str:
     """The /rename reply for a session that has an explicit name."""
     return (f"'{title}' {what}.  Other sessions still address it as "
@@ -578,7 +567,10 @@ def _title_only(title: str, agent_name: str, what: str) -> str:
             f"/rename changes only the title.")
 
 
+@_off_loop
 def _cmd_rename(payload: str, state: State, config: Config) -> CommandResult:
+    """Show or set the session's title.  Off the loop: reading or writing a
+    title scans the transcript the first time it is seen."""
     sid = state.session_id
     cfg_dir = getattr(config, "config_dir", None)
     new_title = payload.strip()
@@ -593,13 +585,13 @@ def _cmd_rename(payload: str, state: State, config: Config) -> CommandResult:
     if not sid:
         # No session yet — stash the title and apply it once the
         # session_id arrives (handled in sdk_bridge init).
-        state.pending_rename = new_title
-        state.session_title = new_title
+        stash = {"pending_rename": new_title, "session_title": new_title}
         if state.agent_name:
             return CommandResult(
                 messages=[_msg(_title_only(new_title, state.agent_name,
                                            "will be applied when the session starts"))],
                 state_updates={"session_title": new_title},
+                state_writes=stash,
             )
         # Forwarded all the same: the CLI is usually already running, and its
         # own /rename as the first thing it is sent names it and starts the
@@ -612,14 +604,14 @@ def _cmd_rename(payload: str, state: State, config: Config) -> CommandResult:
             state_updates={"session_title": new_title},
             forward_to_sdk=True,
             forward_payload=f"/rename {new_title}",
+            state_writes=stash,
         )
     try:
         write_session_title(sid, new_title, cfg_dir)
     except (OSError, ValueError) as e:
         return CommandResult(messages=[_msg(f"Rename failed: {e}", level="error")])
-    state.session_title = new_title
-    state.human_title = new_title
-    state.human_title_sid = sid
+    titled = {"session_title": new_title, "human_title": new_title,
+              "human_title_sid": sid}
     if state.agent_name:
         # A session with an explicit name keeps it: that name is its identity
         # in both registries, and handing the CLI this /rename would put the
@@ -628,6 +620,7 @@ def _cmd_rename(payload: str, state: State, config: Config) -> CommandResult:
             messages=[_msg(_title_only(new_title, state.agent_name,
                                        f"is now the title of session {sid[:8]}"))],
             state_updates={"session_title": new_title},
+            state_writes=titled,
         )
     # **And tell the CLI.**  A title written to the transcript is only a title:
     # the name other Claude sessions address this one by (``ListAgents``,
@@ -645,9 +638,11 @@ def _cmd_rename(payload: str, state: State, config: Config) -> CommandResult:
         state_updates={"session_title": new_title},
         forward_to_sdk=True,
         forward_payload=f"/rename {new_title}",
+        state_writes=titled,
     )
 
 
+@_off_loop
 def _cmd_export(payload: str, state: State, config: Config) -> CommandResult:
     sid = state.session_id
     if not sid:

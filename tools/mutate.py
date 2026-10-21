@@ -2862,23 +2862,26 @@ SESSIONNAME_CMD_MUTATIONS = [
     ("/rename sets only the title; the live CLI is never told",
      "        forward_to_sdk=True,\n"
      '        forward_payload=f"/rename {new_title}",\n'
-     "    )\n\n\ndef _cmd_export",
-     "    )\n\n\ndef _cmd_export"),
+     "        state_writes=titled,\n    )\n",
+     "        state_writes=titled,\n    )\n"),
 
     ("/rename before the first turn is not handed to the CLI already running",
      "            forward_to_sdk=True,\n"
      '            forward_payload=f"/rename {new_title}",\n'
-     "        )\n    try:\n",
-     "        )\n    try:\n"),
+     "            state_writes=stash,\n        )\n    try:\n",
+     "            state_writes=stash,\n        )\n    try:\n"),
 
     ("the new title is not recorded as the name, so the next reconnect drops it",
-     "    state.human_title = new_title\n    state.human_title_sid = sid\n",
-     "    state.human_title_sid = sid\n"),
+     '    titled = {"session_title": new_title, "human_title": new_title,\n'
+     '              "human_title_sid": sid}\n',
+     '    titled = {"session_title": new_title,\n'
+     '              "human_title_sid": sid}\n'),
 
     ("the new title is not tied to its session, so the next reconnect re-reads "
      "the transcript over it",
-     "    state.human_title = new_title\n    state.human_title_sid = sid\n",
-     "    state.human_title = new_title\n"),
+     '    titled = {"session_title": new_title, "human_title": new_title,\n'
+     '              "human_title_sid": sid}\n',
+     '    titled = {"session_title": new_title, "human_title": new_title}\n'),
 
     ("a rename during a turn claims to have taken effect already",
      '    when = " once the current turn ends" if state.busy else ""',
@@ -7484,27 +7487,49 @@ LAUNCHLOG_SERVER_MUTATIONS = [
 ]
 
 
-# Slow slash commands off the event loop, and /logout's exit status
-# (tests/test_off_loop_commands.py).
+# Slow slash commands off the event loop, /history drawn behind the loading
+# hold, and /logout's exit status (tests/test_off_loop_commands.py).
 OFFLOOP_CMD_MUTATIONS = [
     ("the slow commands run on the event loop again, so one transcript read "
      "stalls every session on the hub",
-     "    if kind in OFF_LOOP_COMMANDS:\n",
-     "    if False:\n"),
+     '    if handler is None or not getattr(handler, "off_loop", False):\n',
+     "    if True:\n"),
 
     ("every command runs in a worker thread, the ones that write state "
      "included",
-     "    if kind in OFF_LOOP_COMMANDS:\n",
-     "    if True:\n"),
+     '    if handler is None or not getattr(handler, "off_loop", False):\n',
+     "    if handler is None:\n"),
 
-    ("a misspelt name leaves its command on the loop",
-     '"login", "logout"})',
-     '"login", "logout", "histroy"})'),
+    ("/rename is left on the loop",
+     "@_off_loop\ndef _cmd_rename(",
+     "def _cmd_rename("),
 
-    ("/login clears the expired-login flag itself, from a worker thread",
+    ("what a slow command changes is never made",
+     "            setattr(state, name, value)\n",
+     "            pass\n"),
+
+    ("what was meant for a session that changed meanwhile is made anyway",
+     "    if result is not None and sid is not None and state.session_id != sid:\n",
+     "    if False:\n"),
+
+    ("a command run before its session started loses what it changes when "
+     "the session starts meanwhile",
+     "    if result is not None and sid is not None and state.session_id != sid:\n",
+     "    if result is not None and state.session_id != sid:\n"),
+
+    ("/rename writes its title from the worker thread",
+     '    titled = {"session_title": new_title, "human_title": new_title,\n',
+     "    state.session_title = new_title\n"
+     '    titled = {"session_title": new_title, "human_title": new_title,\n'),
+
+    ("/login clears the expired-login flag itself, from the worker thread",
      '    what = ""\n    if ok and method == "console":\n',
      '    if ok:\n        state.auth_error = False\n'
      '    what = ""\n    if ok and method == "console":\n'),
+
+    ("a sign-in that launched leaves the expired-login flag set",
+     '        state_writes={"auth_error": False} if ok else {},\n',
+     "        state_writes={},\n"),
 
     ("a failed logout says Signed out",
      "    if done.returncode != 0:\n",
@@ -7517,14 +7542,52 @@ OFFLOOP_CMD_MUTATIONS = [
 
 OFFLOOP_SERVER_MUTATIONS = [
     ("the hub runs the slow commands inline again",
-     "        result = await run_immediate_command(kind, payload, state, config)\n",
-     "        from commands import try_immediate_command\n"
-     "        result = try_immediate_command(kind, payload, state, config)\n"),
+     "            result = await run_immediate_command(kind, payload, state, config)\n",
+     "            from commands import try_immediate_command\n"
+     "            result = try_immediate_command(kind, payload, state, config)\n"),
 
-    ("a sign-in that launched leaves the expired-login flag set",
-     "                # Optimistic: a fresh 401 sets it again.\n"
-     "                state.auth_error = False\n",
-     ""),
+    ("/history reads before the tab holds its live view, which the "
+     "history's clear then wipes",
+     '    await send_to(ws, {"type": "session_loading", "on": True})\n'
+     "    cap = ",
+     "    cap = "),
+
+    ("/history reads the transcript on the event loop",
+     "            count, history_msgs, _orphans, todos = await asyncio.to_thread(\n"
+     "                functools.partial(render_session_history, jsonl, **cap))\n",
+     "            count, history_msgs, _orphans, todos = render_session_history(\n"
+     "                jsonl, **cap)\n"),
+
+    ("/history N shows the default number of records",
+     "    trouble = await _send_session_history(ws, state, jsonl, max_history=limit)\n",
+     "    trouble = await _send_session_history(ws, state, jsonl)\n"),
+
+    ("/history clears the screen before it knows there is a transcript",
+     "    jsonl = await _session_jsonl(state, rt.config)\n    if jsonl is None:\n",
+     '    await send_to(ws, {"type": "clear_screen"})\n'
+     "    jsonl = await _session_jsonl(state, rt.config)\n    if jsonl is None:\n"),
+
+    ("an empty history leaves the tab loading, holding everything after it",
+     '        await send_to(ws, {"type": "session_loading", "on": False})\n'
+     '        return "info", "No history to display."\n',
+     '        return "info", "No history to display."\n'),
+
+    ("an /export never waits its turn among the large reads",
+     '        if kind == "export":\n'
+     "            jsonl = await _session_jsonl(state, config)\n",
+     "        if False:\n"
+     "            jsonl = await _session_jsonl(state, config)\n"),
+
+    ("a large read never queues behind the others",
+     "            lock = _sb._heavy_lock()\n",
+     "            pass\n"),
+]
+
+OFFLOOP_SESSION_MUTATIONS = [
+    ("two title writes overlap, and one's tail heal can cut off the other's "
+     "record",
+     "    with _title_write_lock:\n        _write_session_title(",
+     "    if True:\n        _write_session_title("),
 ]
 
 
@@ -7777,6 +7840,8 @@ TARGETS = {
                 OFFLOOP_CMD_MUTATIONS, "pytest"),
     "offloop-server": ("server.py", "tests/test_off_loop_commands.py",
                        OFFLOOP_SERVER_MUTATIONS, "pytest"),
+    "offloop-session": ("session.py", "tests/test_off_loop_commands.py",
+                        OFFLOOP_SESSION_MUTATIONS, "pytest"),
     "holders": ("proc_guard.py", "tests/test_proc_guard.py",
                 HOLDERS_MUTATIONS, "pytest"),
     "sessionjob": ("proc_guard.py", "tests/test_session_job.py",

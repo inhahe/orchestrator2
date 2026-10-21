@@ -72,13 +72,19 @@ Three layers, deliberately separated:
   snapshot; nothing is lost.
 - **Immediate commands never touch the SDK, and never stall the loop.**
   `/help`, `/cls`, `/status` etc. are synchronous handlers, so they work
-  mid-turn. The few that wait on I/O are named in
-  `commands.OFF_LOOP_COMMANDS`: `/history` and `/export` read a whole
-  transcript, and `/login` and `/logout` run `claude auth`.
-  `run_immediate_command` runs those in a worker thread, so the other sessions
-  keep running meanwhile. They may read `state` but never write it: the one
-  write `/login` needs (clearing `auth_error` once a sign-in has launched) is
-  done by the hub, on the loop, when it sees `login_launched`.
+  mid-turn. The few that wait on I/O are marked `commands._off_loop`:
+  `/login` and `/logout` run `claude auth`, and `/export` and `/rename` can
+  read a whole transcript. `run_immediate_command` runs those in a worker
+  thread, so the other sessions keep running meanwhile. They may read `state`
+  but never write it. What they change comes back as the result's
+  `state_writes` and is made on the loop, and not at all if the session
+  changed while they ran (a `/clear` or `/resume` from another tab). Title
+  writes take a lock, since two `/rename`s can now overlap. An `/export` of a
+  large transcript queues with the other large reads (`_transcript_read_slot`).
+- **`/history` is drawn the way an attach draws it** (`server._send_session_history`):
+  `clear_screen`, then "loading session…", then the read in a thread. While
+  loading, the tab holds what the session says and draws it after the
+  history, so a live turn is neither drawn above the history nor wiped by it.
 - **The SDK connection is owned by the worker task.** `bridge.connect()`,
   `disconnect()` and `reconnect()` may only be called *from* `worker_loop`'s
   task. Anything else — a route handler, a timer, an `asyncio.create_task` —

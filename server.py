@@ -4964,6 +4964,145 @@ async def _handle_resume_after_limit(ws: WebSocket, bridge, payload: str) -> Non
                        "data": {"message": "usage: /resume-after-limit [on|off]"}})
 
 
+async def _session_jsonl(state: State, config: Config) -> Path | None:
+    """The transcript of *state*'s session, or None if it has none on disk.
+
+    Looked up under the session's own account (``config.config_dir``), so a
+    cross-account session's is found, and passed explicitly rather than
+    through the environment, which the worker thread shares.
+    """
+    sid = state.session_id
+    if not sid:
+        return None
+    found = await asyncio.to_thread(find_session_dir, sid,
+                                    getattr(config, "config_dir", None))
+    jsonl = found / f"{sid}.jsonl" if found is not None else None
+    return jsonl if jsonl is not None and jsonl.exists() else None
+
+
+def _transcript_read_slot(jsonl: Path, sid: str | None):
+    """What a read of all of *jsonl* waits its turn on: the lock the CLI's
+    resume reads take (``sdk_bridge._heavy_lock``) when the file is large,
+    else nothing, so the ordinary case never waits.
+
+    Large transcripts read at once thrash the disk: on a three-session
+    launch, six readers moving ~4 GB together stretched a 5 s attach to 42 s.
+    """
+    lock = None
+    try:
+        # Imported here, not at module scope: sdk_bridge pulls in the Agent
+        # SDK (and mcp), which the deferred-startup design keeps off the
+        # ``import server`` path.  A transcript is read only once a bridge
+        # runs, so by then this is a sys.modules hit.
+        import sdk_bridge as _sb
+        if jsonl.stat().st_size >= _sb.HEAVY_CONNECT_BYTES:
+            lock = _sb._heavy_lock()
+    except (OSError, ImportError):
+        pass
+    if lock is None:
+        return contextlib.nullcontext()
+    if lock.locked():
+        log.info("[history] waiting for a large session read to finish "
+                 "before reading %s", sid)
+    return lock
+
+
+async def _send_session_history(ws: WebSocket, state: State, jsonl: Path, *,
+                                max_history: int | None = None,
+                                ) -> tuple[str, str] | None:
+    """Send *ws* the history in *jsonl*, the transcript of *state*'s session.
+
+    "loading session…" goes first.  Besides keeping the tab from looking
+    blank while a large transcript is read, it makes the tab hold the live
+    messages that arrive meanwhile until the history is drawn (chat.js
+    ``handleMessage``), so none is drawn above the history or wiped by it.
+    The read runs in a thread, behind ``_transcript_read_slot``.
+
+    *max_history* caps the records rendered; None leaves
+    ``render_session_history``'s default.  Returns None once history has
+    been sent, else the system message subtype and text that say why none
+    was; loading is turned off then.
+    """
+    sid = state.session_id
+    await send_to(ws, {"type": "session_loading", "on": True})
+    cap = {} if max_history is None else {"max_history": max_history}
+    try:
+        async with _transcript_read_slot(jsonl, sid):
+            count, history_msgs, _orphans, todos = await asyncio.to_thread(
+                functools.partial(render_session_history, jsonl, **cap))
+    except Exception as exc:
+        log.warning("[history] failed to load history for %s: %s",
+                    sid, exc, exc_info=True)
+        await send_to(ws, {"type": "session_loading", "on": False})
+        return "error", f"History load failed: {exc}"
+    # Seed the plan panel from the transcript.  ``current_todos`` is
+    # otherwise written only by a *live* TodoWrite, so after a restart the
+    # panel sat empty until the agent happened to rewrite its list, though
+    # the CLI had rebuilt its own todo state from this same transcript.
+    # Don't clobber a list a live TodoWrite has already provided.
+    if todos and not state.current_todos:
+        state.current_todos = todos
+        log.info("[history] seeded %d todo(s) for %s", len(todos), sid)
+    log.info("[history] rendered %d msgs (%d records) for %s",
+             len(history_msgs), count, sid)
+    if not history_msgs:
+        await send_to(ws, {"type": "session_loading", "on": False})
+        return "info", "No history to display."
+    # Newest first, older backfilled above.  Reading the transcript is only
+    # half the wait: building a thousand-odd DOM nodes takes real time too.
+    # Only the last screenful is worth anything at that moment, so it goes
+    # on its own and the rest arrives behind it.
+    tail = history_msgs[-HISTORY_FIRST_SLICE:]
+    head = history_msgs[:-len(tail)]
+    await send_to(ws, {"type": "history", "messages": tail,
+                       "more_above": len(head)})
+    if head:
+        await send_to(ws, {"type": "history_prepend", "messages": head})
+    log.info("[history] sent %d history messages for %s "
+             "(%d immediate, %d backfilled)",
+             len(history_msgs), sid, len(tail), len(head))
+    return None
+
+
+async def _handle_history(ws: WebSocket, rt: SessionRuntime,
+                          payload: str) -> None:
+    """``/history [N]``: redraw the session from its transcript, its last N
+    records (``render_session_history``'s default without N).
+
+    Drawn the way an attach draws it (``_send_session_history``), so what
+    the session says while a large transcript is read is drawn after the
+    history rather than wiped by it.
+    """
+    async def say(text: str, level: str) -> None:
+        await send_to(ws, {"type": "system_msg", "subtype": level,
+                           "data": {"message": text}})
+
+    limit = None
+    arg = payload.strip()
+    if arg:
+        try:
+            limit = int(arg)
+        except ValueError:
+            await say("Usage: /history [N]", "error")
+            return
+        if limit <= 0:
+            await say("N must be positive.", "error")
+            return
+    state = rt.state
+    if not state.session_id:
+        await say("No active session.", "warning")
+        return
+    jsonl = await _session_jsonl(state, rt.config)
+    if jsonl is None:
+        await say(f"Session {state.session_id[:8]} not found on disk.", "error")
+        return
+    await send_to(ws, {"type": "clear_screen"})
+    trouble = await _send_session_history(ws, state, jsonl, max_history=limit)
+    if trouble is not None:
+        level, text = trouble
+        await say(text, level)
+
+
 async def _send_initial_state(ws: WebSocket) -> None:
     """Send session history, status, panels, and completions on attach.
 
@@ -5009,104 +5148,17 @@ async def _send_initial_state(ws: WebSocket) -> None:
     await send_to(ws, {"type": "clear_screen"})
 
     # Session history (if this session continues an on-disk one).
-    # render_session_history does synchronous file I/O that can take seconds
-    # on large JSONL files (200+ MB), so run it in a thread to avoid blocking
-    # the event loop (which would stall the WebSocket and potentially cause
-    # the client to time out before the history arrives).
     if state.session_id:
         log.info("[history] loading for session_id=%s rt=%s",
                  state.session_id, rt.rid)
-        # Show an immediate "loading session…" placeholder so the freshly
-        # opened tab isn't blank while the (possibly large) history renders.
-        # The frontend clears it automatically when the history replay lands;
-        # the branches below turn it off explicitly when no history is sent.
+        # At once, so the tab is not blank while the transcript is found.
         await send_to(ws, {"type": "session_loading", "on": True})
-        try:
-            loop = asyncio.get_running_loop()
-            # Scope the lookup to this session's account so a cross-account
-            # hub session's history is found under *its* config dir, not the
-            # hub's.  Passed explicitly (not via env) to stay thread-safe.
-            _cfg_dir = getattr(config, "config_dir", None)
-            session_dir = await loop.run_in_executor(
-                None, find_session_dir, state.session_id, _cfg_dir,
-            )
-            log.info("[history] find_session_dir → %s", session_dir)
-            if session_dir:
-                jsonl = session_dir / f"{state.session_id}.jsonl"
-                # Take a turn in the same queue the CLI resume reads use.
-                # Both read the *same* transcript, and they used to do it
-                # concurrently: on a three-session launch that meant six
-                # readers moving ~4 GB at once, which stretched a 5 s attach
-                # to 42 s.  Serialising costs a little waiting and saves a lot
-                # of thrashing.  Small sessions skip the lock entirely, so the
-                # ordinary case is unaffected.
-                # Imported here, not at module scope: sdk_bridge pulls in the
-                # Agent SDK (and mcp), which the deferred-startup design keeps
-                # off the ``import server`` path.  By now the bridge is running,
-                # so this is a sys.modules hit.
-                _hist_lock = None
-                try:
-                    import sdk_bridge as _sb
-                    if jsonl.stat().st_size >= _sb.HEAVY_CONNECT_BYTES:
-                        _hist_lock = _sb._heavy_lock()
-                except (OSError, ImportError):
-                    pass
-                if _hist_lock is not None and _hist_lock.locked():
-                    log.info("[history] waiting for a large session read to "
-                             "finish before loading %s", state.session_id)
-                async with contextlib.nullcontext() if _hist_lock is None else _hist_lock:
-                    _count, history_msgs, _orphans, _todos = await loop.run_in_executor(
-                        None, render_session_history, jsonl,
-                    )
-                # Seed the plan panel from the transcript.  ``current_todos``
-                # is otherwise written only by a *live* TodoWrite, so after a
-                # restart the panel sat empty until the agent happened to
-                # rewrite its list — even though the CLI had rebuilt its own
-                # todo state from this same transcript, so Claude still knew
-                # the plan and only the user's view of it was missing.
-                # Don't clobber a list a live TodoWrite has already provided.
-                if _todos and not state.current_todos:
-                    state.current_todos = _todos
-                    log.info("[history] seeded %d todo(s) for %s",
-                             len(_todos), state.session_id)
-                log.info("[history] rendered %d msgs (%d records) for %s",
-                         len(history_msgs), _count, state.session_id)
-                if history_msgs:
-                    # Newest first, older backfilled above.
-                    #
-                    # Reading the transcript is only half the wait: building a
-                    # thousand-odd DOM nodes takes real time too, and the user
-                    # is staring at an empty chat for all of it.  Only the last
-                    # screenful is worth anything at that moment, so send it on
-                    # its own and let the rest arrive behind it.
-                    tail = history_msgs[-HISTORY_FIRST_SLICE:]
-                    head = history_msgs[:-len(tail)] if tail else history_msgs
-                    await send_to(ws, {
-                        "type": "history",
-                        "messages": tail,
-                        "more_above": len(head),
-                    })
-                    if head:
-                        await send_to(ws, {
-                            "type": "history_prepend",
-                            "messages": head,
-                        })
-                    log.info("[history] sent %d history messages for %s "
-                             "(%d immediate, %d backfilled)",
-                             len(history_msgs), state.session_id,
-                             len(tail), len(head))
-                else:
-                    log.info("[history] no messages to send for %s",
-                             state.session_id)
-                    await send_to(ws, {"type": "session_loading", "on": False})
-            else:
-                log.warning("[history] session_dir not found for %s",
-                            state.session_id)
-                await send_to(ws, {"type": "session_loading", "on": False})
-        except Exception as exc:
-            log.warning("[history] failed to load history for %s: %s",
-                        state.session_id, exc, exc_info=True)
+        jsonl = await _session_jsonl(state, config)
+        log.info("[history] transcript: %s", jsonl)
+        if jsonl is None:
             await send_to(ws, {"type": "session_loading", "on": False})
+        else:
+            await _send_session_history(ws, state, jsonl)
     else:
         log.info("[history] no session_id on state (rt=%s)", rt.rid)
 
@@ -5912,6 +5964,10 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             await _handle_usage(ws, rt)
             return
 
+        if kind == "history":
+            await _handle_history(ws, rt, payload)
+            return
+
         # /apikey -- the session's own API key, in a Config only this module
         # can replace.
         if kind == "apikey":
@@ -5925,8 +5981,15 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
         if kind == "model-show":
             await _refresh_models_for_show()
 
-        # Try immediate command.
-        result = await run_immediate_command(kind, payload, state, config)
+        # Try immediate command.  An /export reads the whole transcript, so
+        # it takes its turn among the other large reads.
+        slot = contextlib.nullcontext()
+        if kind == "export":
+            jsonl = await _session_jsonl(state, config)
+            if jsonl is not None:
+                slot = _transcript_read_slot(jsonl, state.session_id)
+        async with slot:
+            result = await run_immediate_command(kind, payload, state, config)
         if result is not None:
             for m in result.messages:
                 await send_to(ws, m)
@@ -5945,8 +6008,6 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
                     # a prompt nobody has echoed yet.
                     await _enqueue_prompt(rt, result.forward_payload)
             if result.login_launched:
-                # Optimistic: a fresh 401 sets it again.
-                state.auth_error = False
                 # Browser OAuth completes asynchronously; watch for it, then
                 # refresh the account field / status bar for this runtime.
                 asyncio.create_task(_watch_login(rt, result.login_launched))
