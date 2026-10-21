@@ -94,6 +94,8 @@ project is from the old in-place sweep killed mid-mutation, and the source
 beside it may still be a mutant; a run refuses to start until it is dealt
 with.
 """
+import ast
+import importlib.util
 import os
 import shutil
 import stat
@@ -5740,6 +5742,22 @@ MUTATE_TOOL_MUTATIONS = [
     ("a leftover .mutbak is ignored, and a mutant is copied as the source",
      "    left = _left_mutated(ROOT)\n    if left:\n",
      "    left = _left_mutated(ROOT)\n    if False:\n"),
+
+    ("Python mutants are run unchecked, so a SyntaxError counts as a catch",
+     "            why = _fails_everywhere(mutant, src_rel, undefined) if py else None\n",
+     "            why = None\n"),
+
+    ("a mutant that does not parse is run like any other",
+     '        return f"mutant does not parse: {exc.msg}, line {exc.lineno}"\n',
+     "        return None\n"),
+
+    ("a mutant naming something undefined is run like any other",
+     "    return f\"mutant names undefined {', '.join(new)}\" if new else None\n",
+     "    return None\n"),
+
+    ("what the original leaves undefined is blamed on every mutant",
+     "    new = sorted((now or set()) - (undefined or set()))\n",
+     "    new = sorted(now or set())\n"),
 ]
 
 
@@ -6756,7 +6774,7 @@ SESSIONKEY_SERVER_MUTATIONS = [
 
     ("a detached child is not given the key its launch took",
      '        env["ANTHROPIC_API_KEY"] = cfg.api_key\n',
-     ""),
+     "        pass\n"),
 
     ("a launch with a key of its own is sent to a subscription sign-in",
      "    if api_key or auth.is_logged_in():\n",
@@ -6900,7 +6918,7 @@ SESSIONKEY_SERVER_MUTATIONS = [
 
     ("a new conversation loses its key across a restart",
      '        env["ANTHROPIC_API_KEY"] = launch_key\n',
-     ""),
+     "        pass\n"),
 
     ("a resumed primary's key goes as the launch key as well",
      "                  if state is not None and not sid else None)\n",
@@ -6950,11 +6968,12 @@ SESSIONKEY_SERVER_MUTATIONS = [
 
     ("/apikey off leaves the key remembered",
      "            _session_api_keys.pop(sid, None)\n",
-     ""),
+     "            pass\n"),
 
     ("/apikey off does not reconnect",
      '            rt.bridge.event_queue.put_nowait(("connect", ""))\n'
      '        text = ("This session no longer',
+     '            pass\n'
      '        text = ("This session no longer'),
 
     ("/apikey with a word it does not know drops the key",
@@ -7009,7 +7028,7 @@ SESSIONKEY_BRIDGE_MUTATIONS = [
 
     ("the id a new one replaces is not reported",
      "        if old and old != sid:\n            self._report_session_id(old)\n",
-     ""),
+     "        if old and old != sid:\n"),
 
     ("/clear does not report the id it drops",
      "        if state.session_id:\n            self._report_session_id(state.session_id)\n",
@@ -7130,7 +7149,8 @@ COST_SESSION_MUTATIONS = [
      "                if attempt == _COST_READ_TRIES - 1:\n"
      "                    raise\n"
      "                time.sleep(_COST_READ_WAIT_S)\n",
-     ""),
+     "            except PermissionError:\n"
+     "                raise\n"),
 
     ("a record being replaced is read as none, and saved over",
      "        except PermissionError:\n"
@@ -8067,6 +8087,38 @@ def _print_safely(text: str) -> None:
     print(text.encode(enc, "replace").decode(enc))
 
 
+def _undefined_names(text: str, filename: str) -> set[str] | None:
+    """The names Python source *text* uses but never defines, per pyflakes,
+    or None when pyflakes is not installed.  Raises SyntaxError when *text*
+    does not parse."""
+    tree = ast.parse(text, filename)
+    try:
+        from pyflakes import checker, messages
+    except ImportError:
+        return None
+    return {m.message_args[0]
+            for m in checker.Checker(tree, filename=filename).messages
+            if isinstance(m, messages.UndefinedName)}
+
+
+def _fails_everywhere(mutant: str, filename: str,
+                      undefined: set[str] | None) -> str | None:
+    """Why a Python mutant would fail every test that loads it, or None.
+
+    A mutant that does not parse, or that names something nothing defines,
+    fails wherever it runs rather than where it misbehaves, so its being
+    caught says nothing about the behaviour its name claims to break.
+    *undefined* is what the original already leaves undefined (None: not
+    checked, without pyflakes).
+    """
+    try:
+        now = _undefined_names(mutant, filename)
+    except SyntaxError as exc:
+        return f"mutant does not parse: {exc.msg}, line {exc.lineno}"
+    new = sorted((now or set()) - (undefined or set()))
+    return f"mutant names undefined {', '.join(new)}" if new else None
+
+
 def sweep(label: str, src_rel: str, test_rel: str, mutations,
           runner: str = "node", *, root: Path) -> list[str]:
     """Try each mutation of *src_rel* in the copy at *root*.
@@ -8081,6 +8133,8 @@ def sweep(label: str, src_rel: str, test_rel: str, mutations,
     crlf = b"\r\n" in raw
     # Anchors are written with \n, so match against the text the same way.
     original = raw.decode("utf-8").replace("\r\n", "\n")
+    py = src_rel.endswith(".py")
+    undefined = _undefined_names(original, src_rel) if py else None
 
     print(f"\n=== {label}: {src_rel} x {test_rel} ===")
     if not run(runner, test_rel, root, show_failure=True):
@@ -8096,6 +8150,11 @@ def sweep(label: str, src_rel: str, test_rel: str, mutations,
                 survivors.append(f"{label}: {name}  [anchor not unique]")
                 continue
             mutant = original.replace(old, new)
+            why = _fails_everywhere(mutant, src_rel, undefined) if py else None
+            if why:
+                print(f"{i:2}. SKIP ({why}) {name}")
+                survivors.append(f"{label}: {name}  [{why}]")
+                continue
             if crlf:
                 mutant = mutant.replace("\n", "\r\n")
             src.write_bytes(mutant.encode("utf-8"))
@@ -8124,6 +8183,10 @@ def main(argv: list[str]) -> int:
         print(f"unknown target(s): {', '.join(unknown)}")
         print(f"available: {', '.join(TARGETS)}")
         return 2
+    if importlib.util.find_spec("pyflakes") is None:
+        print("pyflakes is not installed, so a Python mutant that names "
+              "something undefined is run like any other and its NameError "
+              "counted as a catch:  pip install pyflakes")
     left = _left_mutated(ROOT)
     if left:
         print("A sweep from before 2026-10-02, which mutated files in place, "

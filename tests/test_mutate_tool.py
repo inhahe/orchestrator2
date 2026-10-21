@@ -381,6 +381,55 @@ def test_python_compiles_each_run_from_the_source(mutate, tmp_path, monkeypatch)
         "the run used the bytecode of the source before"
 
 
+# --- mutants that would fail wherever they ran -------------------------------------
+#
+# Their catch says nothing about what they claim to break: a SyntaxError or a
+# NameError fails every test that loads the file.  Found 2026-10-21 in eight of
+# the project's own: six did not parse, two called a name nothing defined.
+
+def _sweep_one(mutate, tmp_path, monkeypatch, mutation, *, src="calc.py",
+               text=None):
+    project = _project(tmp_path / "proj")
+    if text is not None:
+        (project / src).write_bytes(text.encode())
+    _target(mutate, monkeypatch, project, {
+        "one": (src, "tests/test_calc.py", [mutation], "pytest")})
+    seen = _recorder(mutate, monkeypatch, src)
+    mutate.main(["mutate.py"])
+    return seen
+
+
+def test_a_mutant_that_does_not_parse_is_not_run(mutate, tmp_path, monkeypatch,
+                                                 capsys):
+    seen = _sweep_one(mutate, tmp_path, monkeypatch,
+                      ("add is cut short", "    return a + b\n", "    return a +\n"))
+    out = capsys.readouterr().out
+    assert len(seen) == 1, "the mutant was run"
+    assert "survivor: one: add is cut short  [mutant does not parse" in out, out
+
+
+def test_a_mutant_naming_something_undefined_is_not_run(mutate, tmp_path,
+                                                        monkeypatch, capsys):
+    pytest.importorskip("pyflakes")
+    seen = _sweep_one(mutate, tmp_path, monkeypatch,
+                      ("add calls a helper", "    return a + b\n",
+                       "    return _no_such_helper(a, b)\n"))
+    out = capsys.readouterr().out
+    assert len(seen) == 1, "the mutant was run"
+    assert ("survivor: one: add calls a helper  "
+            "[mutant names undefined _no_such_helper]") in out, out
+
+
+def test_what_the_original_leaves_undefined_is_not_blamed_on_the_mutant(
+        mutate, tmp_path, monkeypatch):
+    # Real sources have them: a name a test or another module injects.
+    pytest.importorskip("pyflakes")
+    seen = _sweep_one(mutate, tmp_path, monkeypatch,
+                      ("the limit moves", "LIMIT = 10\n", "LIMIT = 11\n"),
+                      text=CALC + "\n\ndef late():\n    return injected_later\n")
+    assert len(seen) == 2, "the mutant was not run"
+
+
 def test_a_baseline_that_fails_says_why(mutate, tmp_path, monkeypatch, capsys):
     project = _project(tmp_path / "proj")
     (project / "calc.py").write_bytes(CALC.replace("LIMIT = 10", "LIMIT = 12").encode())
