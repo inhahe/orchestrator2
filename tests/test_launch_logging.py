@@ -19,7 +19,6 @@ its console has said so already.  The hub's side is in
 from __future__ import annotations
 
 import io
-import json
 import logging
 import os
 import sys
@@ -64,19 +63,45 @@ def test_a_launch_that_failed_is_in_the_log_file(log_file):
     assert "command line:" in text
 
 
-def test_so_is_one_that_failed_before_reading_its_flags(monkeypatch, tmp_path):
-    """argparse refuses the command line before main() has opened the log, so
-    the --log-file on that command line is opened for the one record."""
+def _no_log_file_yet(monkeypatch, argv):
     root = logging.getLogger()
     monkeypatch.setattr(root, "handlers", [
         h for h in root.handlers if not isinstance(h, logging.FileHandler)])
+    monkeypatch.setattr(sys, "argv", ["server.py", *argv])
+
+
+def test_so_is_one_that_failed_before_reading_its_flags(monkeypatch, tmp_path):
+    """argparse refuses the command line before main() has opened the log, so
+    the --log-file on that command line is opened for the one record."""
     path = tmp_path / "given.log"
-    monkeypatch.setattr(sys, "argv",
-                        ["server.py", "--log-file", str(path), "--noresume"])
+    _no_log_file_yet(monkeypatch, ["--log-file", str(path), "--noresume"])
 
     server._report_launch_failure("unrecognized arguments: --noresume")
 
     assert "unrecognized arguments: --noresume" in path.read_text(encoding="utf-8")
+
+
+def test_even_into_a_directory_not_made_yet(monkeypatch, tmp_path):
+    """As main() would have made it."""
+    path = tmp_path / "logs" / "new" / "o2.log"
+    _no_log_file_yet(monkeypatch, ["--log-file", str(path), "--noresume"])
+
+    server._report_launch_failure("unrecognized arguments: --noresume")
+
+    assert "--noresume" in path.read_text(encoding="utf-8")
+
+
+def test_a_flag_after_log_file_is_not_taken_for_its_path(monkeypatch, tmp_path):
+    """``--log-file --port 9000``: argparse refuses it for want of a path,
+    and so does this, rather than leaving a file called --port."""
+    work = tmp_path / "launched-from"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    _no_log_file_yet(monkeypatch, ["--log-file", "--port", "9000"])
+
+    server._report_launch_failure("argument --log-file: expected one argument")
+
+    assert list(work.iterdir()) == []
 
 
 def test_the_console_is_not_told_twice(log_file):
@@ -94,25 +119,8 @@ def test_the_console_is_not_told_twice(log_file):
     assert "launch: joined" in log_file.read_text(encoding="utf-8")
 
 
-def _hub_answers(monkeypatch, answer: dict) -> None:
-    import urllib.request
-
-    class _Resp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def read(self):
-            return json.dumps(answer).encode("utf-8")
-
-    monkeypatch.setattr(urllib.request, "urlopen",
-                        lambda req, timeout=None: _Resp())
-
-
-def test_a_launch_that_joined_the_hub_says_which_session(monkeypatch, log_file):
-    _hub_answers(monkeypatch, {"ok": True, "rid": "s12", "reused": True})
+def test_a_launch_that_joined_the_hub_says_which_session(hub_answers, log_file):
+    hub_answers({"ok": True, "rid": "s12", "reused": True})
 
     server._launch_into_hub(8420, cwd="C:\\os", resume=None, no_continue=False,
                             agent_name="Lane-A")

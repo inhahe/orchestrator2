@@ -1804,6 +1804,7 @@ async def _create_runtime(
     api_key: str | None = None,
     compact_at: int | None = None,
     auto_compact: bool | None = None,
+    seed_id: str | None = None,
 ) -> SessionRuntime:
     """Spin up a fresh live session runtime (config clone + state + bridge).
 
@@ -1835,6 +1836,10 @@ async def _create_runtime(
       ``--auto-compact``/``--no-compact``), set on its State.  None: not
       given, so what the session kept from before (``_sync_session_compaction``),
       else no orchestrator compaction at the default for its model.
+    * ``seed_id`` — the on-disk session to open, when the caller has already
+      decided it from the arguments above: the launch API, which has checked
+      that session's name, must open that session and not whichever one is
+      most recent by now.  None: decided here, the same way.
     * otherwise — continue the most recent session in *cwd*.
 
     Registers the runtime, starts its bridge, and refreshes the lobby.
@@ -1902,8 +1907,9 @@ async def _create_runtime(
     # Decide which on-disk session (if any) seeds this runtime: in the
     # session's own account, whose config dir holds its session files.
     # Decided before the config is: a session reopened keeps the key it had.
-    seed_id = _session_to_open(resume, resolved_cwd, config_dir,
-                               continue_recent=not no_continue)
+    if seed_id is None:
+        seed_id = _session_to_open(resume, resolved_cwd, config_dir,
+                                   continue_recent=not no_continue)
     # Set every time, never inherited, like the name: the hub's config is its
     # launch's session's, and that launch's key is that session's alone.
     overrides["api_key"] = _session_key(seed_id, api_key)
@@ -3528,9 +3534,23 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
 
     Called over HTTP by a second launch that found this hub already running.
     Mirrors the WebSocket ``open``/``new`` lobby actions but is reachable
-    before any browser tab has attached.
+    before any browser tab has attached.  Every launch it handles is logged
+    with what became of it, an exception included: one raised in a route
+    otherwise reaches only uvicorn's own log, on a console a headless hub
+    does not have.
     """
+    try:
+        return await _session_launch(body)
+    except Exception as exc:
+        log.exception("hub launch (cwd=%s resume=%s name=%s) failed",
+                      body.get("cwd"), body.get("resume"), body.get("agent_name"))
+        return {"ok": False, "error": str(exc)}
+
+
+async def _session_launch(body: dict[str, Any]) -> dict[str, Any]:
+    """``api_session_launch``, less the logging of what it raises."""
     if config is None:
+        log.warning("hub launch not handled: the server is not initialised")
         return {"ok": False, "error": "server not initialised"}
     cwd = body.get("cwd")
     resume = (body.get("resume") or "").strip() or None
@@ -3582,27 +3602,31 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     # second bridge against the same session file.
     target_sid = _session_to_open(resume, cwd or config.cwd, config_dir,
                                   continue_recent=not no_continue)
+    # What the launch asked for, on the line that says what became of it.
+    asked = (f"cwd={cwd or config.cwd} account={config_dir} resume={resume} "
+             f"no_continue={no_continue} name={agent_name}")
+    # The name the registry remembers for a session the launch did not
+    # choose, which it may therefore not rename (_rename_refusal).  Read
+    # before the open sessions are searched: no await may come between that
+    # search and the reuse or the new runtime below, or two launches of one
+    # closed session would both find it closed and open it twice.
+    remembered = (await asyncio.to_thread(_remembered_name, target_sid)
+                  if agent_name and target_sid and not resume else None)
     existing = next(
         (r for r in runtimes.values()
          if target_sid and getattr(r.state, "session_id", None) == target_sid),
         None,
     )
-    # What the launch asked for, on the line that says what became of it.
-    asked = (f"cwd={cwd or config.cwd} account={config_dir} resume={resume} "
-             f"no_continue={no_continue} name={agent_name}")
     # Before anything else is applied, so that a refused launch changes
-    # nothing -- not even the key below.  An open session's own name is its
-    # live one; a closed session's is the one remembered for it.
-    if agent_name and target_sid:
-        current = ((existing.state.agent_name
-                    if existing is not None and existing.state is not None
-                    else None)
-                   or await asyncio.to_thread(_remembered_name, target_sid))
-        refusal = _rename_refusal(target_sid, current, agent_name,
-                                  explicit=bool(resume), cwd=cwd or config.cwd)
-        if refusal:
-            log.warning("hub launch (%s): refused: %s", asked, refusal)
-            return {"ok": False, "error": refusal, "refused": True}
+    # nothing -- not even the key below.  An open session's name is its live
+    # one.
+    live_name = (getattr(existing.state, "agent_name", None)
+                 if existing is not None else None)
+    refusal = _rename_refusal(target_sid, live_name or remembered, agent_name,
+                              explicit=bool(resume), cwd=cwd or config.cwd)
+    if refusal:
+        log.warning("hub launch (%s): refused: %s", asked, refusal)
+        return {"ok": False, "error": refusal, "refused": True}
     # The launch says what its session is billed to: without a key, that is
     # the account's login, whatever key the session ran with before.
     if target_sid and not api_key:
@@ -3729,7 +3753,7 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
                                    initial_prompt=initial_prompt,
                                    resume_interrupted_turn=resume_interrupted_turn,
                                    api_key=api_key, compact_at=compact_at,
-                                   auto_compact=auto_compact)
+                                   auto_compact=auto_compact, seed_id=target_sid)
     except Exception as exc:
         log.exception("hub launch (%s) failed", asked)
         return {"ok": False, "error": str(exc)}
@@ -6585,12 +6609,17 @@ _FILE_LOG_FMT = "%(asctime)s [pid %(process)d] [%(name)s] %(levelname)s: %(messa
 
 
 def _log_file_in_argv(argv: list[str]) -> str | None:
-    """The ``--log-file`` on a command line argparse has not read."""
+    """The ``--log-file`` on a command line argparse has not read: None if
+    there is none, or if what follows it is another flag, as argparse would
+    also say."""
     for i, arg in enumerate(argv):
         if arg == "--log-file" and i + 1 < len(argv):
-            return argv[i + 1]
-        if arg.startswith("--log-file="):
-            return arg.split("=", 1)[1]
+            value = argv[i + 1]
+        elif arg.startswith("--log-file="):
+            value = arg.split("=", 1)[1]
+        else:
+            continue
+        return value if value and not value.startswith("-") else None
     return None
 
 
@@ -6598,10 +6627,10 @@ def _file_log(level: int, msg: str, *args: Any) -> None:
     """Write one record to the ``--log-file`` alone, not the console.
 
     For what became of a launch: whether it joined a hub, was refused,
-    started a server, or failed to start.  Its console has already said so
-    and is gone once its window closes, and without these lines all a launch
-    left in the log was "log file opened" and "server shut down".  A launch
-    that failed before its flags were read has no file handler yet, so the
+    started a server, or failed to start.  The console has said so in words
+    already, but it is gone once its window closes, and the log is where the
+    launch's outcome sits beside the hub's side of it.  A launch that failed
+    before its flags were read has no file handler yet, so the
     ``--log-file`` on its command line is opened for the one record.
     """
     handlers = [h for h in logging.getLogger().handlers
@@ -6612,8 +6641,9 @@ def _file_log(level: int, msg: str, *args: Any) -> None:
         if not path:
             return
         try:
-            temporary = logging.FileHandler(str(Path(path).resolve()),
-                                            encoding="utf-8")
+            target = Path(path).resolve()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = logging.FileHandler(str(target), encoding="utf-8")
         except OSError:
             return
         temporary.setFormatter(logging.Formatter(_FILE_LOG_FMT))
@@ -7061,7 +7091,8 @@ def main() -> None:
     # A server of this launch's own opens the session the hub would have, and
     # under this launch's name, so the hub's refusal to rename a session the
     # launch did not choose applies here too (_rename_refusal).
-    if config.agent_name and not config.resume and not config.no_continue:
+    if (config.agent_name and not config.resume and not config.no_continue
+            and not config.start_fresh):
         _sid = _session_to_open(None, config.cwd, config.config_dir,
                                 continue_recent=True)
         _refusal = _rename_refusal(_sid, _remembered_name(_sid),

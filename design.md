@@ -220,7 +220,10 @@ A launch that argparse refuses has not set up its log yet, so `_file_log`
 opens the `--log-file` on its command line for that one record. The hub logs
 one line per `/api/session/launch`, giving what was asked (directory,
 account, resume, name; never the prompt or a key) and what it did: opened the
-session as a new runtime, found it already open, or refused. Before
+session as a new runtime, found it already open, refused, or failed. Failures
+include an exception, which `api_session_launch` catches around
+`_session_launch`. Uncaught, a route's exception reaches only uvicorn's own
+logger, which writes to a console that a headless hub does not have. Before
 2026-10-21, a launch left only "log file opened" and "server shut down" in the
 log. Four lanes refused before reaching the hub looked exactly like launches
 that had worked, and the hub said nothing about a launch that landed on a
@@ -4149,9 +4152,19 @@ name over at all. Now:
   over and over, ending with Lane E's session called Lane-D. The check runs in
   `/api/session/launch` before anything else, and in `main()` before a launch
   starts a hub of its own, since that hub would open the same session under
-  the same name. A launch that names its session (`--resume`, or a picker)
-  still renames it, which is how a misnamed session is put right. Naming a
-  session that has no name, or giving one its own name again, is no rename.
+  the same name. `main()` skips the check when the launch opens a new
+  conversation (`--no-continue`, or `--start-fresh` from ⟳ Restart). A launch
+  that names its session (`--resume`, or a picker) still renames it, which is
+  how a misnamed session is put right. Naming a session that has no name, or
+  giving one its own name again, is no rename. Two constraints in the hub keep
+  the check and the open in agreement:
+  * The registry read (`_remembered_name`, in a thread) comes **before** the
+    search of the open sessions. The search and the reuse or the new runtime
+    have no await between them. If they did, two launches of one closed
+    session would both find it closed and open it twice on one transcript.
+  * `_create_runtime` is handed the session that was checked (`seed_id`),
+    rather than looking for the most recent session again. By then another
+    session, named something else, may have written to disk.
 
 **Two live sessions under one name** are possible — an explicit name is taken
 at face value (§3.3) — and used to fail silently and badly. Found 2026-09-24:

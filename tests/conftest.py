@@ -106,3 +106,27 @@ def _no_hub_state_in_a_real_account(monkeypatch, tmp_path_factory):
         return spare_dir() / "wakeups" if _is_real_account(d.parent.parent) else d
 
     monkeypatch.setattr(wakeup_store, "_state_dir", wakeups_dir)
+
+
+@pytest.fixture
+def hub_answers(monkeypatch):
+    """Make a launch's POST to a running hub get *answer*: call the fixture
+    with the JSON object the hub would send back."""
+    import json
+    import urllib.request
+
+    def answer_with(answer: dict) -> None:
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps(answer).encode("utf-8")
+
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            lambda req, timeout=None: _Resp())
+
+    return answer_with

@@ -209,21 +209,46 @@ class _LiveBridge:
         self.adopted_labels.append(labels)
 
 
+def _land(monkeypatch, body, *, current_name=None, current_labels=None,
+          cli_path=None, open_=True):
+    """A launch at session "sid-live", which is also its directory's most
+    recent -- open in the hub if *open_*, else closed.  Without "resume" in
+    *body*, the launch reaches it by continuing the most recent session.
+
+    Returns the hub's answer, the open runtime (None if closed) and what
+    ``_create_runtime`` was asked for, once per session it was asked to open.
+    """
+    monkeypatch.setattr(server, "find_most_recent_session_for_cwd",
+                        lambda cwd, config_dir=None: Path("sid-live.jsonl"))
+    monkeypatch.setattr(server, "config", parse_args([]))
+    created: list[dict] = []
+
+    async def fake_create_runtime(**kw):
+        created.append(kw)
+        return types.SimpleNamespace(rid="R2")
+
+    monkeypatch.setattr(server, "_create_runtime", fake_create_runtime)
+    rt = None
+    if open_:
+        st = State()
+        st.session_id = "sid-live"
+        st.agent_name = current_name
+        st.agent_labels = dict(current_labels or {})
+        cfg = parse_args(["--cli-path", cli_path] if cli_path else [])
+        br = _LiveBridge()
+        br.config = cfg
+        rt = types.SimpleNamespace(rid="R1", state=st, config=cfg, bridge=br)
+    monkeypatch.setattr(server, "runtimes", {"R1": rt} if rt else {})
+    res = asyncio.run(server.api_session_launch({"cwd": "C:\\w", **body}))
+    return res, rt, created
+
+
 def _reuse(monkeypatch, body, *, current_name=None, current_labels=None,
            cli_path=None):
-    """Launch at a session the hub already has open."""
-    st = State()
-    st.session_id = "sid-live"
-    st.agent_name = current_name
-    st.agent_labels = dict(current_labels or {})
-    cfg = parse_args(["--cli-path", cli_path] if cli_path else [])
-    br = _LiveBridge()
-    br.config = cfg
-    rt = types.SimpleNamespace(rid="R1", state=st, config=cfg, bridge=br)
-    monkeypatch.setattr(server, "runtimes", {"R1": rt})
-    monkeypatch.setattr(server, "config", parse_args([]))
-    res = asyncio.run(server.api_session_launch(
-        {"cwd": "C:\\w", "resume": "sid-live", **body}))
+    """Launch at a session the hub already has open, named with --resume."""
+    res, rt, _created = _land(monkeypatch, {"resume": "sid-live", **body},
+                              current_name=current_name,
+                              current_labels=current_labels, cli_path=cli_path)
     return res, rt
 
 
@@ -262,37 +287,6 @@ def test_a_cli_for_a_session_that_is_already_open_is_applied(monkeypatch, tmp_pa
 # account, Lane E's or Lane F's, whichever had last been written), and each
 # renamed it: Lane E's session ended up as "Lane-D", which no message or halt
 # for Lane E could reach, and Lanes A-D were never opened at all.
-
-def _land(monkeypatch, body, *, current_name=None, open_=True):
-    """A launch without --resume, continuing its directory's most recent
-    session, "sid-live" -- open in the hub if *open_*, else closed.
-
-    Returns the hub's answer, the open runtime (None if closed) and the
-    sessions ``_create_runtime`` was asked to open.
-    """
-    monkeypatch.setattr(server, "find_most_recent_session_for_cwd",
-                        lambda cwd, config_dir=None: Path("sid-live.jsonl"))
-    monkeypatch.setattr(server, "config", parse_args([]))
-    created: list[dict] = []
-
-    async def fake_create_runtime(**kw):
-        created.append(kw)
-        return types.SimpleNamespace(rid="R2")
-
-    monkeypatch.setattr(server, "_create_runtime", fake_create_runtime)
-    rt = None
-    if open_:
-        st = State()
-        st.session_id = "sid-live"
-        st.agent_name = current_name
-        cfg = parse_args([])
-        br = _LiveBridge()
-        br.config = cfg
-        rt = types.SimpleNamespace(rid="R1", state=st, config=cfg, bridge=br)
-    monkeypatch.setattr(server, "runtimes", {"R1": rt} if rt else {})
-    res = asyncio.run(server.api_session_launch({"cwd": "C:\\w", **body}))
-    return res, rt, created
-
 
 def test_a_launch_without_resume_does_not_rename_the_session_it_continued(monkeypatch):
     res, rt, _created = _land(
@@ -367,34 +361,75 @@ def test_the_hub_logs_what_became_of_each_launch(monkeypatch, caplog):
     assert "name=Lane-A): opened as R2 (session sid-live)" in text
 
 
-def _hub_answers(monkeypatch, answer: dict) -> None:
-    import urllib.request
+def test_so_does_one_that_failed_on_the_way(monkeypatch, caplog):
+    """Raised out of the route, it reached only uvicorn's own log, on the
+    console a headless hub has not got."""
+    caplog.set_level("INFO", logger="orchestrator2")
 
-    class _Resp:
-        def __enter__(self):
-            return self
+    async def broken(name):
+        raise RuntimeError("registry gone")
 
-        def __exit__(self, *a):
-            return False
+    monkeypatch.setattr(_LiveBridge, "adopt_agent_name", lambda self, name: broken(name))
 
-        def read(self):
-            return json.dumps(answer).encode("utf-8")
+    res, _rt, _created = _land(monkeypatch, {"agent_name": "Lane-A"})
 
-    monkeypatch.setattr(urllib.request, "urlopen",
-                        lambda req, timeout=None: _Resp())
+    assert res == {"ok": False, "error": "registry gone"}
+    assert "hub launch (cwd=C:\\w resume=None name=Lane-A) failed" in caplog.text
 
 
-def test_the_launch_is_told_it_was_refused(monkeypatch):
-    _hub_answers(monkeypatch, {"ok": False, "refused": True, "error": "is Lane-E"})
+def test_the_hub_opens_the_session_whose_name_it_checked(monkeypatch):
+    """Not whichever one is most recent by the time the runtime is made: a
+    session written to in between may be named something else."""
+    _res, _rt, created = _land(monkeypatch, {"agent_name": "Lane-A"}, open_=False)
+
+    assert created[0]["seed_id"] == "sid-live"
+
+
+def test_two_launches_of_one_closed_session_open_it_once(monkeypatch):
+    """Reading the registry yields to the event loop.  Done between the
+    search for an open session and making a runtime, it let both launches
+    find the session closed and open it twice, on one transcript."""
+    monkeypatch.setattr(server, "find_most_recent_session_for_cwd",
+                        lambda cwd, config_dir=None: Path("sid-live.jsonl"))
+    monkeypatch.setattr(server, "config", parse_args([]))
+    monkeypatch.setattr(server, "runtimes", {})
+    created: list[str] = []
+
+    async def fake_create_runtime(**kw):
+        # As the real one does: registered before its first await.
+        st = State()
+        st.session_id = kw.get("seed_id") or "sid-live"
+        st.agent_name = kw.get("agent_name")
+        rid = f"R{len(created) + 1}"
+        created.append(rid)
+        server.runtimes[rid] = types.SimpleNamespace(
+            rid=rid, state=st, config=parse_args([]), bridge=_LiveBridge())
+        return server.runtimes[rid]
+
+    monkeypatch.setattr(server, "_create_runtime", fake_create_runtime)
+
+    async def both():
+        return await asyncio.gather(*(
+            server.api_session_launch({"cwd": "C:\\w", "agent_name": "Lane-E"})
+            for _ in range(2)))
+
+    results = asyncio.run(both())
+
+    assert created == ["R1"], "the session was opened twice"
+    assert [r["rid"] for r in results] == ["R1", "R1"]
+
+
+def test_the_launch_is_told_it_was_refused(hub_answers):
+    hub_answers({"ok": False, "refused": True, "error": "is Lane-E"})
 
     with pytest.raises(server.LaunchRefused, match="is Lane-E"):
         server._launch_into_hub(8787, cwd="C:\\w", resume=None,
                                 no_continue=False, agent_name="Lane-A")
 
 
-def test_a_hub_that_could_not_open_it_is_not_a_refusal(monkeypatch):
+def test_a_hub_that_could_not_open_it_is_not_a_refusal(hub_answers):
     """That one still falls back to a server of the launch's own."""
-    _hub_answers(monkeypatch, {"ok": False, "error": "cannot see C:\\w"})
+    hub_answers({"ok": False, "error": "cannot see C:\\w"})
 
     assert server._launch_into_hub(8787, cwd="C:\\w", resume=None,
                                    no_continue=False) is None
@@ -466,6 +501,20 @@ def test_but_starts_one_for_a_session_named_as_asked(monkeypatch, tmp_path):
                             hub=None)
 
     assert isinstance(reached, _FellThrough)
+
+
+def test_nor_one_replacing_a_new_conversation(monkeypatch, tmp_path):
+    """⟳ Restart of a named session that has had no turn yet: its
+    replacement opens a new conversation (--start-fresh), not the most
+    recent one, so there is nothing of anyone else's to rename."""
+    agent_comms.name_session("sid-live", "Lane-E")
+    monkeypatch.setattr(server, "find_most_recent_session_for_cwd",
+                        lambda cwd, config_dir=None: Path("sid-live.jsonl"))
+
+    reached, _log = _launch(monkeypatch, tmp_path,
+                            ["--agent-name", "Lane-A", "--start-fresh"], hub=None)
+
+    assert isinstance(reached, _FellThrough), "the restart was refused"
 
 
 # --------------------------------------------------------------------------

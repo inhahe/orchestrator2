@@ -4042,18 +4042,18 @@ AGENTNAME_SERVER_MUTATIONS = [
      "                                   cli_path=cli_path,\n"),
 
     ("naming a session that is already open does nothing",
-     "                await existing.bridge.adopt_agent_name(agent_name)\n",
-     "                pass\n"),
+     "            await existing.bridge.adopt_agent_name(agent_name)\n",
+     "            pass\n"),
 
     ("the same name again re-registers a running session",
-     "                    and existing.state.agent_name != agent_name\n",
+     "                and existing.state.agent_name != agent_name\n",
      ""),
 
     ("--cli-path for a session that is already open is recorded but never "
      "applied",
-     "                _replace_runtime_config(existing, cli_path=cli_path)\n"
-     "                need_reconnect = True\n",
-     "                _replace_runtime_config(existing, cli_path=cli_path)\n"),
+     "            _replace_runtime_config(existing, cli_path=cli_path)\n"
+     "            need_reconnect = True\n",
+     "            _replace_runtime_config(existing, cli_path=cli_path)\n"),
 
     ("the runtime and its bridge disagree about which CLI it runs",
      "    if rt.bridge is not None:\n"
@@ -4107,17 +4107,65 @@ AGENTNAME_SERVER_MUTATIONS = [
      "                    if isinstance(raw_labels, dict) else raw_labels)\n"),
 
     ("labels for a session that is already open are ignored",
-     "                await existing.bridge.adopt_agent_labels(agent_labels)\n",
-     "                pass\n"),
+     "            await existing.bridge.adopt_agent_labels(agent_labels)\n",
+     "            pass\n"),
 
     ("the same labels again re-publish a running session",
-     "                    and existing.state.agent_labels != agent_labels\n",
+     "                and existing.state.agent_labels != agent_labels\n",
      ""),
 
     ("a restart brings the primary session back unnamed",
      "    if name:\n"
      '        child.extend(["--agent-name", name])\n',
      ""),
+
+    ('a launch that did not choose its session renames it anyway',
+     '    if refusal:\n        log.warning(',
+     '    if False:\n        log.warning('),
+
+    ('a launch that named its session is refused too',
+     'explicit=bool(resume), cwd=cwd or config.cwd)',
+     'explicit=False, cwd=cwd or config.cwd)'),
+
+    ('the name remembered for a closed session is not consulted',
+     '    remembered = (await asyncio.to_thread(_remembered_name, target_sid)\n',
+     '    remembered = (None\n'),
+
+    ('an unnamed session a launch continued is refused its name',
+     '    if explicit or not sid or not requested or not current or current == requested:\n',
+     '    if explicit or not sid or not requested or current == requested:\n'),
+
+    ("a session's own name again counts as a rename",
+     '    if explicit or not sid or not requested or not current or current == requested:\n',
+     '    if explicit or not sid or not requested or not current:\n'),
+
+    ('the hub opens whichever session is most recent by then',
+     'auto_compact=auto_compact, seed_id=target_sid)',
+     'auto_compact=auto_compact)'),
+
+    ('a refusal reads as a hub that could not open the session',
+     '    if isinstance(data, dict) and not data.get("ok") and data.get("refused"):\n',
+     '    if False:\n'),
+
+    ('a refused launch falls back to a server of its own',
+     '        except LaunchRefused as exc:\n            _stop_launch(str(exc), dialog=config.open_browser)\n        if rid:\n',
+     '        except LaunchRefused as exc:\n            rid = None\n        if rid:\n'),
+
+    ('a launch starting its own hub renames the session anyway',
+     '        if _refusal:\n            _stop_launch(_refusal, dialog=config.open_browser)\n',
+     '        if False:\n            pass\n'),
+
+    ('a restart replacing a new conversation is refused',
+     '            and not config.start_fresh):\n',
+     '            ):\n'),
+
+    ('the hub says nothing of a launch onto an open session',
+     '        log.info("hub launch (%s): session %s is already open as %s",\n                 asked, target_sid, existing.rid)\n',
+     ''),
+
+    ('a launch that raises in the hub is not logged',
+     '        return await _session_launch(body)\n    except Exception as exc:\n',
+     '        return await _session_launch(body)\n    except ZeroDivisionError as exc:\n'),
 ]
 
 AGENTNAME_CFG_MUTATIONS = [
@@ -4787,11 +4835,11 @@ INITPROMPT_SERVER_MUTATIONS = [
      '                                   initial_prompt=None,\n'),
 
     ("an open session is not sent it",
-     '                existing.state.queued_prompts.append(initial_prompt)\n',
-     '                pass\n'),
+     '            existing.state.queued_prompts.append(initial_prompt)\n',
+     '            pass\n'),
 
     ("an open session gets it twice",
-     '\n                    and initial_prompt not in existing.state.queued_prompts):',
+     '\n                and initial_prompt not in existing.state.queued_prompts):',
      '):'),
 
     ("/cwd and /resume send it again",
@@ -4918,12 +4966,12 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
      "    if not ref:\n        return cfg, None, None\n"),
 
     ("an unsettled launch goes on to the hub",
-     "    if _err:\n        print(_err, file=sys.stderr)\n",
-     "    if False:\n        print(_err, file=sys.stderr)\n"),
+     "        _stop_launch(_err, dialog=config.open_browser)\n",
+     "        pass\n"),
 
     ("an unsettled launch leaves no log",
-     "        _report_launch_failure(_err, dialog=config.open_browser)\n",
-     ""),
+     "    _report_launch_failure(message, dialog=dialog)\n    sys.exit(2)\n",
+     "    sys.exit(2)\n"),
 
     ("the note is not printed",
      "    if _note:\n        print(_note)\n",
@@ -6320,16 +6368,16 @@ SESSIONKEY_SERVER_MUTATIONS = [
      "                                   api_key=None, compact_at=compact_at,\n"),
 
     ("a session already open ignores a launch's key",
-     '            if getattr(existing.config, "api_key", None) != api_key:\n',
-     "            if False:\n"),
+     '        if getattr(existing.config, "api_key", None) != api_key:\n',
+     "        if False:\n"),
 
     ("a launch without a key leaves an open session on the one it has",
-     '            if getattr(existing.config, "api_key", None) != api_key:\n',
-     '            if api_key and getattr(existing.config, "api_key", None) != api_key:\n'),
+     '        if getattr(existing.config, "api_key", None) != api_key:\n',
+     '        if api_key and getattr(existing.config, "api_key", None) != api_key:\n'),
 
     ("a launch that changes no key reconnects the open session anyway",
-     '            if getattr(existing.config, "api_key", None) != api_key:\n',
-     "            if True:\n"),
+     '        if getattr(existing.config, "api_key", None) != api_key:\n',
+     "        if True:\n"),
 
     ("a launch without a key leaves the session's key remembered",
      "        if _session_api_keys.pop(target_sid, None):\n",
@@ -6340,21 +6388,21 @@ SESSIONKEY_SERVER_MUTATIONS = [
      "        if _session_api_keys.clear() or True:\n"),
 
     ("an open session's tabs are not told why a launch reconnected it",
-     "                await existing.broadcast({\n"
-     '                    "type": "system_msg", "subtype": "info",\n'
-     '                    "data": {"message": f"Reconnecting: this session now "\n',
-     "                await existing.broadcast({\n"
-     '                    "type": "system_msg", "subtype": "info",\n'
-     '                    "data": {"message": f"Reconnecting. "\n'),
+     "            await existing.broadcast({\n"
+     '                "type": "system_msg", "subtype": "info",\n'
+     '                "data": {"message": f"Reconnecting: this session now "\n',
+     "            await existing.broadcast({\n"
+     '                "type": "system_msg", "subtype": "info",\n'
+     '                "data": {"message": f"Reconnecting. "\n'),
 
     ("a session still stopping remembers its key again",
      "    if rt.bridge is not None:\n        rt.bridge.on_session_id = None\n",
      ""),
 
     ("a launch's key for an open session waits for a reconnect that never comes",
-     "                _replace_runtime_config(existing, api_key=api_key)\n"
-     "                need_reconnect = True\n",
-     "                _replace_runtime_config(existing, api_key=api_key)\n"),
+     "            _replace_runtime_config(existing, api_key=api_key)\n"
+     "            need_reconnect = True\n",
+     "            _replace_runtime_config(existing, api_key=api_key)\n"),
 
     ("a key a live session is given is not billed until its next turn",
      '    if "api_key" in changes and rt.state is not None:\n',
@@ -6916,6 +6964,38 @@ ACCOUNT_TRIM_MUTATIONS = [
 ]
 
 
+# What became of a launch, in the --log-file (tests/test_launch_logging.py).
+LAUNCHLOG_SERVER_MUTATIONS = [
+    ('a failed launch is not in the log file',
+     '    _file_log(logging.ERROR, "launch failed: ',
+     '    (lambda *a: None)(logging.ERROR, "launch failed: '),
+
+    ('a launch that failed before reading its flags is not logged',
+     '        path = _log_file_in_argv(sys.argv[1:])\n',
+     '        path = None\n'),
+
+    ('a flag after --log-file is taken for its path',
+     '        return value if value and not value.startswith("-") else None\n',
+     '        return value\n'),
+
+    ("the log's directory is not made",
+     '            target.parent.mkdir(parents=True, exist_ok=True)\n',
+     ''),
+
+    ('the console is told too',
+     '    handlers = [h for h in logging.getLogger().handlers\n                if isinstance(h, logging.FileHandler)]\n',
+     '    handlers = list(logging.getLogger().handlers)\n'),
+
+    ('a launch that joined the hub is not logged',
+     '    _file_log(logging.INFO, "launch: joined the hub on port %d, which %s %s "',
+     '    (lambda *a: None)(logging.INFO, "launch: joined the hub on port %d, which %s %s "'),
+
+    ('a headless server that died starting is not logged',
+     '                _file_log(logging.ERROR, "launch: the headless server (pid %d) "',
+     '                (lambda *a: None)(logging.ERROR, "launch: the headless server (pid %d) "'),
+]
+
+
 TARGETS = {
     "chat": ("static/chat.js", "tests/hidden_window.test.js",
              CHAT_MUTATIONS, "node"),
@@ -7042,6 +7122,8 @@ TARGETS = {
                   AGENTNAME_MUTATIONS, "pytest"),
     "agentname-server": ("server.py", "tests/test_agent_name_per_session.py",
                          AGENTNAME_SERVER_MUTATIONS, "pytest"),
+    "launchlog-server": ("server.py", "tests/test_launch_logging.py",
+                         LAUNCHLOG_SERVER_MUTATIONS, "pytest"),
     "agentname-cfg": ("config.py", "tests/test_agent_name_per_session.py",
                       AGENTNAME_CFG_MUTATIONS, "pytest"),
     "agentname-comms": ("agent_comms.py", "tests/test_agent_name_per_session.py",
