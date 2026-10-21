@@ -1,5 +1,41 @@
 # Known issues / tech debt — orchestrator2
 
+## The context count is a running total, so `--auto-compact` compacts every few turns — OPEN (found 2026-10-21)
+
+`state.context_tokens` is taken from `ResultMessage.usage` (falling back to
+`model_usage`) by `extract_context_tokens` (state.py), at sdk_bridge.py's two
+`ResultMessage` handlers. The CLI builds that `usage` by adding up every API
+call's usage (`accumulateUsage` on each `message_stop`, QueryEngine.ts in
+claude-code-mod); `model_usage` is a total for the whole session. The figure
+grows with the number of API calls, not with the size of the context. The
+log's `compact_boundary received: ... pre_tokens=` shows that figure (see
+below) and reached 110,583,841 on 2026-10-20, far beyond any context window.
+
+Consequence: with `--auto-compact --compact-at 300000`, as the SlateOS lanes
+run, the count passes the threshold after nearly every turn. The check near
+the end of the turn loop in sdk_bridge.py then sends `/compact` every
+`compact_cooldown_turns + 1` turns, however small the context really is. The
+CLI's own auto-compact still runs at its default threshold too.
+
+A second bug in the same place: the `compact_boundary` handler reads
+`msg.compact_metadata`, but the SDK's `SystemMessage` has only `subtype` and
+`data`, so the metadata is never found. Every boundary is logged and shown as
+`trigger=sdk`, with orchestrator2's own count in place of the CLI's
+`pre_tokens`.
+
+Proper fix: let the CLI do the compacting. Set `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
+to compact_at + 33,000 in the CLI's environment. The CLI fires at the window
+minus the 20k it reserves for the summary and a 13k buffer; it accepts
+100k–1M. For a compact_at below 67k, add `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`.
+Then remove orchestrator2's own check and cooldown. Changing the threshold
+mid-session then needs a CLI restart, since the environment is fixed when the
+CLI starts. Take the displayed count from the last `AssistantMessage.usage`
+(per call) or `ClaudeSDKClient.get_context_usage()`, which also returns the
+CLI's `autoCompactThreshold`. Read `msg.data["compact_metadata"]` for the
+boundary. Note that CLI 2.1.280 has an `/autocompact` command of its own,
+which writes the `autoCompactWindow` setting; orchestrator2's `/autocompact`
+shadows it.
+
 ## A launch that did not choose its session renamed it — FIXED (2026-10-21)
 
 Found 2026-10-20, checking SlateOS after its move to a new PC. Six lanes were
