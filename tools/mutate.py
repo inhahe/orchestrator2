@@ -94,11 +94,12 @@ project is from the old in-place sweep killed mid-mutation, and the source
 beside it may still be a mutant; a run refuses to start until it is dealt
 with.
 
-**A Python mutant that would fail everywhere is not run.**  One that does not
-compile, or that uses a name pyflakes finds undefined in it but not in the
-original, fails every test that loads the file, so its being caught would
-prove nothing about what it claims to break.  It is reported as a survivor,
-with the reason (``_fails_everywhere``).
+**A mutant that would fail everywhere is not run.**  A Python one that does
+not compile, or that uses a name pyflakes finds undefined in it but not in
+the original, or a JavaScript one ``node --check`` rejects, fails every test
+that loads the file, so its being caught would prove nothing about what it
+claims to break.  It is reported as a survivor, with the reason
+(``_fails_everywhere``, ``_js_parse_error``).
 """
 import ast
 import importlib.util
@@ -186,11 +187,11 @@ STATUSLOOP_MUTATIONS = [
 
     ("a deferred wakeup looks like an ordinary one",
      "    if (_wakeupDefers) text += ' \u00b7 deferred ' + _wakeupDefers;",
-     ""),
+     "    if (false) text += ' \u00b7 deferred ' + _wakeupDefers;"),
 
     ("every wakeup claims to be deferred",
      "    if (_wakeupDefers) text += ' \u00b7 deferred ' + _wakeupDefers;",
-     "    text += ' \u00b7 deferred ' + _wakeupDefers;"),
+     "    if (true) text += ' \u00b7 deferred ' + _wakeupDefers;"),
 
     ("the tooltip stops saying how to stop it",
      "         + '  Stop it with /loop off.');",
@@ -5749,8 +5750,8 @@ MUTATE_TOOL_MUTATIONS = [
      "            original = mutant = original.replace(old, new)\n"),
 
     ("line endings are not kept",
-     "            if crlf:\n                mutant = ",
-     "            if False:\n                mutant = "),
+     '            src.write_bytes((mutant.replace("\\n", "\\r\\n") if crlf\n',
+     '            src.write_bytes((mutant.replace("\\n", "\\r\\n") if False\n'),
 
     ("the source is not put back for the next target",
      "    finally:\n        src.write_bytes(raw)\n",
@@ -5761,8 +5762,20 @@ MUTATE_TOOL_MUTATIONS = [
      "    left = _left_mutated(ROOT)\n    if False:\n"),
 
     ("Python mutants are run unchecked, so a SyntaxError counts as a catch",
-     "            why = _fails_everywhere(mutant, src_rel, undefined) if py else None\n",
-     "            why = None\n"),
+     "            if py:\n                why = _fails_everywhere(",
+     "            if False:\n                why = _fails_everywhere("),
+
+    ("JavaScript mutants are run unchecked, so a SyntaxError counts as a catch",
+     "            elif js:\n                bad = _js_parse_error(src)\n",
+     "            elif False:\n                bad = _js_parse_error(src)\n"),
+
+    ("a JavaScript mutant that does not parse is run like any other",
+     "    if p.returncode == 0:\n        return None\n",
+     "    if True:\n        return None\n"),
+
+    ("a JavaScript target that does not parse has every mutant refused",
+     "                  \"so its mutants are run unchecked\")\n            js = False\n",
+     "                  \"so its mutants are run unchecked\")\n"),
 
     ("a mutant that does not compile is run like any other",
      '        return f"mutant does not compile: {exc.msg}, line {exc.lineno}"\n',
@@ -8180,10 +8193,10 @@ def run(runner: str, test_rel: str, root: Path, timeout: float = 300.0, *,
     """True only if the suite *passed*.  A mutant that makes it hang has not
     survived -- it just failed slowly, so a timeout is a False, not a stall.
 
-    A JavaScript mutant that does not parse fails here too, which counts as
-    a catch though it proves nothing; a Python one never gets here
-    (``_fails_everywhere``).  So the mutations above are written to stay
-    valid code.
+    A mutant that does not compile or parse would fail here too, counted as
+    a catch though it proved nothing, so none gets here: ``sweep`` checks
+    Python with ``_fails_everywhere`` and JavaScript with
+    ``_js_parse_error`` first.
 
     Python runs with PYTHONDONTWRITEBYTECODE.  The copy has no __pycache__ and
     none is written, so each run compiles the source as it stands.  Python
@@ -8259,6 +8272,24 @@ def _fails_everywhere(mutant: str, filename: str,
     return f"mutant names undefined {', '.join(new)}" if new else None
 
 
+def _js_parse_error(path: Path) -> str | None:
+    """Why ``node --check`` rejects the JavaScript in *path*, or None: it
+    parses, or node could not be run to say."""
+    node = shutil.which("node")
+    if node is None:
+        return None
+    try:
+        p = subprocess.run([node, "--check", str(path)], capture_output=True,
+                           timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode == 0:
+        return None
+    err = p.stderr.decode("utf-8", "replace").splitlines()
+    return next((ln.strip() for ln in err if "Error" in ln),
+                f"node --check exited {p.returncode}")
+
+
 def sweep(label: str, src_rel: str, test_rel: str, mutations,
           runner: str = "node", *, root: Path) -> list[str]:
     """Try each mutation of *src_rel* in the copy at *root*.
@@ -8289,6 +8320,13 @@ def sweep(label: str, src_rel: str, test_rel: str, mutations,
             print(f"{src_rel} does not compile ({exc.msg}, line {exc.lineno}), "
                   "so its mutants are run unchecked")
             py = False
+    js = src_rel.endswith(".js")
+    if js:
+        bad = _js_parse_error(src)
+        if bad:
+            print(f"{src_rel} does not parse as JavaScript ({bad}), "
+                  "so its mutants are run unchecked")
+            js = False
 
     survivors = []
     try:
@@ -8299,14 +8337,18 @@ def sweep(label: str, src_rel: str, test_rel: str, mutations,
                 survivors.append(f"{label}: {name}  [anchor not unique]")
                 continue
             mutant = original.replace(old, new)
-            why = _fails_everywhere(mutant, src_rel, undefined) if py else None
+            src.write_bytes((mutant.replace("\n", "\r\n") if crlf
+                             else mutant).encode("utf-8"))
+            why = None
+            if py:
+                why = _fails_everywhere(mutant, src_rel, undefined)
+            elif js:
+                bad = _js_parse_error(src)
+                why = f"mutant does not parse: {bad}" if bad else None
             if why:
                 print(f"{i:2}. SKIP ({why}) {name}")
                 survivors.append(f"{label}: {name}  [{why}]")
                 continue
-            if crlf:
-                mutant = mutant.replace("\n", "\r\n")
-            src.write_bytes(mutant.encode("utf-8"))
             passed = run(runner, test_rel, root)
             print(f"{i:2}. {'SURVIVED' if passed else 'caught  '} {name}")
             if passed:

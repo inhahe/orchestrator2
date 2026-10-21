@@ -436,6 +436,49 @@ def test_a_target_that_does_not_compile_does_not_end_the_run(mutate, tmp_path,
     assert len(seen) == 4, "a mutant was not run"
 
 
+CALC_JS = "function add(a, b) {\n  return a + b;\n}\n"
+
+
+def _sweep_js(mutate, tmp_path, monkeypatch, mutation, *, text=CALC_JS):
+    """Sweep calc.js with *mutation*; ``node --check`` is real, the suite
+    is the recorder."""
+    if not shutil.which("node"):
+        pytest.skip("node is not installed")
+    project = _project(tmp_path / "proj")
+    (project / "calc.js").write_bytes(text.encode())
+    _target(mutate, monkeypatch, project, {
+        "js": ("calc.js", "tests/test_calc.py", [mutation], "node")})
+    seen = _recorder(mutate, monkeypatch, "calc.js")
+    mutate.main(["mutate.py"])
+    return seen
+
+
+def test_a_javascript_mutant_that_does_not_parse_is_not_run(mutate, tmp_path,
+                                                            monkeypatch, capsys):
+    seen = _sweep_js(mutate, tmp_path, monkeypatch,
+                     ("add is cut short", "  return a + b;\n", "  return a +;\n"))
+    out = capsys.readouterr().out
+    assert len(seen) == 1, "the mutant was run"
+    assert ("survivor: js: add is cut short  "
+            "[mutant does not parse: SyntaxError") in out, out
+
+
+def test_a_javascript_mutant_that_parses_is_run(mutate, tmp_path, monkeypatch):
+    seen = _sweep_js(mutate, tmp_path, monkeypatch,
+                     ("add subtracts", "return a + b;", "return a - b;"))
+    assert len(seen) == 2, "the mutant was not run"
+
+
+def test_a_javascript_target_that_does_not_parse_runs_its_mutants_unchecked(
+        mutate, tmp_path, monkeypatch, capsys):
+    seen = _sweep_js(mutate, tmp_path, monkeypatch,
+                     ("add subtracts", "return a + b;", "return a - b;"),
+                     text=CALC_JS.rstrip("}\n") + "\n")
+    out = capsys.readouterr().out
+    assert "calc.js does not parse as JavaScript" in out, out
+    assert len(seen) == 2, "the mutant was not run"
+
+
 def test_a_mutant_naming_something_undefined_is_not_run(mutate, tmp_path,
                                                         monkeypatch, capsys):
     pytest.importorskip("pyflakes")
