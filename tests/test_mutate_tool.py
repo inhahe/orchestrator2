@@ -469,13 +469,68 @@ def test_a_javascript_mutant_that_parses_is_run(mutate, tmp_path, monkeypatch):
     assert len(seen) == 2, "the mutant was not run"
 
 
+def test_a_javascript_mutant_is_parsed_as_a_page_parses_a_script(
+        mutate, tmp_path, monkeypatch, capsys):
+    # A top-level return: fine in the CommonJS module ``node --check``
+    # assumes, illegal in a <script>, which is how the page loads it.
+    seen = _sweep_js(mutate, tmp_path, monkeypatch,
+                     ("add is replaced by a return", CALC_JS, "return 1;\n"))
+    out = capsys.readouterr().out
+    assert len(seen) == 1, "the mutant was run"
+    assert "Illegal return statement" in out, out
+
+
 def test_a_javascript_target_that_does_not_parse_runs_its_mutants_unchecked(
         mutate, tmp_path, monkeypatch, capsys):
     seen = _sweep_js(mutate, tmp_path, monkeypatch,
                      ("add subtracts", "return a + b;", "return a - b;"),
-                     text=CALC_JS.rstrip("}\n") + "\n")
+                     text="function add(a, b) {\n  return a + b;\n")
     out = capsys.readouterr().out
     assert "calc.js does not parse as JavaScript" in out, out
+    assert len(seen) == 2, "the mutant was not run"
+
+
+def _node_that_fails(mutate, monkeypatch, *, after=0):
+    """Make node fail for reasons of its own -- Python run with node's
+    arguments exits 2 -- once *after* checks have gone to the real one."""
+    real = shutil.which("node")
+    calls = []
+
+    def node():
+        calls.append(1)
+        return real if len(calls) <= after else sys.executable
+
+    monkeypatch.setattr(mutate, "_node", node)
+
+
+def test_a_javascript_target_node_cannot_check_runs_its_mutants_unchecked(
+        mutate, tmp_path, monkeypatch, capsys):
+    # Refused, the mutant would be a false survivor: node, not the code, failed.
+    _node_that_fails(mutate, monkeypatch)
+    seen = _sweep_js(mutate, tmp_path, monkeypatch,
+                     ("add subtracts", "return a + b;", "return a - b;"))
+    out = capsys.readouterr().out
+    assert "calc.js's mutants are run unchecked: node exited" in out, out
+    assert len(seen) == 2, "the mutant was not run"
+
+
+def test_a_javascript_mutant_node_cannot_check_is_run_and_says_so(
+        mutate, tmp_path, monkeypatch, capsys):
+    _node_that_fails(mutate, monkeypatch, after=1)     # the target's check passes
+    seen = _sweep_js(mutate, tmp_path, monkeypatch,
+                     ("add subtracts", "return a + b;", "return a - b;"))
+    out = capsys.readouterr().out
+    assert "run unchecked: node exited" in out, out
+    assert len(seen) == 2, "the mutant was not run"
+
+
+def test_without_node_javascript_mutants_run_unchecked(mutate, tmp_path,
+                                                       monkeypatch, capsys):
+    monkeypatch.setattr(mutate, "_node", lambda: None)
+    seen = _sweep_js(mutate, tmp_path, monkeypatch,
+                     ("add subtracts", "return a + b;", "return a - b;"))
+    out = capsys.readouterr().out
+    assert "run unchecked: node is not installed" in out, out
     assert len(seen) == 2, "the mutant was not run"
 
 

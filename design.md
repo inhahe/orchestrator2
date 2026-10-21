@@ -4756,15 +4756,19 @@ Now a run copies the project and works there:
   nothing. It is reported as a survivor, with the reason. Eight of the
   project's own mutants were like that when this was added (2026-10-21), one
   of them hiding an untested fallback. Without pyflakes only the compile check
-  runs, and the sweep says so. A JavaScript mutant is checked with
-  `node --check` the same way. A target whose own source does not compile or
-  parse has its mutants run unchecked, and the run goes on.
+  runs, and the sweep says so. A JavaScript mutant is only parsed, as the
+  page parses a `<script>` (node's `vm.Script`, not `node --check`, which
+  assumes a CommonJS module and passes a top-level `return`), and refused if
+  it does not parse; nothing checks its names. A target whose own source does
+  not compile or parse, or a mutant node cannot check (node missing, or
+  failing for reasons of its own), is run unchecked, the output says so, and
+  the run goes on.
 
 The suite does not depend on which drive it runs from. One test did (it
 expected `D:` in a path Windows resolves against the *current* drive), and was
-fixed so that it could run from the copy. `tests/test_mutate_tool.py` (25)
+fixed so that it could run from the copy. `tests/test_mutate_tool.py` (29)
 drives the tool against small throwaway projects. Its mutation target,
-`mutate-tool` (28), sweeps the tool itself.
+`mutate-tool` (30), sweeps the tool itself.
 
 ---
 

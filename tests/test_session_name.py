@@ -64,9 +64,8 @@ from claude_agent_sdk import (                          # noqa: E402
 )
 
 import commands                                        # noqa: E402
-import hubkit                                          # noqa: E402
 from config import DISPATCHER_DEAD, parse_args         # noqa: E402
-from hubkit import FakeWS                              # noqa: E402
+from hubkit import FakeWS, one_session_hub             # noqa: E402
 from sdk_bridge import SDKBridge                        # noqa: E402
 from state import State, init_state_from_config         # noqa: E402
 
@@ -951,9 +950,7 @@ def test_clear_drops_a_waiting_rename():
 def hub(monkeypatch):
     """The shared hub, its session live, with a real bridge: what /rename
     hands the CLI goes through it."""
-    def live_bridge(cfg, st):
-        st.session_id = "sid-live"
-
+    def real_bridge(cfg, st):
         async def bc(m):
             pass
 
@@ -962,7 +959,8 @@ def hub(monkeypatch):
         return br
 
     monkeypatch.setattr(commands, "write_session_title", lambda *a, **k: None)
-    with hubkit.one_session_hub(bridge=live_bridge) as rt:
+    with one_session_hub(bridge=real_bridge) as rt:
+        rt.state.session_id = "sid-live"
         yield rt
 
 

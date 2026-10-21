@@ -96,12 +96,14 @@ with.
 
 **A mutant that would fail everywhere is not run.**  A Python one that does
 not compile, or that uses a name pyflakes finds undefined in it but not in
-the original, or a JavaScript one ``node --check`` rejects, fails every test
-that loads the file, so its being caught would prove nothing about what it
-claims to break.  It is reported as a survivor, with the reason
+the original, or a JavaScript one that does not parse as a page's <script>,
+fails every test that loads the file, so its being caught would prove
+nothing about what it claims to break.  (JavaScript is only parsed: nothing
+checks its names.)  It is reported as a survivor, with the reason
 (``_fails_everywhere``, ``_js_parse_error``).
 """
 import ast
+import functools
 import importlib.util
 import os
 import shutil
@@ -196,6 +198,28 @@ STATUSLOOP_MUTATIONS = [
     ("the tooltip stops saying how to stop it",
      "         + '  Stop it with /loop off.');",
      "         + '');"),
+
+    ("a wakeup armed during a turn does not say it waits for the turn",
+     "    else if (_wakeupBusy) text += ' · after this turn';",
+     "    else if (false) text += ' · after this turn';"),
+
+    ("every wakeup says it waits for a turn, idle or not",
+     "    else if (_wakeupBusy) text += ' · after this turn';",
+     "    else if (true) text += ' · after this turn';"),
+
+    ("a deferred wakeup during a turn says both",
+     "    if (_wakeupDefers) text += ' · deferred ' + _wakeupDefers;\n"
+     "    else if (_wakeupBusy)",
+     "    if (_wakeupDefers) text += ' · deferred ' + _wakeupDefers;\n"
+     "    if (_wakeupBusy)"),
+
+    ("the tooltip does not say a wakeup never fires mid-turn",
+     "         + (_wakeupBusy && !_wakeupDefers\n",
+     "         + (false\n"),
+
+    ("the tooltip says it waits for the turn when it was deferred as well",
+     "         + (_wakeupBusy && !_wakeupDefers\n",
+     "         + (_wakeupBusy\n"),
 ]
 
 CHATMODAL_MUTATIONS = [
@@ -5766,16 +5790,28 @@ MUTATE_TOOL_MUTATIONS = [
      "            if False:\n                why = _fails_everywhere("),
 
     ("JavaScript mutants are run unchecked, so a SyntaxError counts as a catch",
-     "            elif js:\n                bad = _js_parse_error(src)\n",
-     "            elif False:\n                bad = _js_parse_error(src)\n"),
+     "            elif js:\n                try:\n",
+     "            elif False:\n                try:\n"),
+
+    ("a node that fails for its own reasons is read as a SyntaxError, and "
+     "refuses a mutant that parses",
+     "    if p.returncode == _JS_SYNTAX_EXIT:\n",
+     "    if True:\n"),
+
+    ("one mutant node cannot check ends the whole run",
+     "                except _Unchecked as exc:\n"
+     '                    print(f"    run unchecked: {exc}")\n',
+     "                except ZeroDivisionError as exc:\n"
+     '                    print(f"    run unchecked: {exc}")\n'),
 
     ("a JavaScript mutant that does not parse is run like any other",
      "    if p.returncode == 0:\n        return None\n",
      "    if True:\n        return None\n"),
 
     ("a JavaScript target that does not parse has every mutant refused",
-     "                  \"so its mutants are run unchecked\")\n            js = False\n",
-     "                  \"so its mutants are run unchecked\")\n"),
+     "                      \"so its mutants are run unchecked\")\n"
+     "                js = False\n",
+     "                      \"so its mutants are run unchecked\")\n"),
 
     ("a mutant that does not compile is run like any other",
      '        return f"mutant does not compile: {exc.msg}, line {exc.lineno}"\n',
@@ -8193,10 +8229,12 @@ def run(runner: str, test_rel: str, root: Path, timeout: float = 300.0, *,
     """True only if the suite *passed*.  A mutant that makes it hang has not
     survived -- it just failed slowly, so a timeout is a False, not a stall.
 
-    A mutant that does not compile or parse would fail here too, counted as
-    a catch though it proved nothing, so none gets here: ``sweep`` checks
-    Python with ``_fails_everywhere`` and JavaScript with
-    ``_js_parse_error`` first.
+    A mutant that does not compile or parse fails here, counted as a catch
+    though it proves nothing, so ``sweep`` refuses those first
+    (``_fails_everywhere``, ``_js_parse_error``).  Some still arrive: those
+    of a target whose own source does not compile or parse, and any the
+    check could not run on (no pyflakes, node unable to say), each said so
+    in the output.
 
     Python runs with PYTHONDONTWRITEBYTECODE.  The copy has no __pycache__ and
     none is written, so each run compiles the source as it stands.  Python
@@ -8272,22 +8310,49 @@ def _fails_everywhere(mutant: str, filename: str,
     return f"mutant names undefined {', '.join(new)}" if new else None
 
 
+#: Parses the file named by its argument the way a page parses a <script>: a
+#: classic script, not the CommonJS module ``node --check`` assumes, where a
+#: top-level ``return`` passes and the page then rejects it.  A SyntaxError
+#: exits ``_JS_SYNTAX_EXIT`` with its message on stdout; any other failure is
+#: node's, not the file's.
+_JS_SYNTAX_EXIT = 65
+_JS_PARSE = (
+    "const f = process.argv[1];"
+    "try { new (require('vm').Script)(require('fs').readFileSync(f, 'utf8'),"
+    " {filename: f}); }"
+    "catch (e) { if (e instanceof SyntaxError) {"
+    " process.stdout.write(String(e.message));"
+    f" process.exit({_JS_SYNTAX_EXIT}); }} throw e; }}"
+)
+
+
+class _Unchecked(Exception):
+    """node could not say whether a file parses; the message says why."""
+
+
+@functools.lru_cache(maxsize=1)
+def _node() -> str | None:
+    """The node executable, or None if it is not installed."""
+    return shutil.which("node")
+
+
 def _js_parse_error(path: Path) -> str | None:
-    """Why ``node --check`` rejects the JavaScript in *path*, or None: it
-    parses, or node could not be run to say."""
-    node = shutil.which("node")
+    """The SyntaxError a page would hit loading *path* as a script, or None
+    if it parses.  Raises ``_Unchecked`` when node cannot say: it is not
+    installed, does not finish, or fails for a reason of its own."""
+    node = _node()
     if node is None:
-        return None
+        raise _Unchecked("node is not installed")
     try:
-        p = subprocess.run([node, "--check", str(path)], capture_output=True,
-                           timeout=60)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
+        p = subprocess.run([node, "-e", _JS_PARSE, str(path)],
+                           capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise _Unchecked(f"node did not run: {exc}") from exc
     if p.returncode == 0:
         return None
-    err = p.stderr.decode("utf-8", "replace").splitlines()
-    return next((ln.strip() for ln in err if "Error" in ln),
-                f"node --check exited {p.returncode}")
+    if p.returncode == _JS_SYNTAX_EXIT:
+        return "SyntaxError: " + p.stdout.decode("utf-8", "replace").strip()
+    raise _Unchecked(f"node exited {p.returncode}")
 
 
 def sweep(label: str, src_rel: str, test_rel: str, mutations,
@@ -8322,11 +8387,16 @@ def sweep(label: str, src_rel: str, test_rel: str, mutations,
             py = False
     js = src_rel.endswith(".js")
     if js:
-        bad = _js_parse_error(src)
-        if bad:
-            print(f"{src_rel} does not parse as JavaScript ({bad}), "
-                  "so its mutants are run unchecked")
+        try:
+            bad = _js_parse_error(src)
+        except _Unchecked as exc:
+            print(f"{src_rel}'s mutants are run unchecked: {exc}")
             js = False
+        else:
+            if bad:
+                print(f"{src_rel} does not parse as JavaScript ({bad}), "
+                      "so its mutants are run unchecked")
+                js = False
 
     survivors = []
     try:
@@ -8343,7 +8413,11 @@ def sweep(label: str, src_rel: str, test_rel: str, mutations,
             if py:
                 why = _fails_everywhere(mutant, src_rel, undefined)
             elif js:
-                bad = _js_parse_error(src)
+                try:
+                    bad = _js_parse_error(src)
+                except _Unchecked as exc:
+                    print(f"    run unchecked: {exc}")
+                    bad = None
                 why = f"mutant does not parse: {bad}" if bad else None
             if why:
                 print(f"{i:2}. SKIP ({why}) {name}")

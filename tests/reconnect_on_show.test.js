@@ -766,6 +766,30 @@ test('an undeferred wakeup does not mention deferrals', (h) => {
   assert(!/deferred/.test(els.field.textContent), els.field.textContent);
 });
 
+test('a wakeup armed during a turn says it waits for the turn', (h) => {
+  // It never fires mid-turn, so a bare countdown would promise a prompt at a
+  // time it will not come.
+  const els = statusOf(h, { wakeup_at: h.now / 1000 + 60,
+                            busy_class: 'working' });
+  assert(/after this turn/.test(els.field.textContent), els.field.textContent);
+  assert(/never fires mid-turn/.test(els.field.title), els.field.title);
+});
+
+test('an idle session\'s wakeup says nothing about a turn', (h) => {
+  const els = statusOf(h, { wakeup_at: h.now / 1000 + 60, busy_class: 'idle' });
+  assert(!/after this turn/.test(els.field.textContent), els.field.textContent);
+  assert(!/mid-turn/.test(els.field.title), els.field.title);
+});
+
+test('a deferral outranks waiting for the turn', (h) => {
+  // Deferred already means a turn was running; saying both is noise.
+  const els = statusOf(h, { wakeup_at: h.now / 1000 + 60, wakeup_defers: 2,
+                            busy_class: 'working' });
+  assert(/deferred 2/.test(els.field.textContent), els.field.textContent);
+  assert(!/after this turn/.test(els.field.textContent), els.field.textContent);
+  assert(!/never fires mid-turn/.test(els.field.title), els.field.title);
+});
+
 test('a wakeup already due reads as "now" rather than a negative number', (h) => {
   const els = statusOf(h, { wakeup_at: h.now / 1000 - 5 });
   assert(els.field.textContent === 'now', els.field.textContent);
