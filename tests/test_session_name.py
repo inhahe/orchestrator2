@@ -64,7 +64,9 @@ from claude_agent_sdk import (                          # noqa: E402
 )
 
 import commands                                        # noqa: E402
+import hubkit                                          # noqa: E402
 from config import DISPATCHER_DEAD, parse_args         # noqa: E402
+from hubkit import FakeWS                              # noqa: E402
 from sdk_bridge import SDKBridge                        # noqa: E402
 from state import State, init_state_from_config         # noqa: E402
 
@@ -945,46 +947,23 @@ def test_clear_drops_a_waiting_rename():
 # Through the real WS router
 # --------------------------------------------------------------------------
 
-class _WS:
-    def __init__(self):
-        self.sent = []
-
-    async def send_text(self, data):
-        self.sent.append(json.loads(data))
-
-
 @pytest.fixture
 def hub(monkeypatch):
-    import server
-    from session_runtime import SessionRuntime
-    cfg = parse_args([])
-    st = State()
-    st.session_id = "sid-live"
-    rt = SessionRuntime(config=cfg, state=st, rid="R1")
+    """The shared hub, its session live, with a real bridge: what /rename
+    hands the CLI goes through it."""
+    def live_bridge(cfg, st):
+        st.session_id = "sid-live"
 
-    async def bc(m):
-        pass
+        async def bc(m):
+            pass
 
-    rt.bridge = SDKBridge(config=cfg, state=st, broadcaster=bc)
-    rt.bridge.client = object()
-    saved = (dict(server.runtimes), server._default_runtime, server.config,
-             server.state, server.bridge, dict(server._ws_runtime))
-    server.runtimes.clear()
-    server.runtimes[rt.rid] = rt
-    server._default_runtime = rt
-    server.config = cfg
-    server.state = st
-    server.bridge = rt.bridge
+        br = SDKBridge(config=cfg, state=st, broadcaster=bc)
+        br.client = object()
+        return br
+
     monkeypatch.setattr(commands, "write_session_title", lambda *a, **k: None)
-    yield rt
-    server.runtimes.clear()
-    server.runtimes.update(saved[0])
-    server._default_runtime = saved[1]
-    server.config = saved[2]
-    server.state = saved[3]
-    server.bridge = saved[4]
-    server._ws_runtime.clear()
-    server._ws_runtime.update(saved[5])
+    with hubkit.one_session_hub(bridge=live_bridge) as rt:
+        yield rt
 
 
 def _slash_rename(ws):
@@ -993,7 +972,7 @@ def _slash_rename(ws):
 
 
 def test_the_router_hands_rename_to_the_bridge(hub):
-    ws = _WS()
+    ws = FakeWS()
 
     asyncio.run(_slash_rename(ws))
 
@@ -1005,7 +984,7 @@ def test_the_router_never_queues_rename_as_a_prompt(hub):
     send, mergeable into the next prompt -- and sends straight into the CLI
     when idle, as a turn."""
     hub.state.busy = True
-    ws = _WS()
+    ws = FakeWS()
 
     asyncio.run(_slash_rename(ws))
 
@@ -1016,7 +995,7 @@ def test_the_router_never_queues_rename_as_a_prompt(hub):
 def test_the_router_does_not_echo_it_as_something_said_to_the_model(hub):
     """The user typed our /rename, which answered already. Echoing the forward
     as "You: /rename Lane A" would read as a message to the model."""
-    ws = _WS()
+    ws = FakeWS()
 
     asyncio.run(_slash_rename(ws))
 

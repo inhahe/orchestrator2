@@ -34,67 +34,13 @@ outage turned on is ``queued`` vs ``enqueued`` — same prompt, same UI-visible
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 from pathlib import Path
-
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import server                                   # noqa: E402
-from config import parse_args                   # noqa: E402
-from session_runtime import SessionRuntime      # noqa: E402
-from state import State                         # noqa: E402
-
-
-class FakeWS:
-    def __init__(self) -> None:
-        self.sent: list[dict] = []
-
-    async def send_text(self, data: str) -> None:
-        self.sent.append(json.loads(data))
-
-
-class FakeBridge:
-    """Enough SDKBridge for the WS router: an event queue and the no-op hooks."""
-
-    def __init__(self) -> None:
-        self.event_queue: asyncio.Queue = asyncio.Queue()
-        self.stopped = False
-
-    async def flush_pending_turn_end(self) -> None:
-        pass
-
-    async def stop(self, **_kw) -> None:
-        self.stopped = True
-
-
-@pytest.fixture
-def hub(monkeypatch):
-    """A single-runtime hub with the module globals saved and restored."""
-    cfg = parse_args([])
-    st = State()
-    rt = SessionRuntime(config=cfg, state=st, rid="R1")
-    rt.bridge = FakeBridge()
-
-    saved = (dict(server.runtimes), server._default_runtime, server.config,
-             server.state, server.bridge, dict(server._ws_runtime))
-    server.runtimes.clear()
-    server.runtimes[rt.rid] = rt
-    server._default_runtime = rt
-    server.config = cfg
-    server.state = st
-    server.bridge = rt.bridge
-    yield rt
-    server.runtimes.clear()
-    server.runtimes.update(saved[0])
-    server._default_runtime = saved[1]
-    server.config = saved[2]
-    server.state = saved[3]
-    server.bridge = saved[4]
-    server._ws_runtime.clear()
-    server._ws_runtime.update(saved[5])
+from hubkit import FakeWS                       # noqa: E402
 
 
 def _acks(ws: FakeWS) -> list[dict]:

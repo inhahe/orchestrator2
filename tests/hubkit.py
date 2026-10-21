@@ -36,9 +36,13 @@ class FakeBridge:
 
 
 @contextlib.contextmanager
-def one_session_hub():
+def one_session_hub(bridge=None):
     """Make a runtime with a fresh Config and State the hub's only and default
-    one, and yield it; the hub's globals are put back afterwards."""
+    one, and yield it; the hub's globals are put back afterwards.
+
+    *bridge*, called with that Config and State, makes the runtime's bridge;
+    a ``FakeBridge`` without it.
+    """
     import server
     from config import parse_args
     from session_runtime import SessionRuntime
@@ -47,7 +51,7 @@ def one_session_hub():
     cfg = parse_args([])
     st = State()
     rt = SessionRuntime(config=cfg, state=st, rid="R1")
-    rt.bridge = FakeBridge()
+    rt.bridge = bridge(cfg, st) if bridge is not None else FakeBridge()
     saved = (dict(server.runtimes), server._default_runtime, server.config,
              server.state, server.bridge, dict(server._ws_runtime))
     server.runtimes.clear()
