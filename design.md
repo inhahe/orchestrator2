@@ -342,15 +342,18 @@ any directory ... maybe also ... from any claude account"). It worked only in
 the hub's own session, only on its account, and found a title only in that
 session's directory; from any other tab it said "Use Sessions". Now it runs the
 launch's resolver, `_settle_launch_resume(how="/resume")`, on the tab's
-session's directory with no directory or account fixed, so an id is followed
-anywhere, a title is found here first and then anywhere, and a title several
-sessions share is answered with the list. The hub's own session, given one on
+session's directory and account (`home_account`) with neither fixed, so an id
+is followed anywhere, a title is found there first and then anywhere, and a
+title several sessions share is answered with the list. The hub's own session, given one on
 its own account, still switches in place (`_reconfigure`), stopping the one it
 left. Any other tab, or a session on another account (a runtime runs on one
 account for life), opens it as the session list does — or goes to it, when
 it is open — and the session it was on carries on, to the idle timer: the
-lobby's *open* and `/resume` share `_open_session`, which also refuses to fork
-a session another process holds (`session_elsewhere`).
+lobby's *open* and `/resume` share `_open_session`. Neither way resumes a
+session another process holds (`_held_elsewhere` sends `session_elsewhere`),
+which in place would stop the working session for one that can only park.
+Where the session was found is said once the tab shows it: showing a session
+begins by clearing the chat.
 
 **`_create_runtime` refuses a working directory it cannot see**, raising
 `NotADirectoryError` naming both the requested and resolved forms. It is the
@@ -2528,10 +2531,13 @@ nothing to the transcript: it logs, and the turn's next call hits the limit.
 **What has the session stopped is the State's rejection** — what
 `apply_rate_limit_info` sets from that event and the status bar's "rate
 limited" reads (asked for: re-use the detection that was there rather than
-write a second). It stands until the model answers again: an
-`AssistantMessage` that is not the CLI's own (`_is_synthetic`: `<synthetic>`
-model or an `error`) clears it (`_note_assistant_message`), as proof the API
-took the request, and ends any pending resume. The CLI's messages prove
+write a second). The model answering clears it: an `AssistantMessage` that
+is not the CLI's own (`_is_synthetic`: `<synthetic>` model or an `error`), as
+proof the API took the request (`_note_assistant_message`), and that is also
+the one thing that ends a pending resume. A `/login` (`reset_rate_limit`) or
+the CLI reporting the limit lifted (a `/compact` after the reset) clears the
+rejection too, with the session still stopped, so the resume, once armed,
+waits on the limit it was armed for (`_limit_armed_stop`), not on the State. The CLI's messages prove
 nothing: before this, the limit message arriving just after the event wiped
 the rejection and its reset time, and a session locked out until 9pm read
 "idle"; and a background task's turn failing on "API Error: Connection error"
@@ -2615,7 +2621,9 @@ report decides the reset (a later limit is the one that holds), but a reset
 read from text (`reset_from_text`, the CLI's `formatResetTime` forms, in the
 IANA zone it names — on Windows only with `tzdata`, else local time) gives way
 to an earlier report of the same limit with headers. The limit found is put on
-the State as its `RateLimitEvent` would have been (`_adopt_limit_stop`), so
+the State as its `RateLimitEvent` would have been (`_adopt_limit_stop`) -- on
+the session's first connect only: a reconnect reads the same transcript, and
+the State may since have been cleared on purpose by a `/login` -- so
 the bar says `rate limited` before the fresh CLI has said anything — unless
 its reset is more than `LATE_S` (12 h) past: the plan is half a day old, and
 opening a session to look at it should not set it going, so it is only
@@ -2629,8 +2637,11 @@ about 30 ms each.
 
 **Closed while waiting.** The schedule is mirrored to
 `<hub account>/orchestrator2/limit-resumes/<cwd>__<sid>.json` (`cwd`,
-`session_id`, `config_dir`, `due_at`, `resets_at`, `reopens`, and the model,
-effort, Claude Code binary and bell set it runs with). It shares its store
+`session_id`, `config_dir`, `due_at`, `resets_at`, `reopens`, `attempts`, and
+the model, effort, Claude Code binary and bell set it runs with -- the bell set
+`/bell` made, not the launch's). The attempts go with it so a session closed
+between retries, once a backoff outlasts the idle timeout, goes on counting
+when it is reopened instead of retrying for ever. It shares its store
 with the wakeup loop's (`record_store.RecordStore`: atomic writes, a record
 read back only into the slot it names), and like it moves with the session
 when its id changes (`rekey`, from `_take_session_id`: the rolling trim starts
@@ -2648,7 +2659,8 @@ takes the record; at the hub's start, `_restore_limit_resumes` takes them all.
 When one comes due, `_reopen_for_limit` reads it again, leaves a session that
 is open already to its own bridge (the primary, which a restart resumes
 itself), reschedules one put off, waits `LIMIT_REOPEN_WAIT_S` while
-`LIMIT_REOPEN_MAX_OPEN` (6) sessions it reopened are still open — the
+`LIMIT_REOPEN_MAX_OPEN` (6) sessions it reopened are still open with no tab on
+them (one somebody is watching is theirs) — the
 wakeup restore's `MAX_RESURRECT`, for the same commit limit, but a wait rather
 than a cap, since each was asked to carry on — counts the reopen
 (`note_reopened`), and opens it with its own settings and the option on, one at
@@ -2656,8 +2668,9 @@ a time, `LIMIT_REOPEN_STAGGER_S` apart, starting its idle timer so a session
 nobody watches closes again when done. A session that cannot connect never
 schedules its resume, which is what writes a fresh record, so `plan_reopen`
 drops a record reopened `MAX_REOPENS` (2) times, as it does one more than 12 h
-overdue or more than 8 days ahead; the bridge's open check drops a record
-whose session has moved on.
+overdue or more than 8 days ahead, or whose counters are not numbers (which
+would otherwise stop the restore of every record after it); the bridge's open
+check drops a record whose session has moved on.
 
 Tests: `tests/test_resume_after_limit.py`, `tests/test_cut_off_turn.py` (through
 a real connect); mutation targets `limitresume`, `limitresume-server`,

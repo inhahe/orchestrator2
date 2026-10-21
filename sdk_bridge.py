@@ -977,6 +977,14 @@ class SDKBridge:
         # The reset the session gave up resuming after: it is not resumed
         # again until a later limit, or until asked.
         self._limit_gave_up_for: int | None = None
+        # The limit the pending resume is for, as it was when armed.  The
+        # State's rejection can be cleared meanwhile by more than the model
+        # answering -- a /login, the CLI reporting the limit lifted after a
+        # /compact -- and the session is still stopped then.
+        self._limit_armed_stop: dict | None = None
+        # The session whose transcript the open check has read: a reconnect
+        # of it reads the same, and the State has the live word since.
+        self._limit_open_checked: str | None = None
         # The reset the pending resume waits for, so another turn running into
         # the same limit (a background task finishing, say) leaves it be.
         self._limit_armed_for: int | None = None
@@ -994,6 +1002,9 @@ class SDKBridge:
         # notifications into its conversation, which the next turn takes
         # (_show_carried).
         self._carried_unseen = False
+        # Set by interrupt() when what it stops is a ghost turn, so that
+        # turn's end knows the user took the session over.
+        self._ghost_interrupted = False
         # Deferred ``bg-done`` bell.  See _arm_bg_done_bell().
         self._bg_done_bell_task: asyncio.Task | None = None
         # Set the moment we learn the CLI subprocess is gone (dispatcher crash,
@@ -1845,6 +1856,11 @@ class SDKBridge:
             "data": {"elapsed": fmt_duration(abs(elapsed))},
         })
 
+        # What the CLI carried into a resumed conversation goes with the
+        # first turn (_show_carried) -- set before the dispatcher starts, as
+        # the CLI's own turn can be the first.
+        self._carried_unseen = bool(resume_sid)
+
         # Start the message dispatcher.  Bump the generation counter
         # so the dispatcher can detect it's been superseded.
         self._dispatcher_gen += 1
@@ -1872,7 +1888,6 @@ class SDKBridge:
         # background tasks that died with its last process, a turn left
         # waiting, a usage limit it is waiting on.  Replaced on every connect.
         await self._announce_on_open(resume_sid, cut_off, limit_stop)
-        self._carried_unseen = bool(resume_sid)
 
         # The connect worked, so the requested resume has been honoured and is
         # spent.  Later reconnects resume ``state.session_id`` explicitly (see
@@ -3500,6 +3515,7 @@ class SDKBridge:
                 await self._end_ghost_turn(subtype, interrupted=getattr(
                     msg, "terminal_reason", None) in ("aborted_streaming",
                                                       "aborted_tools"))
+            self._ghost_interrupted = False
 
         else:
             # RateLimitEvent (top-level message, NOT a SystemMessage).
@@ -4102,7 +4118,7 @@ class SDKBridge:
 
     async def _hint_limit_resume(self, reset: int) -> None:
         """With the option off, say once per limit that it could carry on."""
-        if self._limit_hinted_for == reset:
+        if self._limit_hinted_for == reset or reset <= time.time():
             return
         self._limit_hinted_for = reset
         try:
@@ -4142,7 +4158,9 @@ class SDKBridge:
                       # reopened session would take the hub's.
                       "effort": st.effort or "auto",
                       "cli_path": getattr(cfg, "cli_path", None),
-                      "bell_on": getattr(cfg, "bell_on", None)})
+                      # The set /bell made, not the launch's.
+                      "bell_on": " ".join(sorted(st.bell_events)) or "none"},
+            attempts=self._limit_attempts)
 
     def _remind_limit_notice(self) -> None:
         """Keep the pending resume's notice among the open notices.  A turn
@@ -4177,6 +4195,7 @@ class SDKBridge:
         due = max(reset + limit_resume.MARGIN_S, now + floor, earliest)
         self._cancel_limit_resume(forget=False)
         self._limit_armed_for = reset
+        self._limit_armed_stop = dict(stop)
         self._limit_defers = 0
         self.state.limit_resume_at = due
         self._save_limit_record(due, reset)
@@ -4213,6 +4232,7 @@ class SDKBridge:
         it.  Never cancels the calling task (see _cancel_wakeup)."""
         t, self._limit_task = self._limit_task, None
         self._limit_armed_for = None
+        self._limit_armed_stop = None
         self._limit_notice = None
         self.state.limit_resume_at = None
         if forget:
@@ -4232,10 +4252,12 @@ class SDKBridge:
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
             return
+        # Not cut short by the State's rejection going: a /login or the CLI
+        # reporting the limit lifted clears it with the session still
+        # stopped.  The model answering is what ends the wait, by cancelling
+        # this task (_note_limit_over).
         while not self.stop_event.is_set():
             st = self.state
-            if self._stopped_by_limit() is None:
-                return                       # the session has moved on
             # A turn is running, or there is no CLI to send to.  A turn means
             # the session is working: if it is only a background task's turn
             # running into the limit again, it ends and this tries again.
@@ -4262,7 +4284,7 @@ class SDKBridge:
                 continue
             prompt = await asyncio.to_thread(self._read_last_prompt)
             # The read took time; whatever happened meanwhile wins.
-            stop = self._stopped_by_limit()
+            stop = self._limit_armed_stop
             if self.stop_event.is_set() or stop is None \
                     or st.busy or st.connecting:
                 continue
@@ -4352,6 +4374,12 @@ class SDKBridge:
         has passed.
         """
         st = self.state
+        if sid == self._limit_open_checked:
+            # A reconnect: the State has the CLI's live word by now, and it
+            # may since have been cleared on purpose (a /login to another
+            # account), which the old transcript would undo.
+            return
+        self._limit_open_checked = sid
         rec = limit_resume.load(self.config.cwd, sid)
         if rec is not None:
             st.resume_after_limit = True
@@ -4388,6 +4416,11 @@ class SDKBridge:
             return
         if current["resets_at"] == self._limit_gave_up_for:
             return
+        if rec is not None and rec.get("resets_at") == current["resets_at"]:
+            # Reopened in the middle of the retries: they go on counting,
+            # or a session closed between them would retry for ever.
+            self._limit_attempts = int(rec.get("attempts") or 0)
+            self._limit_sent_for = current["resets_at"] if self._limit_attempts else None
         await self._arm_limit_resume(current, opened=True,
                                      earliest=now + limit_resume.SETTLE_S)
 
@@ -4512,6 +4545,16 @@ class SDKBridge:
         await self._show_carried(during_turn=False)
         return True
 
+    def _read_carried(self) -> list[str]:
+        """:func:`session.carried_notifications` for this session's
+        transcript; nothing when it cannot be read."""
+        try:
+            jsonl = self._jsonl_for(self.state.session_id)
+            return carried_notifications(read_tail(jsonl)[0]) if jsonl else []
+        except Exception:
+            log.debug("could not read what the CLI carried", exc_info=True)
+            return []
+
     async def _show_carried(self, *, during_turn: bool) -> None:
         """Show what the CLI carried into the conversation on resume, at the
         first turn after the connect -- the turn that takes it to the model.
@@ -4519,22 +4562,14 @@ class SDKBridge:
         On resume the CLI reports the background tasks the previous process
         left unfinished as a notification of its own, written into the
         conversation without a turn (``session.is_carried_notification``).
-        It goes to the model with the next message, so that message is not
-        only what the user typed -- and nothing showed it, live or in
-        history.  Read from the transcript, where the CLI wrote it on resume.
+        It goes to the model with the next message, so that message is more
+        than what the user typed, and the user is shown the rest.  Read from
+        the transcript, where the CLI wrote it on resume.
         """
         if not self._carried_unseen:
             return
         self._carried_unseen = False
-        jsonl = self._jsonl_for(self.state.session_id)
-        if jsonl is None:
-            return
-        try:
-            records, _start = await asyncio.to_thread(read_tail, jsonl)
-        except Exception:
-            log.debug("could not read what the CLI carried", exc_info=True)
-            return
-        for text in carried_notifications(records):
+        for text in await asyncio.to_thread(self._read_carried):
             log.info("showing a notification the CLI carried (%d chars)", len(text))
             try:
                 await self._broadcast_injected_prompt(text, during_turn=during_turn)
@@ -4614,7 +4649,8 @@ class SDKBridge:
         except Exception as exc:
             log.warning("ghost-turn status_update broadcast failed: %r", exc)
 
-        await self._after_limit_turn(interrupted=interrupted)
+        await self._after_limit_turn(
+            interrupted=interrupted or self._ghost_interrupted)
 
         # If the user queued a prompt while this ghost turn was running,
         # server.py saw state.busy == True and routed it to
@@ -7315,6 +7351,7 @@ class SDKBridge:
             # subsequent turn for the full timeout.
             if self.state.busy:
                 self._interrupt_settled.clear()
+                self._ghost_interrupted = True
 
         # Issue the interrupt *before* poking the parked worker, so the
         # wind-down is at least in flight before a new turn can be started.

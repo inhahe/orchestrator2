@@ -671,3 +671,20 @@ def test_opening_a_session_a_limit_stopped_schedules_its_resume(opened):
                for _s, t in notices)
     assert st.rate_limit_status == "rejected"
     assert st.limit_resume_at == reset + limit_resume.MARGIN_S
+
+
+def test_what_the_cli_carried_is_flagged_before_its_turn_can_start(opened, monkeypatch):
+    """Review: set after the dispatcher started, a turn the CLI began on
+    connect could take the notification before the flag said to show it."""
+    seen = []
+
+    def dispatcher(self, *, gen):
+        seen.append(self._carried_unseen)     # as the dispatcher is started
+
+        async def nothing():
+            pass
+        return nothing()
+
+    monkeypatch.setattr(SDKBridge, "_message_dispatcher", dispatcher)
+    opened(DONE)
+    assert seen == [True]

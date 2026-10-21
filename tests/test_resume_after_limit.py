@@ -1353,3 +1353,177 @@ def test_only_the_idle_teardown_keeps_it():
     src = inspect.getsource(server)
     assert src.count("idle=True") == 1
     assert "rt.bridge.stop(idle_teardown=idle)" in inspect.getsource(server._teardown_runtime)
+
+
+# ---------------------------------------------------------------------------
+# The second review
+# ---------------------------------------------------------------------------
+
+def test_a_login_meanwhile_does_not_drop_the_resume(tmp_path, monkeypatch):
+    """Review: a /login (or the CLI reporting the limit lifted) clears the
+    rejection with the session still stopped; the timer took that for the
+    session having moved on, and left the resume half-cancelled."""
+    from state import reset_rate_limit
+    _due_now(monkeypatch)
+    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+    br.client = object()
+
+    async def go():
+        br._adopt_limit_stop({"resets_at": int(NOW) - 5, "kind": "five_hour",
+                              "hit_at": None})
+        br._limit_resume_sent = False
+        await br._arm_limit_resume(br._stopped_by_limit())
+        task = br._limit_task
+        reset_rate_limit(st)                  # a /login in another tab
+        await asyncio.wait_for(task, 5)
+        return br.event_queue.get_nowait()
+
+    kind, text = asyncio.run(go())
+    assert kind == "message" and "5-hour session limit" in text
+    assert br._limit_task is None and st.limit_resume_at is None
+    assert limit_resume.load(str(tmp_path), SID) is None
+
+
+def test_an_older_limits_headers_do_not_outrank_a_later_text(tmp_path):
+    """Review: the same kind of limit hit again later, named only in a
+    /compact's text, lost to the headers of the earlier one, long reset."""
+    at = datetime(2026, 10, 21, 22, 0).astimezone().timestamp()
+    old_reset = int(at) - 8 * 3600
+    later = "You've hit your session limit · resets 2:30am (America/New_York)"
+    p = _write(tmp_path / "s.jsonl", [_prompt("go", at - 13 * 3600),
+                                      _limit(at - 13 * 3600, old_reset),
+                                      *_failed_compact(at, later)])
+    stop = limit_resume.limit_stop_in(p)
+    assert stop["resets_at"] == limit_resume.reset_from_text(later, at) > at
+
+
+def test_the_retries_go_on_counting_across_a_reopen(tmp_path, monkeypatch):
+    """Review: closed between retries and reopened, the count started again
+    from nothing, and the session retried for ever."""
+    reset = int(NOW) - 5
+    p = _stopped_transcript(tmp_path, reset)
+    limit_resume.save(str(tmp_path), SID, due_at=NOW + 900, resets_at=reset,
+                      attempts=3)
+    br, st, _ = _bridge(tmp_path, monkeypatch)
+
+    async def go():
+        await br._limit_on_open(SID, limit_resume.limit_stop_in(p))
+        try:
+            assert br._limit_attempts == 3 and br._limit_sent_for == reset
+            assert st.limit_resume_at >= time.time() + limit_resume.RETRY_S * 4 - 5
+        finally:
+            _stop_timers(br)
+
+    asyncio.run(go())
+
+
+def test_the_record_keeps_the_attempts_and_the_bell(tmp_path, monkeypatch):
+    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+    st.bell_events = set()                    # /bell none
+
+    async def go():
+        br._limit_attempts = 2
+        br._adopt_limit_stop({"resets_at": RESET, "kind": None, "hit_at": None})
+        await br._arm_limit_resume(br._stopped_by_limit())
+        _stop_timers(br)
+
+    asyncio.run(go())
+    rec = limit_resume.load(str(tmp_path), SID)
+    assert rec["attempts"] == 2
+    assert rec["bell_on"] == "none", "the launch's set, not the one /bell made"
+
+
+def test_a_reconnect_does_not_put_back_a_limit_a_login_cleared(tmp_path, monkeypatch):
+    """Review: after /login to another account, /connect read the old
+    transcript and the session was 'rate limited' again."""
+    from state import reset_rate_limit
+    p = _stopped_transcript(tmp_path)
+    br, st, _ = _bridge(tmp_path, monkeypatch)
+
+    async def go():
+        stop = limit_resume.limit_stop_in(p)
+        await br._limit_on_open(SID, stop)
+        assert st.rate_limit_status == "rejected"
+        reset_rate_limit(st)
+        await br._limit_on_open(SID, stop)    # the reconnect
+        assert st.rate_limit_status is None
+
+    asyncio.run(go())
+
+
+def test_no_hint_for_a_reset_already_past(tmp_path, monkeypatch):
+    br, st, sent = _bridge(tmp_path, monkeypatch)
+    asyncio.run(br._hint_limit_resume(int(NOW) - 60))
+    assert "/resume-after-limit on" not in _texts(sent)
+
+
+def test_a_ghost_turn_the_user_interrupted_arms_nothing(tmp_path, monkeypatch):
+    """Review: the ghost path read the interrupt only from the result's
+    terminal_reason; the bridge knows it interrupted the turn."""
+    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+    br._adopt_limit_stop({"resets_at": RESET, "kind": None, "hit_at": None})
+
+    class _Quiet:
+        async def interrupt(self):
+            pass
+
+    async def go():
+        st.busy = True                        # a ghost turn is streaming
+        br.client = _Quiet()
+        await br.interrupt()
+        await br._handle_async_message(_result())
+
+    asyncio.run(go())
+    assert br._limit_task is None
+
+
+def test_a_record_with_a_bad_count_is_not_a_record(tmp_path):
+    """Review: one such file stopped the hub's restore at it."""
+    rec = {"session_id": SID, "cwd": str(tmp_path), "due_at": NOW + 60, "reopens": "x"}
+    assert limit_resume.plan_reopen(rec).reopen is False
+    assert not limit_resume._valid({**rec, "reopens": True})
+    assert limit_resume._valid({**rec, "reopens": 1})
+
+
+def test_the_restore_goes_on_past_a_record_it_cannot_schedule(tmp_path, monkeypatch):
+    limit_resume.save(str(tmp_path / "a"), "a-sid", due_at=RESET, resets_at=RESET)
+    limit_resume.save(str(tmp_path / "b"), "b-sid", due_at=RESET + 1, resets_at=RESET)
+    seen = []
+
+    def schedule(rec):
+        seen.append(rec["session_id"])
+        if rec["session_id"] == "a-sid":
+            raise ValueError("bad")
+
+    monkeypatch.setattr(server, "_schedule_limit_reopen", schedule)
+    asyncio.run(server._restore_limit_resumes())
+    assert seen == ["a-sid", "b-sid"]
+
+
+def test_a_reopened_session_someone_is_watching_takes_no_place(tmp_path, monkeypatch):
+    """Review: six sessions the user had opened and kept working in held the
+    places, and every other due session waited until it went stale."""
+    limit_resume.save(str(tmp_path), SID, due_at=NOW - 5, resets_at=NOW - 65)
+    full = {f"X{i}" for i in range(server.LIMIT_REOPEN_MAX_OPEN)}
+    watched = [_RT(str(tmp_path), _St(session_id=f"other-{i}"), rid=rid)
+               for i, rid in enumerate(sorted(full))]
+    for r in watched:
+        r.clients = {object()}
+    opened = []
+
+    class _R:
+        rid = "R9"
+        clients = set()
+
+    async def create(**kw):
+        opened.append(kw)
+        return _R()
+
+    monkeypatch.setattr(server, "_limit_reopened", set(full))
+    monkeypatch.setattr(server, "_create_runtime", create)
+    monkeypatch.setattr(server, "runtimes", {r.rid: r for r in watched})
+    monkeypatch.setattr(server, "_maybe_start_idle_timer", lambda *a, **k: None)
+    monkeypatch.setattr(server, "LIMIT_REOPEN_STAGGER_S", 0.0)
+    monkeypatch.setattr(server, "_limit_reopen_lock", None)
+    asyncio.run(server._reopen_for_limit(limit_resume.load(str(tmp_path), SID), 0.0))
+    assert [o["resume"] for o in opened] == [SID]

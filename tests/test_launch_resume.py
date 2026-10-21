@@ -656,12 +656,14 @@ def test_resume_inside_a_session_names_the_ones_that_share_a_title(machine, monk
 # directory it was in -- from any other tab it said "Use Sessions".
 # --------------------------------------------------------------------------
 
-def _tab(machine, monkeypatch, *, primary, cwd=None, live=()):
+def _tab(machine, monkeypatch, *, primary, cwd=None, live=(), account=None,
+         holder=None):
     """A tab on a session in *cwd* (machine.orch), and what /resume does from
     it: messages sent, runtimes attached, opened, and in-place switches."""
     from session_runtime import SessionRuntime
     import proc_guard
-    rt = SessionRuntime(config=dataclasses.replace(parse_args([]), cwd=cwd or machine.orch),
+    rt = SessionRuntime(config=dataclasses.replace(parse_args([]), cwd=cwd or machine.orch,
+                                                   config_dir=account),
                         state=State(), rid="R1")
     rt.state.session_id = "s-current"
     got = types.SimpleNamespace(sent=[], attached=[], opened=[], switched=[])
@@ -671,6 +673,7 @@ def _tab(machine, monkeypatch, *, primary, cwd=None, live=()):
 
     async def attach(_ws, target):
         got.attached.append(target)
+        got.sent.append({"type": "_attached"})
 
     async def create(**kw):
         got.opened.append(kw)
@@ -693,7 +696,7 @@ def _tab(machine, monkeypatch, *, primary, cwd=None, live=()):
     monkeypatch.setattr(server, "runtimes",
                         {r.rid: r for r in (rt, *live)})
     monkeypatch.setattr(server, "_default_runtime", rt if primary else None)
-    monkeypatch.setattr(proc_guard, "find_foreign_session_holder", lambda _sid: None)
+    monkeypatch.setattr(proc_guard, "find_foreign_session_holder", lambda _sid: holder)
     return rt, got
 
 
@@ -709,7 +712,7 @@ def test_resume_from_any_tab_finds_a_title_in_another_directory(machine, monkeyp
     _session(machine.default, machine.os, LIVE, "OS F")
     rt, got = _tab(machine, monkeypatch, primary=False)
     _resume(rt, "OS F")
-    assert [(o["resume"], o["config_dir"]) for o in got.opened] == [(LIVE, None)]
+    assert [(o["resume"], o["config_dir"]) for o in got.opened] ==         [(LIVE, str(machine.default))]
     assert Path(got.opened[0]["cwd"]).resolve() == Path(machine.os).resolve()
     assert [a.state.session_id for a in got.attached] == [LIVE]
     assert "Use Sessions" not in _said(got)
@@ -804,3 +807,37 @@ def test_a_secondary_tabs_resume_reaches_the_command(machine, monkeypatch):
     asyncio.run(server._handle_ws_message(ws, {"type": "message",
                                                "text": "/resume OS F"}))
     assert [o["resume"] for o in got.opened] == [LIVE]
+
+
+def test_where_it_was_found_is_said_once_the_tab_shows_it(machine, monkeypatch):
+    """Review: said first, it was wiped by the clear that showing a session
+    begins with."""
+    _session(machine.other, machine.os, OTHER, "Work thing")
+    rt, got = _tab(machine, monkeypatch, primary=False)
+    _resume(rt, "Work thing")
+    kinds = [m.get("type") for m in got.sent]
+    note = next(i for i, m in enumerate(got.sent)
+                if "on account .claude-work" in m.get("data", {}).get("message", ""))
+    assert kinds.index("_attached") < note
+
+
+def test_the_hubs_tab_never_switches_to_a_session_held_elsewhere(machine, monkeypatch):
+    """Review: in place, the working session was stopped for one that could
+    only park on DuplicateSessionError."""
+    _session(machine.default, machine.os, LIVE, "OS F")
+    held = types.SimpleNamespace(holder_pid=4242, started=0.0, port=None)
+    rt, got = _tab(machine, monkeypatch, primary=True, holder=held)
+    _resume(rt, "OS F")
+    assert got.switched == [] and got.opened == []
+    assert [m["session_id"] for m in got.sent if m.get("type") == "session_elsewhere"] == [LIVE]
+
+
+def test_a_title_is_looked_for_in_the_tabs_own_account_first(machine, monkeypatch):
+    """Review: the "here" lookup used the hub's account, so a tab on another
+    account was answered with a list, or the hub's session of that name."""
+    _session(machine.other, machine.os, OTHER, "Notes")
+    _session(machine.default, machine.orch, LIVE, "Notes")
+    rt, got = _tab(machine, monkeypatch, primary=False, cwd=machine.os,
+                   account=str(machine.other))
+    _resume(rt, "Notes")
+    assert [(o["resume"], o["config_dir"]) for o in got.opened] ==         [(OTHER, str(machine.other))]

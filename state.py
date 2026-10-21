@@ -851,9 +851,10 @@ class State:
     rate_limit_resets_at: int | None = None
     # Which window a rejection is for (the CLI's ``rateLimitType``, e.g.
     # "five_hour"), so the session can say which limit stopped it, and when
-    # the rejection began (Unix time).  A rejection stands until the model
-    # answers again (SDKBridge._note_assistant_message), which makes it what
-    # says a usage limit has the session stopped (--resume-after-limit).
+    # the rejection began (Unix time).  It is what says a usage limit has the
+    # session stopped (--resume-after-limit): set by the CLI's report, and
+    # cleared by the model answering (SDKBridge._note_assistant_message), by
+    # the CLI reporting the limit lifted, or by a /login (reset_rate_limit).
     rate_limit_type: str | None = None
     rate_limit_overage_resets_at: int | None = None
     rate_limit_hit_at: float | None = None

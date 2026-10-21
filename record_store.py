@@ -78,7 +78,7 @@ class RecordStore:
             return
         try:
             self.path_for(cwd, session_id).unlink()
-        except (OSError, FileNotFoundError):
+        except OSError:
             pass
 
     def records(self) -> list[dict]:
@@ -102,6 +102,12 @@ class RecordStore:
             out.append(rec)
         return out
 
+    def update(self, rec: dict, **changes: Any) -> None:
+        """Write *rec* back with *changes*, under the session it names."""
+        fields = {k: v for k, v in rec.items()
+                  if k not in ("cwd", "session_id", "saved_at")}
+        self.save(rec["cwd"], rec["session_id"], {**fields, **changes})
+
     def rekey(self, cwd: str, old_id: str | None, new_id: str | None) -> bool:
         """Move *old_id*'s record to *new_id*: the same session, under the id
         its CLI now gives it (the rolling context trim starts a new
@@ -114,8 +120,6 @@ class RecordStore:
         rec = self.load(cwd, old_id)
         if rec is None:
             return False
-        fields = {k: v for k, v in rec.items()
-                  if k not in ("cwd", "session_id", "saved_at")}
-        self.save(cwd, new_id, fields)
+        self.update({**rec, "session_id": new_id})
         self.clear(cwd, old_id)
         return True

@@ -152,3 +152,24 @@ def test_nothing_is_shown_without_a_resume(tmp_path, monkeypatch):
     br.client = _Client(br)
     asyncio.run(br.run_turn("hi"))
     assert not [m for m in sent if m["type"] == "injected_prompt"]
+
+
+def test_a_transcript_that_cannot_be_found_never_stops_the_prompt(tmp_path, monkeypatch):
+    """Review: the lookup ran on the event loop, outside the read's guard, so
+    an error in it was raised into run_turn before the prompt was sent."""
+    br, sent = _bridge(tmp_path, monkeypatch, [_reply(), _carried()])
+    queried = []
+
+    class _Recording(_Client):
+        async def query(self, prompt):
+            queried.append(prompt)
+            await super().query(prompt)
+
+    def broken(*_a, **_k):
+        raise OSError("projects directory unreadable")
+
+    monkeypatch.setattr(sdk_bridge, "find_session_dir", broken)
+    br.client = _Recording(br)
+    br._carried_unseen = True
+    asyncio.run(br.run_turn("continue"))
+    assert queried == ["continue"]

@@ -309,17 +309,22 @@ def limit_stop_in(jsonl: Path, *,
     records, _start = tail if tail is not None else read_tail(jsonl)
     found: dict | None = None
     exact = False                     # whether found's reset is a header's
+    text_at: float | None = None      # when found's text-read reset was written
 
     def report(at: float | None, reset: int | None, kind: str | None,
                from_headers: bool) -> None:
-        nonlocal found, exact
+        nonlocal found, exact, text_at
         if found is None:
             found = {"resets_at": reset, "kind": kind, "hit_at": at}
             exact = from_headers and bool(reset)
+            text_at = None if from_headers else at
             return
-        if reset and (not found["resets_at"]
-                      or (from_headers and not exact
-                          and kind == found["kind"])):
+        # The same window's headers say it to the second -- if it is the same
+        # window: one that had already reset when the later text was written
+        # is an older limit, and the text's is the one that holds.
+        same_window = (from_headers and not exact and kind == found["kind"]
+                       and bool(reset) and reset > (text_at or 0))
+        if reset and (not found["resets_at"] or same_window):
             found["resets_at"], found["kind"] = reset, kind
             exact = from_headers
         found["hit_at"] = at or found["hit_at"]
@@ -501,11 +506,16 @@ def _state_dir() -> Path:
     return account_dir() / "orchestrator2" / "limit-resumes"
 
 
+def _count(v: Any) -> bool:
+    return v is None or (isinstance(v, int) and not isinstance(v, bool) and v >= 0)
+
+
 def _valid(rec: Any) -> bool:
     return (isinstance(rec, dict)
             and isinstance(rec.get("session_id"), str) and rec["session_id"]
             and isinstance(rec.get("cwd"), str) and rec["cwd"]
-            and _is_time(rec.get("due_at")))
+            and _is_time(rec.get("due_at"))
+            and _count(rec.get("reopens")) and _count(rec.get("attempts")))
 
 
 #: Looked up through the module each time, so a test can move the directory.
@@ -519,13 +529,16 @@ SETTINGS = ("model", "effort", "cli_path", "bell_on")
 
 def save(cwd: str, session_id: str | None, *, due_at: float, resets_at: float,
          config_dir: str | None = None,
-         settings: dict[str, Any] | None = None, reopens: int = 0) -> None:
-    """Record that *session_id* waits on a limit until *due_at*.  Failures
-    never stop the resume being armed in the session itself."""
+         settings: dict[str, Any] | None = None, reopens: int = 0,
+         attempts: int = 0) -> None:
+    """Record that *session_id* waits on a limit until *due_at*: after
+    *attempts* resumes that ran back into it.  Failures never stop the resume
+    being armed in the session itself."""
     if not session_id or not _is_time(due_at):
         return
     fields: dict[str, Any] = {"config_dir": config_dir, "due_at": float(due_at),
-                              "resets_at": float(resets_at), "reopens": int(reopens)}
+                              "resets_at": int(resets_at), "reopens": int(reopens),
+                              "attempts": int(attempts)}
     for key in SETTINGS:
         value = (settings or {}).get(key)
         if isinstance(value, str) and value:
@@ -550,10 +563,7 @@ def rekey(cwd: str, old_id: str | None, new_id: str | None) -> bool:
 
 def note_reopened(rec: dict) -> None:
     """Count one reopen of *rec*'s session by the hub (``MAX_REOPENS``)."""
-    fields = {k: v for k, v in rec.items()
-              if k not in ("cwd", "session_id", "saved_at")}
-    fields["reopens"] = int(rec.get("reopens") or 0) + 1
-    _store.save(rec["cwd"], rec["session_id"], fields)
+    _store.update(rec, reopens=int(rec.get("reopens") or 0) + 1)
 
 
 def iter_records() -> Iterator[dict]:

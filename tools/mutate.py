@@ -3037,13 +3037,13 @@ RECSTORE_MUTATIONS = [
     ("clearing a record does nothing, leaving one that runs the same turn "
      "again on the next start",
      "        try:\n            self.path_for(cwd, session_id).unlink()\n"
-     "        except (OSError, FileNotFoundError):\n            pass",
+     "        except OSError:\n            pass",
      "        pass"),
 
     ("a session whose id changed keeps its record under the old id, where "
      "nothing clears it and the next start acts on the old transcript",
-     "        self.save(cwd, new_id, fields)\n        self.clear(cwd, old_id)\n",
-     "        self.save(cwd, new_id, fields)\n"),
+     '        self.update({**rec, "session_id": new_id})\n        self.clear(cwd, old_id)\n',
+     '        self.update({**rec, "session_id": new_id})\n'),
 ]
 
 # --resume-after-limit (design.md 6h).  tests/test_resume_after_limit.py.
@@ -3093,6 +3093,30 @@ LIMITRESUME_BRIDGE_MUTATIONS = [
     ("an opened session's limit is never put on the State",
      "        if st.rate_limit_status != \"rejected\":\n            self._adopt_limit_stop(stop)",
      "        if False:\n            self._adopt_limit_stop(stop)"),
+
+    ("a /login meanwhile drops the resume, leaving it half-cancelled",
+     "            stop = self._limit_armed_stop\n",
+     "            stop = self._stopped_by_limit()\n"),
+
+    ("a reconnect puts back the limit a /login cleared",
+     "        if sid == self._limit_open_checked:",
+     "        if False:"),
+
+    ("a session reopened between retries starts counting again",
+     '            self._limit_attempts = int(rec.get("attempts") or 0)',
+     "            self._limit_attempts = 0"),
+
+    ("the hint names a reset already past",
+     "        if self._limit_hinted_for == reset or reset <= time.time():",
+     "        if self._limit_hinted_for == reset:"),
+
+    ("a ghost turn the user interrupted arms a resume",
+     "                self._ghost_interrupted = True\n",
+     ""),
+
+    ("a reopened session rings the launch's bell, not the one /bell set",
+     '                      "bell_on": " ".join(sorted(st.bell_events)) or "none"},',
+     '                      "bell_on": getattr(cfg, "bell_on", None)},'),
 ]
 
 LIMITRESUME_SERVER_MUTATIONS = [
@@ -3102,7 +3126,7 @@ LIMITRESUME_SERVER_MUTATIONS = [
      ""),
 
     ("every session that comes due is reopened at once, with no cap",
-     "            if len(_limit_reopened) >= LIMIT_REOPEN_MAX_OPEN:",
+     "            if len(headless) >= LIMIT_REOPEN_MAX_OPEN:",
      "            if False:"),
 
     ("a reopened session runs on the hub's model, effort and CLI",
@@ -3117,6 +3141,14 @@ LIMITRESUME_SERVER_MUTATIONS = [
     ("a resume due in a moment is closed only to be reopened",
      "                and resume_at - time.time() < timeout)",
      "                and False)"),
+
+    ("one record that cannot be scheduled stops the restore of the rest",
+     "        try:\n            _schedule_limit_reopen(rec)\n        except Exception:",
+     "        if True:\n            _schedule_limit_reopen(rec)\n        if False:"),
+
+    ("sessions the user took over keep their places among the reopened",
+     "            headless = [r for r in _limit_reopened if not runtimes[r].clients]",
+     "            headless = list(_limit_reopened)"),
 ]
 
 LIMITRESUME_MODULE_MUTATIONS = [
@@ -3129,8 +3161,12 @@ LIMITRESUME_MODULE_MUTATIONS = [
      "                report(at, None,"),
 
     ("a reset read from text wins over the same limit's exact headers",
-     '                          and kind == found["kind"])):',
-     "                          and False)):"),
+     '        same_window = (from_headers and not exact and kind == found["kind"]\n',
+     "        same_window = (False\n"),
+
+    ("an older limit's headers win over a later one named only in text",
+     "                       and bool(reset) and reset > (text_at or 0))",
+     "                       and bool(reset))"),
 
     ("a session note is repeated as part of the user's prompt",
      "        text = rest.strip() if sep else text",
@@ -3139,6 +3175,11 @@ LIMITRESUME_MODULE_MUTATIONS = [
     ("the resume waits for extra usage's reset, which is billed",
      "    for ts in (resets_at, overage_resets_at):",
      "    for ts in (overage_resets_at, resets_at):"),
+
+    ("a record whose counter is no number is taken as one, and stops the "
+     "hub's restore",
+     '            and _count(rec.get("reopens")) and _count(rec.get("attempts")))',
+     "            and True)"),
 
     ("a clock time already past today is taken as today's",
      "            if when_ <= base:\n                when_ += timedelta(days=1)\n",
@@ -3161,8 +3202,8 @@ CARRIED_MUTATIONS = [
      "        return True\n"),
 
     ("it is shown again with every prompt",
-     "        self._carried_unseen = False\n        jsonl = self._jsonl_for(self.state.session_id)",
-     "        jsonl = self._jsonl_for(self.state.session_id)"),
+     "        self._carried_unseen = False\n        for text in await asyncio.to_thread(self._read_carried):",
+     "        for text in await asyncio.to_thread(self._read_carried):"),
 ]
 
 CARRIED_HISTORY_MUTATIONS = [
@@ -3185,8 +3226,17 @@ RESUMEANYWHERE_MUTATIONS = [
 
     ("the hub's session switches in place to another account's session, "
      "which its CLI cannot resume",
-     "    if rt is _default_runtime and account is None and not live:",
-     "    if rt is _default_runtime and not live:"),
+     "    elif rt is _default_runtime and _same_path(account, tab_account):",
+     "    elif rt is _default_runtime:"),
+
+    ("the hub's own tab resumes in place a session another process holds",
+     "        if await _held_elsewhere(ws, sid, account=account, cwd=found.cwd):\n"
+     "            return\n        await say(\"info\", f\"Resuming {ref} ...\")",
+     "        await say(\"info\", f\"Resuming {ref} ...\")"),
+
+    ("where the session was found is said before the chat is cleared",
+     "    if note:\n        await say(\"info\", note)\n",
+     ""),
 
     ("resuming the session the tab is on opens it a second time",
      '    if sid == getattr(rt.state, "session_id", None):',
