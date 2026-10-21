@@ -4857,7 +4857,7 @@ class SDKBridge:
         """
         await self._flush_pending_compact_turn_end()
 
-    def _apply_pending_rename(self, sid: str) -> bool:
+    async def _apply_pending_rename(self, sid: str) -> bool:
         """Apply a queued ``/rename`` title to session *sid* if one exists.
 
         Returns True when a pending title was successfully written (and the
@@ -4866,17 +4866,23 @@ class SDKBridge:
         can't locate the file — the title stays queued in
         ``state.pending_rename`` for a later retry (called again at
         end-of-turn, by which point the file exists).
+
+        The write runs in a thread: the first one to a transcript scans it,
+        and it may wait for a ``/rename`` of the same session.
         """
         state = self.state
         title = state.pending_rename
         if not title:
             return False
         try:
-            write_session_title(sid, title, getattr(self.config, "config_dir", None))
+            await asyncio.to_thread(write_session_title, sid, title,
+                                    getattr(self.config, "config_dir", None))
         except Exception as exc:
             # Keep the title queued and try again after the turn.
             log.info("pending rename not applied yet (%s) — will retry", exc)
             return False
+        if state.pending_rename != title:
+            return True            # a newer one was queued meanwhile
         state.pending_rename = None
         state.session_title = title
         log.info("applied pending rename: %s → '%s'", sid[:8], title)
@@ -5030,7 +5036,7 @@ class SDKBridge:
                 # the session JSONL to disk yet, so the write can't find the
                 # file.  _apply_pending_rename keeps the title queued for a
                 # retry at end-of-turn instead of dropping it.
-                self._apply_pending_rename(sid)
+                await self._apply_pending_rename(sid)
                 # Warn if the SDK silently started a fresh session
                 # instead of resuming the one we asked for.  This used to be
                 # gated on ``first_init`` as well — but ``init_seen`` is set
@@ -5918,7 +5924,7 @@ class SDKBridge:
                     # reload the title.  Reload only when nothing is pending
                     # so a fresh title isn't clobbered by a stale disk read.
                     if state.session_id:
-                        if not self._apply_pending_rename(state.session_id):
+                        if not await self._apply_pending_rename(state.session_id):
                             # Don't clobber a user-set title that hasn't been
                             # persisted yet (e.g. /rename before the JSONL was
                             # flushed to disk — pending_rename is still queued).

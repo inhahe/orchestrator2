@@ -1,17 +1,20 @@
 """Slash commands that wait on I/O run off the hub's event loop.
 
-``/login`` and ``/logout`` wait on ``claude auth``; ``/rename`` and
-``/export`` can read a whole transcript.  Their handlers are marked
-``commands._off_loop``, and ``run_immediate_command`` runs those in a worker
-thread, so every other session on the hub keeps running meanwhile.  That is
-safe only while they never write ``state``: what they change comes back as
-``state_writes`` and is made on the loop, and not at all if the session
-changed under them.
+``/login`` and ``/logout`` wait on ``claude auth``, and ``/rename`` can scan
+a whole transcript.  Their handlers are marked ``commands._off_loop``, and
+``run_immediate_command`` runs those in a worker thread, so every other
+session on the hub keeps running meanwhile.  That is safe only while they
+never write ``state``: what they change comes back as ``state_writes`` and is
+made on the loop, and not at all if the session changed under them.  Title
+writes take turns per transcript, and a rename queued before the session
+started is written off the loop too.
 
-``/history`` is drawn the way an attach draws it: "loading session..." first,
-so the tab holds what the session says during the read and draws it after the
-history.  An ``/export`` of a large transcript takes its turn among the other
-large reads.  ``/logout`` reports a logout that failed.
+``/history`` and ``/export`` read a whole transcript, so the hub handles them
+itself: in a thread, each in its turn among the large reads.  ``/history`` is
+drawn as an attach draws it: "loading session..." first, so the tab holds
+what the session says during the read, then a history that takes the place
+of the view, so a read that fails leaves the view alone.  ``/logout``
+reports a logout that failed.
 """
 
 from __future__ import annotations
@@ -30,19 +33,36 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import auth                                      # noqa: E402
 import commands                                  # noqa: E402
+import sdk_bridge                                # noqa: E402
 import server                                    # noqa: E402
 import session                                   # noqa: E402
 from config import parse_args                    # noqa: E402
 from hubkit import FakeWS                        # noqa: E402
-from state import State                          # noqa: E402
+from state import State, init_state_from_config  # noqa: E402
 
 SID = "1aa74fb0-ca4e-42cb-80c3-ef7302fee0a4"
-SLOW = ("export", "login", "logout", "rename")
+SLOW = ("login", "logout", "rename")
+_REAL_RUN = subprocess.run
+
+
+def _fake_logout(monkeypatch, result, note=None):
+    """Answer ``claude auth logout`` with *result*'s (code, stdout, stderr);
+    every other subprocess.run, which this patch also reaches, runs for real."""
+    code, out, err = result
+
+    def run(cmd, *a, **kw):
+        if list(cmd[1:3]) != ["auth", "logout"]:
+            return _REAL_RUN(cmd, *a, **kw)
+        if note:
+            note("logout")
+        return subprocess.CompletedProcess(cmd, code, out, err)
+
+    monkeypatch.setattr(subprocess, "run", run)
 
 
 @pytest.fixture
 def world(monkeypatch, tmp_path):
-    """Fakes for everything the slow handlers reach, each noting the thread
+    """Fakes for everything the slow commands reach, each noting the thread
     it ran on: a transcript on disk, the title store, the auth CLI, and a
     sign-in that launches."""
     ran = []
@@ -51,8 +71,7 @@ def world(monkeypatch, tmp_path):
         ran.append((what, threading.get_ident()))
 
     (tmp_path / f"{SID}.jsonl").write_text("{}\n", encoding="utf-8")
-    for mod in (commands, server):
-        monkeypatch.setattr(mod, "find_session_dir", lambda _s, _d=None: tmp_path)
+    monkeypatch.setattr(server, "find_session_dir", lambda _s, _d=None: tmp_path)
 
     def markdown(_jsonl):
         note("export")
@@ -65,24 +84,20 @@ def world(monkeypatch, tmp_path):
         note("login")
         return True, "a window has opened."
 
-    def cli(*a, **_kw):
-        note("logout")
-        return subprocess.CompletedProcess(a, 0, "", "")
-
     monkeypatch.setattr(commands, "render_session_markdown", markdown)
     monkeypatch.setattr(commands, "write_session_title", write_title)
     monkeypatch.setattr(commands, "read_session_title", lambda *_a: "Old title")
     monkeypatch.setattr(auth, "find_claude_cli", lambda: "claude")
     monkeypatch.setattr(auth, "is_logged_in", lambda _d=None: True)
     monkeypatch.setattr(auth, "launch_login", launch)
-    monkeypatch.setattr(commands.subprocess, "run", cli)
+    _fake_logout(monkeypatch, (0, "", ""), note)
     st = State()
     st.session_id = SID
     # So /login takes its launching path, the one with something to change.
     st.auth_error = True
-    payload = {"export": str(tmp_path / "out.md"), "rename": "New title",
-               "login": "", "logout": ""}
-    return SimpleNamespace(state=st, ran=ran, payload=payload, tmp=tmp_path)
+    payload = {"rename": "New title", "login": "", "logout": ""}
+    return SimpleNamespace(state=st, ran=ran, payload=payload, tmp=tmp_path,
+                           note=note)
 
 
 def _run(kind, w):
@@ -224,14 +239,73 @@ def test_a_session_that_starts_meanwhile_keeps_what_was_meant_for_it(monkeypatch
     assert res.forward_payload == "/rename t"
 
 
-def test_title_writes_take_turns(monkeypatch):
-    """Two /renames can now overlap, and healing a transcript's tail can
+def test_a_misspelt_write_fails_rather_than_adding_an_attribute():
+    res = commands.CommandResult(state_writes={"auth_eror": False})
+    with pytest.raises(AttributeError, match="auth_eror"):
+        commands._apply_writes(res, State())
+
+
+# --------------------------------------------------------------------------
+# Title writes
+# --------------------------------------------------------------------------
+
+def test_title_writes_to_a_transcript_take_turns(monkeypatch, tmp_path):
+    """Two /renames of a session can overlap, and healing its tail can
     truncate it under a record the other has just appended."""
+    monkeypatch.setattr(session, "find_session_dir", lambda _s, _d=None: tmp_path)
     held = []
-    monkeypatch.setattr(session, "_write_session_title",
-                        lambda *_a: held.append(session._title_write_lock.locked()))
+
+    def append(jsonl, _sid, _title):
+        held.append(session._title_write_lock(jsonl).locked())
+
+    monkeypatch.setattr(session, "_append_title", append)
     session.write_session_title(SID, "t")
     assert held == [True]
+
+
+def test_title_writes_to_different_transcripts_do_not_wait_for_each_other(tmp_path):
+    """The first write to a large transcript scans it; another session's
+    rename must not wait that out."""
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    assert session._title_write_lock(a) is session._title_write_lock(a)
+    assert session._title_write_lock(a) is not session._title_write_lock(b)
+
+
+def _bridge(st):
+    async def nowhere(_m):
+        pass
+    return sdk_bridge.SDKBridge(config=parse_args([]), state=st,
+                                broadcaster=nowhere)
+
+
+def test_a_queued_rename_is_written_off_the_loop(monkeypatch):
+    """It is written at the session's init and at a turn's end, both on the
+    loop, and may wait on a /rename of the same transcript."""
+    ran_on = []
+    monkeypatch.setattr(sdk_bridge, "write_session_title",
+                        lambda *_a, **_k: ran_on.append(threading.get_ident()))
+    st = init_state_from_config(parse_args([]))
+    st.pending_rename = "Queued"
+    br = _bridge(st)
+
+    async def go():
+        return await br._apply_pending_rename(SID), threading.get_ident()
+
+    ok, loop_thread = asyncio.run(go())
+    assert ok and ran_on and ran_on[0] != loop_thread
+    assert (st.pending_rename, st.session_title) == (None, "Queued")
+
+
+def test_a_rename_queued_while_one_was_written_waits_its_turn(monkeypatch):
+    st = init_state_from_config(parse_args([]))
+    st.pending_rename = "First"
+
+    def write(*_a, **_k):
+        st.pending_rename = "Second"         # queued meanwhile
+
+    monkeypatch.setattr(sdk_bridge, "write_session_title", write)
+    assert asyncio.run(_bridge(st)._apply_pending_rename(SID)) is True
+    assert st.pending_rename == "Second"
 
 
 # --------------------------------------------------------------------------
@@ -240,9 +314,7 @@ def test_title_writes_take_turns(monkeypatch):
 
 def _logout(monkeypatch, returncode, stdout="", stderr=""):
     monkeypatch.setattr(auth, "find_claude_cli", lambda: "claude")
-    monkeypatch.setattr(
-        commands.subprocess, "run",
-        lambda *a, **kw: subprocess.CompletedProcess(a, returncode, stdout, stderr))
+    _fake_logout(monkeypatch, (returncode, stdout, stderr))
     res = commands.try_immediate_command("logout", "", State(), parse_args([]))
     (msg,) = res.messages
     return msg["subtype"], msg["data"]["message"]
@@ -290,6 +362,15 @@ def _type(text, ws=None):
     return ws, asyncio.run(go())
 
 
+def _said(ws):
+    return [(m["subtype"], m["data"]["message"]) for m in ws.sent
+            if m["type"] == "system_msg"]
+
+
+def _kinds(ws):
+    return [(m["type"], m.get("on")) for m in ws.sent]
+
+
 def test_the_hub_runs_a_slow_command_off_its_loop(hub, world):
     _ws, loop_thread = _type("/logout")
     threads = [t for what, t in world.ran if what == "logout"]
@@ -307,29 +388,31 @@ def transcript(hub, world, monkeypatch):
     """The hub's session on disk, and a render of it that notes how it was
     called and what the tab had been sent by then."""
     hub.state.session_id = SID
+    ws = FakeWS()
     reads = []
 
-    def render(jsonl, **kw):
+    def render(_jsonl, **kw):
         reads.append(SimpleNamespace(thread=threading.get_ident(), kw=kw,
-                                     sent=[dict(m) for m in reads_ws[0].sent]))
+                                     sent=_kinds(ws)))
         return 1, [{"type": "user_message", "content": "hi"}], [], []
 
-    reads_ws = [FakeWS()]
     monkeypatch.setattr(server, "render_session_history", render)
-    return SimpleNamespace(ws=reads_ws[0], reads=reads)
+    return SimpleNamespace(ws=ws, reads=reads)
 
 
 def test_history_holds_the_live_view_before_it_reads(transcript):
-    """Cleared, then "loading session..." on, both before the read: what the
-    session says meanwhile is held by the tab and drawn after the history."""
-    _ws, loop_thread = _type("/history 50", transcript.ws)
+    """"loading session..." before the read, so what the session says
+    meanwhile is held by the tab and drawn after the history, and no clear:
+    the history takes the place of the view."""
+    ws, loop_thread = _type("/history 50", transcript.ws)
 
     (read,) = transcript.reads
     assert read.thread != loop_thread, "the transcript was read on the loop"
     assert read.kw == {"max_history": 50}
-    assert [(m["type"], m.get("on")) for m in read.sent][-2:] == \
-        [("clear_screen", None), ("session_loading", True)]
-    assert transcript.ws.sent[-1]["type"] == "history"
+    assert read.sent[-1:] == [("session_loading", True)]
+    assert ("clear_screen", None) not in _kinds(ws)
+    last = ws.sent[-1]
+    assert last["type"] == "history" and last["replace"] is True
 
 
 def test_history_without_a_count_leaves_the_default(transcript):
@@ -341,21 +424,37 @@ def test_history_without_a_count_leaves_the_default(transcript):
     ("x", "error", "Usage: /history [N]"),
     ("0", "error", "N must be positive."),
 ])
-def test_history_refuses_a_bad_count_without_clearing(transcript, arg, level, text):
+def test_history_refuses_a_bad_count(transcript, arg, level, text):
     ws, _loop = _type(f"/history {arg}", transcript.ws)
-    assert [(m["subtype"], m["data"]["message"]) for m in ws.sent
-            if m["type"] == "system_msg"] == [(level, text)]
-    assert not [m for m in ws.sent if m["type"] == "clear_screen"]
+    assert _said(ws) == [(level, text)]
     assert transcript.reads == []
 
 
-def test_history_of_a_session_not_on_disk_says_so_without_clearing(transcript,
-                                                                   monkeypatch):
-    monkeypatch.setattr(server, "find_session_dir", lambda _s, _d=None: None)
+@pytest.mark.parametrize("lookup", ["nothing", "raises"])
+def test_history_of_a_transcript_not_found_says_so(transcript, monkeypatch,
+                                                   lookup):
+    """Raises too: a projects folder that cannot be listed."""
+    def find(_s, _d=None):
+        if lookup == "raises":
+            raise PermissionError("locked")
+        return None
+
+    monkeypatch.setattr(server, "find_session_dir", find)
     ws, _loop = _type("/history", transcript.ws)
-    assert any("not found on disk" in m["data"]["message"]
-               for m in ws.sent if m["type"] == "system_msg")
-    assert not [m for m in ws.sent if m["type"] == "clear_screen"]
+    assert any("not found on disk" in text for _level, text in _said(ws))
+    assert ("session_loading", True) not in _kinds(ws)
+
+
+def test_a_history_that_cannot_be_read_leaves_the_view(transcript, monkeypatch):
+    def render(_jsonl, **_kw):
+        raise ValueError("a truncated tail")
+
+    monkeypatch.setattr(server, "render_session_history", render)
+    ws, _loop = _type("/history", transcript.ws)
+    assert _kinds(ws)[-3:-1] == [("session_loading", True),
+                                 ("session_loading", False)]
+    assert not [m for m in ws.sent if m["type"] in ("clear_screen", "history")]
+    assert any("History load failed" in text for _level, text in _said(ws))
 
 
 def test_history_with_nothing_in_it_turns_loading_off_and_says_so(transcript,
@@ -363,14 +462,59 @@ def test_history_with_nothing_in_it_turns_loading_off_and_says_so(transcript,
     monkeypatch.setattr(server, "render_session_history",
                         lambda _j, **_kw: (0, [], [], []))
     ws, _loop = _type("/history", transcript.ws)
-    assert {"type": "session_loading", "on": False} in ws.sent
-    assert any(m["data"]["message"] == "No history to display."
-               for m in ws.sent if m["type"] == "system_msg")
+    assert ("session_loading", False) in _kinds(ws)
+    assert ("info", "No history to display.") in _said(ws)
+
+
+def test_an_attach_whose_history_cannot_be_read_says_so(transcript,
+                                                         monkeypatch):
+    """Not just a blank chat."""
+    def render(_jsonl, **_kw):
+        raise ValueError("a truncated tail")
+
+    monkeypatch.setattr(server, "render_session_history", render)
+    monkeypatch.setattr(server, "_picker_mode", False)
+    ws = transcript.ws
+    server._ws_runtime[ws] = server._default_runtime
+    asyncio.run(server._send_initial_state(ws))
+    assert ("session_loading", False) in _kinds(ws)
+    assert any(level == "error" and "History load failed" in text
+               for level, text in _said(ws))
+
+
+def test_an_attach_of_a_transcript_not_found_turns_loading_off(transcript,
+                                                               monkeypatch):
+    def find(_s, _d=None):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(server, "find_session_dir", find)
+    monkeypatch.setattr(server, "_picker_mode", False)
+    ws = transcript.ws
+    server._ws_runtime[ws] = server._default_runtime
+    asyncio.run(server._send_initial_state(ws))
+    kinds = _kinds(ws)
+    assert kinds.index(("session_loading", True)) < \
+        kinds.index(("session_loading", False)), \
+        "the tab was left loading, holding everything after it"
+
+
+def test_the_hub_exports_off_its_loop(hub, world):
+    hub.state.session_id = SID
+    ws, loop_thread = _type(f"/export {world.tmp / 'out.md'}")
+    threads = [t for what, t in world.ran if what == "export"]
+    assert threads and loop_thread not in threads
+    assert any(text.startswith("Exported") for _level, text in _said(ws))
+    assert (world.tmp / "out.md").read_text(encoding="utf-8") == "# s\n"
+
+
+def test_an_export_with_no_session_says_so(hub, world):
+    ws, _loop = _type("/export")
+    assert _said(ws) == [("warning", "No active session yet.")]
+    assert not [w for w, _t in world.ran if w == "export"]
 
 
 def test_a_large_export_takes_its_turn_among_the_large_reads(hub, world,
                                                              monkeypatch):
-    import sdk_bridge
     monkeypatch.setattr(sdk_bridge, "HEAVY_CONNECT_BYTES", 0)
     monkeypatch.setattr(sdk_bridge, "_heavy_connect_lock", None)
     hub.state.session_id = SID

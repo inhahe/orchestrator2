@@ -327,7 +327,9 @@ const Chat = (() => {
     });
   }
 
-  function clear() {
+  // *keepHeld*: the next view is this session's own history (a /history), so
+  // what is held back belongs after it, not with the view being wiped.
+  function clear(keepHeld) {
     if (_streamRenderRaf != null) {
       cancelAnimationFrame(_streamRenderRaf);
       _streamRenderRaf = null;
@@ -338,7 +340,7 @@ const Chat = (() => {
     _loadingEl = null;   // was a child of elMessages, just cleared
     // Held back for the view being wiped; drawn now, they would land in the
     // next one.
-    _pendingMessages = [];
+    if (!keepHeld) _pendingMessages = [];
     _catchingUp = false;
     _thinkingToFit = [];
     _toolBlocks.clear();
@@ -730,7 +732,11 @@ const Chat = (() => {
       case 'command_data':    _addCommandData(msg); break;
       case 'modal':           _openModal(msg); break;
       case 'bell':            _playBell(); break;
-      case 'history':         _replayHistory(msg.messages, msg.more_above); break;
+      case 'history':
+        // A /history takes the place of what is shown, keeping what is held.
+        if (msg.replace) clear(true);
+        _replayHistory(msg.messages, msg.more_above);
+        break;
       case 'history_prepend': _prependHistory(msg.messages); break;
       default:
         console.warn('[chat] unhandled message type:', msg.type, msg);

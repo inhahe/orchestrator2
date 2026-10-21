@@ -627,5 +627,36 @@ test('a summary fitted while the history is still drawing is not emptied at its 
          + JSON.stringify(summaries(p)[0]));
 });
 
+// --- /history takes the place of the view, keeping what it held ------------
+
+function shown(p, text) {
+  p.Chat.handleMessage({ type: 'system_msg', subtype: 'info',
+                         data: { message: text } });
+}
+
+test('a replacing history wipes the view and draws what was held after it', () => {
+  // What a /history sends: loading on (so the tab holds what the session
+  // says during the read), then the history in place of the view.
+  const p = makePage();
+  shown(p, 'the old view');
+  p.Chat.handleMessage({ type: 'session_loading', on: true });
+  shown(p, 'said meanwhile');
+  p.Chat.handleMessage({ type: 'history', messages: msgs('h', 2), replace: true });
+  p.flushTimers();
+  const t = p.texts().join(' | ');
+  assert(!t.includes('the old view'), 'the old view stayed: ' + t);
+  assert(t.includes('said meanwhile'), 'what was held was lost: ' + t);
+  assert(t.indexOf('h1') < t.indexOf('said meanwhile'),
+         'what was held was drawn above the history: ' + t);
+});
+
+test('a history that does not replace leaves the view to a clear_screen', () => {
+  const p = makePage();
+  shown(p, 'already shown');
+  p.hist(msgs('h', 1));
+  assert(p.texts().join(' | ').includes('already shown'),
+         'an attach history wiped the view itself');
+});
+
 console.log(`\n${ran - failures}/${ran} passed`);
 process.exit(failures ? 1 : 0);

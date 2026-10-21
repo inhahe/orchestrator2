@@ -652,6 +652,14 @@ BACKFILL_MUTATIONS = [
     ("elMessages is left pointing at the scratch container",
      "      elMessages = real;\n",
      ""),
+
+    ("a /history drops what the tab held during its read",
+     "    if (!keepHeld) _pendingMessages = [];",
+     "    _pendingMessages = [];"),
+
+    ("a /history is drawn below the view it should replace",
+     "        if (msg.replace) clear(true);\n",
+     ""),
 ]
 
 HISTREAD_MUTATIONS = [
@@ -6005,7 +6013,7 @@ CUTOFF_CHAT_MUTATIONS = [
     ("what was held for a session left behind is drawn in the next",
      "    // Held back for the view being wiped; drawn now, they would land in the\n"
      "    // next one.\n"
-     "    _pendingMessages = [];\n",
+     "    if (!keepHeld) _pendingMessages = [];\n",
      ""),
 
     ("a replay that ends while the next session loads draws its messages early",
@@ -6150,8 +6158,8 @@ CATCHUP_CHAT_MUTATIONS = [
      "    _scrollToBottom();\n"),
 
     ("clearing holds what comes next for the view it wiped",
-     "    _pendingMessages = [];\n    _catchingUp = false;\n",
-     "    _pendingMessages = [];\n"),
+     "    if (!keepHeld) _pendingMessages = [];\n    _catchingUp = false;\n",
+     "    if (!keepHeld) _pendingMessages = [];\n"),
 
     ("a catch-up measures each thinking summary as it is drawn",
      "    if (isSingleLine && nChars > 0 && (_drawingInBulk || _replayInProgress)) {\n",
@@ -7533,6 +7541,10 @@ OFFLOOP_CMD_MUTATIONS = [
      "    if result is not None and sid is not None and state.session_id != sid:\n",
      "    if result is not None and state.session_id != sid:\n"),
 
+    ("a misspelt state write adds an attribute and leaves the real one",
+     "            if not hasattr(state, name):\n",
+     "            if False:\n"),
+
     ("/rename writes its title from the worker thread",
      '    titled = {"session_title": new_title, "human_title": new_title,\n',
      "    state.session_title = new_title\n"
@@ -7558,12 +7570,12 @@ OFFLOOP_CMD_MUTATIONS = [
 
 OFFLOOP_SERVER_MUTATIONS = [
     ("the hub runs the slow commands inline again",
-     "            result = await run_immediate_command(kind, payload, state, config)\n",
-     "            from commands import try_immediate_command\n"
-     "            result = try_immediate_command(kind, payload, state, config)\n"),
+     "        result = await run_immediate_command(kind, payload, state, config)\n",
+     "        from commands import try_immediate_command\n"
+     "        result = try_immediate_command(kind, payload, state, config)\n"),
 
     ("/history reads before the tab holds its live view, which the "
-     "history's clear then wipes",
+     "history then wipes",
      '    await send_to(ws, {"type": "session_loading", "on": True})\n'
      "    cap = ",
      "    cap = "),
@@ -7575,24 +7587,43 @@ OFFLOOP_SERVER_MUTATIONS = [
      "                jsonl, **cap)\n"),
 
     ("/history N shows the default number of records",
-     "    trouble = await _send_session_history(ws, state, jsonl, max_history=limit)\n",
-     "    trouble = await _send_session_history(ws, state, jsonl)\n"),
+     "    trouble = await _send_session_history(ws, state, jsonl, max_history=limit,\n",
+     "    trouble = await _send_session_history(ws, state, jsonl,\n"),
 
-    ("/history clears the screen before it knows there is a transcript",
-     "    jsonl = await _session_jsonl(state, rt.config)\n    if jsonl is None:\n",
+    ("/history is drawn below the view rather than in its place",
+     "                                          replace=True)\n",
+     "                                          replace=False)\n"),
+
+    ("/history clears the view before its read, so one that fails leaves "
+     "nothing",
+     "    trouble = await _send_session_history(ws, state, jsonl, max_history=limit,\n",
      '    await send_to(ws, {"type": "clear_screen"})\n'
-     "    jsonl = await _session_jsonl(state, rt.config)\n    if jsonl is None:\n"),
+     "    trouble = await _send_session_history(ws, state, jsonl, max_history=limit,\n"),
 
     ("an empty history leaves the tab loading, holding everything after it",
      '        await send_to(ws, {"type": "session_loading", "on": False})\n'
      '        return "info", "No history to display."\n',
      '        return "info", "No history to display."\n'),
 
+    ("a projects folder that cannot be listed ends the attach, leaving the "
+     "tab loading",
+     "    except OSError as exc:\n"
+     '        log.warning("[history] could not look for the transcript of %s: %s",\n',
+     "    except ZeroDivisionError as exc:\n"
+     '        log.warning("[history] could not look for the transcript of %s: %s",\n'),
+
+    ("an attach whose history cannot be read leaves a blank chat and no word",
+     '            if trouble is not None and trouble[0] == "error":\n',
+     "            if False:\n"),
+
     ("an /export never waits its turn among the large reads",
-     '        if kind == "export":\n'
-     "            jsonl = await _session_jsonl(state, config)\n",
-     "        if False:\n"
-     "            jsonl = await _session_jsonl(state, config)\n"),
+     "    async with _transcript_read_slot(jsonl, sid):\n        said = ",
+     "    async with contextlib.nullcontext():\n        said = "),
+
+    ("/export reads the transcript on the event loop",
+     "        said = await asyncio.to_thread(export_session, jsonl, sid, payload,\n"
+     "                                       rt.config.cwd)\n",
+     "        said = export_session(jsonl, sid, payload, rt.config.cwd)\n"),
 
     ("a large read never queues behind the others",
      "            lock = _sb._heavy_lock()\n",
@@ -7602,8 +7633,25 @@ OFFLOOP_SERVER_MUTATIONS = [
 OFFLOOP_SESSION_MUTATIONS = [
     ("two title writes overlap, and one's tail heal can cut off the other's "
      "record",
-     "    with _title_write_lock:\n        _write_session_title(",
-     "    if True:\n        _write_session_title("),
+     "    with _title_write_lock(jsonl):\n        _append_title(",
+     "    if True:\n        _append_title("),
+
+    ("every transcript shares one lock, so a long scan of one holds up "
+     "renames of all",
+     "        return _title_write_locks.setdefault(jsonl, threading.Lock())\n",
+     "        return _title_write_locks.setdefault(None, threading.Lock())\n"),
+]
+
+OFFLOOP_BRIDGE_MUTATIONS = [
+    ("a queued rename is written on the event loop",
+     "            await asyncio.to_thread(write_session_title, sid, title,\n"
+     '                                    getattr(self.config, "config_dir", None))\n',
+     '            write_session_title(sid, title, getattr(self.config, "config_dir", None))\n'),
+
+    ("a rename queued while one was written is dropped",
+     "        if state.pending_rename != title:\n"
+     "            return True            # a newer one was queued meanwhile\n",
+     ""),
 ]
 
 
@@ -7858,6 +7906,8 @@ TARGETS = {
                        OFFLOOP_SERVER_MUTATIONS, "pytest"),
     "offloop-session": ("session.py", "tests/test_off_loop_commands.py",
                         OFFLOOP_SESSION_MUTATIONS, "pytest"),
+    "offloop-bridge": ("sdk_bridge.py", "tests/test_off_loop_commands.py",
+                       OFFLOOP_BRIDGE_MUTATIONS, "pytest"),
     "holders": ("proc_guard.py", "tests/test_proc_guard.py",
                 HOLDERS_MUTATIONS, "pytest"),
     "sessionjob": ("proc_guard.py", "tests/test_session_job.py",

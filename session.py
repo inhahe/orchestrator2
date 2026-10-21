@@ -1648,10 +1648,18 @@ def heal_tail_before_append(jsonl: Path) -> dict[str, int]:
     return removed
 
 
-#: One title write at a time.  ``/rename`` runs in a worker thread, so two can
-#: overlap; ``heal_tail_before_append`` may truncate the file, which would cut
-#: off a record the other had just appended.
-_title_write_lock = threading.Lock()
+#: One title write at a time to each transcript.  ``/rename`` runs in a worker
+#: thread, so two can overlap, and ``heal_tail_before_append`` may truncate the
+#: file under a record the other has just appended.  Per transcript, so the
+#: first write to a large one, which scans it, holds up no other session's.
+_title_write_locks: dict[Path, threading.Lock] = {}
+_title_write_locks_guard = threading.Lock()
+
+
+def _title_write_lock(jsonl: Path) -> threading.Lock:
+    """The lock that title writes to *jsonl* take turns on."""
+    with _title_write_locks_guard:
+        return _title_write_locks.setdefault(jsonl, threading.Lock())
 
 
 def write_session_title(
@@ -1669,25 +1677,22 @@ def write_session_title(
     appending to the JSONL alone does not make a rename stick — see the long
     note above ``_RENAME_PIN_PATH``.
     """
-    with _title_write_lock:
-        _write_session_title(session_id, title, config_dir)
-
-
-def _write_session_title(session_id: str, title: str,
-                         config_dir: str | None) -> None:
     project = find_session_dir(session_id, config_dir)
-    jsonl = (project / f"{session_id}.jsonl") if project is not None else None
+    if project is None:
+        raise OSError(f"session {session_id} not found on disk")
+    jsonl = project / f"{session_id}.jsonl"
+    with _title_write_lock(jsonl):
+        _append_title(jsonl, session_id, title)
+
+
+def _append_title(jsonl: Path, session_id: str, title: str) -> None:
+    """``write_session_title``'s work on transcript *jsonl*, under its lock."""
+    if not jsonl.exists():
+        raise OSError(f"session jsonl missing: {jsonl}")
     # Snapshot what the file says *before* we append.  That's the value the CLI
     # has cached and will keep re-stamping at EOF, so the pin has to recognise
     # it as obsolete rather than as a competing rename.
-    prev = (_resolve_title_raw(jsonl)[0]
-            if jsonl is not None and jsonl.exists() else None)
-
-    if project is None:
-        raise OSError(f"session {session_id} not found on disk")
-    assert jsonl is not None
-    if not jsonl.exists():
-        raise OSError(f"session jsonl missing: {jsonl}")
+    prev = _resolve_title_raw(jsonl)[0]
     record = {
         "type": "custom-title",
         "customTitle": title,

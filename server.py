@@ -130,6 +130,7 @@ from session import (
 )
 from commands import (
     classify,
+    export_session,
     format_mcp_status,
     get_command_completions,
     run_immediate_command,
@@ -4964,8 +4965,16 @@ async def _handle_resume_after_limit(ws: WebSocket, bridge, payload: str) -> Non
                        "data": {"message": "usage: /resume-after-limit [on|off]"}})
 
 
+async def _say(ws: WebSocket, text: str, level: str = "info") -> None:
+    """Show *ws* a system message of subtype *level*."""
+    await send_to(ws, {"type": "system_msg", "subtype": level,
+                       "data": {"message": text}})
+
+
 async def _session_jsonl(state: State, config: Config) -> Path | None:
-    """The transcript of *state*'s session, or None if it has none on disk.
+    """The transcript of *state*'s session, or None if it has none on disk,
+    or none could be looked for (a projects folder that cannot be listed,
+    which is logged).
 
     Looked up under the session's own account (``config.config_dir``), so a
     cross-account session's is found, and passed explicitly rather than
@@ -4974,10 +4983,15 @@ async def _session_jsonl(state: State, config: Config) -> Path | None:
     sid = state.session_id
     if not sid:
         return None
-    found = await asyncio.to_thread(find_session_dir, sid,
-                                    getattr(config, "config_dir", None))
-    jsonl = found / f"{sid}.jsonl" if found is not None else None
-    return jsonl if jsonl is not None and jsonl.exists() else None
+    try:
+        found = await asyncio.to_thread(find_session_dir, sid,
+                                        getattr(config, "config_dir", None))
+        jsonl = found / f"{sid}.jsonl" if found is not None else None
+        return jsonl if jsonl is not None and jsonl.exists() else None
+    except OSError as exc:
+        log.warning("[history] could not look for the transcript of %s: %s",
+                    sid, exc)
+        return None
 
 
 def _transcript_read_slot(jsonl: Path, sid: str | None):
@@ -5009,6 +5023,7 @@ def _transcript_read_slot(jsonl: Path, sid: str | None):
 
 async def _send_session_history(ws: WebSocket, state: State, jsonl: Path, *,
                                 max_history: int | None = None,
+                                replace: bool = False,
                                 ) -> tuple[str, str] | None:
     """Send *ws* the history in *jsonl*, the transcript of *state*'s session.
 
@@ -5019,9 +5034,13 @@ async def _send_session_history(ws: WebSocket, state: State, jsonl: Path, *,
     The read runs in a thread, behind ``_transcript_read_slot``.
 
     *max_history* caps the records rendered; None leaves
-    ``render_session_history``'s default.  Returns None once history has
-    been sent, else the system message subtype and text that say why none
-    was; loading is turned off then.
+    ``render_session_history``'s default.  *replace*: the history takes the
+    place of what the tab shows, rather than following a ``clear_screen``
+    sent before it; the messages the tab holds are kept either way.  Not
+    cleared first, a view whose history cannot be read stays as it was.
+
+    Returns None once history has been sent, else the system message
+    subtype and text that say why none was; loading is turned off then.
     """
     sid = state.session_id
     await send_to(ws, {"type": "session_loading", "on": True})
@@ -5055,7 +5074,7 @@ async def _send_session_history(ws: WebSocket, state: State, jsonl: Path, *,
     tail = history_msgs[-HISTORY_FIRST_SLICE:]
     head = history_msgs[:-len(tail)]
     await send_to(ws, {"type": "history", "messages": tail,
-                       "more_above": len(head)})
+                       "more_above": len(head), "replace": replace})
     if head:
         await send_to(ws, {"type": "history_prepend", "messages": head})
     log.info("[history] sent %d history messages for %s "
@@ -5071,36 +5090,54 @@ async def _handle_history(ws: WebSocket, rt: SessionRuntime,
 
     Drawn the way an attach draws it (``_send_session_history``), so what
     the session says while a large transcript is read is drawn after the
-    history rather than wiped by it.
+    history rather than wiped by it, and replacing the view rather than
+    clearing it first, so a history that cannot be read leaves it alone.
     """
-    async def say(text: str, level: str) -> None:
-        await send_to(ws, {"type": "system_msg", "subtype": level,
-                           "data": {"message": text}})
-
     limit = None
     arg = payload.strip()
     if arg:
         try:
             limit = int(arg)
         except ValueError:
-            await say("Usage: /history [N]", "error")
+            await _say(ws, "Usage: /history [N]", "error")
             return
         if limit <= 0:
-            await say("N must be positive.", "error")
+            await _say(ws, "N must be positive.", "error")
             return
     state = rt.state
     if not state.session_id:
-        await say("No active session.", "warning")
+        await _say(ws, "No active session.", "warning")
         return
     jsonl = await _session_jsonl(state, rt.config)
     if jsonl is None:
-        await say(f"Session {state.session_id[:8]} not found on disk.", "error")
+        await _say(ws, f"Session {state.session_id[:8]} not found on disk.",
+                   "error")
         return
-    await send_to(ws, {"type": "clear_screen"})
-    trouble = await _send_session_history(ws, state, jsonl, max_history=limit)
+    trouble = await _send_session_history(ws, state, jsonl, max_history=limit,
+                                          replace=True)
     if trouble is not None:
         level, text = trouble
-        await say(text, level)
+        await _say(ws, text, level)
+
+
+async def _handle_export(ws: WebSocket, rt: SessionRuntime,
+                         payload: str) -> None:
+    """``/export [path]``: write the conversation out as markdown
+    (``commands.export_session``).  In a thread, and in its turn among the
+    large reads: it reads the whole transcript."""
+    state = rt.state
+    sid = state.session_id
+    if not sid:
+        await _say(ws, "No active session yet.", "warning")
+        return
+    jsonl = await _session_jsonl(state, rt.config)
+    if jsonl is None:
+        await _say(ws, f"Session {sid[:8]} not found on disk.", "error")
+        return
+    async with _transcript_read_slot(jsonl, sid):
+        said = await asyncio.to_thread(export_session, jsonl, sid, payload,
+                                       rt.config.cwd)
+    await send_to(ws, said)
 
 
 async def _send_initial_state(ws: WebSocket) -> None:
@@ -5158,7 +5195,11 @@ async def _send_initial_state(ws: WebSocket) -> None:
         if jsonl is None:
             await send_to(ws, {"type": "session_loading", "on": False})
         else:
-            await _send_session_history(ws, state, jsonl)
+            trouble = await _send_session_history(ws, state, jsonl)
+            # A history with nothing in it needs no word; one that could not
+            # be read does, or the chat is just blank.
+            if trouble is not None and trouble[0] == "error":
+                await _say(ws, trouble[1], "error")
     else:
         log.info("[history] no session_id on state (rt=%s)", rt.rid)
 
@@ -5968,6 +6009,10 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             await _handle_history(ws, rt, payload)
             return
 
+        if kind == "export":
+            await _handle_export(ws, rt, payload)
+            return
+
         # /apikey -- the session's own API key, in a Config only this module
         # can replace.
         if kind == "apikey":
@@ -5981,15 +6026,8 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
         if kind == "model-show":
             await _refresh_models_for_show()
 
-        # Try immediate command.  An /export reads the whole transcript, so
-        # it takes its turn among the other large reads.
-        slot = contextlib.nullcontext()
-        if kind == "export":
-            jsonl = await _session_jsonl(state, config)
-            if jsonl is not None:
-                slot = _transcript_read_slot(jsonl, state.session_id)
-        async with slot:
-            result = await run_immediate_command(kind, payload, state, config)
+        # Try immediate command.
+        result = await run_immediate_command(kind, payload, state, config)
         if result is not None:
             for m in result.messages:
                 await send_to(ws, m)

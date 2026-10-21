@@ -33,7 +33,6 @@ from state import (
     state_to_status_dict,
 )
 from session import (
-    find_session_dir,
     read_session_title,
     render_session_markdown,
     save_session_compaction_soon,
@@ -238,7 +237,6 @@ _IMMEDIATE_HANDLERS: dict[str, str] = {
     "debug":           "_cmd_debug",
     "clear-screen":    "_cmd_clear_screen",
     "rename":          "_cmd_rename",
-    "export":          "_cmd_export",
     "show-thinking":   "_cmd_show_thinking",
     "collapse":        "_cmd_collapse",
     "collapse-threshold": "_cmd_collapse_threshold",
@@ -301,9 +299,16 @@ def _handler_for(kind: str):
 
 def _apply_writes(result: CommandResult | None,
                   state: State) -> CommandResult | None:
-    """Make *result*'s ``state_writes``; returns *result*."""
+    """Make *result*'s ``state_writes``; returns *result*.
+
+    Each must name an attribute *state* already has: a misspelt one would
+    otherwise add a new attribute and leave the real one as it was.
+    """
     if result is not None:
         for name, value in result.state_writes.items():
+            if not hasattr(state, name):
+                raise AttributeError(f"state_writes names {name!r}, "
+                                     "which State does not have")
             setattr(state, name, value)
     return result
 
@@ -642,41 +647,34 @@ def _cmd_rename(payload: str, state: State, config: Config) -> CommandResult:
     )
 
 
-@_off_loop
-def _cmd_export(payload: str, state: State, config: Config) -> CommandResult:
-    sid = state.session_id
-    if not sid:
-        return CommandResult(messages=[_msg("No active session yet.", level="warning")])
-    # Scope the lookup to *this* session's account — a cross-account hub runtime
-    # stores its session under its own account, not the hub's.
-    project_dir = find_session_dir(sid, getattr(config, "config_dir", None))
-    if project_dir is None:
-        return CommandResult(messages=[_msg(f"Session {sid[:8]} not found on disk.", level="error")])
-    jsonl = project_dir / f"{sid}.jsonl"
-    if not jsonl.exists():
-        return CommandResult(messages=[_msg(f"Session file not found: {jsonl}", level="error")])
+def export_session(jsonl: Path, sid: str, path_arg: str,
+                   cwd: str) -> dict[str, Any]:
+    """``/export [path]``'s work: write transcript *jsonl*, of session *sid*,
+    out as markdown, and return the message that says where or why not.
 
-    path_arg = payload.strip()
+    *path_arg* is the path the user gave: a file, or a directory to put a
+    stamped file in; empty means a stamped file in *cwd*.  Reads the whole
+    transcript, so the hub runs it in a thread (``server._handle_export``).
+    """
+    stamped = f"claude-{sid[:8]}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+    path_arg = path_arg.strip()
     if path_arg:
         out_path = Path(path_arg).expanduser()
         if out_path.is_dir():
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            out_path = out_path / f"claude-{sid[:8]}-{stamp}.md"
+            out_path = out_path / stamped
     else:
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        out_path = Path(config.cwd) / f"claude-{sid[:8]}-{stamp}.md"
-
+        out_path = Path(cwd) / stamped
     try:
         markdown = render_session_markdown(jsonl)
     except Exception as e:
-        return CommandResult(messages=[_msg(f"Export failed: {e}", level="error")])
+        return _msg(f"Export failed: {e}", level="error")
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(markdown, encoding="utf-8")
     except OSError as e:
-        return CommandResult(messages=[_msg(f"Export write failed: {e}", level="error")])
+        return _msg(f"Export write failed: {e}", level="error")
     size = out_path.stat().st_size
-    return CommandResult(messages=[_msg(f"Exported → {out_path.resolve()} ({size} bytes)")])
+    return _msg(f"Exported → {out_path.resolve()} ({size} bytes)")
 
 
 def _cmd_show_thinking(payload: str, state: State, _config: Config) -> CommandResult:

@@ -73,18 +73,24 @@ Three layers, deliberately separated:
 - **Immediate commands never touch the SDK, and never stall the loop.**
   `/help`, `/cls`, `/status` etc. are synchronous handlers, so they work
   mid-turn. The few that wait on I/O are marked `commands._off_loop`:
-  `/login` and `/logout` run `claude auth`, and `/export` and `/rename` can
-  read a whole transcript. `run_immediate_command` runs those in a worker
-  thread, so the other sessions keep running meanwhile. They may read `state`
-  but never write it. What they change comes back as the result's
-  `state_writes` and is made on the loop, and not at all if the session
-  changed while they ran (a `/clear` or `/resume` from another tab). Title
-  writes take a lock, since two `/rename`s can now overlap. An `/export` of a
-  large transcript queues with the other large reads (`_transcript_read_slot`).
-- **`/history` is drawn the way an attach draws it** (`server._send_session_history`):
-  `clear_screen`, then "loading session…", then the read in a thread. While
-  loading, the tab holds what the session says and draws it after the
-  history, so a live turn is neither drawn above the history nor wiped by it.
+  `/login` and `/logout` run `claude auth`, and `/rename` can scan a whole
+  transcript. `run_immediate_command` runs those in a worker thread, so the
+  other sessions keep running meanwhile. They may read `state` but never
+  write it. What they change comes back as the result's `state_writes`
+  (each must name an attribute State has) and is made on the loop, and not
+  at all if the session changed while they ran (a `/clear` or `/resume` from
+  another tab). Title writes take turns per transcript, since two `/rename`s
+  can now overlap; a rename queued before the session started is written in
+  a thread too.
+- **`/history` and `/export` read a whole transcript, so the hub runs them**
+  (`server._handle_history`, `_handle_export`): in a thread, each in its turn
+  among the large reads (`_transcript_read_slot`). `/history` is drawn the
+  way an attach draws it (`_send_session_history`): "loading session…" before
+  the read, so the tab holds what the session says meanwhile and draws it
+  after the history, then a `history` with `replace`, which takes the place
+  of the view and keeps what is held. Not cleared first, a view whose
+  history cannot be read stays as it was. An attach that cannot read its
+  history says so rather than leaving a blank chat.
 - **The SDK connection is owned by the worker task.** `bridge.connect()`,
   `disconnect()` and `reconnect()` may only be called *from* `worker_loop`'s
   task. Anything else — a route handler, a timer, an `asyncio.create_task` —
@@ -1013,8 +1019,10 @@ cut off and is waiting (§6e), the one thing the user must see on opening it.
 So while "loading session…" shows, `chat.js` holds live chat messages as it
 already did during the batched replay (`_pendingMessages`), and draws them
 after the history -- or when loading ends without one, or the history is
-empty. A `clear_screen` drops what was held for the view it wipes.
-Tests: `history_backfill.test.js`; mutation target `cutoff-chat`.
+empty. A `clear_screen` drops what was held for the view it wipes. A
+`history` with `replace` (a `/history`) clears the view itself and keeps what
+is held, since what was said during its read belongs after it.
+Tests: `history_backfill.test.js`; mutation targets `cutoff-chat`, `backfill`.
 
 The cost of that boundedness: a `TodoWrite` further back than the cap is not
 found, so a very stale plan seeds nothing rather than seeding something wrong.
