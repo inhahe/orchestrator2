@@ -39,6 +39,14 @@ from `SDKBridge._take_session_id`). Test:
 `test_a_new_session_id_takes_the_schedules_with_it`; mutation targets
 `limitresume` (both moves) and `recstore`.
 
+## `--resume`'s "pick one by id" said it needed --cwd and --config-dir — FIXED (2026-10-21)
+
+When several sessions shared a title and the launch had fixed neither
+directory nor account, the list ended "Resume one by its id (--resume <id>),
+with the --cwd and --config-dir it needs." An id is followed to its own
+directory and account in that case, so no flag is needed; it now says so
+only when one was given. Found while making `/resume` use the same resolver.
+
 ## `/loop`'s messages went to every tab of every session — FIXED (2026-10-21)
 
 `_handle_loop` in server.py sent "Wakeup loop stopped" and "armed" with the

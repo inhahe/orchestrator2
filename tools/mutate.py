@@ -3145,6 +3145,23 @@ LIMITRESUME_MODULE_MUTATIONS = [
      ""),
 ]
 
+# /resume <id|title> from any tab, in any directory and account.
+# tests/test_launch_resume.py.
+RESUMEANYWHERE_MUTATIONS = [
+    ("a tab on any session but the hub's own is told to use Sessions",
+     'if kind in ("switch-cwd", "resume-pick") and rt is not _default_runtime:',
+     'if kind in ("switch-cwd", "resume", "resume-pick") and rt is not _default_runtime:'),
+
+    ("the hub's session switches in place to another account's session, "
+     "which its CLI cannot resume",
+     "    if rt is _default_runtime and account is None and not live:",
+     "    if rt is _default_runtime and not live:"),
+
+    ("resuming the session the tab is on opens it a second time",
+     '    if sid == getattr(rt.state, "session_id", None):',
+     "    if False:"),
+]
+
 # A background tab Chrome kills is asleep, not gone: its session is kept.
 # tests/test_asleep_tab.py and tests/reconnect_on_show.test.js.
 ASLEEP_SERVER_MUTATIONS = [
@@ -7384,6 +7401,8 @@ TARGETS = {
                            LIMITRESUME_SERVER_MUTATIONS, "pytest"),
     "limitresume-module": ("limit_resume.py", "tests/test_resume_after_limit.py",
                            LIMITRESUME_MODULE_MUTATIONS, "pytest"),
+    "resumeanywhere": ("server.py", "tests/test_launch_resume.py",
+                       RESUMEANYWHERE_MUTATIONS, "pytest"),
     "asleep-server": ("server.py", "tests/test_asleep_tab.py",
                       ASLEEP_SERVER_MUTATIONS, "pytest"),
     "asleep-app": ("static/app.js", "tests/reconnect_on_show.test.js",

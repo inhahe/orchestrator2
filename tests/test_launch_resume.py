@@ -644,3 +644,163 @@ def test_resume_inside_a_session_names_the_ones_that_share_a_title(machine, monk
 
     assert not ok and "2 sessions here are called 'OS F'" in err
     assert LIVE in err and IDLE in err
+
+
+# --------------------------------------------------------------------------
+# /resume in a tab: any directory, any account
+#
+# Asked 2026-10-21: "add a command to resume a session from any directory, not
+# just the one you're currently in. maybe also be able to resume from any
+# claude account".  --resume already did both; /resume worked only in the
+# hub's own session, only on its account, and found a title only in the
+# directory it was in -- from any other tab it said "Use Sessions".
+# --------------------------------------------------------------------------
+
+def _tab(machine, monkeypatch, *, primary, cwd=None, live=()):
+    """A tab on a session in *cwd* (machine.orch), and what /resume does from
+    it: messages sent, runtimes attached, opened, and in-place switches."""
+    from session_runtime import SessionRuntime
+    import proc_guard
+    rt = SessionRuntime(config=dataclasses.replace(parse_args([]), cwd=cwd or machine.orch),
+                        state=State(), rid="R1")
+    rt.state.session_id = "s-current"
+    got = types.SimpleNamespace(sent=[], attached=[], opened=[], switched=[])
+
+    async def send_to(_ws, m):
+        got.sent.append(m)
+
+    async def attach(_ws, target):
+        got.attached.append(target)
+
+    async def create(**kw):
+        got.opened.append(kw)
+        new = SessionRuntime(config=parse_args([]), state=State(), rid="R9")
+        new.state.session_id = kw.get("resume")
+        return new
+
+    async def reconfigure(**kw):
+        got.switched.append(kw)
+        return True, None
+
+    async def nothing(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(server, "send_to", send_to)
+    monkeypatch.setattr(server, "_attach_ws", attach)
+    monkeypatch.setattr(server, "_create_runtime", create)
+    monkeypatch.setattr(server, "_reconfigure", reconfigure)
+    monkeypatch.setattr(server, "_send_initial_state", nothing)
+    monkeypatch.setattr(server, "runtimes",
+                        {r.rid: r for r in (rt, *live)})
+    monkeypatch.setattr(server, "_default_runtime", rt if primary else None)
+    monkeypatch.setattr(proc_guard, "find_foreign_session_holder", lambda _sid: None)
+    return rt, got
+
+
+def _resume(rt, ref):
+    asyncio.run(server._handle_resume(object(), rt, ref))
+
+
+def _said(got):
+    return " | ".join(m.get("data", {}).get("message", "") for m in got.sent)
+
+
+def test_resume_from_any_tab_finds_a_title_in_another_directory(machine, monkeypatch):
+    _session(machine.default, machine.os, LIVE, "OS F")
+    rt, got = _tab(machine, monkeypatch, primary=False)
+    _resume(rt, "OS F")
+    assert [(o["resume"], o["config_dir"]) for o in got.opened] == [(LIVE, None)]
+    assert Path(got.opened[0]["cwd"]).resolve() == Path(machine.os).resolve()
+    assert [a.state.session_id for a in got.attached] == [LIVE]
+    assert "Use Sessions" not in _said(got)
+
+
+def test_resume_follows_a_session_into_another_account(machine, monkeypatch):
+    _session(machine.other, machine.os, OTHER, "Work thing")
+    rt, got = _tab(machine, monkeypatch, primary=False)
+    _resume(rt, OTHER)
+    assert [(o["resume"], o["config_dir"]) for o in got.opened] == \
+        [(OTHER, str(machine.other))]
+    assert "on account .claude-work" in _said(got)
+
+
+def test_resume_in_the_hubs_own_session_still_switches_in_place(machine, monkeypatch):
+    _session(machine.default, machine.os, LIVE, "OS F")
+    rt, got = _tab(machine, monkeypatch, primary=True)
+    _resume(rt, "OS F")
+    assert got.switched == [{"resume": LIVE}] and got.opened == []
+
+
+def test_resume_in_the_hubs_session_of_another_accounts_opens_it(machine, monkeypatch):
+    """The hub's own session runs on the hub's account; a session on another
+    is opened alongside, as the session list would."""
+    _session(machine.other, machine.os, OTHER, "Work thing")
+    rt, got = _tab(machine, monkeypatch, primary=True)
+    _resume(rt, "Work thing")
+    assert got.switched == []
+    assert [o["config_dir"] for o in got.opened] == [str(machine.other)]
+
+
+def test_resume_names_the_sessions_sharing_a_title(machine, monkeypatch):
+    _session(machine.default, machine.os, LIVE, "OS F")
+    _session(machine.other, machine.os, OTHER, "OS F")
+    rt, got = _tab(machine, monkeypatch, primary=False)
+    _resume(rt, "OS F")
+    said = _said(got)
+    assert got.opened == [] and got.attached == []
+    assert LIVE in said and OTHER in said and "/resume <id>" in said
+    assert "--cwd" not in said, "an id is followed anywhere; no flag is needed"
+
+
+def test_resume_goes_to_a_session_that_is_open_already(machine, monkeypatch):
+    from session_runtime import SessionRuntime
+    _session(machine.default, machine.os, LIVE, "OS F")
+    open_one = SessionRuntime(config=parse_args([]), state=State(), rid="R5")
+    open_one.state.session_id = LIVE
+    rt, got = _tab(machine, monkeypatch, primary=True, live=[open_one])
+    _resume(rt, LIVE)
+    assert got.attached == [open_one]
+    assert got.opened == [] and got.switched == []
+
+
+def test_resume_of_the_tabs_own_session_says_so(machine, monkeypatch):
+    _session(machine.default, machine.orch, "s-current", "Here")
+    rt, got = _tab(machine, monkeypatch, primary=False)
+    _resume(rt, "Here")
+    assert "this tab is on" in _said(got)
+    assert got.opened == [] and got.attached == []
+
+
+def test_resume_of_nothing_says_what_there_is(machine, monkeypatch):
+    rt, got = _tab(machine, monkeypatch, primary=False)
+    _resume(rt, "No such thing")
+    assert "Resume failed" in _said(got) and got.opened == []
+
+
+def test_the_lobby_opens_through_the_same_helper(machine, monkeypatch):
+    """The session list's open and /resume do one thing, in one place."""
+    _session(machine.other, machine.os, OTHER, "Work thing")
+    rt, got = _tab(machine, monkeypatch, primary=False)
+    asyncio.run(server._handle_lobby_message(
+        object(), {"type": "open", "session_id": OTHER,
+                   "account": str(machine.other)}))
+    assert [(o["resume"], o["config_dir"]) for o in got.opened] == \
+        [(OTHER, str(machine.other))]
+
+
+def test_a_secondary_tabs_resume_reaches_the_command(machine, monkeypatch):
+    """It used to stop at "Use Sessions to open a different folder or
+    session." before looking for anything."""
+    _session(machine.default, machine.os, LIVE, "OS F")
+    rt, got = _tab(machine, monkeypatch, primary=False)
+    rt.bridge = object()
+    ws = object()
+    monkeypatch.setitem(server._ws_runtime, ws, rt)
+
+    async def ack(*_a, **_k):
+        pass
+
+    monkeypatch.setattr(server, "_ack_prompt", ack)
+    asyncio.run(server._handle_ws_message(ws, {"type": "message",
+                                               "text": "/resume OS F"}))
+    assert [o["resume"] for o in got.opened] == [LIVE]

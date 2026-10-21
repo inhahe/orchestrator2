@@ -539,7 +539,7 @@ Type these in the input box. Commands starting with `/` are processed by the orc
 | `/logout` | Sign the active account out |
 | `/apikey [off]` | Say whether this session has an API key of its own: the `ANTHROPIC_API_KEY` of the launch that opened it. `/apikey off` drops the key and reconnects the session on its account's own login. A key is never typed here; see [Using an Anthropic API key](#using-an-anthropic-api-key). |
 | `/connect` | Reconnect. If the browser↔server WebSocket has dropped (e.g. server restart), revives it client-side even after auto-reconnect has given up; if the socket is alive, reconnects the SDK bridge. Prompts typed while disconnected are queued and sent once reconnected. |
-| `/resume [id\|title]` | Resume a specific session, or open the session picker |
+| `/resume [id\|title]` | Resume a session from any tab: an id anywhere on this machine, a title in this directory first and then in every directory and account (several sharing it are listed, to pick one by id). In the hub's own session, a session on its account switches in place; otherwise it opens beside, as the session list does, or goes to it if it is open. Without an argument, open the session picker |
 | `/quit`, `/exit`, `/q` | Graceful exit |
 | `/quit!`, `/exit!`, `/q!` | Force exit |
 | `/interrupt`, `/i` | Stop the current turn |

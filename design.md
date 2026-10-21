@@ -336,6 +336,22 @@ process follows the session to its own. `--detach` hands its child the
 account the launch followed. In a session, `/resume <title>` that several
 sessions share now says so, listing them, instead of "session not found".
 
+**`/resume <id|title>` in a tab looks where `--resume` looks**
+(`_handle_resume`, asked for 2026-10-21: "a command to resume a session from
+any directory ... maybe also ... from any claude account"). It worked only in
+the hub's own session, only on its account, and found a title only in that
+session's directory; from any other tab it said "Use Sessions". Now it runs the
+launch's resolver, `_settle_launch_resume(how="/resume")`, on the tab's
+session's directory with no directory or account fixed, so an id is followed
+anywhere, a title is found here first and then anywhere, and a title several
+sessions share is answered with the list. The hub's own session, given one on
+its own account, still switches in place (`_reconfigure`), stopping the one it
+left. Any other tab, or a session on another account (a runtime runs on one
+account for life), opens it as the session list does — or goes to it, when
+it is open — and the session it was on carries on, to the idle timer: the
+lobby's *open* and `/resume` share `_open_session`, which also refuses to fork
+a session another process holds (`session_elsewhere`).
+
 **`_create_runtime` refuses a working directory it cannot see**, raising
 `NotADirectoryError` naming both the requested and resolved forms. It is the
 single funnel for every way a session is born — the launch API and the lobby's

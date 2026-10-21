@@ -5580,62 +5580,128 @@ async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
         if not sid:
             await _lobby_error(ws, "No session_id provided.")
             return True
-        # Already live?  Just attach to the existing runtime.
-        existing = next(
-            (r for r in runtimes.values()
-             if getattr(r.state, "session_id", None) == sid),
-            None,
-        )
-        if existing is not None:
-            await _attach_ws(ws, existing)
-            return True
-        cur = _runtime_for_ws(ws)
-        default_cwd = cur.config.cwd if cur and cur.config else (
-            config.cwd if config else None)
         account = (msg.get("account") or "").strip() or None
-        # Verify the session still exists on disk before spinning up a runtime
-        # to resume it.  Without this a stale ?open=<sid> (e.g. a browser-
-        # restored tab pointing at a deleted/moved session) would create an
-        # empty runtime that just sits idle with blank state and no history —
-        # which looks broken with no explanation.  Land in the lobby instead.
-        loop = asyncio.get_running_loop()
-        session_dir = await loop.run_in_executor(
-            None, find_session_dir, sid, account)
-        if session_dir is None:
-            await _enter_lobby(ws, notice=(
-                "That session could no longer be found on disk — it may have "
-                "been deleted or moved. Pick a session below to continue."))
-            return True
-        # Don't fork a doomed duplicate.  If another hub (or a stray
-        # ``claude --resume``) already holds this session, resuming it here would
-        # only hit DuplicateSessionError on connect and park unable to run.  Tell
-        # the tab where it's already open so it can focus that window instead.
-        holder = await asyncio.to_thread(
-            proc_guard.find_foreign_session_holder, sid)
-        if holder is not None and not (
-                config and getattr(config, "allow_duplicate_session", False)):
-            await send_to(ws, {
-                "type": "session_elsewhere",
-                "session_id": sid,
-                "holder_pid": holder.holder_pid,
-                "started": holder.started,
-                "port": holder.port,          # None => not a focusable hub
-                "cwd": msg.get("cwd") or "",
-                "account": account or "",
-            })
-            await _push_session_list(ws)      # so declining lands on the list
-            return True
-        cwd = msg.get("cwd") or find_session_cwd(sid, account) or default_cwd
         try:
-            rt = await _create_runtime(cwd=cwd, resume=sid, config_dir=account)
+            rt, gone, holder = await _open_session(
+                ws, sid, account=account, cwd=msg.get("cwd") or None)
         except Exception as exc:
             log.exception("failed to open session %s", sid)
             await _lobby_error(ws, f"Couldn't open that session: {exc}")
             return True
-        await _attach_ws(ws, rt)
+        if gone:
+            await _enter_lobby(ws, notice=(
+                "That session could no longer be found on disk — it may have "
+                "been deleted or moved. Pick a session below to continue."))
+        elif holder is not None:
+            await _push_session_list(ws)      # so declining lands on the list
+        else:
+            await _attach_ws(ws, rt)
         return True
 
     return False
+
+
+async def _open_session(ws: WebSocket, sid: str, *, account: str | None,
+                        cwd: str | None) -> tuple[SessionRuntime | None, bool, Any]:
+    """The runtime for session *sid* of *account* (None: the hub's), opened
+    if it is not open already -- what the lobby's open and ``/resume`` do.
+
+    Returns ``(runtime, gone, holder)``.  *gone*: there is no such session on
+    disk any more, so nothing was opened.  *holder*: another process (another
+    hub, a stray ``claude --resume``) holds it, so nothing was opened and *ws*
+    has been sent ``session_elsewhere``, which offers to go there.  A runtime
+    that cannot be created raises.  The session runs in *cwd*, or in its own
+    directory.
+    """
+    existing = next((r for r in runtimes.values()
+                     if getattr(r.state, "session_id", None) == sid), None)
+    if existing is not None:
+        return existing, False, None
+    # Gone from disk: without this a stale ?open=<sid> (a browser-restored tab
+    # pointing at a deleted or moved session) would create an empty runtime
+    # that sits idle with no history, which looks broken with no explanation.
+    if await asyncio.to_thread(find_session_dir, sid, account) is None:
+        return None, True, None
+    # Don't fork a doomed duplicate: resuming a session another process holds
+    # would only hit DuplicateSessionError on connect and park unable to run.
+    holder = await asyncio.to_thread(proc_guard.find_foreign_session_holder, sid)
+    if holder is not None and not (
+            config and getattr(config, "allow_duplicate_session", False)):
+        await send_to(ws, {
+            "type": "session_elsewhere",
+            "session_id": sid,
+            "holder_pid": holder.holder_pid,
+            "started": holder.started,
+            "port": holder.port,          # None => not a focusable hub
+            "cwd": cwd or "",
+            "account": account or "",
+        })
+        return None, False, holder
+    cur = _runtime_for_ws(ws)
+    default_cwd = cur.config.cwd if cur and cur.config else (
+        config.cwd if config else None)
+    where = cwd or await asyncio.to_thread(find_session_cwd, sid, account) or default_cwd
+    return await _create_runtime(cwd=where, resume=sid, config_dir=account), False, None
+
+
+async def _handle_resume(ws: WebSocket, rt: SessionRuntime, ref: str) -> None:
+    """``/resume <id|title>`` -- the session, in whatever directory or account
+    it is in.
+
+    Resolved as a launch's ``--resume`` is (``_settle_launch_resume``): an id
+    anywhere on this machine; a title in this session's directory first, then
+    anywhere, and when several sessions share it, a list of them to choose
+    from by id.  The hub's own session, given one in its own account, switches
+    to it in place as ``/resume`` always has (``_reconfigure``).  Any other
+    tab, or a session in another account, opens it as the session list does
+    -- or goes to it, if it is open -- leaving the session it was on running.
+    """
+    cfg = dataclasses.replace(rt.config, resume=ref, cwd_given=False, config_dir=None)
+    try:
+        found, note, err = await asyncio.to_thread(
+            _settle_launch_resume, cfg, how="/resume")
+    except Exception as exc:
+        log.exception("/resume %s: could not look it up", ref)
+        err, found, note = f"Couldn't look for that session: {exc}", None, None
+    if err:
+        await send_to(ws, {"type": "system_msg", "subtype": "error",
+                           "data": {"message": f"Resume failed: {err}"}})
+        return
+    sid, account = found.resume, found.config_dir or None
+    if sid == getattr(rt.state, "session_id", None):
+        await send_to(ws, {"type": "system_msg", "subtype": "info",
+                           "data": {"message": "That is the session this tab is on."}})
+        return
+    if note:
+        await send_to(ws, {"type": "system_msg", "subtype": "info",
+                           "data": {"message": note}})
+    live = any(getattr(r.state, "session_id", None) == sid for r in runtimes.values())
+    if rt is _default_runtime and account is None and not live:
+        await send_to(ws, {"type": "system_msg", "subtype": "info",
+                           "data": {"message": f"Resuming {ref} ..."}})
+        ok, why = await _reconfigure(resume=sid)
+        if ok:
+            await _send_initial_state(ws)
+        else:
+            await send_to(ws, {"type": "system_msg", "subtype": "error",
+                               "data": {"message": f"Resume failed: {why}"}})
+        return
+    try:
+        # found.cwd is the session's own directory: the resolver follows it
+        # there (_follow).
+        target, gone, holder = await _open_session(
+            ws, sid, account=account, cwd=found.cwd)
+    except Exception as exc:
+        log.exception("/resume %s: could not open it", ref)
+        await send_to(ws, {"type": "system_msg", "subtype": "error",
+                           "data": {"message": f"Resume failed: {exc}"}})
+        return
+    if gone:
+        await send_to(ws, {"type": "system_msg", "subtype": "error",
+                           "data": {"message": f"Resume failed: session {sid} is "
+                                               f"no longer on disk."}})
+    elif holder is None:
+        await _attach_ws(ws, target)
 
 
 async def _do_interrupt(bridge: Any, broadcast: Any) -> None:
@@ -5779,10 +5845,10 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
                                "data": {"message": "Shutting down."}})
             return
 
-        if kind in ("switch-cwd", "resume", "resume-pick") and rt is not _default_runtime:
+        if kind in ("switch-cwd", "resume-pick") and rt is not _default_runtime:
             # These reconfigure the *default* runtime in place; from a
-            # secondary session, the way to change folder/session is the
-            # lobby (Sessions → open/new).
+            # secondary session, the way to change folder is the lobby
+            # (Sessions → open/new), or /resume <id|title>.
             await send_to(ws, {"type": "system_msg", "subtype": "info",
                                "data": {"message": "Use Sessions to open a different folder or session."}})
             return
@@ -5804,14 +5870,7 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             return
 
         if kind == "resume":
-            await send_to(ws, {"type": "system_msg", "subtype": "info",
-                               "data": {"message": f"Resuming {payload} ..."}})
-            ok, err = await _reconfigure(resume=payload)
-            if ok:
-                await _send_initial_state(ws)
-            else:
-                await send_to(ws, {"type": "system_msg", "subtype": "error",
-                                   "data": {"message": f"Resume failed: {err}"}})
+            await _handle_resume(ws, rt, payload)
             return
 
         # /mcp — list/manage MCP servers.  Needs the live SDK client
@@ -6378,7 +6437,8 @@ def _session_line(s: dict[str, Any], account: str, *, title: bool = False) -> st
     return line
 
 
-def _settle_launch_resume(cfg: Config) -> tuple[Config, str | None, str | None]:
+def _settle_launch_resume(cfg: Config, *, how: str = "--resume"
+                          ) -> tuple[Config, str | None, str | None]:
     """Settle ``--resume <title|id>`` before the launch goes anywhere.
 
     Returns ``(config, note, error)``.  ``config`` is what to launch with: the
@@ -6407,6 +6467,9 @@ def _settle_launch_resume(cfg: Config) -> tuple[Config, str | None, str | None]:
 
     An id is followed the same way; the terminal picker has always done that
     ("resume is cwd-scoped").
+
+    *how* is the command the messages tell the user to use: ``--resume`` for
+    a launch, ``/resume`` in a tab (``_handle_resume``).
     """
     ref = (cfg.resume or "").strip()
     if not ref or ref == _PICKER_SENTINEL:
@@ -6482,7 +6545,7 @@ def _settle_launch_resume(cfg: Config) -> tuple[Config, str | None, str | None]:
         lines = [f"More than one session in {cfg.cwd} is called '{ref}', so "
                  f"none was resumed:"]
         lines += [_session_line(s, account) for s in mine]
-        lines.append("Resume one by its id (--resume <id>), or rename the "
+        lines.append(f"Resume one by its id ({how} <id>), or rename the "
                      "others first.")
         others = [s for s in named if s["session_id"] not in ids]
         if others:
@@ -6512,10 +6575,13 @@ def _settle_launch_resume(cfg: Config) -> tuple[Config, str | None, str | None]:
             if s.get("config_dir") and not _same_path(s["config_dir"], account):
                 need.append(f"--config-dir \"{s['config_dir']}\"")
             lines.append(f"Resume it with {' '.join(need)}." if need else
-                         "Resume it by its id (--resume <id>).")
+                         f"Resume it by its id ({how} <id>).")
         else:
-            lines.append("Resume one by its id (--resume <id>), with the --cwd "
-                         "and --config-dir it needs.")
+            # An id is followed to its directory and account (_follow),
+            # unless the launch fixed one of them.
+            lines.append(f"Resume one by its id ({how} <id>)"
+                         + (", with the --cwd and --config-dir it needs"
+                            if cfg.cwd_given or account_given else "") + ".")
         return cfg, None, "\n".join(lines)
     similar = [s for s in _all() if s["title"] and want in s["title"].casefold()]
     if similar:
