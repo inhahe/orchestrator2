@@ -178,10 +178,9 @@ def test_a_session_gets_what_its_launch_gave_as_its_own(monkeypatch, tmp_path):
 
 # -- A session already open ----------------------------------------------------
 
-def _land_on_open_session(monkeypatch, tmp_path, body, synced=False, bridge=None):
+def _land_on_open_session(monkeypatch, tmp_path, body, synced=False):
     """A launch onto the hub's own session S1; *synced*: its record has been
-    merged into it already (``_sync_session_compaction``); *bridge*: the
-    session's, if it is to have one."""
+    merged into it already (``_sync_session_compaction``)."""
     hub = parse_args(["--model", MODEL])
     hub_values = (hub.compact_at, hub.auto_compact)
 
@@ -203,7 +202,6 @@ def _land_on_open_session(monkeypatch, tmp_path, body, synced=False, bridge=None
         bridge = None
 
     rt = _RT()
-    rt.bridge = bridge
     monkeypatch.setattr(server, "config", hub)
     monkeypatch.setattr(server, "runtimes", {"R4": rt})
     monkeypatch.setattr(server, "_session_to_open", lambda *a, **k: "S1")
@@ -229,32 +227,6 @@ def test_a_launch_without_them_leaves_the_session_alone(monkeypatch, tmp_path):
     assert not hasattr(rt.state, "_compact_at")
     assert not hasattr(rt.state, "_auto_compact")
 
-
-class _Events:
-    """A bridge's event queue, as the hub feeds it."""
-
-    def __init__(self):
-        self.items = []
-
-    def put_nowait(self, item):
-        self.items.append(item)
-
-
-def test_a_session_already_open_is_told_to_give_its_cli_them(monkeypatch, tmp_path):
-    """Its CLI has the threshold it started with: the bridge restarts it, if
-    the threshold changed (tests/test_cli_compaction.py)."""
-    bridge = types.SimpleNamespace(event_queue=_Events())
-    _land_on_open_session(monkeypatch, tmp_path,
-                          {"compact_at": 300000, "auto_compact": True}, bridge=bridge)
-
-    assert bridge.event_queue.items == [("compaction", "")]
-
-
-def test_a_launch_without_them_does_not_disturb_the_cli(monkeypatch, tmp_path):
-    bridge = types.SimpleNamespace(event_queue=_Events())
-    _land_on_open_session(monkeypatch, tmp_path, {}, bridge=bridge)
-
-    assert bridge.event_queue.items == []
 
 
 def test_autocompact_reports_the_sessions_own_setting():
@@ -330,15 +302,18 @@ def test_a_session_reopened_without_its_launch_keeps_its_compaction(monkeypatch,
     assert server.own_compaction(st) == (300000, True)
 
 
+SID = "0d19661f-62b7-47b2-a94f-d7537aec0fa5"
+
+
 def test_a_session_about_to_be_resumed_has_it_before_its_cli_starts(monkeypatch, tmp_path):
     """The CLI takes its compaction from its environment, so the State must
     hold it before the CLI starts -- while its session_id is still the
     session it is leaving, or none."""
-    save_session_compaction("S1", 300000, True)
-    cfg, st = _new_runtime(monkeypatch, tmp_path, ["--model", MODEL], resume="S1")
+    save_session_compaction(SID, 300000, True)
+    cfg, st = _new_runtime(monkeypatch, tmp_path, ["--model", MODEL], resume=SID)
     st.session_id = None
 
-    asyncio.run(server._await_session_compaction("S1", cfg, st))
+    asyncio.run(server._await_session_compaction(SID, cfg, st))
 
     assert server.own_compaction(st) == (300000, True)
 
@@ -346,15 +321,27 @@ def test_a_session_about_to_be_resumed_has_it_before_its_cli_starts(monkeypatch,
 def test_a_merge_already_under_way_is_waited_for(monkeypatch, tmp_path):
     """The CLI named the session, starting the merge, and a reconnect came
     before it finished: the new CLI must not start without it."""
-    save_session_compaction("S1", 300000, True)
-    cfg, st = _new_runtime(monkeypatch, tmp_path, ["--model", MODEL], resume="S1")
+    save_session_compaction(SID, 300000, True)
+    cfg, st = _new_runtime(monkeypatch, tmp_path, ["--model", MODEL], resume=SID)
 
     async def scenario():
-        _got_id("S1", cfg, st)
-        await server._await_session_compaction("S1", cfg, st)
+        _got_id(SID, cfg, st)
+        await server._await_session_compaction(SID, cfg, st)
         return server.own_compaction(st)
 
     assert asyncio.run(scenario()) == (300000, True)
+
+
+def test_a_title_nothing_resolved_gets_no_record(monkeypatch, tmp_path):
+    """--resume "OS A" with no session of that title reaches the connect as
+    it is, and the CLI refuses it; a record kept under it would be junk."""
+    cfg, st = _new_runtime(monkeypatch, tmp_path, ["--model", MODEL],
+                           compact_at=300000, auto_compact=True)
+
+    asyncio.run(server._await_session_compaction("OS A", cfg, st))
+
+    assert not session_record_exists("OS A")
+    assert getattr(st, "_compaction_sid", None) is None
 
 
 def test_what_a_launch_gives_beats_what_was_kept_and_is_kept(monkeypatch, tmp_path):

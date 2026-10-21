@@ -223,24 +223,26 @@ setting (`--settings`), which outranks the user's, project's and local settings
 files. Both were checked against the real CLI.
 
 The CLI reads the variables only when it starts, so a change reaches it as a new
-CLI. `_make_options` records what it gave the CLI (`_cli_compaction_env`), and
-`_compaction_changed` compares that with the session's. `/autocompact` (in
-`server.py`, after `try_immediate_command`) and a launch onto an open session
-put `("compaction", "")` on the bridge's event queue. Either way, the restart
-happens in `_apply_compaction_if_quiet`, and only when nothing would be cut
-short. That means no turn of ours and no ghost turn: neither `state.busy` with
-the worker parked, nor the CLI having said `running` before that turn's first
-output. It also means no turn that the CLI's compaction closed and the CLI is
-continuing (`pending_compact_turn_end`), no background task, and no connect.
-That is `_run_pending_cli_command`'s idle test, plus the tasks. Otherwise the
-restart waits for the next quiet point: the end of a turn (`_between_turns`),
-or a wakeup in `_await_next_prompt`. The wakeup is `bg-all-done`, or the
-`("wakeup", "compaction")` that `_end_ghost_turn` and
-`_flush_pending_compact_turn_end` send when the CLI is behind. Nothing is held for later, unlike `_reconnect_or_defer`:
-each quiet point compares the State with the CLI again, so a change undone in
-the meantime costs nothing. A parked worker is not a quiet one, so the
-`"compaction"` event does not drain the prompt queue unless it restarted the
-CLI.
+CLI. `_make_options` records what it gave the CLI (`state.cli_compaction`), and
+`_compaction_changed` compares that with the session's own. A change comes from
+`/autocompact`, a launch onto an open session, or a kept record merged in only
+after the CLI started. The restart happens in exactly one place:
+`_apply_compaction_before_turn`, called by `run_turn` after it has waited out
+any interrupt and any ghost turn, just before sending its prompt.
+
+Every other moment risks killing a turn the CLI is starting by itself, before
+that turn's first output shows it: a finished background task's notification
+being delivered, a peer's message, the continuation after its own compaction.
+Restarts tried at quiet points were found by review to do exactly that: at
+`bg-all-done`, at the end of a turn, and at the end of a ghost turn. Even at the
+start of our own turn, the restart waits for a later turn while the CLI says it
+is `running`, while a compaction-closed turn may go on
+(`pending_compact_turn_end`), while a background task runs (whose notices it
+would orphan), or while the transport is dead (the recovery's new CLI takes the
+change anyway). Nothing is held between turns: each one compares the State with
+the CLI again, so a change undone in between costs nothing. The cost is one CLI
+start before the turn, once per change. `/autocompact` reports what the CLI
+still has while a change waits (`commands._compaction_report`).
 
 Until 2026-10-21 orchestrator2 compacted by itself, sending `/compact` between
 turns when `state.context_tokens` passed the threshold. That count was the

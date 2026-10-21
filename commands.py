@@ -18,6 +18,7 @@ from config import (
     EFFORT_CHOICES,
     SLASH_COMMANDS,
     Config,
+    compaction_env,
     get_known_models,
     model_cache_age,
     model_list_source,
@@ -738,32 +739,41 @@ def _remember_compaction(state: State, config: Config) -> None:
                                      getattr(config, "config_dir", None))
 
 
-_COMPACT_OFF = "OFF: the CLI compacts at its own default"
+def _compaction_report(state: State, config: Config) -> str:
+    """What ``/autocompact`` says of the session's compaction: the session's
+    own, and, while its CLI still runs on another (it takes a change only by
+    restarting, before the session's next turn), that one too."""
+    at, on = session_compaction(state, config)
+    text = (f"auto-compact ON: the CLI compacts at ~{at} tok" if on
+            else "auto-compact OFF: the CLI compacts at its own default")
+    cli = getattr(state, "cli_compaction", None)
+    if cli is not None and compaction_env(*cli) != compaction_env(at, on):
+        now = f"~{cli[0]} tok" if cli[1] else "its own default"
+        text += (f" -- from the session's next turn, which restarts the CLI "
+                 f"to take it; until then, at {now}")
+    return text
 
 
 def _cmd_autocompact(payload: str, state: State, config: Config) -> CommandResult:
     """Show or set the session's compaction.  The CLI does the compacting, at
     the threshold its environment gives it, so a change reaches it as a new
-    CLI: the hub tells the bridge, which restarts it when the session is
-    quiet (``SDKBridge._apply_compaction_if_quiet``)."""
+    CLI, started before the session's next turn
+    (``SDKBridge._apply_compaction_before_turn``)."""
     p = payload.strip().lower()
     if not p:
-        at, on = session_compaction(state, config)
-        status = f"ON: the CLI compacts at ~{at} tok" if on else _COMPACT_OFF
-        return CommandResult(messages=[_msg(f"auto-compact {status}")])
+        return CommandResult(messages=[_msg(_compaction_report(state, config))])
     if p in ("on", "true", "enable", "1"):
         state._auto_compact = True  # type: ignore[attr-defined]
         _remember_compaction(state, config)
-        at, _on = session_compaction(state, config)
         return CommandResult(
-            messages=[_msg(f"auto-compact ON: the CLI compacts at ~{at} tok")],
+            messages=[_msg(_compaction_report(state, config))],
             state_updates={"auto_compact": True},
         )
     if p in ("off", "false", "disable", "0"):
         state._auto_compact = False  # type: ignore[attr-defined]
         _remember_compaction(state, config)
         return CommandResult(
-            messages=[_msg(f"auto-compact {_COMPACT_OFF}")],
+            messages=[_msg(_compaction_report(state, config))],
             state_updates={"auto_compact": False},
         )
     try:
@@ -776,7 +786,7 @@ def _cmd_autocompact(payload: str, state: State, config: Config) -> CommandResul
     state._auto_compact = True  # type: ignore[attr-defined]
     _remember_compaction(state, config)
     return CommandResult(
-        messages=[_msg(f"auto-compact ON: the CLI compacts at ~{n} tok")],
+        messages=[_msg(_compaction_report(state, config))],
         state_updates={"auto_compact": True, "compact_at": n},
     )
 

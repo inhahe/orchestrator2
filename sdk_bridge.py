@@ -897,10 +897,6 @@ class SDKBridge:
         # resume, before its CLI starts: returns once the State holds that
         # session's kept compaction, which the CLI takes from its environment.
         self.sync_compaction: Callable[[str, Config], Awaitable[None]] | None = None
-        # The compaction variables the running CLI was started with
-        # (connect); compared with the session's own to tell whether a
-        # change needs a new CLI (_compaction_changed).
-        self._cli_compaction_env: dict[str, str] | None = None
         # Told an effort level the CLI refused (_effort_refused), so the hub
         # can drop it from the Config the session is rebuilt from.
         self.on_effort_refused: Callable[[str], None] | None = None
@@ -1198,45 +1194,45 @@ class SDKBridge:
         return compaction_env(*session_compaction(self.state, self.config))
 
     def _compaction_changed(self) -> bool:
-        """Whether the session's compaction is not what its CLI started with,
-        so that only a new CLI would have it.  False before the first CLI,
-        which will start with it anyway."""
-        return (self._cli_compaction_env is not None
-                and self._compaction_env() != self._cli_compaction_env)
+        """Whether the session's compaction is not what its CLI started with
+        (``state.cli_compaction``), so that only a new CLI would have it.
+        False before the first CLI, which will start with it anyway."""
+        cli = self.state.cli_compaction
+        return cli is not None and compaction_env(*cli) != self._compaction_env()
 
-    async def _apply_compaction_if_quiet(self, *, asked: bool = False) -> bool:
-        """Restart the CLI with the session's compaction, if that differs from
-        what the CLI started with and nothing would be cut short: no turn of
-        ours, no ghost turn (``state.busy`` with the worker parked, or the CLI
-        saying it is running before that turn's first output), no turn that
-        a compaction closed and the CLI is continuing, no background task, no
-        connect under way.  The idle test ``_run_pending_cli_command`` makes,
-        plus the tasks.  Returns True if it did.
+    async def _apply_compaction_before_turn(self) -> None:
+        """Called by ``run_turn`` before it sends its prompt: if the session's
+        compaction has changed since its CLI started (``/autocompact``, a
+        launch onto the session, a record merged in late), restart the CLI
+        to give it the new one.
 
-        Called at each point the session becomes quiet, and when the
-        compaction is changed (*asked*: ``/autocompact``, or a launch onto
-        the session), which is told when it has to wait.  Nothing is held
-        for later: the next quiet point compares the State with the CLI
-        again, so a change undone in the meantime costs nothing.
+        Only here, where orchestrator2 is about to use the CLI itself and has
+        just waited out any interrupt and ghost turn.  A restart at any other
+        moment risks killing a turn the CLI is starting by itself: one
+        delivering a finished background task's notification, or continuing
+        after its own compaction, before its first output says so.  For the
+        same reason it waits for another turn while the CLI says it is
+        running, while a compaction-closed turn may still be continuing
+        (``pending_compact_turn_end``), and while a background task runs,
+        whose notices the restart would orphan.  Nothing is held: each turn
+        compares again, so a change undone in between costs nothing.
         """
         if not self._compaction_changed():
-            return False
-        at, on = session_compaction(self.state, self.config)
-        label = f"auto-compact at {fmt_tok(at)}" if on else "auto-compact off"
-        if (self._active_bg_tasks() or self.turn_active.is_set()
-                or self.state.busy or self.state.connecting
+            return
+        state = self.state
+        if (self._active_bg_tasks() or state.busy or state.connecting
                 or self._cli_state == "running"
-                or self.state.pending_compact_turn_end is not None):
-            if asked:
-                await self.broadcast({"type": "system_msg", "subtype": "info",
-                                      "data": {"message": (
-                    f"{label}: applied once the session is idle and no "
-                    f"background task is running, by restarting its CLI.")}})
-            return False
-        await self.broadcast({"type": "system_msg", "subtype": "info",
-                              "data": {"message": f"{label}: restarting the CLI to apply it."}})
+                or state.pending_compact_turn_end is not None
+                or self.client is None or self._transport_dead):
+            return
+        # No await between the test and the restart: nothing can start in
+        # between.
         await self.reconnect()
-        return True
+        at, on = session_compaction(state, self.config)
+        await self.broadcast({"type": "system_msg", "subtype": "info",
+                              "data": {"message": (
+            f"Restarted the CLI to compact at ~{fmt_tok(at)} tok." if on else
+            "Restarted the CLI to compact at its own default.")}})
 
     def _make_options(self, resume_id: str | None = None, *,
                       recovering: bool = False) -> ClaudeAgentOptions:
@@ -1312,11 +1308,12 @@ class SDKBridge:
         # (``autoCompactWindow``), which reaches the CLI however it starts.
         # Recorded as what the CLI starts with: options are built only to
         # start one (_compaction_changed).
-        self._cli_compaction_env = self._compaction_env()
-        kwargs["env"].update(self._cli_compaction_env)
+        self.state.cli_compaction = session_compaction(self.state, self.config)
+        cli_env = compaction_env(*self.state.cli_compaction)
+        kwargs["env"].update(cli_env)
         for var in CLI_COMPACTION_VARS:
             os.environ.pop(var, None)
-        if self._cli_compaction_env:
+        if cli_env:
             kwargs["settings"] = json.dumps({"autoCompactEnabled": True})
 
         # A turn that was cut off mid-flight: finish it, or wait?
@@ -1571,8 +1568,9 @@ class SDKBridge:
             "" if not resume_sid else (
                 ", a cut-off turn is finished" if self._finishing_cut_off_turn
                 else ", a cut-off turn waits"),
-            {k: v for k, v in (self._cli_compaction_env or {}).items() if v}
-            or "the CLI's default",
+            (f"at {self.state.cli_compaction[0]}"
+             if self.state.cli_compaction and self.state.cli_compaction[1]
+             else "the CLI's default"),
         )
         # NOT consumed here.  It used to be cleared right after building the
         # options ("one-time use"), which meant a first connect that *failed*
@@ -4107,13 +4105,6 @@ class SDKBridge:
                 self.event_queue.put_nowait(("cli-command", ""))
             except Exception as exc:
                 log.warning("ghost-turn CLI-command poke failed: %r", exc)
-        # And a change of the session's compaction that waited for this turn
-        # to end (_apply_compaction_if_quiet, from the wakeup branch).
-        if self._compaction_changed():
-            try:
-                self.event_queue.put_nowait(("wakeup", "compaction"))
-            except Exception as exc:
-                log.warning("ghost-turn compaction poke failed: %r", exc)
 
     # ------------------------------------------------------------------
     # Deferred compact turn_end helpers
@@ -4186,10 +4177,6 @@ class SDKBridge:
             })
         except Exception as exc:
             log.warning("deferred compact turn_end broadcast failed: %r", exc)
-        # The turn is over after all: a change of the session's compaction
-        # that waited for it can go ahead (_apply_compaction_if_quiet).
-        if self._compaction_changed():
-            self.event_queue.put_nowait(("wakeup", "compaction"))
 
     async def _await_interrupt_settled(self, timeout: float = 5.0) -> None:
         """Hold a starting turn until an outstanding interrupt has wound down.
@@ -4879,6 +4866,10 @@ class SDKBridge:
         # ``turn_active``.  The park point already declines to pop a prompt
         # while one is streaming; this covers every other way into run_turn.
         await self._await_ghost_settled()
+
+        # The session's compaction, if its CLI does not have it yet.  Here and
+        # nowhere else: see _apply_compaction_before_turn.
+        await self._apply_compaction_before_turn()
 
         # Drain stale messages from the queue.
         drained = 0
@@ -6268,7 +6259,6 @@ class SDKBridge:
         quit_requested = False
         btw_prompts: list[str] = []
         recycle_requested = False
-        compaction_asked = False
 
         while not self.event_queue.empty():
             try:
@@ -6311,11 +6301,6 @@ class SDKBridge:
                     "type": "system_msg", "subtype": "info",
                     "data": {"message": f"thinking → {'on' if state.thinking_enabled else 'off'}"},
                 })
-            elif kind == "compaction":
-                # /autocompact, or a launch onto this session, changed it
-                # during the turn; the state already has it.  Applied below,
-                # if the session is quiet then.
-                compaction_asked = True
             elif kind == "clear-context":
                 await self._clear_context()
                 return await self._await_next_prompt()
@@ -6381,10 +6366,6 @@ class SDKBridge:
             # it *here*, above the queued-prompt branch, so the next prompt runs
             # under the settings the user asked for rather than one turn late.
             await self._flush_deferred_reconnect()
-        # The session's compaction, if the CLI does not have it yet (a change
-        # during the turn, or one that waited for it) and nothing is running:
-        # also above the queued-prompt branch, for the same reason.
-        await self._apply_compaction_if_quiet(asked=compaction_asked)
 
         # A /rename typed during the turn: the CLI is free now, and the command
         # is not a turn, so it goes before anything that starts one.
@@ -6581,17 +6562,6 @@ class SDKBridge:
                 return None
             if kind == "compact":
                 return "/compact"
-            if kind == "compaction":
-                # /autocompact, or a launch onto this session.  Parked does not
-                # mean quiet -- a ghost turn may be streaming -- so it is
-                # applied only if it is; else at the next quiet point.  Only
-                # after a restart is a queued prompt sendable here: one typed
-                # during it went to the queue, as for the commands below.
-                if await self._apply_compaction_if_quiet(asked=True):
-                    prompt = await self._pop_queued_prompt()
-                    if prompt is not None:
-                        return prompt
-                continue
             # Config-change commands (model/effort/thinking/connect/clear) are
             # applied via the shared helper so idle behaviour matches the
             # initial-prompt wait exactly.
@@ -6690,10 +6660,7 @@ class SDKBridge:
                 # finishes, which is the moment a /model switch we postponed
                 # (see _reconnect_or_defer) becomes free.  Do it before popping
                 # a queued prompt, so the prompt runs under the new settings.
-                # It is also the moment a ghost turn has ended (it re-pokes),
-                # which a change of the session's compaction waits for.
                 await self._flush_deferred_reconnect()
-                await self._apply_compaction_if_quiet()
                 prompt = await self._pop_queued_prompt()
                 if prompt is not None:
                     return prompt

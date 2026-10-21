@@ -204,44 +204,51 @@ def _connect_hub_bridge(monkeypatch, cfg, st, resume_id):
     return br
 
 
+SID = "0d19661f-62b7-47b2-a94f-d7537aec0fa5"
+
+
 def test_a_reopened_session_starts_its_cli_with_the_threshold_it_kept(monkeypatch):
     """Reopened without the launch that set it -- from the session list,
     after a hub restart.  The CLI names the session only once it has started,
     too late for its environment."""
-    save_session_compaction("S1", 300000, True)
+    save_session_compaction(SID, 300000, True)
     st = State()
 
-    br = _connect_hub_bridge(monkeypatch, parse_args([]), st, "S1")
+    _connect_hub_bridge(monkeypatch, parse_args([]), st, SID)
 
     assert _CLI.made[0].env[WINDOW] == "333000"
-    assert br._cli_compaction_env == compaction_env(300_000, True)
+    assert st.cli_compaction == (300_000, True)
 
 
 def test_a_session_left_to_the_default_starts_its_cli_without_them(monkeypatch):
     st = State()
+    cfg = parse_args([])
 
-    br = _connect_hub_bridge(monkeypatch, parse_args([]), st, "S2")
+    _connect_hub_bridge(monkeypatch, cfg, st, "1e2d3c4b-0000-4000-8000-000000000002")
 
     assert WINDOW not in _CLI.made[0].env
-    assert br._cli_compaction_env == {}
+    assert st.cli_compaction == (cfg.compact_at, False)
 
 
-# -- A change restarts the CLI ---------------------------------------------------
+# -- A change reaches the CLI before the session's next turn -----------------
 
-def _parked(br, *events):
-    """Run the parked worker on *events*, then a quit: what it returned."""
-    for event in events:
-        br.event_queue.put_nowait(event)
-    br.event_queue.put_nowait(("quit", ""))
-    return asyncio.run(br._await_next_prompt())
+class _NoQuery:
+    """A client the turn gets as far as: query() is where it stops."""
+
+
+def _turn(br):
+    """Start a turn up to the point it sends its prompt."""
+    br.client = _NoQuery()
+    with pytest.raises(AttributeError):
+        asyncio.run(br.run_turn("next prompt"))
 
 
 def _changed(argv=()):
     """A bridge whose CLI started at the CLI's default, on a session since
-    given auto-compact at 300k."""
+    given auto-compact at 300k (/autocompact, or a launch onto it)."""
     br, st, sent, connects = _bridge(argv)
     st.session_id = "S1"
-    br._cli_compaction_env = {}
+    st.cli_compaction = (br.config.compact_at, False)
     st._compact_at, st._auto_compact = 300_000, True
     return br, st, sent, connects
 
@@ -250,22 +257,22 @@ def _shown(sent):
     return " | ".join(str(m.get("data", {}).get("message", "")) for m in sent)
 
 
-def test_a_changed_threshold_restarts_the_cli():
+def test_the_next_turn_restarts_the_cli_with_a_changed_threshold():
     br, st, sent, connects = _changed()
 
-    _parked(br, ("compaction", ""))
+    _turn(br)
 
     assert connects == ["S1"]
-    assert "auto-compact at 300k: restarting the CLI" in _shown(sent)
+    assert "Restarted the CLI to compact at ~300k tok" in _shown(sent)
 
 
 def test_an_unchanged_one_leaves_the_cli_alone():
     br, st, _sent, connects = _bridge(["--auto-compact", "--compact-at", "300000"])
     st.session_id = "S1"
-    br._cli_compaction_env = compaction_env(300_000, True)
+    st.cli_compaction = (300_000, True)
     st._compact_at = 300_000            # /autocompact 300000, as it was
 
-    _parked(br, ("compaction", ""))
+    _turn(br)
 
     assert connects == []
 
@@ -274,113 +281,84 @@ def test_before_the_first_cli_there_is_nothing_to_restart():
     br, st, _sent, connects = _bridge()
     st._compact_at, st._auto_compact = 300_000, True
 
-    _parked(br, ("compaction", ""))
+    _turn(br)
 
     assert connects == []
 
 
-def test_a_restart_waits_for_running_background_tasks():
-    """Restarting the CLI would orphan them, as a /model switch would."""
-    br, st, sent, connects = _changed()
-    st.background_tasks["t1"] = {"name": "build", "seq": 1}
-
-    _parked(br, ("compaction", ""))
-
-    assert connects == []
-    assert "applied once the session is idle" in _shown(sent)
-
-
-def test_it_is_applied_when_they_finish():
+def test_a_change_undone_before_the_turn_costs_nothing():
     br, st, _sent, connects = _changed()
-    st.background_tasks["t1"] = {"name": "build", "seq": 1}
-    _parked(br, ("compaction", ""))
-    st.background_tasks.clear()
-
-    _parked(br, ("wakeup", "bg-all-done"))
-
-    assert connects == ["S1"]
-
-
-def test_a_change_undone_before_then_costs_nothing():
-    br, st, _sent, connects = _changed()
-    st.background_tasks["t1"] = {"name": "build", "seq": 1}
-    _parked(br, ("compaction", ""))
     st._auto_compact = False            # /autocompact off: as the CLI has it
-    st.background_tasks.clear()
 
-    _parked(br, ("wakeup", "bg-all-done"))
+    _turn(br)
 
     assert connects == []
 
 
-def test_a_ghost_turn_is_not_cut_off_for_it():
-    """The worker is parked while the CLI streams a turn of its own (a
-    peer's message, a background task's notice): restarting it then would
-    cut that turn off."""
+def test_it_waits_for_another_turn_while_a_background_task_runs():
+    """Restarting the CLI would orphan the task's notice, as a /model switch
+    would."""
     br, st, _sent, connects = _changed()
-    st.busy = True
+    st.background_tasks["t1"] = {"name": "build", "seq": 1}
 
-    _parked(br, ("compaction", ""))
+    _turn(br)
 
     assert connects == []
 
 
-def test_a_ghost_turn_is_not_sent_a_queued_prompt_by_it():
-    """A prompt typed during a ghost turn waits for it to end.  A compaction
-    event that changes nothing must not send it into the busy CLI, which
-    would end that prompt's turn on the ghost turn's result."""
-    br, st, _sent, connects = _bridge()
-    st.session_id = "S1"
-    br._cli_compaction_env = {}
-    st.busy = True
-    st.queued_prompts.append("hello")
-
-    assert _parked(br, ("compaction", "")) is None
-    assert list(st.queued_prompts) == ["hello"]
-
-
-def test_a_turn_the_cli_has_begun_by_itself_is_not_cut_off():
-    """It says "running" seconds before the turn's first output marks the
-    session busy."""
+def test_it_waits_while_the_cli_says_it_is_running():
+    """A turn the CLI has begun by itself -- to deliver a finished task's
+    notice, say -- says "running" before its first output marks the session
+    busy; a restart then would throw that turn, and the notice, away."""
     br, st, _sent, connects = _changed()
     br._cli_state = "running"
 
-    _parked(br, ("compaction", ""))
+    _turn(br)
 
     assert connects == []
 
 
-def test_what_the_cli_does_after_compacting_is_not_cut_off():
-    """A turn the CLI's compaction closed goes on as a turn of its own,
-    whose first output may not have come yet."""
+def test_it_waits_while_a_compaction_closed_turn_may_go_on():
+    """After compacting, the CLI carries on with the turn, as one of its
+    own, whose first output may not have come yet."""
     br, st, _sent, connects = _changed()
     st.pending_compact_turn_end = {"subtype": "success", "started_at": 0.0}
 
-    _parked(br, ("compaction", ""))
+    _turn(br)
 
     assert connects == []
 
 
-def test_it_is_applied_when_that_turn_turns_out_to_be_over():
+def test_it_waits_on_a_cli_that_is_already_gone():
+    """The recovery that follows starts the new CLI with it anyway."""
     br, st, _sent, connects = _changed()
-    st.pending_compact_turn_end = {"subtype": "success", "started_at": 0.0}
-    _parked(br, ("compaction", ""))
+    br._transport_dead = True
 
-    asyncio.run(br._flush_pending_compact_turn_end())
-    _parked(br)
+    _turn(br)
+
+    assert connects == []
+
+
+def test_the_turn_after_does_it():
+    br, st, _sent, connects = _changed()
+    br._cli_state = "running"
+    _turn(br)
+    br._cli_state = "idle"
+
+    _turn(br)
 
     assert connects == ["S1"]
 
 
-def test_the_end_of_a_ghost_turn_applies_it():
+def test_nothing_restarts_the_cli_while_the_session_is_parked():
+    """Parked is not quiet: the CLI may be in a turn of its own."""
     br, st, _sent, connects = _changed()
-    st.busy = True
-    _parked(br, ("compaction", ""))
+    for event in (("wakeup", "bg-all-done"), ("wakeup", "queue-edit-done"),
+                  ("quit", "")):
+        br.event_queue.put_nowait(event)
 
-    asyncio.run(br._end_ghost_turn("success"))
-    _parked(br)
-
-    assert connects == ["S1"]
+    assert asyncio.run(br._await_next_prompt()) is None
+    assert connects == []
 
 
 _PARKED = "<parked>"
@@ -400,30 +378,16 @@ def _looped(argv=()):
     return br, st, sent, connects
 
 
-def test_a_change_made_during_a_turn_restarts_the_cli_after_it():
+def test_nor_does_the_end_of_a_turn():
+    """The CLI may begin a turn of its own straight after ours."""
     br, st, _sent, connects = _looped()
     st.session_id = "S1"
-    br._cli_compaction_env = compaction_env(300_000, True)
-    st._auto_compact = False            # /autocompact off, mid-turn
-    br.event_queue.put_nowait(("compaction", ""))
-
-    asyncio.run(br._between_turns("done", False))
-
-    assert connects == ["S1"]
-
-
-def test_after_a_turn_it_still_waits_for_background_tasks():
-    br, st, _sent, connects = _looped()
-    st.session_id = "S1"
-    br._cli_compaction_env = compaction_env(300_000, True)
+    st.cli_compaction = (300_000, True)
     st._auto_compact = False
-    st.background_tasks["t1"] = {"name": "build", "seq": 1}
-    br.event_queue.put_nowait(("compaction", ""))
 
     asyncio.run(br._between_turns("done", False))
 
     assert connects == []
-    assert br._deferred_reconnect is None, "nothing is held to go stale"
 
 
 def test_orchestrator2_never_compacts_by_itself():
@@ -436,35 +400,29 @@ def test_orchestrator2_never_compacts_by_itself():
     assert not [m for m in sent if "ompact" in str(m.get("data", {}).get("message", ""))]
 
 
-def test_autocompact_in_a_tab_tells_the_bridge(monkeypatch):
-    import json
-    from session_runtime import SessionRuntime
-
-    class _WS:
-        async def send_text(self, data):
-            json.loads(data)
-
-    class _Bridge:
-        def __init__(self):
-            self.event_queue = asyncio.Queue()
-
-    cfg = parse_args([])
+def test_autocompact_says_when_the_cli_has_yet_to_take_it():
+    import commands
     st = State()
-    rt = SessionRuntime(config=cfg, state=st, rid="R1")
-    rt.bridge = _Bridge()
-    monkeypatch.setattr(server, "runtimes", {"R1": rt})
-    monkeypatch.setattr(server, "_default_runtime", rt)
-    monkeypatch.setattr(server, "config", cfg)
-    monkeypatch.setattr(server, "state", st)
-    monkeypatch.setattr(server, "bridge", rt.bridge)
+    cfg = parse_args([])
+    st.cli_compaction = (cfg.compact_at, False)
 
-    for text in ("/autocompact", "/autocompact 300000", "/autocompact off"):
-        asyncio.run(server._handle_ws_message(_WS(), {"type": "message", "text": text}))
+    msg = commands._cmd_autocompact("300000", st, cfg).messages[0]["data"]["message"]
 
-    got = []
-    while not rt.bridge.event_queue.empty():
-        got.append(rt.bridge.event_queue.get_nowait())
-    assert got == [("compaction", ""), ("compaction", "")], "only the two changes"
+    assert msg == ("auto-compact ON: the CLI compacts at ~300000 tok -- from the "
+                   "session's next turn, which restarts the CLI to take it; "
+                   "until then, at its own default")
+
+
+def test_autocompact_says_nothing_more_once_it_has():
+    import commands
+    st = State()
+    cfg = parse_args([])
+    st.cli_compaction = (300_000, True)
+    st._compact_at, st._auto_compact = 300_000, True
+
+    msg = commands._cmd_autocompact("", st, cfg).messages[0]["data"]["message"]
+
+    assert msg == "auto-compact ON: the CLI compacts at ~300000 tok"
 
 
 # -- The count shown is the latest call's ------------------------------------

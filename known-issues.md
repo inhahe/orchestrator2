@@ -30,7 +30,7 @@ Fixed by letting the CLI do the compacting (design.md, *The CLI does the
 compacting*). A session with auto-compact on starts its CLI with
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` = compact_at + 33,000, plus
 `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` below 67k (`config.compaction_env`). A
-change restarts the CLI once nothing is running in the session. orchestrator2's
+change restarts the CLI just before the session's next turn. orchestrator2's
 own check, its cooldown and `--compact-cooldown-turns` are gone. The count is
 now the main thread's latest API call's input (`state.call_context_tokens`),
 and the boundary reads `msg.data["compact_metadata"]`.

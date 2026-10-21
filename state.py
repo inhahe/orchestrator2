@@ -706,6 +706,10 @@ class State:
     # Turn/compact state
     last_result_subtype: str | None = None
     compact_during_last_turn: bool = False
+    # (threshold, on): the compaction the running CLI was started with, which
+    # it keeps until it is replaced -- not necessarily the session's own
+    # (session_compaction) after a change.  None before the first CLI.
+    cli_compaction: tuple[int, bool] | None = None
     # A compact-induced ResultMessage suppresses run_turn's turn_end on the
     # assumption that a post-compact ghost turn will own it.  When no ghost
     # turn follows (the turn genuinely ended at compaction), this holds the

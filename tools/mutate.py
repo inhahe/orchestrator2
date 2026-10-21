@@ -6312,9 +6312,9 @@ COMPACTION_SERVER_MUTATIONS = [
      "        \"compact_at\": own_compaction(st)[0],\n",
      "        \"compact_at\": getattr(rt.config, \"compact_at\", None),\n"),
 
-    ("a launch onto an open session leaves its CLI on the old threshold",
-     "        elif compaction_given and existing.bridge is not None:\n",
-     "        elif False:\n"),
+    ("a title nothing resolved gets a record of its own",
+     "    if not _UUID_RE.fullmatch(sid or \"\"):\n        return\n",
+     ""),
 
     ("a session's kept compaction applies only once the CLI has named it",
      "        if getattr(st, \"_compaction_sid\", None) != sid or own_compaction(st) != own:\n",
@@ -6326,8 +6326,9 @@ COMPACTION_SERVER_MUTATIONS = [
 ]
 
 # The CLI compacts, at the session's threshold, which it reads from its
-# environment when it starts; a change restarts it only when the session is
-# quiet; the count shown is the latest main-thread call's.
+# environment when it starts; a change restarts it only just before a turn
+# orchestrator2 starts, when nothing of the CLI's own is running; the count
+# shown is the latest main-thread call's.
 # tests/test_cli_compaction.py; design.md, "The CLI does the compacting".
 COMPACTION_CONFIG_MUTATIONS = [
     ("auto-compact off still sets the threshold",
@@ -6353,7 +6354,7 @@ COMPACTION_CONFIG_MUTATIONS = [
 
 COMPACTION_BRIDGE_MUTATIONS = [
     ("the CLI is not given the session's threshold",
-     "        kwargs[\"env\"].update(self._cli_compaction_env)\n",
+     "        kwargs[\"env\"].update(cli_env)\n",
      ""),
 
     ("a threshold the hub inherited reaches a session without one",
@@ -6368,68 +6369,37 @@ COMPACTION_BRIDGE_MUTATIONS = [
      "        if target and self.sync_compaction is not None:\n",
      "        if False:\n"),
 
-    ("what the CLI started with is not recorded",
-     "        self._cli_compaction_env = self._compaction_env()\n"
-     "        kwargs[\"env\"].update(self._cli_compaction_env)\n",
-     "        kwargs[\"env\"].update(self._compaction_env())\n"),
+    ("what the CLI started with is recorded as the hub's default",
+     "        self.state.cli_compaction = session_compaction(self.state, self.config)\n",
+     "        self.state.cli_compaction = (self.config.compact_at, self.config.auto_compact)\n"),
 
     ("an unchanged threshold restarts the CLI",
-     "        return (self._cli_compaction_env is not None\n"
-     "                and self._compaction_env() != self._cli_compaction_env)\n",
-     "        return self._cli_compaction_env is not None\n"),
+     "        return cli is not None and compaction_env(*cli) != self._compaction_env()\n",
+     "        return cli is not None\n"),
 
     ("a CLI that has not started yet is restarted",
-     "        return (self._cli_compaction_env is not None\n                and ",
-     "        return (True\n                and "),
+     "        return cli is not None and compaction_env(*cli) != self._compaction_env()\n",
+     "        return compaction_env(*(cli or (0, False))) != self._compaction_env()\n"),
 
-    ("a change made during a turn is not applied after it",
-     "        await self._apply_compaction_if_quiet(asked=compaction_asked)\n",
+    ("a turn does not give the CLI a changed threshold",
+     "        await self._apply_compaction_before_turn()\n",
      ""),
 
-    ("a change made while idle is not applied",
-     "                if await self._apply_compaction_if_quiet(asked=True):\n",
-     "                if False:\n"),
-
-    ("a compaction event sends a queued prompt into a ghost turn",
-     "                if await self._apply_compaction_if_quiet(asked=True):\n"
-     "                    prompt = await self._pop_queued_prompt()\n",
-     "                await self._apply_compaction_if_quiet(asked=True)\n"
-     "                if True:\n"
-     "                    prompt = await self._pop_queued_prompt()\n"),
-
-    ("a change restarts the CLI under running work",
-     "        if (self._active_bg_tasks() or self.turn_active.is_set()\n"
-     "                or self.state.busy or self.state.connecting\n",
-     "        if (False\n"
-     "                or self.state.busy or self.state.connecting\n"),
-
-    ("a change cuts off a ghost turn",
-     "                or self.state.busy or self.state.connecting\n",
-     "                or self.state.connecting\n"),
+    ("a change restarts the CLI under a running background task",
+     "        if (self._active_bg_tasks() or state.busy or state.connecting\n",
+     "        if (state.busy or state.connecting\n"),
 
     ("a change cuts off a turn the CLI has begun by itself",
      "                or self._cli_state == \"running\"\n",
      ""),
 
     ("a change cuts off what the CLI does after compacting",
-     "                or self.state.pending_compact_turn_end is not None):\n",
-     "                or False):\n"),
-
-    ("a compaction-closed turn that ends does not wake the worker for it",
-     "        if self._compaction_changed():\n"
-     "            self.event_queue.put_nowait((\"wakeup\", \"compaction\"))\n",
-     "        if False:\n"
-     "            self.event_queue.put_nowait((\"wakeup\", \"compaction\"))\n"),
-
-    ("a waiting change is not applied when the tasks finish",
-     "                await self._apply_compaction_if_quiet()\n",
+     "                or state.pending_compact_turn_end is not None\n",
      ""),
 
-    ("the end of a ghost turn does not wake the worker for it",
-     "        if self._compaction_changed():\n            try:\n"
-     "                self.event_queue.put_nowait((\"wakeup\", \"compaction\"))\n",
-     "        if False:\n            try:\n"
-     "                self.event_queue.put_nowait((\"wakeup\", \"compaction\"))\n"),
+    ("a change restarts a CLI that is already gone, past its recovery",
+     "                or self.client is None or self._transport_dead):\n",
+     "                or self.client is None):\n"),
 
     ("the context is never counted",
      "                if isinstance(msg, (AssistantMessage, SystemMessage)):\n"
@@ -6463,14 +6433,16 @@ COMPACTION_HUB_MUTATIONS = [
     ("the bridge cannot ask for a session's kept threshold",
      "    br.sync_compaction = lambda sid, id_cfg: _await_session_compaction(sid, id_cfg, st)\n",
      ""),
+]
 
-    ("/autocompact does not reach the CLI",
-     "                bridge.event_queue.put_nowait((\"compaction\", \"\"))\n",
-     ""),
+COMPACTION_CMD_MUTATIONS = [
+    ("/autocompact hides that the CLI has yet to take it",
+     "    if cli is not None and compaction_env(*cli) != compaction_env(at, on):\n",
+     "    if False:\n"),
 
-    ("/autocompact restarts the CLI when it only showed the setting",
-     "            if result.state_updates and {\"auto_compact\", \"compact_at\"} & result.state_updates.keys():\n",
-     "            if True:\n"),
+    ("/autocompact claims a change the CLI already has is still to come",
+     "    if cli is not None and compaction_env(*cli) != compaction_env(at, on):\n",
+     "    if cli is not None:\n"),
 ]
 
 # A launch's ANTHROPIC_API_KEY bills the session that launch opens and no other
@@ -7489,6 +7461,8 @@ TARGETS = {
                           COMPACTION_BRIDGE_MUTATIONS, "pytest"),
     "compaction-hub": ("server.py", "tests/test_cli_compaction.py",
                        COMPACTION_HUB_MUTATIONS, "pytest"),
+    "compaction-cmd": ("commands.py", "tests/test_cli_compaction.py",
+                       COMPACTION_CMD_MUTATIONS, "pytest"),
     "account-server": ("server.py", "tests/test_session_account.py",
                        ACCOUNT_SERVER_MUTATIONS, "pytest"),
     "account-move": ("server.py", "tests/test_move_stops_original.py",
