@@ -485,6 +485,7 @@ def opened(monkeypatch, tmp_path):
         notices = [(m.get("subtype"), (m.get("data") or {}).get("message", ""))
                    for m in sent if m.get("type") == "system_msg"
                    and m.get("subtype") in ("warning", "info")]
+        run.bridge = br
         return notices, st, dict(_CLI.last.options.env)
 
     return run
@@ -563,13 +564,13 @@ def test_a_new_connect_replaces_what_the_last_one_said():
 def test_the_transcript_is_read_before_the_cli_starts(opened, monkeypatch):
     """Anything the new CLI writes on resume is not the old turn."""
     order = []
-    real = SDKBridge._read_cut_off_turn
+    real = SDKBridge._read_open_tail
 
-    def spy(self, sid):
+    def spy(self, sid, **kw):
         order.append("read")
-        return real(self, sid)
+        return real(self, sid, **kw)
 
-    monkeypatch.setattr(SDKBridge, "_read_cut_off_turn", spy)
+    monkeypatch.setattr(SDKBridge, "_read_open_tail", spy)
     monkeypatch.setattr(_CLI, "connect", lambda self: _mark(order))
 
     opened(CUT)
@@ -640,3 +641,26 @@ def test_a_tab_that_attaches_later_is_told(monkeypatch):
     asyncio.run(server._send_initial_state(ws))
 
     assert got[-1] == {"type": "system_msg", **note}
+
+
+# --------------------------------------------------------------------------
+# What else a connect reads from the transcript's end, in the same read
+# --------------------------------------------------------------------------
+
+def test_opening_a_session_a_limit_stopped_schedules_its_resume(opened):
+    """tests/test_resume_after_limit.py, through a real connect."""
+    import limit_resume
+    import time
+    reset = int(time.time()) + 3600
+    limit = {"type": "assistant", "timestamp": "2026-10-21T00:11:52.680Z",
+             "isApiErrorMessage": True, "error": "rate_limit",
+             "quotaLimits": {"status": "rejected", "resetsAt": reset,
+                             "rateLimitType": "five_hour"},
+             "message": {"model": "<synthetic>", "role": "assistant",
+                         "content": [{"type": "text", "text": "You've hit your "
+                                      "session limit · resets 9pm"}]}}
+    notices, st, _env = opened(DONE + [limit], ["--resume-after-limit"])
+    assert any("This session was stopped by the 5-hour session limit" in t
+               for _s, t in notices)
+    assert st.rate_limit_status == "rejected"
+    assert st.limit_resume_at == reset + limit_resume.MARGIN_S

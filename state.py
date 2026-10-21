@@ -410,7 +410,10 @@ def apply_rate_limit_info(state: State, info: Any) -> None:
     if isinstance(status, str):
         if status == "rejected" and state.rate_limit_status != "rejected":
             state.rate_limit_reset_bell_fired = False
+            state.rate_limit_hit_at = time.time()
             ring_bell(state, "rate-hit")
+        elif status != "rejected":
+            state.rate_limit_hit_at = None
         state.rate_limit_status = status
         if status == "rejected":
             state.rate_limit_type = rl_type if isinstance(rl_type, str) else None
@@ -445,6 +448,7 @@ def reset_rate_limit(state: State) -> bool:
     state.rate_limit_resets_at = None
     state.rate_limit_type = None
     state.rate_limit_overage_resets_at = None
+    state.rate_limit_hit_at = None
     state.rate_limit_reset_bell_fired = False
     state.rate_limit_utils.clear()
     return changed
@@ -846,9 +850,13 @@ class State:
     rate_limit_status: str | None = None
     rate_limit_resets_at: int | None = None
     # Which window a rejection is for (the CLI's ``rateLimitType``, e.g.
-    # "five_hour"), so the session can say which limit stopped it.
+    # "five_hour"), so the session can say which limit stopped it, and when
+    # the rejection began (Unix time).  A rejection stands until the model
+    # answers again (SDKBridge._note_assistant_message), which makes it what
+    # says a usage limit has the session stopped (--resume-after-limit).
     rate_limit_type: str | None = None
     rate_limit_overage_resets_at: int | None = None
+    rate_limit_hit_at: float | None = None
     rate_limit_reset_bell_fired: bool = False
 
     # --resume-after-limit, for this session: /resume-after-limit changes it.

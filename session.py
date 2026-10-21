@@ -452,8 +452,45 @@ def _is_cli_resume_bookkeeping(rec: dict) -> bool:
     return False
 
 
+def read_tail(jsonl: Path, tail_bytes: int = CUT_OFF_TAIL_BYTES
+              ) -> tuple[list[dict], int]:
+    """The main-chain records at *jsonl*'s end, and the offset the read began
+    at (0 when it is the whole file).
+
+    User, assistant, attachment and system records; sidechains (a subagent's)
+    are left out.  One read for every question asked of a session's end when
+    it is opened: whether its last turn was cut off (:func:`cut_off_turn`),
+    whether a usage limit stopped it (``limit_resume.limit_stop_in``).
+    """
+    try:
+        size = jsonl.stat().st_size
+        with open(jsonl, "rb") as f:
+            start = max(0, size - tail_bytes)
+            f.seek(start)
+            raw = f.read()
+    except OSError:
+        return [], 0
+    lines = raw.split(b"\n")
+    if start > 0 and lines:
+        lines = lines[1:]           # the first is cut in half
+    records: list[dict] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and not rec.get("isSidechain") \
+                and rec.get("type") in ("user", "assistant", "attachment", "system"):
+            records.append(rec)
+    return records, start
+
+
 def cut_off_turn(jsonl: Path, *,
-                 tail_bytes: int = CUT_OFF_TAIL_BYTES) -> dict | None:
+                 tail_bytes: int = CUT_OFF_TAIL_BYTES,
+                 tail: tuple[list[dict], int] | None = None) -> dict | None:
     """Whether *jsonl* ends in the middle of a turn, and which turn.
 
     None when it ends on a finished turn (the model's last word), on an API
@@ -474,31 +511,13 @@ def cut_off_turn(jsonl: Path, *,
     so nothing it writes on resume is mistaken for the old turn; what an
     *earlier* resume wrote (its placeholder pair, its report of unfinished
     background tasks) is skipped for the same reason.
+
+    *tail* is :func:`read_tail`'s, for a caller that has read it already.
     """
-    try:
-        size = jsonl.stat().st_size
-        with open(jsonl, "rb") as f:
-            start = max(0, size - tail_bytes)
-            f.seek(start)
-            raw = f.read()
-    except OSError:
-        return None
-    lines = raw.split(b"\n")
-    if start > 0 and lines:
-        lines = lines[1:]           # the first is cut in half
-    records: list[dict] = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(rec, dict) or rec.get("isSidechain"):
-            continue
-        if rec.get("type") in ("user", "assistant", "attachment"):
-            records.append(rec)
+    records, start = tail if tail is not None else read_tail(jsonl, tail_bytes)
+    # A system record is the CLI's (a command's output, a compaction
+    # boundary), never part of a turn.
+    records = [r for r in records if r.get("type") != "system"]
 
     answered: set[str] = set()
     tool_names: dict[str, str] = {}
@@ -2039,6 +2058,11 @@ def describe_integrity_problem(report: dict[str, Any]) -> str:
 #: ``limit_resume`` (as ``PROMPT_PREFIX``) and defined here only because that
 #: module imports this one.
 LIMIT_RESUME_PROMPT_PREFIX = "[orchestrator2] The usage limit has reset"
+
+#: How a one-shot session note begins, which the hub puts in front of the
+#: next prompt (``SDKBridge._with_session_note``): "[orchestrator2] <note>",
+#: a blank line, then the prompt.
+SESSION_NOTE_PREFIX = "[orchestrator2] "
 
 # Content prefixes the Claude Code harness uses for synthetic prompts
 # it feeds to the model.  These are indistinguishable from user-typed

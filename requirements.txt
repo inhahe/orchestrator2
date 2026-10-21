@@ -5,6 +5,12 @@ psutil>=5.9
 uvicorn>=0.34
 websockets>=15.0
 
+# The IANA time zones Python lacks on Windows.  --resume-after-limit reads a
+# reset from the CLI's "resets 9:30am (America/New_York)" when a /compact ran
+# into the limit, which carries no exact time; without this it reads it as
+# local time, which is right unless the CLI ran in another zone.
+tzdata; sys_platform == "win32"
+
 # Only the session-picker TUI (copy_session_tui.py, reached via --resume /
 # --copy / `python copy_session.py`) needs this.  Everything else -- including
 # the hub's own account discovery and /switch -- imports copy_session.py, which

@@ -15,11 +15,29 @@ Every later hit left it that way: the CLI sends the event only when its limit
 state changes. Found while building `--resume-after-limit` (design.md §6h),
 which needs that time.
 
-Fixed by `SDKBridge._note_assistant_message`, which books the limit message as
-the limit and anything else as the model answering. It runs on the ghost-turn
-path too, which never cleared a stale rejection at all.
+Fixed by `SDKBridge._note_assistant_message`, which clears the rejection only
+for the model answering: never for one of the CLI's own messages
+(`_is_synthetic`, a `<synthetic>` model or an `error` -- the first version
+excluded only the limit message, so a background task's turn failing on
+"API Error: Connection error" would still have cleared it, as the review
+found). It runs on the ghost-turn path too, which never cleared a stale
+rejection at all.
 `tests/test_resume_after_limit.py::test_the_limit_message_does_not_wipe_the_rejection`
-fails with `'allowed' == 'rejected'` when the old behaviour is put back.
+fails with `'allowed' == 'rejected'` when the old behaviour is put back
+(mutation target `limitresume`).
+
+## A loop's wakeup record was left under the session's old id — FIXED (2026-10-21)
+
+`wakeup_store` keys a loop's record on the session id, and every clear names
+the current one. The rolling context trim (`--max-context-tokens`) gives the
+session a new id, so a loop armed before a trim left its record under the old
+id: nothing cleared it, and the next hub start reopened the *old* transcript
+and fired the loop there -- a second agent on stale history in the same
+working tree. Found by the review of `--resume-after-limit`, whose records had
+the same flaw. Both now move with the id (`record_store.RecordStore.rekey`,
+from `SDKBridge._take_session_id`). Test:
+`test_a_new_session_id_takes_the_schedules_with_it`; mutation targets
+`limitresume` (both moves) and `recstore`.
 
 ## `/loop`'s messages went to every tab of every session — FIXED (2026-10-21)
 

@@ -2421,26 +2421,10 @@ WAKESTORE_MUTATIONS = [
     #    case (a corrupt or hand-edited record) at the point it arises, rather
     #    than leaving a reader to work out that the floor covers it.
 
-    ("a record is restored into whatever session shares its slot, running a "
-     "turn in the wrong conversation",
-     '        if wakeup_file_for(rec["cwd"], rec["session_id"]).name != path.name:\n'
-     "            continue\n",
-     ""),
-
-    ("one corrupt file costs every other loop its schedule",
-     "        except (OSError, ValueError):\n            continue",
-     "        except OSError:\n            continue"),
-
     ("records come back in arbitrary order, so the resurrection cap revives "
      "whichever the filesystem listed first rather than the soonest due",
      '    recs.sort(key=lambda r: r.get("due_at", 0.0))\n',
      ""),
-
-    ("clearing a fired wakeup does nothing, leaving a record that runs the "
-     "same turn again on the next start",
-     "    try:\n        wakeup_file_for(cwd, session_id).unlink()\n"
-     "    except (OSError, FileNotFoundError):\n        pass",
-     "    pass"),
 
     ("a session with no id, or a wakeup with no prompt, is written to disk "
      "anyway",
@@ -3033,8 +3017,132 @@ MOVESTOP_MUTATIONS = [
 
 MOVESTOP_WAKEUP_MUTATIONS = [
     ("a recorded wakeup can never be read back, so no loop survives a move",
-     "    return rec if _valid(rec) else None\n",
-     "    return None\n"),
+     "        return rec if self._valid(rec) else None\n",
+     "        return None\n"),
+]
+
+# The record store under wakeup_store and limit_resume (record_store.py).
+# tests/test_wakeup_store.py and tests/test_resume_after_limit.py.
+RECSTORE_MUTATIONS = [
+    ("a record is restored into whatever session shares its slot, running a "
+     "turn in the wrong conversation",
+     '            if self.path_for(rec["cwd"], rec["session_id"]).name != path.name:\n'
+     "                continue\n",
+     ""),
+
+    ("one corrupt file costs every other session its schedule",
+     "            except (OSError, ValueError):\n                continue",
+     "            except OSError:\n                continue"),
+
+    ("clearing a record does nothing, leaving one that runs the same turn "
+     "again on the next start",
+     "        try:\n            self.path_for(cwd, session_id).unlink()\n"
+     "        except (OSError, FileNotFoundError):\n            pass",
+     "        pass"),
+
+    ("a session whose id changed keeps its record under the old id, where "
+     "nothing clears it and the next start acts on the old transcript",
+     "        self.save(cwd, new_id, fields)\n        self.clear(cwd, old_id)\n",
+     "        self.save(cwd, new_id, fields)\n"),
+]
+
+# --resume-after-limit (design.md 6h).  tests/test_resume_after_limit.py.
+LIMITRESUME_BRIDGE_MUTATIONS = [
+    ("the CLI's own limit message is taken for the model answering, wiping "
+     "the rejection and its reset the moment they arrive",
+     "        if self._is_synthetic(msg):\n            return False\n"
+     "        self._note_limit_over()",
+     "        self._note_limit_over()"),
+
+    ("a synthetic error under a model's name ends the limit",
+     '                or getattr(msg, "error", None) is not None)',
+     "                or False)"),
+
+    ("a resume the user interrupted counts as running back into the limit, "
+     "and is sent again",
+     "        if interrupted:\n            return\n        stop = self._stopped_by_limit()",
+     "        stop = self._stopped_by_limit()"),
+
+    ("giving up holds only until the next turn into the same limit",
+     "        if reset == self._limit_gave_up_for:\n"
+     "            return       # given up on this one; a later limit is resumed again\n",
+     ""),
+
+    ("a new session id leaves the limit record under the old one",
+     "                limit_resume.rekey(self.config.cwd, old, sid)",
+     "                pass"),
+
+    ("a new session id leaves the wakeup record under the old one",
+     "                rekey_wakeup(self.config.cwd, old, sid)",
+     "                pass"),
+
+    ("a tab attaching after a ghost turn is not told the resume is scheduled",
+     "            self._remind_limit_notice()\n            return",
+     "            return"),
+
+    ("a session note goes in front of a resume, which then reads as typed",
+     "        if prompt_text.startswith(limit_resume.PROMPT_PREFIX):",
+     "        if False:"),
+
+    ("the check on open can break a connect",
+     "            try:\n                await self._limit_on_open(resume_sid, limit_stop)\n"
+     "            except Exception:\n",
+     "            if True:\n                await self._limit_on_open(resume_sid, limit_stop)\n"
+     "            if False:\n"),
+
+    ("an opened session's limit is never put on the State",
+     "        if st.rate_limit_status != \"rejected\":\n            self._adopt_limit_stop(stop)",
+     "        if False:\n            self._adopt_limit_stop(stop)"),
+]
+
+LIMITRESUME_SERVER_MUTATIONS = [
+    ("a reopen is not counted, so one that cannot connect is reopened by "
+     "every idle teardown",
+     "            limit_resume.note_reopened(now_rec)\n",
+     ""),
+
+    ("every session that comes due is reopened at once, with no cap",
+     "            if len(_limit_reopened) >= LIMIT_REOPEN_MAX_OPEN:",
+     "            if False:"),
+
+    ("a reopened session runs on the hub's model, effort and CLI",
+     '                model=now_rec.get("model"), effort=now_rec.get("effort"),\n'
+     '                cli_path=now_rec.get("cli_path"), bell_on=now_rec.get("bell_on"),\n',
+     ""),
+
+    ("a session that never connects is never closed",
+     "        connecting = rt.idle_connecting_defers <= IDLE_CONNECTING_DEFERS",
+     "        connecting = True"),
+
+    ("a resume due in a moment is closed only to be reopened",
+     "                and resume_at - time.time() < timeout)",
+     "                and False)"),
+]
+
+LIMITRESUME_MODULE_MUTATIONS = [
+    ("a record reopened again and again is never dropped",
+     '    if int(rec.get("reopens") or 0) >= MAX_REOPENS:',
+     "    if False:"),
+
+    ("a /compact that ran into the limit gives no reset",
+     "                report(at, reset_from_text(text, at) if at else None,",
+     "                report(at, None,"),
+
+    ("a reset read from text wins over the same limit's exact headers",
+     '                          and kind == found["kind"])):',
+     "                          and False)):"),
+
+    ("a session note is repeated as part of the user's prompt",
+     "        text = rest.strip() if sep else text",
+     "        text = text"),
+
+    ("the resume waits for extra usage's reset, which is billed",
+     "    for ts in (resets_at, overage_resets_at):",
+     "    for ts in (overage_resets_at, resets_at):"),
+
+    ("a clock time already past today is taken as today's",
+     "            if when_ <= base:\n                when_ += timedelta(days=1)\n",
+     ""),
 ]
 
 # A background tab Chrome kills is asleep, not gone: its session is kept.
@@ -5582,14 +5690,12 @@ CUTOFF_SESSION_MUTATIONS = [
 
 CUTOFF_BRIDGE_MUTATIONS = [
     ("an opened session's cut-off turn is never looked for",
-     "        if resume_sid and not self._finishing_cut_off_turn:\n"
-     "            cut_off = await asyncio.to_thread(self._read_cut_off_turn, resume_sid)",
-     "        if False:\n"
-     "            cut_off = await asyncio.to_thread(self._read_cut_off_turn, resume_sid)"),
+     "                cut_off=not self._finishing_cut_off_turn)",
+     "                cut_off=False)"),
 
     ("a recovery announces a turn its CLI is about to finish",
-     "        if resume_sid and not self._finishing_cut_off_turn:",
-     "        if resume_sid:"),
+     "                cut_off=not self._finishing_cut_off_turn)",
+     "                cut_off=True)"),
 
     ("the cut-off turn is found and never mentioned",
      "            await self._post_open_notice(\"warning\", describe_cut_off_turn(cut_off))",
@@ -7267,8 +7373,17 @@ TARGETS = {
                          SESSIONNAME_DISK_MUTATIONS, "pytest"),
     "movestop": ("server.py", "tests/test_move_stops_original.py",
                  MOVESTOP_MUTATIONS, "pytest"),
-    "movestop-wakeup": ("wakeup_store.py", "tests/test_move_stops_original.py",
+    "movestop-wakeup": ("record_store.py", "tests/test_move_stops_original.py",
                         MOVESTOP_WAKEUP_MUTATIONS, "pytest"),
+    "recstore": ("record_store.py",
+                 "tests/test_wakeup_store.py tests/test_resume_after_limit.py",
+                 RECSTORE_MUTATIONS, "pytest"),
+    "limitresume": ("sdk_bridge.py", "tests/test_resume_after_limit.py",
+                    LIMITRESUME_BRIDGE_MUTATIONS, "pytest"),
+    "limitresume-server": ("server.py", "tests/test_resume_after_limit.py",
+                           LIMITRESUME_SERVER_MUTATIONS, "pytest"),
+    "limitresume-module": ("limit_resume.py", "tests/test_resume_after_limit.py",
+                           LIMITRESUME_MODULE_MUTATIONS, "pytest"),
     "asleep-server": ("server.py", "tests/test_asleep_tab.py",
                       ASLEEP_SERVER_MUTATIONS, "pytest"),
     "asleep-app": ("static/app.js", "tests/reconnect_on_show.test.js",

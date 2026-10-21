@@ -99,6 +99,7 @@ Three layers, deliberately separated:
 | `ws_channel.py` | Per-socket outbound queue + writer task; snapshot coalescing |
 | `sdk_bridge.py` | `SDKBridge`: SDK connection, `worker_loop`, `_message_dispatcher`, turn management, the wakeup loop, the resume after a usage limit (§6h) |
 | `limit_resume.py` | `--resume-after-limit` without the bridge (§6h): what stopped a session, read from its transcript; its last prompt; the resume prompt; and the on-disk schedule the hub reopens sessions from |
+| `record_store.py` | `RecordStore`: one small JSON record per session, kept across hub restarts, read back only into its own slot, moved when the session's id changes. Under `wakeup_store` and `limit_resume` |
 | `state.py` | `State` dataclass + `state_to_status_dict()` / `state_to_panels_dict()` serialisers, rate-limit helpers |
 | `config.py` | `Config` dataclass, `parse_args()`, constants (`CONTINUE_PROMPT`, `MARKERS`, …) |
 | `account.py` | Which Claude account (config dir) the hub and each CLI use: the hub's, adopted out of its environment at startup; where an account's files are; and what `CLAUDE_CONFIG_DIR` a child is given — none for the default ("Central-hub reuse": "A CLI on the default account runs with `CLAUDE_CONFIG_DIR` unset"). Stdlib only |
@@ -532,8 +533,9 @@ the copy due when it was (§8, `/move`).
 last hours or days, so the session is closed rather than kept with a CLI
 running, keeps its record (`stop(idle_teardown=True)`), and the hub reopens it
 when the resume comes due. The timer defers only when that resume is due
-within its own timeout, since closing would just mean reopening, and it never
-closes a session that is still connecting.
+within its own timeout, since closing would just mean reopening; and a session
+still connecting gets two more passes (`IDLE_CONNECTING_DEFERS`), not an
+unbounded wait.
 
 **The hub exiting is not an exit from the armed state.** Stopping a session
 cancels its wakeup (`SDKBridge._shutdown` → `_cancel_wakeup`), and until
@@ -2483,106 +2485,151 @@ result with `api_error_status` 429. Its transcript record carries
 `quotaLimits` (2.1.301 adds `apiErrorParams.rate_limit_info`), `resetsAt`
 among them, a Unix time. Every turn after it runs into the same limit,
 whatever starts it (a background task's notification, a peer's message, the
-user's "continue"), and adds another such record. The CLI sends a
-`RateLimitEvent` only when its limit state *changes* (`emitStatusChange`
-deduplicates), so those later hits carry none.
+user's "continue", a `/compact`), and adds another record: a `/compact` adds
+a `local_command` system record, "Error during compaction: You've hit your
+session limit · resets 9:30am (America/New_York)", with no quota headers and no
+synthetic message at all. The CLI sends a `RateLimitEvent` only when its limit
+state *changes* (`emitStatusChange` compares with `isEqual`, per process), so
+those later hits carry none. The CLI's own auto-compaction, failing, writes
+nothing to the transcript: it logs, and the turn's next call hits the limit.
 
-**The limit message is not an answer.** `run_turn` clears a rejection on the
-first `AssistantMessage` of a turn, as proof the API took the request (§ the
-2026-07-22 entry in known-issues.md). The synthetic message arrives a moment
-after the event, so it wiped the rejection and its reset time, and a session
-locked out until 9pm read "idle". `_note_assistant_message` now books the
-limit message as the limit (`_note_limit_hit`) and anything else as the model
-answering, which ends the limit (`_note_limit_over`) and clears a stale
-rejection, on both the turn's path and the ghost-turn path.
+**What has the session stopped is the State's rejection** — what
+`apply_rate_limit_info` sets from that event and the status bar's "rate
+limited" reads (asked for: re-use the detection that was there rather than
+write a second). It stands until the model answers again: an
+`AssistantMessage` that is not the CLI's own (`_is_synthetic`: `<synthetic>`
+model or an `error`) clears it (`_note_assistant_message`), as proof the API
+took the request, and ends any pending resume. The CLI's messages prove
+nothing: before this, the limit message arriving just after the event wiped
+the rejection and its reset time, and a session locked out until 9pm read
+"idle"; and a background task's turn failing on "API Error: Connection error"
+would have cancelled the resume. Keying on the State also catches the
+`/compact` that runs into the limit, which sends only the event. The State
+records when the rejection began (`rate_limit_hit_at`) and its window
+(`rate_limit_type`).
 
 **Off by default**, for the reason in §6e: a session that starts working with
 nobody having typed anything was the whole complaint there. On with
 `--resume-after-limit` (for every session a hub opens, or the one a launch
 opens when it joins a hub; a launch joining a hub that already has the session
 open turns it on there, but never off), or per session with
-`/resume-after-limit on|off`, which is on `State.resume_after_limit`. `/move`
-carries it to the copy. With it off, the first limit a session hits says once
-that `/resume-after-limit on` would carry it on at the reset.
+`/resume-after-limit on|off`, on `State.resume_after_limit`. `/move` carries it
+to the copy. With it off, the first limit a session hits — live or found on
+open, while it still holds — says once that `/resume-after-limit on` would
+carry it on. Turned on while a limit has the session stopped, it schedules at
+once, whenever the limit was hit, before or after this connect; turned on
+before, the next limit is scheduled as it happens; turned on while connecting,
+the open's check finds it on.
 
 **Live.** At the end of every turn, ours or a ghost's, `_after_limit_turn`
-arms the resume if a limit stopped it (`_arm_limit_resume`): due a minute after
-the reset (`MARGIN_S`: the API judges when a window has rolled over). The
-reset is the plan's `resetsAt`, not the earlier extra-usage reset the CLI's own
-text names when both are refused: extra usage is billed, and resuming onto it
-would spend money nobody chose to spend (`limit_resume.effective_reset`). When
-no event gave a reset, the transcript's record does. The notice goes out as an
-open notice (so a tab attaching during the wait sees it), and the status label
-reads `rate limited · resumes 9:01pm`, then `idle · resumes …` for the minute
-after the reset. Another turn running into the same limit leaves the armed
-resume alone. When due, `_limit_resume_timer` waits a minute at a time
-(`MAX_DEFERS` 30, then drops it, and says so) while a turn runs, a connect is
-in flight or there is no CLI; reads the last prompt; checks again, since the
-read took time; and then does what a wakeup does: an `injected_prompt`
-broadcast and `("message", text)` on the event queue. A resume that runs
-straight back into the *same* reset is an attempt: the next waits 2, 4, 8, 16
-minutes, and after `MAX_ATTEMPTS` (5) the session stops resuming by itself
-and says so. A *later* reset (the weekly limit after the session limit) starts
-the count again.
+arms the resume if the State is rejected (`_arm_limit_resume`): due a minute
+after the reset (`MARGIN_S`: the API judges when a window has rolled over).
+The reset is the plan's `resetsAt`, not the earlier extra-usage reset the
+CLI's text names when both are refused: extra usage is billed, and resuming
+onto it would spend money nobody chose to spend (`effective_reset`). A turn
+the user interrupted arms nothing: they took the session over. The notice
+goes out as an open notice, and is put back among them while the resume waits
+(`_remind_limit_notice`: a turn or a connect clears them, and the resume is
+not announced twice), so a tab attaching during the wait is told; the status
+label reads `rate limited · resumes 9:01pm`, then `idle · resumes …` for the
+minute after the reset. When due, `_limit_resume_timer` waits a minute at a
+time (`MAX_DEFERS` 30, then drops it, and says so) while a turn runs, a
+connect is in flight or there is no CLI; reads the last prompt; checks again,
+since the read took time; and then does what a wakeup does: an
+`injected_prompt` broadcast and `("message", text)` on the event queue. A
+resume that runs straight back into the *same* reset is an attempt: the next
+waits 2, 4, 8, 16 minutes, and after `MAX_ATTEMPTS` (5) the session stops
+resuming by itself, says so, and remembers the reset it gave up on
+(`_limit_gave_up_for`), so the next notification's turn into it does not start
+the count again; a *later* reset (the weekly limit after the session limit), or
+`/resume-after-limit on`, does.
 
 **The prompt** (`limit_resume.build_resume_prompt`) begins with
 `PROMPT_PREFIX`, which is one of session.py's harness prefixes, so history
 draws it as an injected prompt and `last_prompt_in` passes over an earlier
-resume. It says which limit stopped the session and when, that nobody typed
-it, to pick the work back up and check what is done before redoing anything,
-and that whatever arrived meanwhile is in the conversation (the CLI drops its
-synthetic error messages from the API request, so those notifications reach
-the model as user messages). Then the user's last prompt, word for word, in
-`<repeated-prompt sent="…">`, framed as a repeat and not a new request; capped
-at `REPEAT_MAX_CHARS` (20,000). Repeated every time, as asked: compaction, and
-the rolling trim of `--max-context-tokens`, can leave only a summary of it,
-and when neither has run a copy costs little. (It does not survive a
-compaction *during* the resumed turn verbatim either — the CLI summarises the
-whole conversation and keeps no message as written — but that summary is then
-written with the prompt in full and recent.) The last prompt is the last user
+resume. (A one-shot session note — `/move`'s — goes after it rather than in
+front, so it still begins so; and is stripped from a prompt it went in front
+of, so it is not repeated.) It says which limit stopped the session and when,
+that nobody typed it, to pick the work back up and check what is done before
+redoing anything, and that whatever arrived meanwhile is in the conversation
+(the CLI drops its synthetic error messages from the API request, so those
+notifications reach the model as user messages). Then the user's last prompt,
+word for word, in `<repeated-prompt sent="…">`, framed as a repeat and not a
+new request; capped at `REPEAT_MAX_CHARS` (20,000). Repeated every time, as
+asked. Measured on this machine's transcripts (2.1.280 and 2.1.301): an
+auto-compaction keeps word for word only the turn's in-flight tail
+(`compactMetadata.preservedMessages`, 3 to 6 records: the last tool call, its
+result, attachments) and summarises the rest — the prompt that started the
+turn included, even one sent six minutes before. So the premise that "the
+current prompt is always sent, even after a compaction" does not hold mid-turn,
+and a long turn's prompt is very likely only in a summary by the time a limit
+stops it; the rolling trim of `--max-context-tokens` can drop it too. The
+repeat is not safe from the *next* compaction either, but that summary is
+written with the prompt in full and recent. The last prompt is the last user
 record that is a typed prompt (no `origin`, or a human one; not meta, a
 command, a tool result, a compaction summary or harness text), read backwards
 in 2 MB chunks for up to 32 MB.
 
-**On open.** `connect()` reads `limit_resume.limit_stop_in` beside
-`cut_off_turn`, before the new CLI writes anything, and `_announce_on_open`
-hands it to `_limit_on_open`. A transcript's last word is a limit when, looking
-back past what arrives while a session is stopped — notifications, peers'
-messages, meta and command records, the CLI's resume bookkeeping, queue
-operations — the first thing found is a limit error with a reset time. A typed
-prompt after it, or any reply, means the session moved on. A record (below)
-turns the option on for its session: it is being reopened for that. A reset
-still ahead makes the status bar say `rate limited` before the fresh CLI has
-said anything. A reset more than `LATE_S` (12 h) past is only reported: the
-plan is a day old, and opening a session to look at it should not set it going
-(`/resume-after-limit on` still resumes it — that is asking). Run on real
-transcripts — a session stopped, then a task notification and the limit
-again; the same with a typed prompt after; a lane stopped mid-turn after a tool
-result with peers' messages after — it found the first and third, not the
-second, in about 30 ms each.
+**On open.** `connect()` reads the transcript's end once (`session.read_tail`,
+`_read_open_tail`) for both `cut_off_turn` and `limit_resume.limit_stop_in`,
+before the new CLI writes anything, and `_announce_on_open` hands the second
+to `_limit_on_open`, which can never fail the connect. A transcript's last word
+is a limit when, looking back past what arrives while a session is stopped —
+notifications, peers' messages, meta and command records and their output,
+the CLI's resume bookkeeping, queue operations — the first thing found is a
+limit error or a `/compact` that ran into one, with a reset that can be read.
+A typed prompt after it, or any reply, means the session moved on. The latest
+report decides the reset (a later limit is the one that holds), but a reset
+read from text (`reset_from_text`, the CLI's `formatResetTime` forms, in the
+IANA zone it names — on Windows only with `tzdata`, else local time) gives way
+to an earlier report of the same limit with headers. The limit found is put on
+the State as its `RateLimitEvent` would have been (`_adopt_limit_stop`), so
+the bar says `rate limited` before the fresh CLI has said anything — unless
+its reset is more than `LATE_S` (12 h) past: the plan is half a day old, and
+opening a session to look at it should not set it going, so it is only
+reported, and kept aside for an explicit `/resume-after-limit on`. A record
+(below) turns the option on for its session: it is being reopened for that.
+Run on real transcripts — a session stopped, then a task notification and the
+limit again; the same with a typed prompt after; a lane stopped mid-turn
+after a tool result with peers' messages after; a lane whose `/compact` ran
+into the limit — it found the first, third and fourth, not the second, in
+about 30 ms each.
 
-**Closed while waiting.** `limit_resume.save` mirrors the schedule to
+**Closed while waiting.** The schedule is mirrored to
 `<hub account>/orchestrator2/limit-resumes/<cwd>__<sid>.json` (`cwd`,
-`session_id`, `config_dir`, `due_at`, `resets_at`, `saved_at`). It is erased
-when the resume is sent, when the limit ends, by `/clear`, by the option going
-off, and by every stop of the session but two: the hub exiting and the idle
-teardown (`stop(idle_teardown=True)`). The idle timer closes a session waiting
-on a limit rather than keep a CLI alive for the hours or days a limit can
-last (§6c is why CLIs are not free), unless the resume is due within its
-timeout, and never one that is still connecting. After an idle teardown,
-`_schedule_limit_reopen` takes the record; at the hub's start,
-`_restore_limit_resumes` takes them all. When one comes due,
-`_reopen_for_limit` reads it again, leaves a session that is open already to
-its own bridge (the primary, which a restart resumes itself), reschedules one
-put off, and otherwise opens it with `resume_after_limit=True` — one at a
-time, `LIMIT_REOPEN_STAGGER_S` apart, since every session on an account comes
-due at once — and starts its idle timer, so a session nobody is watching
-closes again when it is done. The bridge's open check then decides from the
-transcript, so a record whose session has moved on since is dropped there.
-`plan_reopen` drops a record more than 12 h overdue or more than 8 days
-ahead.
+`session_id`, `config_dir`, `due_at`, `resets_at`, `reopens`, and the model,
+effort, Claude Code binary and bell set it runs with). It shares its store
+with the wakeup loop's (`record_store.RecordStore`: atomic writes, a record
+read back only into the slot it names), and like it moves with the session
+when its id changes (`rekey`, from `_take_session_id`: the rolling trim starts
+a new transcript, and a record left under the old id would be cleared by
+nothing and acted on at the next start, in the transcript the session left).
+It is erased when the resume is sent, when the limit ends, by `/clear`, by the
+option going off, and by every stop of the session but two: the hub exiting
+and the idle teardown (`stop(idle_teardown=True)`). The idle timer closes a
+session waiting on a limit rather than keep a CLI alive for the hours or days
+a limit can last (§6c is why CLIs are not free), unless the resume is due
+within its timeout; a session still connecting is given `IDLE_CONNECTING_DEFERS`
+(2) more passes, and no more, since a connect that cannot succeed with prompts
+queued retries without end. After an idle teardown, `_schedule_limit_reopen`
+takes the record; at the hub's start, `_restore_limit_resumes` takes them all.
+When one comes due, `_reopen_for_limit` reads it again, leaves a session that
+is open already to its own bridge (the primary, which a restart resumes
+itself), reschedules one put off, waits `LIMIT_REOPEN_WAIT_S` while
+`LIMIT_REOPEN_MAX_OPEN` (6) sessions it reopened are still open — the
+wakeup restore's `MAX_RESURRECT`, for the same commit limit, but a wait rather
+than a cap, since each was asked to carry on — counts the reopen
+(`note_reopened`), and opens it with its own settings and the option on, one at
+a time, `LIMIT_REOPEN_STAGGER_S` apart, starting its idle timer so a session
+nobody watches closes again when done. A session that cannot connect never
+schedules its resume, which is what writes a fresh record, so `plan_reopen`
+drops a record reopened `MAX_REOPENS` (2) times, as it does one more than 12 h
+overdue or more than 8 days ahead; the bridge's open check drops a record
+whose session has moved on.
 
-Tests: `tests/test_resume_after_limit.py`.
+Tests: `tests/test_resume_after_limit.py`, `tests/test_cut_off_turn.py` (through
+a real connect); mutation targets `limitresume`, `limitresume-server`,
+`limitresume-module`, `recstore`.
 
 ## 6b. Subprocess ownership (`proc_guard.py`)
 

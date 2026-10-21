@@ -38,14 +38,12 @@ tolerates more, with no knob to get wrong.
 
 from __future__ import annotations
 
-import json
-import os
-import re
 import time
 from pathlib import Path
 from typing import Any, Iterator, NamedTuple
 
 from account import account_dir
+from record_store import RecordStore
 
 #: A record older than this is not a schedule, it is litter.
 WAKEUP_MAX_AGE_S = 24 * 3600
@@ -73,78 +71,8 @@ class Plan(NamedTuple):
     reason: str       # human-readable, for the log and the banner
 
 
-def _sanitize(s: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9]", "-", s)
-
-
 def _state_dir() -> Path:
     return account_dir() / "orchestrator2" / "wakeups"
-
-
-def wakeup_file_for(cwd: str, session_id: str) -> Path:
-    """One file per session, named like the prompt queue's."""
-    try:
-        resolved = str(Path(cwd).resolve(strict=False))
-    except OSError:
-        resolved = cwd
-    return _state_dir() / f"{_sanitize(resolved)}__{_sanitize(session_id)}.json"
-
-
-def save_wakeup(cwd: str, session_id: str | None, *, due_at: float,
-                prompt: str, armed_at: float | None = None,
-                config_dir: str | None = None) -> None:
-    """Record a scheduled wakeup.  Failures never break arming."""
-    if not session_id or not prompt or not isinstance(due_at, (int, float)):
-        return
-    path = wakeup_file_for(cwd, session_id)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({
-                "cwd": cwd,
-                "session_id": session_id,
-                "config_dir": config_dir,
-                "due_at": float(due_at),
-                "armed_at": float(armed_at if armed_at is not None else time.time()),
-                "prompt": prompt,
-                "saved_at": time.time(),
-            }, f)
-        os.replace(tmp, path)
-    except OSError:
-        pass
-
-
-def load_wakeup(cwd: str, session_id: str | None) -> dict | None:
-    """The wakeup recorded for *session_id* in *cwd*, if there is a valid one.
-
-    For a caller that has to carry a live loop somewhere else -- ``/move``,
-    which stops the session that holds it (and so erases this record) and
-    re-arms it in the copy.
-    """
-    if not session_id:
-        return None
-    try:
-        rec = json.loads(wakeup_file_for(cwd, session_id).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return rec if _valid(rec) else None
-
-
-def clear_wakeup(cwd: str, session_id: str | None) -> None:
-    """Forget a wakeup, because it fired or was cancelled.
-
-    Called on *every* exit from the armed state -- which the hub itself going
-    down is not: that ends the process, not the loop, so ``SDKBridge.stop``
-    leaves the record for the next start to restore.  A record that outlives its
-    wakeup is a turn waiting to be run twice.
-    """
-    if not session_id:
-        return
-    try:
-        wakeup_file_for(cwd, session_id).unlink()
-    except (OSError, FileNotFoundError):
-        pass
 
 
 def _valid(rec: Any) -> bool:
@@ -156,31 +84,64 @@ def _valid(rec: Any) -> bool:
             and isinstance(rec.get("cwd"), str) and rec["cwd"])
 
 
+#: Looked up through the module each time, so a test can move the directory.
+_store = RecordStore(lambda: _state_dir(), _valid)
+
+
+def wakeup_file_for(cwd: str, session_id: str) -> Path:
+    """One file per session, named like the prompt queue's."""
+    return _store.path_for(cwd, session_id)
+
+
+def save_wakeup(cwd: str, session_id: str | None, *, due_at: float,
+                prompt: str, armed_at: float | None = None,
+                config_dir: str | None = None) -> None:
+    """Record a scheduled wakeup.  Failures never break arming."""
+    if not session_id or not prompt or not isinstance(due_at, (int, float)):
+        return
+    _store.save(cwd, session_id, {
+        "config_dir": config_dir,
+        "due_at": float(due_at),
+        "armed_at": float(armed_at if armed_at is not None else time.time()),
+        "prompt": prompt,
+    })
+
+
+def load_wakeup(cwd: str, session_id: str | None) -> dict | None:
+    """The wakeup recorded for *session_id* in *cwd*, if there is a valid one.
+
+    For a caller that has to carry a live loop somewhere else -- ``/move``,
+    which stops the session that holds it (and so erases this record) and
+    re-arms it in the copy.
+    """
+    return _store.load(cwd, session_id)
+
+
+def clear_wakeup(cwd: str, session_id: str | None) -> None:
+    """Forget a wakeup, because it fired or was cancelled.
+
+    Called on *every* exit from the armed state -- which the hub itself going
+    down is not: that ends the process, not the loop, so ``SDKBridge.stop``
+    leaves the record for the next start to restore.  A record that outlives
+    its wakeup is a turn waiting to be run twice.
+    """
+    _store.clear(cwd, session_id)
+
+
+def rekey_wakeup(cwd: str, old_id: str | None, new_id: str | None) -> bool:
+    """Move a wakeup's record to the id its session now has
+    (``RecordStore.rekey``)."""
+    return _store.rekey(cwd, old_id, new_id)
+
+
 def iter_pending_wakeups() -> Iterator[dict]:
-    """Every record on disk, newest-due first.
+    """Every record on disk, soonest due first.
 
     Used at hub start, where we do not yet know which sessions exist -- the
-    record is what tells us to bring one back.
+    record is what tells us to bring one back.  Soonest first because the
+    resurrection is capped: the ones it revives should be the ones due.
     """
-    try:
-        paths = sorted(_state_dir().glob("*.json"))
-    except OSError:
-        return
-    recs = []
-    for path in paths:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                rec = json.load(f)
-        except (OSError, ValueError):
-            continue
-        if not _valid(rec):
-            continue
-        # The filename is derived from cwd+session_id, so a record whose
-        # recorded id does not match its own slot has been tampered with or
-        # moved.  Restoring it would run a turn in the wrong session.
-        if wakeup_file_for(rec["cwd"], rec["session_id"]).name != path.name:
-            continue
-        recs.append(rec)
+    recs = _store.records()
     recs.sort(key=lambda r: r.get("due_at", 0.0))
     yield from recs
 

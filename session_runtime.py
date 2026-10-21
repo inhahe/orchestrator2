@@ -91,6 +91,9 @@ class SessionRuntime:
         # (the session was still working when it fired) re-arms with the same
         # grace instead of silently dropping to the much shorter desktop one.
         self.idle_mobile: bool = False
+        # Idle passes in a row that found it connecting; bounded by
+        # server.IDLE_CONNECTING_DEFERS.
+        self.idle_connecting_defers: int = 0
         self.created_at = time.time()
         self.last_activity = self.created_at
         # Last status+panels snapshot the ticker actually sent, and when.  An

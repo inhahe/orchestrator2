@@ -5,15 +5,20 @@ session limit resets and then continue at that time? if there's not, make one.
 it should probably include the previous prompt, with a note saying the prompt
 was repeated ... it should probably read rate limit messages that came as the
 last message before a resume, too (besides notifications of background tasks
-completing and whatever)".
+completing and whatever)".  Then: a ``/compact`` that ran into the limit is
+one more such message; the existing detection that sets the state to "rate
+limited" is to be reused rather than a second one written; and
+``/resume-after-limit`` must work issued before or after the limit is
+announced, with the limit hit before or after the session was opened.
 
-So: the reset time is read from what the CLI reports (the RateLimitEvent live,
-the transcript's quota headers on open); the resume repeats the user's last
-prompt, framed as a repeat; and a session opened while it was stopped by a
-limit -- with notifications and peers' messages after the error -- is picked up
-too.  Found on the way: the bridge took the CLI's limit message for the model
-answering, so it wiped the rejection (and its reset time) the instant it
-arrived, and a locked-out session read "idle".
+So: what has a session stopped is the State's rate-limit rejection, which the
+CLI's RateLimitEvent sets, and on open the transcript's record of it; the
+resume repeats the user's last prompt, framed as a repeat; and a session
+opened while stopped by a limit -- with notifications, peers' messages and a
+failed ``/compact`` after the error -- is picked up too.  Found on the way:
+the bridge took the CLI's limit message for the model answering, so it wiped
+the rejection (and its reset time) the instant it arrived, and a locked-out
+session read "idle".
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -35,6 +41,7 @@ from claude_agent_sdk.types import RateLimitEvent, RateLimitInfo  # noqa: E402
 import limit_resume  # noqa: E402
 import sdk_bridge  # noqa: E402
 import server  # noqa: E402
+import wakeup_store  # noqa: E402
 from commands import classify  # noqa: E402
 from config import SLASH_COMMANDS, Config, parse_args  # noqa: E402
 from sdk_bridge import SDKBridge  # noqa: E402
@@ -42,26 +49,32 @@ from session import _classify_user_text  # noqa: E402
 from state import init_state_from_config, state_to_status_dict  # noqa: E402
 
 SID = "11111111-2222-3333-4444-555555555555"
+NEW_SID = "99999999-8888-7777-6666-555555555555"
 
 
 def _iso(ts: float) -> str:
-    from datetime import datetime, timezone
+    from datetime import timezone
     return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _at(iso: str) -> float:
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
 
 
 # ---------------------------------------------------------------------------
 # Transcript records, shaped like the CLI's (2.1.280 / 2.1.301)
 # ---------------------------------------------------------------------------
 
-def _limit(ts, reset, kind="five_hour", **quota):
+LIMIT_TEXT = "You've hit your session limit · resets 9:30am (America/New_York)"
+
+
+def _limit(ts, reset, kind="five_hour", text=LIMIT_TEXT, **quota):
     q = {"status": "rejected", "resetsAt": reset, "rateLimitType": kind,
          "overageStatus": "rejected", "isUsingOverage": False, **quota}
     return {"type": "assistant", "timestamp": _iso(ts), "isApiErrorMessage": True,
             "error": "rate_limit", "apiErrorStatus": 429, "quotaLimits": q,
             "message": {"model": "<synthetic>", "role": "assistant",
-                        "content": [{"type": "text", "text":
-                                     "You've hit your session limit · resets 9pm "
-                                     "(America/New_York)"}]}}
+                        "content": [{"type": "text", "text": text}]}}
 
 
 def _prompt(text, ts, **extra):
@@ -103,6 +116,23 @@ def _queue_op(ts):
     return {"type": "queue-operation", "operation": "enqueue", "timestamp": _iso(ts)}
 
 
+def _failed_compact(ts, text=LIMIT_TEXT):
+    """A /compact that ran into the limit, as 2.1.301 records it: the caveat,
+    the command, and its error as a local_command system record."""
+    return [
+        _prompt("<local-command-caveat>Caveat: The messages below were generated "
+                "by the user while running local commands.</local-command-caveat>",
+                ts, isMeta=True),
+        _prompt("<command-name>/compact</command-name>\n            "
+                "<command-message>compact</command-message>\n            "
+                "<command-args></command-args>", ts),
+        {"type": "system", "subtype": "local_command", "timestamp": _iso(ts),
+         "isMeta": False, "level": "info",
+         "content": f"<local-command-stderr>Error during compaction: {text}"
+                    f"</local-command-stderr>"},
+    ]
+
+
 def _write(path: Path, records) -> Path:
     path.write_text("\n".join(json.dumps(r) for r in records) + "\n",
                     encoding="utf-8")
@@ -122,8 +152,8 @@ def test_a_session_whose_last_word_is_a_limit_is_found(tmp_path):
                                       _reply("working", NOW - 500),
                                       _limit(NOW - 400, RESET)])
     stop = limit_resume.limit_stop_in(p)
-    assert stop == {"resets_at": RESET, "kind": "five_hour",
-                    "hit_at": _iso(NOW - 400), "last_at": _iso(NOW - 400)}
+    assert stop["resets_at"] == RESET and stop["kind"] == "five_hour"
+    assert stop["hit_at"] == pytest.approx(_at(_iso(NOW - 400)))
 
 
 def test_what_arrived_while_it_was_stopped_is_looked_past(tmp_path):
@@ -137,8 +167,52 @@ def test_what_arrived_while_it_was_stopped_is_looked_past(tmp_path):
     ])
     stop = limit_resume.limit_stop_in(p)
     assert stop["resets_at"] == RESET
-    assert stop["hit_at"] == _iso(NOW - 800), "when it was stopped, not the last retry"
-    assert stop["last_at"] == _iso(NOW - 590)
+    assert stop["hit_at"] == pytest.approx(_at(_iso(NOW - 800))), \
+        "when it was stopped, not the last retry"
+
+
+def test_a_compaction_that_ran_into_the_limit_is_looked_past(tmp_path):
+    """The sequence reported: the limit, then "Error during compaction:
+    You've hit your session limit", then a task's notification."""
+    p = _write(tmp_path / "s.jsonl", [
+        _prompt("go", NOW - 900), _tool_use("t1", NOW - 800),
+        _tool_result("t1", NOW - 790), _limit(NOW - 780, RESET),
+        _queue_op(NOW - 700), *_failed_compact(NOW - 700), _notification(NOW - 600),
+    ])
+    stop = limit_resume.limit_stop_in(p)
+    assert stop is not None and stop["resets_at"] == RESET, \
+        "the quota's reset, not one read from the text"
+
+
+def test_a_later_limit_named_only_in_text_wins(tmp_path):
+    """The session limit's error, then a /compact hours later that ran into
+    the weekly one: the weekly one is what still holds."""
+    at = datetime(2026, 10, 21, 8, 0).astimezone().timestamp()
+    weekly = f"You've hit your weekly limit · resets Oct 25, 6pm ({NY})"
+    p = _write(tmp_path / "s.jsonl", [_prompt("go", at - 900),
+                                      _limit(at - 800, int(at) - 60),
+                                      *_failed_compact(at, weekly)])
+    stop = limit_resume.limit_stop_in(p)
+    assert stop["kind"] == "seven_day"
+    assert stop["resets_at"] == _ny(2026, 10, 25, 18, 0)
+
+
+def test_a_compaction_alone_is_read_for_its_reset(tmp_path):
+    """No limit error before it -- the /compact was the first thing to run
+    into the limit -- so the reset comes from its text."""
+    at = datetime(2026, 10, 21, 8, 0).astimezone().timestamp()
+    p = _write(tmp_path / "s.jsonl", [_prompt("go", at - 600), _reply("done", at - 300),
+                                      *_failed_compact(at)])
+    stop = limit_resume.limit_stop_in(p)
+    assert stop is not None and stop["kind"] == "five_hour"
+    want = limit_resume.reset_from_text(LIMIT_TEXT, at)
+    assert stop["resets_at"] == want and want > at
+
+
+def test_a_compaction_failing_for_another_reason_is_not_a_limit(tmp_path):
+    p = _write(tmp_path / "s.jsonl", [_prompt("go", NOW - 600), _reply("done", NOW - 300),
+                                      *_failed_compact(NOW - 10, "Not enough messages")])
+    assert limit_resume.limit_stop_in(p) is None
 
 
 def test_a_prompt_after_the_limit_means_it_moved_on(tmp_path):
@@ -173,10 +247,20 @@ def test_another_api_error_is_not_a_limit(tmp_path):
     assert limit_resume.limit_stop_in(p) is None
 
 
-@pytest.mark.parametrize("quota", [{"resetsAt": None}, {"status": "allowed"}])
-def test_a_limit_with_no_reset_to_wait_for_is_none(tmp_path, quota):
+def test_a_limit_with_no_quota_is_read_for_its_reset(tmp_path):
     p = _write(tmp_path / "s.jsonl", [_prompt("go", NOW - 900),
-                                      _limit(NOW - 10, RESET, **quota)])
+                                      _limit(NOW - 10, None)])
+    stop = limit_resume.limit_stop_in(p)
+    assert stop is not None and stop["resets_at"] > NOW - 10
+
+
+@pytest.mark.parametrize("quota, text", [
+    ({"resetsAt": None}, "You've hit your session limit"),     # no time at all
+    ({"status": "allowed"}, LIMIT_TEXT),                        # not a rejection
+])
+def test_a_limit_with_no_reset_to_wait_for_is_none(tmp_path, quota, text):
+    p = _write(tmp_path / "s.jsonl", [_prompt("go", NOW - 900),
+                                      _limit(NOW - 10, RESET, text=text, **quota)])
     assert limit_resume.limit_stop_in(p) is None
 
 
@@ -211,6 +295,44 @@ def test_the_clis_resume_bookkeeping_is_looked_past(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# A reset read from the CLI's text
+# ---------------------------------------------------------------------------
+
+NY = "America/New_York"
+
+
+def _ny(*args):
+    from zoneinfo import ZoneInfo
+    return datetime(*args, tzinfo=ZoneInfo(NY)).timestamp()
+
+
+@pytest.mark.parametrize("text, at, want", [
+    (f"resets 9:30am ({NY})", _ny(2026, 10, 21, 8, 0), _ny(2026, 10, 21, 9, 30)),
+    (f"resets 9pm ({NY})", _ny(2026, 10, 21, 8, 0), _ny(2026, 10, 21, 21, 0)),
+    # A clock time already past today is tomorrow's.
+    (f"resets 9:30am ({NY})", _ny(2026, 10, 21, 10, 0), _ny(2026, 10, 22, 9, 30)),
+    (f"resets Oct 23, 9am ({NY})", _ny(2026, 10, 21, 8, 0), _ny(2026, 10, 23, 9, 0)),
+    (f"resets Jan 2, 2027, 6pm ({NY})", _ny(2026, 12, 30, 8, 0), _ny(2027, 1, 2, 18, 0)),
+    # A date with no year, already past, is next year's.
+    (f"resets Jan 2, 6pm ({NY})", _ny(2026, 12, 30, 8, 0), _ny(2027, 1, 2, 18, 0)),
+])
+def test_the_clis_reset_texts_are_read(text, at, want):
+    assert limit_resume.reset_from_text("You've hit your weekly limit · " + text, at) == want
+
+
+def test_a_reset_with_no_zone_is_local_time():
+    at = datetime(2026, 10, 21, 8, 0).astimezone().timestamp()
+    want = datetime(2026, 10, 21, 21, 0).astimezone().timestamp()
+    assert limit_resume.reset_from_text("resets 9pm", at) == want
+
+
+def test_an_unknown_zone_falls_back_to_local_time():
+    at = datetime(2026, 10, 21, 8, 0).astimezone().timestamp()
+    assert limit_resume.reset_from_text("resets 9pm (Nowhere/Atlantis)", at) == \
+        limit_resume.reset_from_text("resets 9pm", at)
+
+
+# ---------------------------------------------------------------------------
 # The prompt it was given
 # ---------------------------------------------------------------------------
 
@@ -233,6 +355,26 @@ def test_the_last_prompt_is_the_users_not_what_came_after(tmp_path):
     ])
     found = limit_resume.last_prompt_in(p)
     assert found == {"text": "the real prompt", "at": _iso(NOW - 1000)}
+
+
+def test_a_session_note_is_not_part_of_the_prompt(tmp_path):
+    """/move's one-shot note goes in front of the next prompt; the resume
+    repeats the prompt, not the note."""
+    p = _write(tmp_path / "s.jsonl", [
+        _prompt("[orchestrator2] This session was moved to D:\\x.\n\nport it", NOW - 100),
+        _limit(NOW - 10, RESET)])
+    assert limit_resume.last_prompt_in(p)["text"] == "port it"
+
+
+def test_a_resume_that_carried_a_note_is_still_passed_over(tmp_path):
+    br_note = "This session was moved."
+    resume = limit_resume.build_resume_prompt(kind=None, hit_at=None,
+                                              resets_at=None, prompt=None)
+    p = _write(tmp_path / "s.jsonl", [
+        _prompt("the real prompt", NOW - 200),
+        _prompt(f"{resume}\n\n[orchestrator2] {br_note}", NOW - 100),
+        _limit(NOW - 10, RESET)])
+    assert limit_resume.last_prompt_in(p)["text"] == "the real prompt"
 
 
 def test_a_prompt_far_back_is_found_across_chunks(tmp_path):
@@ -258,7 +400,7 @@ def test_a_prompt_beyond_the_limit_is_not_searched_for(tmp_path):
 
 def test_the_resume_repeats_the_prompt_and_says_it_is_a_repeat():
     text = limit_resume.build_resume_prompt(
-        kind="seven_day", hit_at=_iso(NOW - 3600), resets_at=NOW - 60,
+        kind="seven_day", hit_at=NOW - 3600, resets_at=NOW - 60,
         prompt={"text": "port the scheduler\nand test it", "at": _iso(NOW - 7200)})
     assert text.startswith(limit_resume.PROMPT_PREFIX)
     assert "weekly limit" in text
@@ -288,9 +430,13 @@ def test_with_no_prompt_to_repeat_there_is_no_block():
 # ---------------------------------------------------------------------------
 
 def test_a_record_round_trips_and_is_cleared(tmp_path):
-    limit_resume.save(str(tmp_path), SID, due_at=RESET + 60, resets_at=RESET)
+    limit_resume.save(str(tmp_path), SID, due_at=RESET + 60, resets_at=RESET,
+                      settings={"model": "claude-opus-5-5", "effort": "max",
+                                "cli_path": None})
     rec = limit_resume.load(str(tmp_path), SID)
     assert rec["due_at"] == RESET + 60 and rec["session_id"] == SID
+    assert rec["model"] == "claude-opus-5-5" and rec["effort"] == "max"
+    assert "cli_path" not in rec
     assert [r["session_id"] for r in limit_resume.iter_records()] == [SID]
     limit_resume.clear(str(tmp_path), SID)
     assert limit_resume.load(str(tmp_path), SID) is None
@@ -298,7 +444,7 @@ def test_a_record_round_trips_and_is_cleared(tmp_path):
 
 def test_a_record_out_of_its_slot_is_ignored(tmp_path):
     limit_resume.save(str(tmp_path), SID, due_at=RESET, resets_at=RESET)
-    path = limit_resume.record_file_for(str(tmp_path), SID)
+    path = limit_resume._store.path_for(str(tmp_path), SID)
     path.rename(path.with_name("elsewhere__x.json"))
     assert list(limit_resume.iter_records()) == []
 
@@ -306,7 +452,7 @@ def test_a_record_out_of_its_slot_is_ignored(tmp_path):
 @pytest.mark.parametrize("due_in, reopen", [
     (600, True),                                   # waiting
     (-600, True),                                  # due while the hub was down
-    (-(limit_resume.LATE_S + 60), False),          # a day-old plan
+    (-(limit_resume.LATE_S + 60), False),          # a half-day-old plan
     (limit_resume.MAX_AHEAD_S + 60, False),        # no limit lasts that long
 ])
 def test_which_records_reopen_their_session(due_in, reopen):
@@ -315,6 +461,17 @@ def test_which_records_reopen_their_session(due_in, reopen):
     assert plan.reopen is reopen
     if reopen:
         assert plan.delay == max(0.0, due_in)
+
+
+def test_a_session_reopened_too_often_is_dropped(tmp_path):
+    """Review: one that cannot connect never schedules its resume, so every
+    idle teardown would reopen it again."""
+    limit_resume.save(str(tmp_path), SID, due_at=NOW - 5, resets_at=NOW - 65)
+    for _ in range(limit_resume.MAX_REOPENS):
+        rec = limit_resume.load(str(tmp_path), SID)
+        assert limit_resume.plan_reopen(rec).reopen
+        limit_resume.note_reopened(rec)
+    assert not limit_resume.plan_reopen(limit_resume.load(str(tmp_path), SID)).reopen
 
 
 def test_junk_is_not_a_record():
@@ -345,29 +502,48 @@ def _texts(sent):
                       if m.get("type") == "system_msg")
 
 
-class _Client:
-    """A CLI whose turns run into a usage limit (or answer, with *reply*)."""
+def _event(reset, kind="five_hour"):
+    return RateLimitEvent(
+        rate_limit_info=RateLimitInfo(status="rejected", resets_at=reset,
+                                      rate_limit_type=kind),
+        uuid="u", session_id=SID)
 
-    def __init__(self, br, reset, reply=None):
+
+def _result(error=True):
+    return ResultMessage(subtype="success", duration_ms=1, duration_api_ms=0,
+                         is_error=error, num_turns=1, session_id=SID,
+                         api_error_status=429 if error else None)
+
+
+class _Client:
+    """A CLI whose turns run into a usage limit -- or answer, with *reply*;
+    or end on a synthetic error that is not a limit, with *other_error*; or
+    are a /compact that runs into it (an event and no message at all)."""
+
+    def __init__(self, br, reset, reply=None, other_error=None, compact=False,
+                 event=True):
         self.br, self.reset, self.reply = br, reset, reply
+        self.other_error, self.compact, self.event = other_error, compact, event
 
     async def query(self, _prompt):
         q = self.br.turn_msg_queue
-        if self.reply is None:
-            q.put_nowait(RateLimitEvent(
-                rate_limit_info=RateLimitInfo(status="rejected", resets_at=self.reset,
-                                              rate_limit_type="five_hour"),
-                uuid="u", session_id=SID))
+        if self.reply is not None:
+            q.put_nowait(AssistantMessage(content=[TextBlock(text=self.reply)],
+                                          model="claude-opus-5-5"))
+            q.put_nowait(_result(error=False))
+            return
+        if self.other_error is not None:
+            q.put_nowait(AssistantMessage(content=[TextBlock(text=self.other_error)],
+                                          model="<synthetic>", error="unknown"))
+            q.put_nowait(_result())
+            return
+        if self.event:
+            q.put_nowait(_event(self.reset))
+        if not self.compact:
             q.put_nowait(AssistantMessage(
                 content=[TextBlock(text="You've hit your session limit · resets 9pm")],
                 model="<synthetic>", error="rate_limit"))
-        else:
-            q.put_nowait(AssistantMessage(content=[TextBlock(text=self.reply)],
-                                          model="claude-opus-5-5"))
-        q.put_nowait(ResultMessage(subtype="success", duration_ms=1,
-                                   duration_api_ms=0, is_error=self.reply is None,
-                                   num_turns=1, session_id=SID,
-                                   api_error_status=429 if self.reply is None else None))
+        q.put_nowait(_result())
 
     async def interrupt(self):  # pragma: no cover
         pass
@@ -403,7 +579,8 @@ def test_off_by_default_it_only_says_it_could(tmp_path, monkeypatch):
 
 
 def test_on_it_schedules_a_resume_for_after_the_reset(tmp_path, monkeypatch):
-    br, st, sent = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+    br, st, sent = _bridge(tmp_path, monkeypatch, "--resume-after-limit",
+                           "--model", "claude-opus-5-5")
     br.client = _Client(br, RESET)
 
     async def go():
@@ -413,6 +590,7 @@ def test_on_it_schedules_a_resume_for_after_the_reset(tmp_path, monkeypatch):
             assert st.limit_resume_at == RESET + limit_resume.MARGIN_S
             rec = limit_resume.load(str(tmp_path), SID)
             assert rec is not None and rec["due_at"] == RESET + limit_resume.MARGIN_S
+            assert rec["model"] == "claude-opus-5-5" and rec["effort"] == "auto"
             assert "carries on by itself" in _texts(sent)
             assert "resumes" in state_to_status_dict(st, br.config)["busy_label"]
             # Another turn running into the same limit leaves it be.
@@ -421,6 +599,41 @@ def test_on_it_schedules_a_resume_for_after_the_reset(tmp_path, monkeypatch):
             await br.run_turn("again")
             assert br._limit_task is task
             assert "carries on by itself" not in _texts(sent[n:])
+        finally:
+            _stop_timers(br)
+
+    asyncio.run(go())
+
+
+def test_a_compact_that_runs_into_the_limit_arms_it_too(tmp_path, monkeypatch):
+    """No synthetic message at all: only the RateLimitEvent, which is why the
+    State's rejection, not the message, is what is read."""
+    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+    br.client = _Client(br, RESET, compact=True)
+
+    async def go():
+        await br.run_turn("/compact")
+        try:
+            assert br._limit_task is not None
+        finally:
+            _stop_timers(br)
+
+    asyncio.run(go())
+
+
+def test_a_repeat_hit_without_an_event_still_counts(tmp_path, monkeypatch):
+    """The CLI sends a RateLimitEvent only when its limit state changes; a
+    second hit has none, and the State still says rejected."""
+    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+
+    async def go():
+        br.client = _Client(br, RESET)
+        await br.run_turn("go")
+        _stop_timers(br)
+        br.client = _Client(br, RESET, event=False)
+        await br.run_turn("again")
+        try:
+            assert br._limit_task is not None
         finally:
             _stop_timers(br)
 
@@ -438,9 +651,29 @@ def test_a_reply_ends_the_limit_and_the_pending_resume(tmp_path, monkeypatch):
         await br.run_turn("carry on")
 
     asyncio.run(go())
-    assert br._limit_task is None and br._limit_hit is None
+    assert br._limit_task is None and br._stopped_by_limit() is None
     assert limit_resume.load(str(tmp_path), SID) is None
     assert st.rate_limit_status == "allowed"
+
+
+def test_another_synthetic_error_does_not_end_the_limit(tmp_path, monkeypatch):
+    """Review: a background task's turn failing on "API Error: Connection
+    error" is not the model answering, and cancelled the pending resume."""
+    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+
+    async def go():
+        br.client = _Client(br, RESET)
+        await br.run_turn("go")
+        task = br._limit_task
+        br.client = _Client(br, RESET, other_error="API Error: Connection error.")
+        await br.run_turn("again")
+        try:
+            assert br._limit_task is task and st.rate_limit_status == "rejected"
+            assert limit_resume.load(str(tmp_path), SID) is not None
+        finally:
+            _stop_timers(br)
+
+    asyncio.run(go())
 
 
 def test_a_background_tasks_turn_into_the_limit_arms_it_too(tmp_path, monkeypatch):
@@ -449,30 +682,26 @@ def test_a_background_tasks_turn_into_the_limit_arms_it_too(tmp_path, monkeypatc
     br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
 
     async def go():
-        await br._handle_async_message(RateLimitEvent(
-            rate_limit_info=RateLimitInfo(status="rejected", resets_at=RESET,
-                                          rate_limit_type="seven_day"),
-            uuid="u", session_id=SID))
+        await br._handle_async_message(_event(RESET, "seven_day"))
         await br._handle_async_message(AssistantMessage(
             content=[TextBlock(text="You've hit your weekly limit")],
             model="<synthetic>", error="rate_limit"))
-        await br._handle_async_message(ResultMessage(
-            subtype="success", duration_ms=1, duration_api_ms=0, is_error=True,
-            num_turns=1, session_id=SID))
+        await br._handle_async_message(_result())
         try:
             assert br._limit_task is not None
-            assert br._limit_hit["kind"] == "seven_day"
+            assert br._stopped_by_limit()["kind"] == "seven_day"
         finally:
             _stop_timers(br)
 
     asyncio.run(go())
 
 
-def test_an_sdk_without_the_error_field_is_read_by_the_text():
-    msg = AssistantMessage(content=[TextBlock(text="You've hit your weekly limit · x")],
-                           model="<synthetic>")
-    assert SDKBridge._is_limit_message(msg)
-    assert not SDKBridge._is_limit_message(AssistantMessage(
+def test_the_cli_is_told_apart_from_the_model():
+    assert SDKBridge._is_synthetic(AssistantMessage(
+        content=[TextBlock(text="You've hit your weekly limit · x")], model="<synthetic>"))
+    assert SDKBridge._is_synthetic(AssistantMessage(
+        content=[TextBlock(text="x")], model="claude-opus-5-5", error="server_error"))
+    assert not SDKBridge._is_synthetic(AssistantMessage(
         content=[TextBlock(text="You've hit your weekly limit, I see")],
         model="claude-opus-5-5"))
 
@@ -508,11 +737,11 @@ def test_a_resume_waits_for_a_running_turn(tmp_path, monkeypatch):
     _due_now(monkeypatch)
     br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
     br.client = object()
-    br._limit_hit = {"resets_at": int(NOW) - 5, "kind": None, "hit_at": None}
+    br._adopt_limit_stop({"resets_at": int(NOW) - 5, "kind": None, "hit_at": None})
     st.busy = True
 
     async def go():
-        await br._arm_limit_resume(br._limit_hit)
+        await br._arm_limit_resume(br._stopped_by_limit())
         await asyncio.sleep(0.05)
         assert br.event_queue.empty(), "sent into a running turn"
         assert br._limit_defers >= 1
@@ -523,25 +752,75 @@ def test_a_resume_waits_for_a_running_turn(tmp_path, monkeypatch):
     assert asyncio.run(go())[0] == "message"
 
 
-def test_resumes_into_the_same_limit_back_off_then_stop(tmp_path, monkeypatch):
-    br, st, sent = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
-    reset = int(NOW) - 5
-
+def _resumes_into_the_limit(br, reset, n):
     async def go():
         dues = []
-        for _ in range(limit_resume.MAX_ATTEMPTS):
-            br._limit_hit = {"resets_at": reset, "kind": "five_hour", "hit_at": None}
+        for _ in range(n):
+            br._adopt_limit_stop({"resets_at": reset, "kind": "five_hour",
+                                  "hit_at": None})
             br._limit_resume_sent, br._limit_sent_for = True, reset
             await br._after_limit_turn()
-            dues.append(st.limit_resume_at)
+            dues.append(br.state.limit_resume_at)
             _stop_timers(br)
         return dues
+    return go()
 
-    dues = asyncio.run(go())
+
+def test_resumes_into_the_same_limit_back_off_then_stop(tmp_path, monkeypatch):
+    br, st, sent = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+    dues = asyncio.run(_resumes_into_the_limit(br, int(NOW) - 5,
+                                               limit_resume.MAX_ATTEMPTS))
     waits = [d - time.time() for d in dues[:-1]]
     assert all(b > a for a, b in zip(waits, waits[1:])), "each wait longer"
     assert dues[-1] is None, "kept resuming into the same limit"
     assert "stopped resuming by itself" in _texts(sent)
+
+
+def test_giving_up_holds_until_a_later_limit_or_asked(tmp_path, monkeypatch):
+    """Review: after giving up, the next notification's turn into the same
+    limit started a fresh five attempts."""
+    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+    reset = int(NOW) - 5
+
+    async def go():
+        await _resumes_into_the_limit(br, reset, limit_resume.MAX_ATTEMPTS)
+        # A ghost turn into the same limit, then a reconnect reading it again.
+        await br._after_limit_turn()
+        assert br._limit_task is None
+        await br._limit_on_open(SID, {"resets_at": reset, "kind": "five_hour",
+                                      "hit_at": None})
+        assert br._limit_task is None
+        # Asked, it tries again.
+        await br.set_resume_after_limit(True)
+        try:
+            assert br._limit_task is not None
+        finally:
+            _stop_timers(br)
+        # And a later limit is resumed by itself.
+        br._limit_gave_up_for = reset
+        br._adopt_limit_stop({"resets_at": RESET, "kind": "seven_day", "hit_at": None})
+        await br._after_limit_turn()
+        try:
+            assert br._limit_task is not None
+        finally:
+            _stop_timers(br)
+
+    asyncio.run(go())
+
+
+def test_an_interrupted_resume_is_not_an_attempt(tmp_path, monkeypatch):
+    """Review: the user stopping the resume before it said anything counted
+    as the resume running back into the limit, and it was sent again."""
+    br, st, sent = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+
+    async def go():
+        br._adopt_limit_stop({"resets_at": int(NOW) - 5, "kind": None, "hit_at": None})
+        br._limit_resume_sent, br._limit_sent_for = True, int(NOW) - 5
+        await br._after_limit_turn(interrupted=True)
+
+    asyncio.run(go())
+    assert br._limit_task is None and br._limit_attempts == 0
+    assert "ran straight back" not in _texts(sent)
 
 
 def test_a_later_limit_starts_the_count_again(tmp_path, monkeypatch):
@@ -550,7 +829,7 @@ def test_a_later_limit_starts_the_count_again(tmp_path, monkeypatch):
 
     async def go():
         br._limit_attempts = 3
-        br._limit_hit = {"resets_at": RESET, "kind": "seven_day", "hit_at": None}
+        br._adopt_limit_stop({"resets_at": RESET, "kind": "seven_day", "hit_at": None})
         br._limit_resume_sent, br._limit_sent_for = True, int(NOW) - 5
         await br._after_limit_turn()
         try:
@@ -562,27 +841,122 @@ def test_a_later_limit_starts_the_count_again(tmp_path, monkeypatch):
     asyncio.run(go())
 
 
-def test_opening_a_stopped_session_schedules_it_and_says_so(tmp_path, monkeypatch):
-    p = _write(tmp_path / f"{SID}.jsonl", [_prompt("go", NOW - 900),
-                                           _limit(NOW - 800, RESET)])
-    br, st, sent = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+def test_the_notice_is_kept_for_tabs_that_attach_later(tmp_path, monkeypatch):
+    """Review: a ghost turn clears the open notices, and the armed resume was
+    not announced again, so a tab opening the session later was not told."""
+    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
 
     async def go():
-        await br._limit_on_open(SID, limit_resume.limit_stop_in(p))
+        br._adopt_limit_stop({"resets_at": RESET, "kind": None, "hit_at": None})
+        await br._after_limit_turn()
+        st.open_notices = []                  # a ghost turn began
+        await br._after_limit_turn()          # ...and ran into the limit too
         try:
-            assert br._limit_task is not None
-            assert st.rate_limit_status == "rejected", "a fresh CLI says nothing yet"
-            assert "This session was stopped by the 5-hour session limit" in _texts(sent)
-            assert st.open_notices, "a tab attaching later is not told"
+            assert any("carries on by itself" in n["data"]["message"]
+                       for n in st.open_notices)
         finally:
             _stop_timers(br)
 
     asyncio.run(go())
 
 
-def test_opened_with_it_off_nothing_is_scheduled_until_asked(tmp_path, monkeypatch):
-    p = _write(tmp_path / f"{SID}.jsonl", [_prompt("go", NOW - 900),
-                                           _limit(NOW - 800, RESET)])
+def test_a_new_session_id_takes_the_schedules_with_it(tmp_path, monkeypatch):
+    """Review: the rolling context trim gives the session a new id, and the
+    record stayed under the old one, cleared by nothing."""
+    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+
+    async def go():
+        br._adopt_limit_stop({"resets_at": RESET, "kind": None, "hit_at": None})
+        await br._arm_limit_resume(br._stopped_by_limit())
+        br._arm_wakeup(600, "loop on")
+        br._take_session_id(NEW_SID)
+        try:
+            assert limit_resume.load(str(tmp_path), SID) is None
+            assert limit_resume.load(str(tmp_path), NEW_SID)["due_at"] == \
+                RESET + limit_resume.MARGIN_S
+            assert wakeup_store.load_wakeup(str(tmp_path), SID) is None
+            assert wakeup_store.load_wakeup(str(tmp_path), NEW_SID)["prompt"] == "loop on"
+            br._cancel_limit_resume()
+            br._cancel_wakeup()
+            assert limit_resume.load(str(tmp_path), NEW_SID) is None
+            assert wakeup_store.load_wakeup(str(tmp_path), NEW_SID) is None
+        finally:
+            _stop_timers(br)
+            br._cancel_wakeup(forget=False)
+
+    asyncio.run(go())
+
+
+def test_a_resume_with_a_session_note_still_begins_as_a_resume(tmp_path, monkeypatch):
+    """Review: after /move the note went in front, and the recorded resume
+    read as something the user typed."""
+    br, st, _ = _bridge(tmp_path, monkeypatch)
+    br._session_note = "This session was moved."
+    resume = limit_resume.build_resume_prompt(kind=None, hit_at=None,
+                                              resets_at=None, prompt=None)
+    sent = br._with_session_note(resume)
+    assert sent.startswith(limit_resume.PROMPT_PREFIX)
+    assert sent.endswith("[orchestrator2] This session was moved.")
+    br._session_note = "Moved."
+    assert br._with_session_note("hi") == "[orchestrator2] Moved.\n\nhi"
+
+
+def test_the_check_on_open_never_breaks_a_connect(tmp_path, monkeypatch):
+    """Review: an exception in it escaped connect() and could kill the
+    worker."""
+    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+
+    async def boom(*a, **k):
+        raise TypeError("int() argument must be ... not 'NoneType'")
+
+    monkeypatch.setattr(br, "_limit_on_open", boom)
+    asyncio.run(br._announce_on_open(SID, None, {"resets_at": RESET}))
+
+
+# --- /resume-after-limit, whenever it is said ---
+
+def _hit_live(br):
+    br.client = _Client(br, RESET)
+    return br.run_turn("go")
+
+
+def test_on_before_a_live_limit(tmp_path, monkeypatch):
+    br, st, _ = _bridge(tmp_path, monkeypatch)
+
+    async def go():
+        await br.set_resume_after_limit(True)
+        await _hit_live(br)
+        try:
+            assert br._limit_task is not None
+        finally:
+            _stop_timers(br)
+
+    asyncio.run(go())
+
+
+def test_on_after_a_live_limit_was_announced(tmp_path, monkeypatch):
+    br, st, sent = _bridge(tmp_path, monkeypatch)
+
+    async def go():
+        await _hit_live(br)
+        assert "/resume-after-limit on" in _texts(sent) and br._limit_task is None
+        said = await br.set_resume_after_limit(True)
+        try:
+            assert br._limit_task is not None
+            assert said == "Resume after limit: on for this session."
+        finally:
+            _stop_timers(br)
+
+    asyncio.run(go())
+
+
+def _stopped_transcript(tmp_path, reset=RESET):
+    return _write(tmp_path / f"{SID}.jsonl", [_prompt("go", NOW - 900),
+                                              _limit(NOW - 800, reset)])
+
+
+def test_on_after_opening_a_session_a_limit_had_stopped(tmp_path, monkeypatch):
+    p = _stopped_transcript(tmp_path)
     br, st, sent = _bridge(tmp_path, monkeypatch)
 
     async def go():
@@ -608,28 +982,62 @@ def test_opened_with_it_off_nothing_is_scheduled_until_asked(tmp_path, monkeypat
     asyncio.run(go())
 
 
-def test_the_status_says_when_on_but_nothing_is_scheduled(tmp_path, monkeypatch):
-    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
-    assert "No usage limit has stopped" in br.limit_resume_status()
-    br._limit_hit = {"resets_at": RESET, "kind": "seven_day", "hit_at": None}
-    assert "nothing is scheduled" in br.limit_resume_status()
+def test_on_while_the_session_was_still_connecting(tmp_path, monkeypatch):
+    """Said before the open's check had run: it is on by then."""
+    p = _stopped_transcript(tmp_path)
+    br, st, _ = _bridge(tmp_path, monkeypatch)
+
+    async def go():
+        assert "No usage limit" in await br.set_resume_after_limit(True)
+        await br._limit_on_open(SID, limit_resume.limit_stop_in(p))
+        try:
+            assert br._limit_task is not None
+        finally:
+            _stop_timers(br)
+
+    asyncio.run(go())
 
 
-def test_opened_long_after_the_reset_it_only_says_so(tmp_path, monkeypatch):
+def test_on_from_the_start_for_a_session_a_limit_had_stopped(tmp_path, monkeypatch):
+    p = _stopped_transcript(tmp_path)
+    br, st, sent = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+
+    async def go():
+        await br._limit_on_open(SID, limit_resume.limit_stop_in(p))
+        try:
+            assert br._limit_task is not None
+            assert st.rate_limit_status == "rejected", "a fresh CLI says nothing yet"
+            assert "This session was stopped by the 5-hour session limit" in _texts(sent)
+            assert st.open_notices, "a tab attaching later is not told"
+        finally:
+            _stop_timers(br)
+
+    asyncio.run(go())
+
+
+def test_on_for_a_limit_long_past_resumes_when_asked(tmp_path, monkeypatch):
     late = int(NOW - limit_resume.LATE_S - 600)
     p = _write(tmp_path / f"{SID}.jsonl", [_prompt("go", late - 900),
                                            _limit(late - 800, late)])
     br, st, sent = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
-    asyncio.run(br._limit_on_open(SID, limit_resume.limit_stop_in(p)))
-    assert br._limit_task is None
-    assert "too long ago" in _texts(sent)
+
+    async def go():
+        await br._limit_on_open(SID, limit_resume.limit_stop_in(p))
+        assert br._limit_task is None and "too long ago" in _texts(sent)
+        assert st.rate_limit_status != "rejected", "a day-old limit is not the State's"
+        await br.set_resume_after_limit(True)
+        try:
+            assert br._limit_task is not None
+        finally:
+            _stop_timers(br)
+
+    asyncio.run(go())
 
 
 def test_a_record_turns_it_on_for_the_session_it_names(tmp_path, monkeypatch):
     """The hub reopens a session it scheduled: it was on for that session,
     whatever the hub was started with."""
-    p = _write(tmp_path / f"{SID}.jsonl", [_prompt("go", NOW - 900),
-                                           _limit(NOW - 800, RESET)])
+    p = _stopped_transcript(tmp_path)
     limit_resume.save(str(tmp_path), SID, due_at=RESET + 60, resets_at=RESET)
     br, st, _ = _bridge(tmp_path, monkeypatch)
 
@@ -653,6 +1061,13 @@ def test_a_record_for_a_session_that_moved_on_is_dropped(tmp_path, monkeypatch):
     assert br._limit_task is None
 
 
+def test_the_status_says_when_on_but_nothing_is_scheduled(tmp_path, monkeypatch):
+    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+    assert "No usage limit has stopped" in br.limit_resume_status()
+    br._adopt_limit_stop({"resets_at": RESET, "kind": "seven_day", "hit_at": None})
+    assert "nothing is scheduled" in br.limit_resume_status()
+
+
 @pytest.mark.parametrize("kw, kept", [
     ({}, False),                          # the user closed or left it
     ({"hub_exiting": True}, True),        # restored at the next start
@@ -662,8 +1077,8 @@ def test_which_stops_keep_the_record(tmp_path, monkeypatch, kw, kept):
     br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
 
     async def go():
-        br._limit_hit = {"resets_at": RESET, "kind": None, "hit_at": None}
-        await br._arm_limit_resume(br._limit_hit)
+        br._adopt_limit_stop({"resets_at": RESET, "kind": None, "hit_at": None})
+        await br._arm_limit_resume(br._stopped_by_limit())
         await br._shutdown(**kw)
         assert br._limit_task is None
 
@@ -675,14 +1090,14 @@ def test_clear_drops_it(tmp_path, monkeypatch):
     br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
 
     async def go():
-        br._limit_hit = {"resets_at": RESET, "kind": None, "hit_at": None}
-        await br._arm_limit_resume(br._limit_hit)
+        br._adopt_limit_stop({"resets_at": RESET, "kind": None, "hit_at": None})
+        await br._arm_limit_resume(br._stopped_by_limit())
         monkeypatch.setattr(br, "disconnect", _anoop)
         monkeypatch.setattr(br, "connect", _anoop)
         await br._clear_context()
 
     asyncio.run(go())
-    assert br._limit_task is None and br._limit_hit is None
+    assert br._limit_task is None
     assert limit_resume.load(str(tmp_path), SID) is None
 
 
@@ -702,6 +1117,19 @@ def test_the_label_says_when_it_resumes():
     assert label.startswith("rate limited · resumes ")
     st.rate_limit_resets_at = int(NOW) - 5          # reset, not yet resumed
     assert state_to_status_dict(st, Config())["busy_label"].startswith("idle · resumes ")
+
+
+def test_the_rejection_records_when_it_began():
+    from state import apply_rate_limit_info
+    st = init_state_from_config(Config())
+    apply_rate_limit_info(st, {"status": "rejected", "resets_at": RESET,
+                               "rate_limit_type": "five_hour"})
+    began = st.rate_limit_hit_at
+    assert began and abs(began - time.time()) < 5
+    apply_rate_limit_info(st, {"status": "rejected", "resets_at": RESET})
+    assert st.rate_limit_hit_at == began, "a repeat is not a new stop"
+    apply_rate_limit_info(st, {"status": "allowed"})
+    assert st.rate_limit_hit_at is None
 
 
 # ---------------------------------------------------------------------------
@@ -791,12 +1219,13 @@ class _St:
 
 
 class _RT:
-    def __init__(self, cwd, st):
-        self.rid = "R1"
+    def __init__(self, cwd, st, rid="R1"):
+        self.rid = rid
         self.clients = set()
         self.state = st
         self.config = type("C", (), {"cwd": cwd})()
         self.idle_timer = None
+        self.idle_connecting_defers = 0
 
 
 def _idle(monkeypatch, rt, timeout=300):
@@ -833,12 +1262,23 @@ def test_a_session_about_to_resume_is_not_closed(tmp_path, monkeypatch, st):
     assert torn == []
 
 
+def test_a_session_that_never_connects_is_closed_in_the_end(tmp_path, monkeypatch):
+    """Review: with prompts queued, a connect that cannot succeed retries
+    without end, and the deferral kept it open for ever."""
+    rt = _RT(str(tmp_path), _St(connecting=True))
+    for _ in range(server.IDLE_CONNECTING_DEFERS):
+        assert _idle(monkeypatch, rt)[0] == []
+    assert _idle(monkeypatch, rt)[0], "still deferring"
+
+
 def _reopen(monkeypatch, rec, live=()):
     opened = []
 
     class _R:
-        rid = "R2"
         clients = set()
+
+        def __init__(self):
+            self.rid = f"R{len(opened)}"
 
     async def create(**kw):
         opened.append(kw)
@@ -853,11 +1293,17 @@ def _reopen(monkeypatch, rec, live=()):
     return opened
 
 
-def test_a_due_session_is_reopened_with_it_on(tmp_path, monkeypatch):
-    limit_resume.save(str(tmp_path), SID, due_at=NOW - 5, resets_at=NOW - 65)
+def test_a_due_session_is_reopened_as_it_ran(tmp_path, monkeypatch):
+    """Review: it was reopened on the hub's model, effort and CLI."""
+    limit_resume.save(str(tmp_path), SID, due_at=NOW - 5, resets_at=NOW - 65,
+                      settings={"model": "claude-opus-5-5", "effort": "max",
+                                "cli_path": "C:/claude-new.exe", "bell_on": "none"})
     opened = _reopen(monkeypatch, limit_resume.load(str(tmp_path), SID))
     assert opened == [{"cwd": str(tmp_path), "resume": SID, "config_dir": None,
+                       "model": "claude-opus-5-5", "effort": "max",
+                       "cli_path": "C:/claude-new.exe", "bell_on": "none",
                        "resume_after_limit": True}]
+    assert limit_resume.load(str(tmp_path), SID)["reopens"] == 1
 
 
 def test_a_session_already_open_is_left_to_its_bridge(tmp_path, monkeypatch):
@@ -869,6 +1315,28 @@ def test_a_session_already_open_is_left_to_its_bridge(tmp_path, monkeypatch):
 def test_a_record_gone_by_then_reopens_nothing(tmp_path, monkeypatch):
     rec = {"session_id": SID, "cwd": str(tmp_path), "due_at": NOW - 5}
     assert _reopen(monkeypatch, rec) == []
+
+
+def test_reopens_past_the_cap_wait_for_a_place(tmp_path, monkeypatch):
+    """Review: every session on an account comes due at once, and each is a
+    CLI; past the cap one waits rather than opening."""
+    limit_resume.save(str(tmp_path), SID, due_at=NOW - 5, resets_at=NOW - 65)
+    full = {f"X{i}" for i in range(server.LIMIT_REOPEN_MAX_OPEN)}
+    live = [_RT(str(tmp_path), _St(session_id=f"other-{i}"), rid=rid)
+            for i, rid in enumerate(sorted(full))]
+    later = []
+    monkeypatch.setattr(server, "_limit_reopened", set(full))
+    monkeypatch.setattr(server, "_schedule_limit_reopen",
+                        lambda rec, delay=None: later.append(delay))
+
+    async def create(**kw):  # pragma: no cover - must not be reached
+        raise AssertionError("opened past the cap")
+
+    monkeypatch.setattr(server, "_create_runtime", create)
+    monkeypatch.setattr(server, "runtimes", {r.rid: r for r in live})
+    monkeypatch.setattr(server, "_limit_reopen_lock", None)
+    asyncio.run(server._reopen_for_limit(limit_resume.load(str(tmp_path), SID), 0.0))
+    assert later == [server.LIMIT_REOPEN_WAIT_S]
 
 
 def test_the_hub_start_schedules_every_record(tmp_path, monkeypatch):

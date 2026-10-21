@@ -2279,11 +2279,21 @@ _limit_reopen_tasks: dict[str, asyncio.Task] = {}
 #: comes due at the same moment, and each is a CLI and a transcript load.
 LIMIT_REOPEN_STAGGER_S = 10.0
 _limit_reopen_lock: asyncio.Lock | None = None
+#: How many sessions reopened for a limit resume may be open at once, and how
+#: long one past that waits for a place.  The wakeup restore's MAX_RESURRECT
+#: for the same reason -- this machine has run out of commit before -- but a
+#: wait, not a cap: every one of them was asked to carry on.
+LIMIT_REOPEN_MAX_OPEN = 6
+LIMIT_REOPEN_WAIT_S = 300.0
+#: The runtimes the hub reopened for a limit resume.  One counts until the
+#: idle timer closes it, once its work is done.
+_limit_reopened: set[str] = set()
 
 
-def _schedule_limit_reopen(rec: dict) -> None:
-    """Reopen *rec*'s session when it comes due, unless the record says it
-    should not be (limit_resume.plan_reopen), when the record is dropped."""
+def _schedule_limit_reopen(rec: dict, *, delay: float | None = None) -> None:
+    """Reopen *rec*'s session when it comes due -- or in *delay* seconds --
+    unless the record says it should not be (limit_resume.plan_reopen), when
+    the record is dropped."""
     sid = rec.get("session_id") or ""
     plan = limit_resume.plan_reopen(rec)
     if not plan.reopen:
@@ -2293,14 +2303,16 @@ def _schedule_limit_reopen(rec: dict) -> None:
     old = _limit_reopen_tasks.pop(sid, None)
     if old is not None and not old.done() and old is not asyncio.current_task():
         old.cancel()
+    wait = plan.delay if delay is None else delay
     _limit_reopen_tasks[sid] = asyncio.create_task(
-        _reopen_for_limit(rec, plan.delay), name=f"limit-reopen-{sid[:8]}")
-    log.info("limit reopen: %s scheduled (%s)", sid[:8], plan.reason)
+        _reopen_for_limit(rec, wait), name=f"limit-reopen-{sid[:8]}")
+    log.info("limit reopen: %s scheduled in %.0fs (%s)", sid[:8], wait, plan.reason)
 
 
 async def _reopen_for_limit(rec: dict, delay: float) -> None:
     """Wait *delay* seconds, then open *rec*'s session if it is still
-    waiting and not open already.  The bridge does the rest on connect."""
+    waiting and not open already, with the settings it ran with.  The bridge
+    does the rest on connect."""
     global _limit_reopen_lock
     sid = rec["session_id"]
     try:
@@ -2321,10 +2333,22 @@ async def _reopen_for_limit(rec: dict, delay: float) -> None:
             if now_rec["due_at"] > time.time() + 1:
                 _schedule_limit_reopen(now_rec)
                 return
+            _limit_reopened.intersection_update(runtimes)
+            if len(_limit_reopened) >= LIMIT_REOPEN_MAX_OPEN:
+                log.info("limit reopen: %d sessions reopened for a limit are "
+                         "still open — %s waits", len(_limit_reopened), sid[:8])
+                _schedule_limit_reopen(now_rec, delay=LIMIT_REOPEN_WAIT_S)
+                return
+            # Counted before it opens: a session that cannot connect never
+            # schedules its resume, which is what writes a fresh record.
+            limit_resume.note_reopened(now_rec)
             rt = await _create_runtime(
                 cwd=now_rec["cwd"], resume=sid,
                 config_dir=now_rec.get("config_dir") or None,
+                model=now_rec.get("model"), effort=now_rec.get("effort"),
+                cli_path=now_rec.get("cli_path"), bell_on=now_rec.get("bell_on"),
                 resume_after_limit=True)
+            _limit_reopened.add(rt.rid)
             log.warning("limit reopen: reopened %s as %s to resume it after "
                         "its usage limit", sid[:8], rt.rid)
             # Nobody is watching it, so it closes again once it is done.
@@ -2621,6 +2645,11 @@ def _maybe_start_idle_timer(rt: SessionRuntime,
     )
 
 
+#: How many idle passes in a row a viewer-less session that is connecting is
+#: given before it is closed like any other.
+IDLE_CONNECTING_DEFERS = 2
+
+
 async def _idle_teardown_after(rt: SessionRuntime, timeout: int) -> None:
     """Wait out the idle grace period, then tear the runtime down.
 
@@ -2670,11 +2699,18 @@ async def _idle_teardown_after(rt: SessionRuntime, timeout: int) -> None:
     # away is better waited for closed (the record reopens the session), but
     # one due before the next look would only close a session to reopen it.
     # And a session still connecting -- a large one reopened for that resume,
-    # say -- is about to do something.
+    # say -- is about to do something; but only for IDLE_CONNECTING_DEFERS
+    # passes, since a connect that cannot succeed (an expired login) with
+    # prompts queued retries without end.
     resume_at = getattr(st, "limit_resume_at", None) if st is not None else None
     resuming = (isinstance(resume_at, (int, float))
                 and resume_at - time.time() < timeout)
     connecting = bool(getattr(st, "connecting", False)) if st is not None else False
+    if connecting:
+        rt.idle_connecting_defers = getattr(rt, "idle_connecting_defers", 0) + 1
+        connecting = rt.idle_connecting_defers <= IDLE_CONNECTING_DEFERS
+    else:
+        rt.idle_connecting_defers = 0
     if busy or bg or waiting or resuming or connecting:
         if busy:
             why = "working"
