@@ -28,6 +28,7 @@ import json
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -250,6 +251,221 @@ def test_a_cli_for_a_session_that_is_already_open_is_applied(monkeypatch, tmp_pa
     assert rt.config.cli_path == str(exe)
     assert rt.bridge.config is rt.config, "runtime and bridge disagree on the CLI"
     assert rt.bridge.event_queue.get_nowait() == ("connect", "")
+
+
+# --------------------------------------------------------------------------
+# A launch that did not choose its session does not rename it
+# --------------------------------------------------------------------------
+#
+# Found 2026-10-20.  Six SlateOS lanes were launched from one directory, none
+# with --resume.  Each continued the directory's most recent session (in this
+# account, Lane E's or Lane F's, whichever had last been written), and each
+# renamed it: Lane E's session ended up as "Lane-D", which no message or halt
+# for Lane E could reach, and Lanes A-D were never opened at all.
+
+def _land(monkeypatch, body, *, current_name=None, open_=True):
+    """A launch without --resume, continuing its directory's most recent
+    session, "sid-live" -- open in the hub if *open_*, else closed.
+
+    Returns the hub's answer, the open runtime (None if closed) and the
+    sessions ``_create_runtime`` was asked to open.
+    """
+    monkeypatch.setattr(server, "find_most_recent_session_for_cwd",
+                        lambda cwd, config_dir=None: Path("sid-live.jsonl"))
+    monkeypatch.setattr(server, "config", parse_args([]))
+    created: list[dict] = []
+
+    async def fake_create_runtime(**kw):
+        created.append(kw)
+        return types.SimpleNamespace(rid="R2")
+
+    monkeypatch.setattr(server, "_create_runtime", fake_create_runtime)
+    rt = None
+    if open_:
+        st = State()
+        st.session_id = "sid-live"
+        st.agent_name = current_name
+        cfg = parse_args([])
+        br = _LiveBridge()
+        br.config = cfg
+        rt = types.SimpleNamespace(rid="R1", state=st, config=cfg, bridge=br)
+    monkeypatch.setattr(server, "runtimes", {"R1": rt} if rt else {})
+    res = asyncio.run(server.api_session_launch({"cwd": "C:\\w", **body}))
+    return res, rt, created
+
+
+def test_a_launch_without_resume_does_not_rename_the_session_it_continued(monkeypatch):
+    res, rt, _created = _land(
+        monkeypatch,
+        {"agent_name": "Lane-A", "initial_prompt": "check your lane",
+         "model": "claude-other"},
+        current_name="Lane-E")
+
+    assert res["ok"] is False and res["refused"] is True
+    assert "'Lane-E'" in res["error"] and "'Lane-A'" in res["error"]
+    assert "--resume" in res["error"]
+    assert rt.bridge.adopted == [], "it was renamed"
+    # Refused means refused: nothing else the launch brought reaches it.
+    assert list(rt.state.queued_prompts) == []
+    assert rt.state.model != "claude-other"
+    assert rt.bridge.event_queue.empty()
+
+
+def test_nor_a_closed_one_remembered_under_another_name(monkeypatch):
+    agent_comms.name_session("sid-live", "Lane-E")
+
+    res, _rt, created = _land(monkeypatch, {"agent_name": "Lane-A"}, open_=False)
+
+    assert res["ok"] is False and res["refused"] is True
+    assert created == [], "it was opened under the new name"
+
+
+def test_an_unnamed_session_it_continued_takes_the_name(monkeypatch):
+    res, rt, _created = _land(monkeypatch, {"agent_name": "Lane-A"})
+
+    assert res["ok"] is True
+    assert rt.bridge.adopted == ["Lane-A"]
+
+
+def test_the_name_the_session_already_has_is_no_rename(monkeypatch):
+    res, rt, _created = _land(
+        monkeypatch, {"agent_name": "Lane-E", "initial_prompt": "go"},
+        current_name="Lane-E")
+
+    assert res["ok"] is True
+    assert list(rt.state.queued_prompts) == ["go"]
+
+
+def test_a_launch_without_a_name_leaves_a_named_session_alone(monkeypatch):
+    res, rt, _created = _land(monkeypatch, {}, current_name="Lane-E")
+
+    assert res["ok"] is True
+    assert rt.state.agent_name == "Lane-E" and rt.bridge.adopted == []
+
+
+def test_a_launch_that_names_its_session_renames_it(monkeypatch):
+    """--resume says which session, so a name with it is a rename on purpose
+    -- how a misnamed session is put right."""
+    res, rt = _reuse(monkeypatch, {"agent_name": "Lane-E"}, current_name="Lane-D")
+
+    assert res["ok"] is True
+    assert rt.bridge.adopted == ["Lane-E"]
+
+
+def test_the_hub_logs_what_became_of_each_launch(monkeypatch, caplog):
+    """It used to log a session it opened, and nothing about a launch that
+    landed on one already open -- the case where a name was overwritten."""
+    caplog.set_level("INFO", logger="orchestrator2")
+
+    _land(monkeypatch, {"agent_name": "Lane-A"}, current_name="Lane-E")
+    _land(monkeypatch, {"agent_name": "Lane-E"}, current_name="Lane-E")
+    _land(monkeypatch, {"agent_name": "Lane-A"}, open_=False)
+
+    text = caplog.text
+    assert "name=Lane-A): refused: Not opened" in text
+    assert "name=Lane-E): session sid-live is already open as R1" in text
+    assert "name=Lane-A): opened as R2 (session sid-live)" in text
+
+
+def _hub_answers(monkeypatch, answer: dict) -> None:
+    import urllib.request
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(answer).encode("utf-8")
+
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda req, timeout=None: _Resp())
+
+
+def test_the_launch_is_told_it_was_refused(monkeypatch):
+    _hub_answers(monkeypatch, {"ok": False, "refused": True, "error": "is Lane-E"})
+
+    with pytest.raises(server.LaunchRefused, match="is Lane-E"):
+        server._launch_into_hub(8787, cwd="C:\\w", resume=None,
+                                no_continue=False, agent_name="Lane-A")
+
+
+def test_a_hub_that_could_not_open_it_is_not_a_refusal(monkeypatch):
+    """That one still falls back to a server of the launch's own."""
+    _hub_answers(monkeypatch, {"ok": False, "error": "cannot see C:\\w"})
+
+    assert server._launch_into_hub(8787, cwd="C:\\w", resume=None,
+                                   no_continue=False) is None
+
+
+class _FellThrough(Exception):
+    pass
+
+
+def _launch(monkeypatch, tmp_path, argv, *, hub):
+    """Run main() on *argv* with a hub that answers *hub* (None: no hub),
+    stopping wherever it would start a server of its own."""
+    log = tmp_path / "launch-error.log"
+    monkeypatch.setattr(server, "config", None)       # main() rebinds it
+    cfg = parse_args(["--cwd", str(tmp_path), *argv])
+    monkeypatch.setattr(server, "_parse_args_or_report", lambda: cfg)
+    monkeypatch.setattr(server, "LAUNCH_ERROR_LOG", str(log))
+    monkeypatch.setenv("ORCH2_NO_DIALOG", "1")
+    monkeypatch.setattr(server, "_probe_hub",
+                        lambda port: None if hub is None else {"app": "orchestrator2"})
+
+    def join(port, **kw):
+        if isinstance(hub, Exception):
+            raise hub
+        return hub
+
+    monkeypatch.setattr(server, "_launch_into_hub", join)
+
+    def fell_through(*a, **kw):
+        raise _FellThrough()
+
+    monkeypatch.setattr(server, "_ensure_logged_in", fell_through)
+    monkeypatch.setattr(server, "_bind_port", fell_through)
+    with pytest.raises((SystemExit, _FellThrough)) as ei:
+        server.main()
+    return ei.value, log
+
+
+def test_a_refused_launch_stops_instead_of_starting_a_server(monkeypatch, tmp_path):
+    """A server of its own would open the same session under the same name:
+    what the hub refused, done in a second hub."""
+    stopped, log = _launch(monkeypatch, tmp_path, ["--agent-name", "Lane-A"],
+                           hub=server.LaunchRefused("already the agent 'Lane-E'"))
+
+    assert isinstance(stopped, SystemExit) and stopped.code == 2, "it went on"
+    assert "already the agent 'Lane-E'" in log.read_text(encoding="utf-8")
+
+
+def test_a_launch_starting_its_own_hub_does_not_rename_either(monkeypatch, tmp_path):
+    """No hub running: the launch's own server would continue the same most
+    recent session, and connect() lets a launch's name beat the record."""
+    agent_comms.name_session("sid-live", "Lane-E")
+    monkeypatch.setattr(server, "find_most_recent_session_for_cwd",
+                        lambda cwd, config_dir=None: Path("sid-live.jsonl"))
+
+    stopped, log = _launch(monkeypatch, tmp_path, ["--agent-name", "Lane-A"],
+                           hub=None)
+
+    assert isinstance(stopped, SystemExit) and stopped.code == 2, "it went on"
+    assert "'Lane-E'" in log.read_text(encoding="utf-8")
+
+
+def test_but_starts_one_for_a_session_named_as_asked(monkeypatch, tmp_path):
+    agent_comms.name_session("sid-live", "Lane-E")
+    monkeypatch.setattr(server, "find_most_recent_session_for_cwd",
+                        lambda cwd, config_dir=None: Path("sid-live.jsonl"))
+
+    reached, _log = _launch(monkeypatch, tmp_path, ["--agent-name", "Lane-E"],
+                            hub=None)
+
+    assert isinstance(reached, _FellThrough)
 
 
 # --------------------------------------------------------------------------

@@ -203,6 +203,29 @@ record speaks for it. The hub's own launch is its own session's: `/resume` and
 defaults. Ending a session's earlier compaction therefore takes `--no-compact`
 (or `/autocompact off`), not just dropping the flags.
 
+**The hub can refuse a launch** (`"refused": true` in its answer, raised as
+`LaunchRefused` by `_launch_into_hub`), and that stops the launch with an
+error (`_stop_launch`). This is unlike a hub that could not open the session,
+after which the launch falls back to a server of its own. A refused launch
+must not fall back, because its own server would do what was refused. The one
+refusal so far is renaming a session the launch did not choose (§9a).
+
+**Every launch logs what became of it in the `--log-file`**, through
+`_file_log`, which writes to the file handlers alone because the console has
+said so in words already. The cases are: joined the hub, and which session it
+opened or already had open; failed, with the message `launch-error.log` gets
+(`_report_launch_failure`); started a headless server, with its pid, or saw it
+die while starting, with its last output; and fell back to a separate server.
+A launch that argparse refuses has not set up its log yet, so `_file_log`
+opens the `--log-file` on its command line for that one record. The hub logs
+one line per `/api/session/launch`, giving what was asked (directory,
+account, resume, name; never the prompt or a key) and what it did: opened the
+session as a new runtime, found it already open, or refused. Before
+2026-10-21, a launch left only "log file opened" and "server shut down" in the
+log. Four lanes refused before reaching the hub looked exactly like launches
+that had worked, and the hub said nothing about a launch that landed on a
+session already open.
+
 **`--resume <title>` is resolved to a session id before anything keys on
 it**, by `session.resolve_session_ref`: the whole title, ignoring case, of
 exactly one session in the launch directory's project, in the launch's
@@ -246,9 +269,9 @@ that name" meant the first two, and the user renamed the third. Now:
   CLI looks for the transcript only under the launch directory's project
   (`getProjectDir(getOriginalCwd())`).
 
-The error goes to stderr and `launch-error.log`. A dialog also appears when
-the console is hidden, or when the launch has `--open`, since no tab is
-coming. ⟳ Restart drops the launch's `--cwd` when it resumes a session: after
+The error goes to stderr, `launch-error.log` and the `--log-file`
+(`_stop_launch`). A dialog also appears when the console is hidden, or when the
+launch has `--open`, since no tab is coming. ⟳ Restart drops the launch's `--cwd` when it resumes a session: after
 `/cwd` or `/resume` that `--cwd` names the wrong directory, and the new
 process follows the session to its own. `--detach` hands its child the
 account the launch followed. In a session, `/resume <title>` that several
@@ -4113,6 +4136,22 @@ name over at all. Now:
   added to older stores by `connect()`'s migration). What a launch does give
   beats the record; what it does not is restored — name and labels
   independently.
+* **A launch that did not choose its session does not rename it**
+  (`_rename_refusal`). Without `--resume`, a launch continues the most recent
+  session in its directory, and which session that is depends on which one
+  last wrote to disk. A name given with such a launch describes the session
+  the user meant, which need not be the one reached. So if that session
+  already has a different name (live in `state.agent_name`, or remembered in
+  `session_names`), the launch is refused, with neither the name nor anything
+  else it brought applied. The error names the session, its name and
+  `--resume`. Found 2026-10-20: six lane launches from one directory, with no
+  `--resume` and on an account holding two of the lanes, renamed those two
+  over and over, ending with Lane E's session called Lane-D. The check runs in
+  `/api/session/launch` before anything else, and in `main()` before a launch
+  starts a hub of its own, since that hub would open the same session under
+  the same name. A launch that names its session (`--resume`, or a picker)
+  still renames it, which is how a misnamed session is put right. Naming a
+  session that has no name, or giving one its own name again, is no rename.
 
 **Two live sessions under one name** are possible — an explicit name is taken
 at face value (§3.3) — and used to fail silently and badly. Found 2026-09-24:

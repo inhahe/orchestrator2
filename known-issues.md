@@ -1,5 +1,37 @@
 # Known issues / tech debt — orchestrator2
 
+## A launch that did not choose its session renamed it — FIXED (2026-10-21)
+
+Found 2026-10-20, checking SlateOS after its move to a new PC. Six lanes were
+launched from one directory with `--agent-name Lane-A` … `Lane-F`, no
+`--resume`, and all on account C, which holds only Lanes E and F. Each launch
+continued the directory's most recent session, Lane E's or Lane F's,
+whichever had last been written, and gave it its name. Lane E's session went
+through Lane-E, -A, -B and -C to Lane-D. No message or halt for Lane E could
+reach it, and Lanes A–D were never opened. Nothing said so: the hub logged
+nothing about a launch that landed on a session already open.
+
+> "do 1" (refuse a launch that would replace a session's agent name)
+
+Now a launch without `--resume` that reaches a session already named
+something else is refused. The message names the session it reached and that
+session's name, and says to use `--resume`. The refusal stops the launch
+instead of falling back to a server of its own, which would have done the
+same thing in a second hub. A launch that is about to start its own hub
+checks the session it would open the same way. With `--resume`, a name
+renames the session on purpose, as before. design.md §9a.
+
+### What became of a launch was not in the log
+
+Earlier the same evening, the same six launches ran with `--resume "OS A"`
+… `"OS F"`, all through the account-C launcher. Four were refused before they
+reached the hub, because those titles were on other accounts. The reasons
+went to `launch-error.log` and a dialog. `orchestrator2.log` showed each of
+them only as "log file opened" and "server shut down". Now every launch
+writes what became of it to the `--log-file`, and only there, since its
+console says so already. The hub logs one line per `/api/session/launch`
+saying what it did. design.md *Central-hub reuse*.
+
 ## A session resumed from another directory started its CLI in the old one — FIXED (2026-10-10)
 
 Found while fixing the picker's restart. `/resume <id>` in the primary tab,

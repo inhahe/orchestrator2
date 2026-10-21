@@ -42,7 +42,7 @@ import sys
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, NoReturn
 
 import bg_stall
 import wakeup_store
@@ -362,6 +362,59 @@ def _session_to_open(resume: str | None, cwd: str, config_dir: str | None, *,
         if recent is not None:
             return recent.stem
     return None
+
+
+class LaunchRefused(Exception):
+    """The hub declined a launch on purpose, saying why.
+
+    Unlike a hub that could not open the session, this must stop the launch:
+    falling back to a server of its own would do there what was refused here.
+    """
+
+
+def _remembered_name(sid: str | None) -> str | None:
+    """The agent name session *sid* was given, as the registry remembers it.
+
+    None when it never had one -- or when the registry cannot be read, which
+    is logged but refuses no launch.
+    """
+    if not sid:
+        return None
+    try:
+        import agent_comms
+        return agent_comms.session_name(sid)
+    except Exception:
+        log.warning("could not read the agent name remembered for session %s",
+                    sid, exc_info=True)
+        return None
+
+
+def _rename_refusal(sid: str | None, current: str | None,
+                    requested: str | None, *, explicit: bool,
+                    cwd: str) -> str | None:
+    """Why a launch may not open session *sid* as the agent *requested*.
+
+    *current* is the agent name the session already has -- live, else
+    remembered.  *explicit* says the launch chose the session itself
+    (``--resume``, or a picker); otherwise it is continuing the most recent
+    session in *cwd*.  Returns None when the launch may go ahead.
+
+    Only a launch that did not choose its session is refused.  One that did
+    and also gives a name means to rename that session, which is how a
+    misnamed one is put right.  Without --resume, which session the launch
+    reaches depends on which one wrote to disk last, so a name given with it
+    describes the session the user *meant*, which need not be this one --
+    and renaming this one would take it away from the agent it is.
+    """
+    requested = (requested or "").strip()
+    current = (current or "").strip()
+    if explicit or not sid or not requested or not current or current == requested:
+        return None
+    return (f"Not opened: without --resume, this launch continued the most "
+            f"recent session in {cwd}, {sid}, which is already the agent "
+            f"'{current}', and it asked for '{requested}'. To open the "
+            f"session that is '{requested}', give its id or title with "
+            f"--resume; to rename this one, name it with --resume.")
 
 
 def _session_dir(sid: str, config_dir: str | None) -> str | None:
@@ -3529,127 +3582,144 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
     # second bridge against the same session file.
     target_sid = _session_to_open(resume, cwd or config.cwd, config_dir,
                                   continue_recent=not no_continue)
+    existing = next(
+        (r for r in runtimes.values()
+         if target_sid and getattr(r.state, "session_id", None) == target_sid),
+        None,
+    )
+    # What the launch asked for, on the line that says what became of it.
+    asked = (f"cwd={cwd or config.cwd} account={config_dir} resume={resume} "
+             f"no_continue={no_continue} name={agent_name}")
+    # Before anything else is applied, so that a refused launch changes
+    # nothing -- not even the key below.  An open session's own name is its
+    # live one; a closed session's is the one remembered for it.
+    if agent_name and target_sid:
+        current = ((existing.state.agent_name
+                    if existing is not None and existing.state is not None
+                    else None)
+                   or await asyncio.to_thread(_remembered_name, target_sid))
+        refusal = _rename_refusal(target_sid, current, agent_name,
+                                  explicit=bool(resume), cwd=cwd or config.cwd)
+        if refusal:
+            log.warning("hub launch (%s): refused: %s", asked, refusal)
+            return {"ok": False, "error": refusal, "refused": True}
     # The launch says what its session is billed to: without a key, that is
     # the account's login, whatever key the session ran with before.
     if target_sid and not api_key:
         if _session_api_keys.pop(target_sid, None):
             log.info("hub launch: session %s is no longer remembered with an "
                      "API key (a launch without one)", target_sid)
-    if target_sid:
-        existing = next(
-            (r for r in runtimes.values()
-             if getattr(r.state, "session_id", None) == target_sid),
-            None,
-        )
-        if existing is not None:
-            # Apply model/effort overrides from this launch to the existing
-            # runtime so the launcher's --model / --effort take effect even
-            # when the session is already live.  Reconnect the bridge so the
-            # new options are picked up by the SDK immediately.
-            need_reconnect = False
-            if model and existing.state is not None and existing.state.model != model:
-                existing.state.model = model
+    if existing is not None:
+        # Apply model/effort overrides from this launch to the existing
+        # runtime so the launcher's --model / --effort take effect even
+        # when the session is already live.  Reconnect the bridge so the
+        # new options are picked up by the SDK immediately.
+        need_reconnect = False
+        if model and existing.state is not None and existing.state.model != model:
+            existing.state.model = model
+            need_reconnect = True
+        if effort and existing.state is not None:
+            new_effort = None if effort == "auto" else effort
+            if existing.state.effort != new_effort:
+                existing.state.effort = new_effort
                 need_reconnect = True
-            if effort and existing.state is not None:
-                new_effort = None if effort == "auto" else effort
-                if existing.state.effort != new_effort:
-                    existing.state.effort = new_effort
-                    need_reconnect = True
-            # Compaction likewise, on the session alone -- where /autocompact
-            # puts it, and what the bridge reads after every turn, so no
-            # reconnect; not its Config, which for the hub's own session is
-            # the hub's and would reach every session opened after.
-            if existing.state is not None:
-                if compact_at:
-                    existing.state._compact_at = compact_at  # type: ignore[attr-defined]
-                if auto_compact is not None:
-                    existing.state._auto_compact = auto_compact  # type: ignore[attr-defined]
-                if compact_at or auto_compact is not None:
-                    log.info("hub launch: auto-compact for rid=%s -> %s at %s",
-                             existing.rid, auto_compact, compact_at)
-                    # Kept now if the session's record has been merged in;
-                    # otherwise the merge, when its id comes, keeps it.
-                    sid = getattr(existing.state, "session_id", None)
-                    if sid and getattr(existing.state, "_compaction_sid", None) == sid:
-                        await asyncio.to_thread(
-                            save_session_compaction, sid, *own_compaction(existing.state),
-                            getattr(existing.config, "config_dir", None))
-            # Same reasoning as model/effort: the launcher asked for a bell
-            # set, so honour it on the session it actually lands on.  No
-            # reconnect needed — bell_events is read at ring time.
-            if bell_on and existing.state is not None:
-                new_bells = parse_bell_events(bell_on)
-                if existing.state.bell_events != new_bells:
-                    log.info(
-                        "hub launch: bell set for rid=%s %s -> %s",
-                        existing.rid, sorted(existing.state.bell_events),
-                        sorted(new_bells),
-                    )
-                    existing.state.bell_events = new_bells
-            # And the CLI binary, which is fixed at connect time like the
-            # model.  Config is frozen and shared by the runtime and its
-            # bridge, so both get the replacement.
-            if cli_path and getattr(existing.config, "cli_path", None) != cli_path:
-                _replace_runtime_config(existing, cli_path=cli_path)
-                need_reconnect = True
-            # And its API key, likewise fixed at connect time.  A launch
-            # without one takes the session off the key it has.
-            if getattr(existing.config, "api_key", None) != api_key:
-                _replace_runtime_config(existing, api_key=api_key)
-                need_reconnect = True
-                now_on = ("the API key of the launch that just opened it"
-                          if api_key else
-                          "its account's own login: the launch that just "
-                          "opened it had no API key")
-                log.info("hub launch: rid=%s session %s now runs on %s",
-                         existing.rid, target_sid, now_on)
-                # The reconnect cuts whatever the session was doing, so its
-                # tabs are told why.
-                await existing.broadcast({
-                    "type": "system_msg", "subtype": "info",
-                    "data": {"message": f"Reconnecting: this session now "
-                                        f"runs on {now_on}."}})
-            # And its labels and name: the launch described this session,
-            # which happens to be open already.  Applied live, without the
-            # reconnect -- see SDKBridge.adopt_agent_labels / adopt_agent_name.
-            # Labels first, so a name change re-registers with them.
-            if (agent_labels and existing.state is not None
-                    and existing.state.agent_labels != agent_labels
-                    and existing.bridge is not None):
-                await existing.bridge.adopt_agent_labels(agent_labels)
-            if (agent_name and existing.state is not None
-                    and existing.state.agent_name != agent_name
-                    and existing.bridge is not None):
-                await existing.bridge.adopt_agent_name(agent_name)
-            if need_reconnect and existing.bridge is not None:
-                # Route the reconnect through the worker's event queue rather
-                # than ``asyncio.create_task(bridge.reconnect())``.  A reconnect
-                # run in a *foreign* task **kills the worker**: the SDK's
-                # subprocess transport enters an anyio task group for its stderr
-                # reader inside whichever task called ``connect()`` (the worker),
-                # and its ``close()`` does ``cancel_scope.cancel()`` from
-                # whichever task calls ``disconnect()``.  anyio delivers that
-                # cancellation to the scope's *host* task — the worker, parked in
-                # ``event_queue.get()`` — and the SDK swallows the resulting
-                # "exited in a different task" RuntimeError under
-                # ``suppress(Exception)``.  Net effect: the reconnect appears to
-                # succeed, ``stop_event`` stays clear, the bridge/state/sockets
-                # all look healthy, and the worker task is silently dead, so
-                # every later prompt sits in the event queue forever and the
-                # session shows "idle" while ignoring input.  See known-issues.md
-                # "worker killed by cross-task SDK disconnect".
-                existing.bridge.event_queue.put_nowait(("connect", ""))
-            # And its prompt.  The launch asked for this session to be sent
-            # it, and the session happens to be open already, so it is queued
-            # like a prompt typed there: sent when the session is next free,
-            # and echoed then.  Not twice, if the same launch runs again
-            # before it has gone out.
-            if (initial_prompt and existing.state is not None
-                    and initial_prompt not in existing.state.queued_prompts):
-                existing.state.queued_prompts.append(initial_prompt)
-                log.info("hub launch: initial prompt queued for rid=%s",
-                         existing.rid)
-            return {"ok": True, "rid": existing.rid, "reused": True}
+        # Compaction likewise, on the session alone -- where /autocompact
+        # puts it, and what the bridge reads after every turn, so no
+        # reconnect; not its Config, which for the hub's own session is
+        # the hub's and would reach every session opened after.
+        if existing.state is not None:
+            if compact_at:
+                existing.state._compact_at = compact_at  # type: ignore[attr-defined]
+            if auto_compact is not None:
+                existing.state._auto_compact = auto_compact  # type: ignore[attr-defined]
+            if compact_at or auto_compact is not None:
+                log.info("hub launch: auto-compact for rid=%s -> %s at %s",
+                         existing.rid, auto_compact, compact_at)
+                # Kept now if the session's record has been merged in;
+                # otherwise the merge, when its id comes, keeps it.
+                sid = getattr(existing.state, "session_id", None)
+                if sid and getattr(existing.state, "_compaction_sid", None) == sid:
+                    await asyncio.to_thread(
+                        save_session_compaction, sid, *own_compaction(existing.state),
+                        getattr(existing.config, "config_dir", None))
+        # Same reasoning as model/effort: the launcher asked for a bell
+        # set, so honour it on the session it actually lands on.  No
+        # reconnect needed — bell_events is read at ring time.
+        if bell_on and existing.state is not None:
+            new_bells = parse_bell_events(bell_on)
+            if existing.state.bell_events != new_bells:
+                log.info(
+                    "hub launch: bell set for rid=%s %s -> %s",
+                    existing.rid, sorted(existing.state.bell_events),
+                    sorted(new_bells),
+                )
+                existing.state.bell_events = new_bells
+        # And the CLI binary, which is fixed at connect time like the
+        # model.  Config is frozen and shared by the runtime and its
+        # bridge, so both get the replacement.
+        if cli_path and getattr(existing.config, "cli_path", None) != cli_path:
+            _replace_runtime_config(existing, cli_path=cli_path)
+            need_reconnect = True
+        # And its API key, likewise fixed at connect time.  A launch
+        # without one takes the session off the key it has.
+        if getattr(existing.config, "api_key", None) != api_key:
+            _replace_runtime_config(existing, api_key=api_key)
+            need_reconnect = True
+            now_on = ("the API key of the launch that just opened it"
+                      if api_key else
+                      "its account's own login: the launch that just "
+                      "opened it had no API key")
+            log.info("hub launch: rid=%s session %s now runs on %s",
+                     existing.rid, target_sid, now_on)
+            # The reconnect cuts whatever the session was doing, so its
+            # tabs are told why.
+            await existing.broadcast({
+                "type": "system_msg", "subtype": "info",
+                "data": {"message": f"Reconnecting: this session now "
+                                    f"runs on {now_on}."}})
+        # And its labels and name: the launch described this session,
+        # which happens to be open already.  Applied live, without the
+        # reconnect -- see SDKBridge.adopt_agent_labels / adopt_agent_name.
+        # Labels first, so a name change re-registers with them.
+        if (agent_labels and existing.state is not None
+                and existing.state.agent_labels != agent_labels
+                and existing.bridge is not None):
+            await existing.bridge.adopt_agent_labels(agent_labels)
+        if (agent_name and existing.state is not None
+                and existing.state.agent_name != agent_name
+                and existing.bridge is not None):
+            await existing.bridge.adopt_agent_name(agent_name)
+        if need_reconnect and existing.bridge is not None:
+            # Route the reconnect through the worker's event queue rather
+            # than ``asyncio.create_task(bridge.reconnect())``.  A reconnect
+            # run in a *foreign* task **kills the worker**: the SDK's
+            # subprocess transport enters an anyio task group for its stderr
+            # reader inside whichever task called ``connect()`` (the worker),
+            # and its ``close()`` does ``cancel_scope.cancel()`` from
+            # whichever task calls ``disconnect()``.  anyio delivers that
+            # cancellation to the scope's *host* task — the worker, parked in
+            # ``event_queue.get()`` — and the SDK swallows the resulting
+            # "exited in a different task" RuntimeError under
+            # ``suppress(Exception)``.  Net effect: the reconnect appears to
+            # succeed, ``stop_event`` stays clear, the bridge/state/sockets
+            # all look healthy, and the worker task is silently dead, so
+            # every later prompt sits in the event queue forever and the
+            # session shows "idle" while ignoring input.  See known-issues.md
+            # "worker killed by cross-task SDK disconnect".
+            existing.bridge.event_queue.put_nowait(("connect", ""))
+        # And its prompt.  The launch asked for this session to be sent
+        # it, and the session happens to be open already, so it is queued
+        # like a prompt typed there: sent when the session is next free,
+        # and echoed then.  Not twice, if the same launch runs again
+        # before it has gone out.
+        if (initial_prompt and existing.state is not None
+                and initial_prompt not in existing.state.queued_prompts):
+            existing.state.queued_prompts.append(initial_prompt)
+            log.info("hub launch: initial prompt queued for rid=%s",
+                     existing.rid)
+        log.info("hub launch (%s): session %s is already open as %s",
+                 asked, target_sid, existing.rid)
+        return {"ok": True, "rid": existing.rid, "reused": True}
     try:
         rt = await _create_runtime(cwd=cwd, resume=resume, no_continue=no_continue,
                                    model=model, effort=effort,
@@ -3661,8 +3731,10 @@ async def api_session_launch(body: dict[str, Any]) -> dict[str, Any]:
                                    api_key=api_key, compact_at=compact_at,
                                    auto_compact=auto_compact)
     except Exception as exc:
-        log.exception("hub session launch failed")
+        log.exception("hub launch (%s) failed", asked)
         return {"ok": False, "error": str(exc)}
+    log.info("hub launch (%s): opened as %s (session %s)",
+             asked, rt.rid, target_sid or "new")
     return {"ok": True, "rid": rt.rid}
 
 
@@ -6291,7 +6363,11 @@ def _launch_into_hub(
     compact_at: int | None = None,
     auto_compact: bool | None = None,
 ) -> str | None:
-    """Ask a running hub to open a session; return its ``rid`` (or None).
+    """Ask a running hub to open a session; return its ``rid``.
+
+    None when the hub could not open it, and the launch may fall back to a
+    server of its own; ``LaunchRefused`` when the hub declined it on purpose,
+    and the launch must stop.
 
     ``bell_on`` is forwarded for the same reason ``model``/``effort`` are: a
     launch that finds a hub already running never builds its own ``Config``,
@@ -6345,6 +6421,8 @@ def _launch_into_hub(
     except Exception as exc:
         log.warning("hub session launch failed: %s", exc)
         return None
+    if isinstance(data, dict) and not data.get("ok") and data.get("refused"):
+        raise LaunchRefused(str(data.get("error") or "The hub refused the launch."))
     if not isinstance(data, dict) or not data.get("ok"):
         log.warning("hub session launch rejected: %s", data)
         # The caller only prints a generic "couldn't open the session", which
@@ -6354,7 +6432,12 @@ def _launch_into_hub(
         if reason:
             print(f"Hub refused the session: {reason}")
         return None
-    return data.get("rid")
+    rid = data.get("rid")
+    _file_log(logging.INFO, "launch: joined the hub on port %d, which %s %s "
+              "(cwd=%s resume=%s name=%s)", port,
+              "already had it open as" if data.get("reused") else "opened it as",
+              rid, cwd, resume, agent_name)
+    return rid
 
 
 def _bind_port(host: str, port: int, wait_secs: float = 0.0) -> tuple[_socket.socket, int]:
@@ -6494,6 +6577,55 @@ def _serve_splash_until(sock: _socket.socket, stop_event: "_threading.Event",
         sock.settimeout(None)
     except OSError:
         pass
+
+
+# Every record in the --log-file carries its PID: several orchestrator2
+# processes -- the hub, and every launch that joins it -- write to one file.
+_FILE_LOG_FMT = "%(asctime)s [pid %(process)d] [%(name)s] %(levelname)s: %(message)s"
+
+
+def _log_file_in_argv(argv: list[str]) -> str | None:
+    """The ``--log-file`` on a command line argparse has not read."""
+    for i, arg in enumerate(argv):
+        if arg == "--log-file" and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith("--log-file="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _file_log(level: int, msg: str, *args: Any) -> None:
+    """Write one record to the ``--log-file`` alone, not the console.
+
+    For what became of a launch: whether it joined a hub, was refused,
+    started a server, or failed to start.  Its console has already said so
+    and is gone once its window closes, and without these lines all a launch
+    left in the log was "log file opened" and "server shut down".  A launch
+    that failed before its flags were read has no file handler yet, so the
+    ``--log-file`` on its command line is opened for the one record.
+    """
+    handlers = [h for h in logging.getLogger().handlers
+                if isinstance(h, logging.FileHandler)]
+    temporary = None
+    if not handlers:
+        path = _log_file_in_argv(sys.argv[1:])
+        if not path:
+            return
+        try:
+            temporary = logging.FileHandler(str(Path(path).resolve()),
+                                            encoding="utf-8")
+        except OSError:
+            return
+        temporary.setFormatter(logging.Formatter(_FILE_LOG_FMT))
+        handlers = [temporary]
+    record = log.makeRecord(log.name, level, __file__, 0, msg, args, None)
+    try:
+        for handler in handlers:
+            if record.levelno >= handler.level:
+                handler.handle(record)
+    finally:
+        if temporary is not None:
+            temporary.close()
 
 
 def _setup_file_logging(log_path: str, fmt: str) -> None:
@@ -6700,8 +6832,20 @@ def _report_launch_failure(message: str, *, dialog: bool = False) -> None:
             fh.write(f"--- {stamp} ---\n{body}\n\n")
     except OSError:
         pass
+    # And in the --log-file, beside everything else this launch did.
+    _file_log(logging.ERROR, "launch failed: %s\n    command line: %s",
+              text.replace("\n", "\n    "), " ".join(sys.argv))
     if (dialog or _console_is_hidden()) and not os.environ.get("ORCH2_NO_DIALOG"):
         _show_error_dialog("orchestrator2 — launch failed", body)
+
+
+def _stop_launch(message: str, *, dialog: bool) -> NoReturn:
+    """End a launch that must not go ahead, saying why on its console, in
+    ``launch-error.log`` and the ``--log-file``, and in a dialog if *dialog*
+    (see ``_report_launch_failure``)."""
+    print(message, file=sys.stderr)
+    _report_launch_failure(message, dialog=dialog)
+    sys.exit(2)
 
 
 def _console_is_hidden() -> bool:
@@ -6821,11 +6965,10 @@ def main() -> None:
     # indistinguishable and bridge / dispatcher / turn diagnosis
     # becomes nearly impossible.
     console_fmt = "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
-    file_fmt = "%(asctime)s [pid %(process)d] [%(name)s] %(levelname)s: %(message)s"
     logging.basicConfig(level=logging.INFO, format=console_fmt)
 
     if config.log_file:
-        _setup_file_logging(config.log_file, file_fmt)
+        _setup_file_logging(config.log_file, _FILE_LOG_FMT)
 
     # --resume (no id) / --copy: show the full-screen terminal picker so the
     # user can choose a project + session to resume (or copy in from another
@@ -6869,11 +7012,9 @@ def main() -> None:
     # _settle_launch_resume.
     config, _note, _err = _settle_launch_resume(config)
     if _err:
-        print(_err, file=sys.stderr)
         # A launch that meant to open a tab gets a dialog too: no tab is
         # coming, and its console may close before anyone reads it.
-        _report_launch_failure(_err, dialog=config.open_browser)
-        sys.exit(2)
+        _stop_launch(_err, dialog=config.open_browser)
     if _note:
         print(_note)
     # The session may be on another account: the hub works in it, as above.
@@ -6900,10 +7041,13 @@ def main() -> None:
             and not config.wait_port
             and config.resume != _PICKER_SENTINEL
             and _probe_hub(config.port) is not None):
-        rid = _launch_into_hub(
-            config.port,
-            **_hub_launch_kwargs(config, join_account),
-        )
+        try:
+            rid = _launch_into_hub(
+                config.port,
+                **_hub_launch_kwargs(config, join_account),
+            )
+        except LaunchRefused as exc:
+            _stop_launch(str(exc), dialog=config.open_browser)
         if rid:
             _announce_joined(config.port, rid, config.open_browser)
             sys.exit(0)
@@ -6911,6 +7055,20 @@ def main() -> None:
         # our own server on a free port.
         print("Hub was running but couldn't open the session — starting a "
               "separate server.")
+        _file_log(logging.WARNING, "launch: the hub on port %d could not open "
+                  "the session; starting a separate server", config.port)
+
+    # A server of this launch's own opens the session the hub would have, and
+    # under this launch's name, so the hub's refusal to rename a session the
+    # launch did not choose applies here too (_rename_refusal).
+    if config.agent_name and not config.resume and not config.no_continue:
+        _sid = _session_to_open(None, config.cwd, config.config_dir,
+                                continue_recent=True)
+        _refusal = _rename_refusal(_sid, _remembered_name(_sid),
+                                   config.agent_name, explicit=False,
+                                   cwd=config.cwd)
+        if _refusal:
+            _stop_launch(_refusal, dialog=config.open_browser)
 
     # --detach: validate everything here (errors visible in terminal),
     # then respawn headless and exit.
@@ -6980,6 +7138,12 @@ def main() -> None:
                 if err:
                     for line in err.splitlines()[-20:]:
                         print(f"  {line}", file=sys.stderr)
+                # The child may have died before opening the log itself.
+                _file_log(logging.ERROR, "launch: the headless server (pid %d) "
+                          "exited with %s while starting; its last output:%s",
+                          proc.pid, rc, "".join(
+                              f"\n    {line}" for line in err.splitlines()[-20:])
+                          or " none")
                 try:
                     os.unlink(err_path)
                 except OSError:
@@ -7002,6 +7166,10 @@ def main() -> None:
         # the parent (which has a visible console).  The child's CREATE_NO_WINDOW
         # environment makes webbrowser.open() unreliable on Windows.
         print(f"orchestrator2 launched on {url}")
+        _file_log(logging.INFO if serving else logging.WARNING,
+                  "launch: started a headless server, pid %d, on port %d%s",
+                  proc.pid, actual_port,
+                  "" if serving else ", which was not serving after 20 s")
         if config.open_browser:
             # Attach straight to the just-launched primary session (bare URLs
             # now land in the lobby).  ``default`` resolves to the hub primary.
@@ -7043,8 +7211,11 @@ def main() -> None:
             rid = None
             while _time.monotonic() < deadline:
                 if _probe_hub(config.port) is not None:
-                    rid = _launch_into_hub(
-                        config.port, **_hub_launch_kwargs(config, join_account))
+                    try:
+                        rid = _launch_into_hub(
+                            config.port, **_hub_launch_kwargs(config, join_account))
+                    except LaunchRefused as exc:
+                        _stop_launch(str(exc), dialog=config.open_browser)
                     if rid:
                         break
                 _time.sleep(0.5)
@@ -7055,6 +7226,9 @@ def main() -> None:
             # on a fresh port so the user at least gets a working instance.
             print(f"Port {config.port} in use but couldn't join the hub — "
                   f"starting a separate server.")
+            _file_log(logging.WARNING, "launch: port %d is in use but its hub "
+                      "could not be joined; starting a separate server",
+                      config.port)
             sock, actual_port = _bind_port("0.0.0.0", 0)
 
         print(f"Port {config.port} in use — using {actual_port} instead.")
