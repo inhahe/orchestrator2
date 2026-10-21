@@ -8,6 +8,10 @@ answer is not in reading them.  This measures instead: is the gear on screen,
 does tapping it put the sidebar on screen, and is the sidebar's content
 actually within the viewport once it is.
 
+It points at a live hub and stubs nothing, so the socket connects, a session
+attaches and the lobby hides: the state the report is about.  A stubbed socket
+leaves the tab in *landing* mode, with the lobby covering everything.
+
 Run by hand (needs Playwright and a browser):
 
     D:/python314/python.exe tools/probe_mobile_sidebar.py
@@ -19,22 +23,11 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-
 # Pixel-8-ish.  Anything at or under the 768px breakpoint exercises the same
 # rules; the point is a real phone width, not a particular phone.
 PHONE = {"width": 412, "height": 915}
 PHONE_UA = ("Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36")
-
-# Stand-ins for the modules app.js talks to, so init() completes without a
-# server.  Only what the sidebar path touches.
-# Nothing is stubbed: the probe points at a live hub, so the socket connects,
-# a session attaches and the lobby hides -- which is the state the report is
-# about.  A stubbed socket leaves the tab in *landing* mode with the lobby
-# covering everything, which is a different (and, as it turns out, also
-# interesting) situation.
-STUBS = ""
 
 
 def _report(page):
@@ -84,15 +77,12 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
-    # Serve from a file:// dir so the /static/ links resolve.
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         ctx = browser.new_context(viewport=PHONE, user_agent=PHONE_UA,
                                   device_scale_factor=2, is_mobile=True,
                                   has_touch=True)
         page = ctx.new_page()
-        page.route("**/*", lambda route: route.continue_())
-        page.add_init_script(STUBS)
         errors = []
         page.on("console", lambda m: errors.append(f"{m.type}: {m.text}")
                 if m.type in ("error", "warning") else None)

@@ -431,38 +431,23 @@ def test_a_model_released_mid_hour_shows_up(hub, monkeypatch):
     assert "claude-opus-5-5" in ids, ids
 
 
-def test_a_failed_refresh_still_answers_from_the_cache(hub, monkeypatch):
+def _http_error(timeout=6.0, api_key=None):
+    return None                          # what the fetch reports one as
+
+
+def _bug_in_the_fetch(timeout=6.0, api_key=None):
+    raise ValueError("unexpected response shape")
+
+
+@pytest.mark.parametrize("fetch", [_http_error, _bug_in_the_fetch])
+def test_a_failed_refresh_still_answers_from_the_cache(hub, monkeypatch, fetch):
     """Unreachable API must degrade to the previous list, not to an error or a
-    hang — and must say which it is showing."""
+    hang — and must say which it is showing.  So must a fetch that raises,
+    though it is meant to report failure as None."""
     _reset_cache()
     config._model_cache = [("claude-opus-5", "Opus 5")]
     config._model_cache_at = config.time.monotonic() - 1800
-
-    def fake_fetch(timeout=6.0, api_key=None):
-        return None                      # what an HTTP error looks like
-
-    monkeypatch.setattr(server, "fetch_available_models", fake_fetch)
-    ws = _FakeWS()
-
-    asyncio.run(_slash_model(ws))
-
-    data = _picker(ws)
-    assert [m["id"] for m in data["models"]] == ["claude-opus-5"]
-    assert data["source"] == "cache"
-    assert data["live"] is False
-
-
-def test_a_fetch_that_raises_still_answers_from_the_cache(hub, monkeypatch):
-    """The fetch is meant to report failure as None, but a bug in it must
-    still leave `/model` answering from the previous list."""
-    _reset_cache()
-    config._model_cache = [("claude-opus-5", "Opus 5")]
-    config._model_cache_at = config.time.monotonic() - 1800
-
-    def fake_fetch(timeout=6.0, api_key=None):
-        raise ValueError("unexpected response shape")
-
-    monkeypatch.setattr(server, "fetch_available_models", fake_fetch)
+    monkeypatch.setattr(server, "fetch_available_models", fetch)
     ws = _FakeWS()
 
     asyncio.run(_slash_model(ws))
@@ -470,6 +455,7 @@ def test_a_fetch_that_raises_still_answers_from_the_cache(hub, monkeypatch):
     data = _picker(ws)
     assert data is not None, "no list was rendered at all"
     assert [m["id"] for m in data["models"]] == ["claude-opus-5"]
+    assert data["source"] == "cache"
     assert data["live"] is False
 
 
@@ -497,10 +483,13 @@ def test_a_hanging_api_does_not_hang_the_command(hub, monkeypatch):
 
     async def go():
         started = time.monotonic()
-        await _slash_model(ws)
-        elapsed = time.monotonic() - started
-        gate.set()
-        return elapsed
+        try:
+            await _slash_model(ws)
+            return time.monotonic() - started
+        finally:
+            # Also when it raises: the run would otherwise wait out the
+            # fake's ten seconds joining the thread.
+            gate.set()
 
     elapsed = asyncio.run(go())
 

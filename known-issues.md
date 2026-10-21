@@ -1309,7 +1309,11 @@ first, and pinned by a test.
 
 **Verified:** `tests/test_model_list.py` (24, up from 6) and the `modellive`
 (`server.py` × 6) and `modelfresh` (`config.py` × 5) mutation targets, 11/11;
-full suite 1,129 passed. The router tests drive the real `_handle_ws_message`
+full suite 1,129 passed. **Correction (2026-10-21):** the "a failed refresh
+propagates" mutant was caught only by a NameError: it named an `_NeverRaised`
+that does not exist. Made honest, it survived, because the `except Exception:`
+after the timeout handler caught the timeout anyway. It is now two mutants,
+one per handler, and a fetch that raises has a test. The router tests drive the real `_handle_ws_message`
 rather than grepping for the call — a source-level assertion survives the
 mutation that deletes it, which is how four wakeup-restore tests passed while
 the guard they checked had been replaced by `if False`.
@@ -1437,6 +1441,13 @@ broadcast had been redirected to nowhere. They are behavioural now: fake
 runtimes, real resurrection, assertions on what was created, armed and sent.
 The fifth survivor was equivalent (a negative-interval guard the `max()` floor
 already covers) and was removed with a note.
+
+**Correction (2026-10-21):** one source-grep was kept beside its behavioural
+rewrite, under the same name (`test_a_revived_session_says_why_it_woke_up`)
+and later in the file, so it replaced the rewrite, which never ran. The mutant
+meant for it was caught only because it called a `_noop_broadcast` that does
+not exist. The source-grep is gone, and the mutant now deletes the broadcast,
+which the behavioural test catches.
 
 ## `/btw` waited behind the queue it exists to jump — FIXED (2026-09-18)
 

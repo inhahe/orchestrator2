@@ -2513,9 +2513,11 @@ MODELLIVE_MUTATIONS = [
 
     ("a refresh that times out propagates instead of falling back to the "
      "list we already have",
-     "        except asyncio.TimeoutError:\n",
      "        except asyncio.TimeoutError:\n"
-     "            raise\n"),
+     '            log.info("model list: live refresh for /model timed out after "\n',
+     "        except asyncio.TimeoutError:\n"
+     "            raise\n"
+     '            log.info("model list: live refresh for /model timed out after "\n'),
 
     ("a refresh that raises propagates instead of falling back to the list "
      "we already have",

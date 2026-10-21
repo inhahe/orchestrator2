@@ -7329,11 +7329,9 @@ class SDKBridge:
         state.current_turn_bg.clear()
         state.next_bg_seq = 1
         self._initial_resume_id = None
-        # Reconnect to a new session, not this one or the most recent: Config
-        # is frozen, so a flag says so for the length of the connect.
-        self._force_no_continue = True
+        # With neither id left, _resume_target finds nothing to resume and
+        # the connect starts a new session.
         await self.connect()
-        self._force_no_continue = False
         await self.broadcast({
             "type": "system_msg", "subtype": "cleared",
             "data": {"message": "Session cleared — fresh context."},
