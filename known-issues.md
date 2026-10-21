@@ -1,5 +1,27 @@
 # Known issues / tech debt — orchestrator2
 
+## A deferred `/model` can lose a finished background task's notification — OPEN (found 2026-10-21)
+
+`/model`, `/effort` and `/thinking` issued while a background task runs are
+held by `_reconnect_or_defer` and applied by `_flush_deferred_reconnect`. One
+of its call sites is the `bg-all-done` wakeup in `_await_next_prompt`, which
+fires the moment the last task finishes. That is when the CLI is about to start
+a turn of its own to deliver the task's `<task-notification>` to the model. It
+has not said `running` yet, and `state.busy` is still False, so the reconnect
+goes ahead. The new CLI resumes with `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=0`,
+and the notification, which lived only in the old CLI's memory, never reaches
+the model. An autonomous session waiting on that task then stalls with nothing
+running.
+
+Found by the second review of the compaction change, whose first design
+restarted the CLI at the same point (see the FIXED entry below). The fix there
+is the fix here too: apply a deferred reconnect in `run_turn`, after
+`_await_interrupt_settled` and `_await_ghost_settled`, just before the prompt
+is sent, under the same conditions as `_apply_compaction_before_turn`. Then
+the `bg-all-done` and `_between_turns` flushes go, and the prompt still runs
+under the new settings. `tests/test_reconnect_bg_tasks.py` pins the current
+flush points and would change with it.
+
 ## The context count was a running total, so `--auto-compact` compacted every few turns — FIXED (2026-10-21)
 
 `state.context_tokens` was taken from `ResultMessage.usage` (falling back to
