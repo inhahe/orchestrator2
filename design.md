@@ -2762,7 +2762,7 @@ reconnection and dispatches every inbound message type to a module:
 | `app.js` | WS connect/reconnect, message router, URL/`?rid=` handling, global keys |
 | `chat.js` | Message stream: text, tool calls, thinking blocks, results |
 | `status.js` | Top status bar from `status_update` |
-| `favicon.js` | The tab's icon: one LED lit for the session's state (below) |
+| `favicon.js` | The tab's icon: a dot in the colour of the session's state (below) |
 | `panels.js` | Live tool / background-task / todo panels from `panel_update` |
 | `lobby.js` | `☰ Sessions` overlay (§8) |
 | `move.js` | `/move` — move this session to another account and/or directory (§8) |
@@ -2777,65 +2777,55 @@ variables it consumes, so themes never require CSS edits.
 ### The tab's icon shows the session's state
 
 Asked for so that a session can be read from the tab strip without switching
-to it. The icon is the rack in `favicon.svg`, whose three LEDs are drawn
-*off*. `Status.update` hands every snapshot to `Favicon.update`. **Each LED
-stands for one fact, and they light independently**, each in the colour the
-status bar writes that fact in:
+to it. A tab viewing a session shows **one dot filling the icon**, in the
+colour the status bar writes the session's state in. `Status.update` hands
+every snapshot to `Favicon.update`. When several states hold at once, the
+first of these wins (`Favicon.colourFor`):
 
-| LED | Lit | Meaning |
-|---|---|---|
-| top | green / yellow / red | the turn: working / compacting / an error (rate limited, not authed, api error, open elsewhere) |
-| top | grey | idle — only when no other LED is lit |
-| middle | purple | background tasks running (`bg_count`, so during a turn too) |
-| bottom | purple | a loop is scheduled (`wakeup_at`) |
-| all three | yellow | not connected: connecting, or disconnected and reconnecting |
-| all three | red | disconnected for good, or the server shut down |
+| Dot | Meaning |
+|---|---|
+| red | an error (rate limited, not authed, api error, open elsewhere), or disconnected for good / the server shut down |
+| yellow | compacting, or not connected: connecting, or disconnected and reconnecting |
+| green | working |
+| purple | background tasks running (`bg_count`, so during a turn too), or a loop scheduled (`wakeup_at`) |
+| grey | idle |
 
-One fact per LED came from a request: *"multiple lights should be able to show
-at once if it's doing two things at once… for example, compacting during
-bg-wait"*. The first version lit a single LED, chosen by priority, and put
-compacting on the middle LED beside bg-wait, so the two could never show
-together. Now compacting during bg-wait is top yellow plus middle purple, and
-a turn with a loop armed is green plus purple.
-
-Position still tells apart things that share a colour. The loop field is
-written in the bg-wait purple, so they get different LEDs.
-`--indicator-compacting` is `$yellow`, a theme token `styles.css` has no
-default for, so the theme always emits it. That makes compacting the same
-yellow as a dropped connection, which is why "not connected" lights all three
-LEDs rather than one: a single yellow would read as compacting. Nothing else
-about the session is known while disconnected anyway, and the status bar hides
-its loop field then too. Idle's grey appears only alone. A session waiting on
-background tasks or a loop is not idle, it is waiting on them.
+So a turn with background tasks running is green ("green takes precedence over
+purple", as asked), and compacting during bg-wait is yellow. The dot replaced
+a rack of three small LEDs, one fact each, which could show several states at
+once but could not be read at the size of a tab icon: *"the browser icons are
+hard to see the status lights in. change them to a dot showing red, green or
+yellow."* What the dot gives up is telling apart states that share a colour:
+compacting and a dropped connection are both yellow, and an error and a
+server that has gone are both red. The status bar still says which. The dot
+has a dark rim, so a pale colour stays visible on a pale tab strip.
 
 - **Colours are read, not copied.** `getComputedStyle` on the page's CSS
   variables resolves through `var()` chains (checked in Edge), so a theme that
-  changes `--green` changes the light. Only plain colour syntax is used; a
+  changes `--green` changes the dot. Only plain colour syntax is used; a
   theme value that is anything else falls back to the default theme's colour
   rather than being written into the SVG.
 - **The icon only changes when the state does.** Snapshots arrive every
   couple of seconds, and rewriting the `<link>` each time makes some browsers
   refetch it.
-- **A tab with no session shows the plain icon and keeps it.** `lobby.js`'s
-  `_setLanding` switches the icon off, and updates are ignored until the tab
-  attaches again. A lobby tab gets no status updates, so any light it showed
-  would be stale, including the yellow a socket drop would otherwise light
-  with nothing ever to clear it.
-- **`favicon.svg` is that same rack with every light off**, and
-  `favicon.test.js` checks it matches what the module draws, so the icon
-  doesn't change shape when a session attaches.
+- **A tab with no session shows the app's own icon and keeps it.** That is
+  `favicon.svg`, the rack, which is also what a tab shows before its session
+  attaches. `lobby.js`'s `_setLanding` switches back to it, and updates are
+  ignored until the tab attaches again. A lobby tab gets no status updates,
+  so any dot it showed would be stale, including the yellow a socket drop
+  would otherwise show with nothing ever to clear it.
 
 Limit: a background tab that the browser has *frozen* runs no script, so its
 icon catches up only when the tab is shown. A throttled tab still handles
 socket messages, and so still updates.
 
-Pinned by `tests/favicon.test.js` (31; each fact alone and in combination,
-grey only alone, the not-connected pattern, the colours that must not look
-alike, the theme, sanitising, rewrite suppression, the lobby) and seven tests
-in `reconnect_on_show.test.js` that drive the real page: status updates, two
-lights at once, a dropped socket, an exhausted reconnect, a closed session.
-Mutation targets are `favicon` (`favicon.js` × 24), `favicon-status` and
-`favicon-lobby` (the two wiring lines).
+Pinned by `tests/favicon.test.js` (26: each state alone, the precedence among
+them, not connected, the dot's size and rim, the theme, sanitising, rewrite
+suppression, the lobby) and seven tests in `reconnect_on_show.test.js` that
+drive the real page: status updates, green over purple, a dropped socket, an
+exhausted reconnect, a closed session. Mutation targets are `favicon`
+(`favicon.js` × 23), `favicon-status` and `favicon-lobby` (the two wiring
+lines).
 
 ### A sent prompt is tracked by id, not by "did anything come back"
 
@@ -3117,7 +3107,7 @@ ours:
   became `orchestrator2`, and the session and cwd fields became `--`. These
   updates are now marked `connection: true`, and `Status.update` stops after
   the state text for them. The session hasn't changed, only the connection to
-  it, and the favicon already shows the drop (all three LEDs yellow). The
+  it, and the favicon already shows the drop (a yellow dot). The
   title is also kept in `sessionStorage` per `rid`, so a tab the browser
   discards and reloads, or one refreshed, shows its name before the socket is
   back.

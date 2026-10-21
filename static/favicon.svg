@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
-  <!-- The rack with every light off: what a tab with no session shows.
-       static/favicon.js draws this same rack with one LED lit for the
-       session's state; tests/favicon.test.js keeps the two identical. -->
+  <!-- The app's icon: what a tab with no session shows (the lobby, or a
+       tab before its session attaches).  A tab viewing a session shows a
+       dot in the colour of the session's state instead (static/favicon.js). -->
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#2b3242"/>

@@ -1,36 +1,29 @@
 /* favicon.js — the browser tab's icon shows what its session is doing.
  *
- * The icon is the rack in static/favicon.svg, whose three LEDs are drawn off.
- * For a tab viewing a session, each LED stands for one thing, lit in the
- * colour the status bar writes it in, and they light independently -- a
- * session doing two things at once shows both:
+ * A tab viewing a session shows one dot filling the icon, so its state can be
+ * read from the tab strip at a glance.  It is in the colour the status bar
+ * writes the state in, and when several states hold at once the first of
+ * these wins:
  *
- *   top     the turn    green working, yellow compacting, red an error
- *                       (rate limited, not authed, api error, open elsewhere),
- *                       grey idle -- grey only when nothing else is lit
- *   middle  purple      background tasks running (bg-wait, or during a turn)
- *   bottom  purple      a loop is scheduled
+ *   red     an error (rate limited, not authed, api error, open elsewhere),
+ *           or disconnected for good / the server shut down
+ *   yellow  compacting, or not connected (connecting, or disconnected and
+ *           reconnecting)
+ *   green   working
+ *   purple  background tasks running, or a loop scheduled
+ *   grey    idle
  *
- * Asked for 2026-09-27: "multiple lights should be able to show at once if
- * it's doing two things at once that show lights. for example, compacting
- * during bg-wait."  Hence one fact per LED.
- *
- * Not connected -- connecting, or disconnected and reconnecting -- lights all
- * three yellow, and red once it has given up or the server shut down.  Nothing
- * else about the session is known then, and a single yellow would read as
- * compacting.
+ * So a turn with background tasks running is green, and compacting during
+ * bg-wait is yellow.
  *
  * Colours are read from the page's CSS variables rather than written in here,
- * so a light stays the colour of its text when the theme changes them.  A tab
- * with no session (the lobby) shows the plain icon, whatever happens.
+ * so the dot stays the colour of the state's text when the theme changes
+ * them.  A tab with no session (the lobby) shows the app's own icon,
+ * static/favicon.svg, whatever happens.
  */
 
 const Favicon = (() => {
   const DEFAULT_HREF = '/static/favicon.svg';
-
-  // Centre line of each rack unit's LED, top to bottom.
-  const ROWS = { top: 17, middle: 32, bottom: 47 };
-  const LED_X = 42;
 
   // The default theme's values, for a variable that does not resolve.
   const FALLBACK = {
@@ -43,33 +36,24 @@ const Favicon = (() => {
     '--system-error':         '#cd3131',
   };
 
-  let _key = null;        // what the icon shows now; null = the plain icon
+  let _key = null;        // the colour shown now; null = the app's icon
   let _landing = false;   // no session in this tab
 
-  function _all(cssVar) {
-    return { top: cssVar, middle: cssVar, bottom: cssVar };
-  }
-
-  /** Which LEDs a status snapshot lights: {top?, middle?, bottom?} -> the CSS
-   *  variable each is lit in.  Unlit LEDs are absent. */
-  function lightsFor(status) {
+  /** The CSS variable whose colour the dot shows for a status snapshot: the
+   *  first state in the order above that the snapshot holds. */
+  function colourFor(status) {
     const s = status || {};
     const cls = s.busy_class || 'idle';
-
-    // Not connected: nothing else is known.
-    if (cls === 'connecting')   return _all('--indicator-connecting');
-    if (cls === 'reconnecting') return _all('--system-warning');
-    if (cls === 'shutdown')     return _all('--system-error');
-
-    const lit = {};
-    if (cls === 'working')         lit.top = '--indicator-working';
-    else if (cls === 'compacting') lit.top = '--indicator-compacting';
-    else if (cls === 'error')      lit.top = '--system-error';
+    if (cls === 'error' || cls === 'shutdown') return '--system-error';
+    if (cls === 'reconnecting') return '--system-warning';
+    if (cls === 'connecting')   return '--indicator-connecting';
+    if (cls === 'compacting')   return '--indicator-compacting';
+    if (cls === 'working')      return '--indicator-working';
     // bg_count says so during a turn too; an older hub only says bg-wait.
-    if (s.bg_count > 0 || cls === 'bg-wait') lit.middle = '--indicator-bg-wait';
-    if (typeof s.wakeup_at === 'number')     lit.bottom = '--indicator-bg-wait';
-    if (!lit.top && !lit.middle && !lit.bottom) lit.top = '--indicator-idle';
-    return lit;
+    if (s.bg_count > 0 || cls === 'bg-wait' || typeof s.wakeup_at === 'number') {
+      return '--indicator-bg-wait';
+    }
+    return '--indicator-idle';
   }
 
   // Only plain colour syntax reaches the SVG.  The value comes from a theme
@@ -84,40 +68,12 @@ const Favicon = (() => {
     return COLOUR.test(v) ? v : FALLBACK[cssVar];
   }
 
-  /** The icon as SVG text.  *lit* maps a row to the colour its LED is lit in;
-   *  rows it leaves out are drawn off.  Null or {} is the plain icon. */
-  function svg(lit) {
-    const on = lit || {};
-    let leds = '';
-    for (const [name, y] of Object.entries(ROWS)) {
-      const colour = on[name];
-      if (colour) {
-        leds +=
-          `<circle cx="${LED_X}" cy="${y}" r="8" fill="${colour}" opacity=".35"/>` +
-          `<circle cx="${LED_X}" cy="${y}" r="4.6" fill="${colour}"/>` +
-          `<circle cx="${LED_X - 1.4}" cy="${y - 1.4}" r="1.5" fill="#fff" opacity=".6"/>`;
-      } else {
-        leds += `<circle cx="${LED_X}" cy="${y}" r="3.6" fill="#11151d"` +
-                ` stroke="#3d4759" stroke-width="1"/>`;
-      }
-    }
-    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">' +
-      '<defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">' +
-      '<stop offset="0" stop-color="#2b3242"/><stop offset="1" stop-color="#1a1f2b"/>' +
-      '</linearGradient></defs>' +
-      '<rect x="10" y="6" width="44" height="52" rx="6" fill="url(#bg)" stroke="#3d4759" stroke-width="2"/>' +
-      '<g fill="#232a38">' +
-      '<rect x="16" y="12" width="32" height="10" rx="2"/>' +
-      '<rect x="16" y="27" width="32" height="10" rx="2"/>' +
-      '<rect x="16" y="42" width="32" height="10" rx="2"/></g>' +
-      '<g fill="#4a5468">' +
-      '<rect x="20" y="15" width="14" height="1.6" rx="0.8"/>' +
-      '<rect x="20" y="18" width="14" height="1.6" rx="0.8"/>' +
-      '<rect x="20" y="30" width="14" height="1.6" rx="0.8"/>' +
-      '<rect x="20" y="33" width="14" height="1.6" rx="0.8"/>' +
-      '<rect x="20" y="45" width="14" height="1.6" rx="0.8"/>' +
-      '<rect x="20" y="48" width="14" height="1.6" rx="0.8"/></g>' +
-      leds + '</svg>';
+  /** The icon as SVG text: a dot in *colour*, as large as the icon allows.
+   *  Its dark rim keeps a pale colour visible on a pale tab strip. */
+  function svg(colour) {
+    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">'
+      + `<circle cx="32" cy="32" r="28" fill="${colour}"`
+      + ' stroke="#000" stroke-opacity=".35" stroke-width="4"/></svg>';
   }
 
   function _show(key, href) {
@@ -128,15 +84,11 @@ const Favicon = (() => {
     if (link) link.href = href;
   }
 
-  /** Light the LEDs for a status snapshot (called from Status.update). */
+  /** Show the dot for a status snapshot (called from Status.update). */
   function update(status) {
     if (_landing) return;
-    const lit = {};
-    for (const [row, cssVar] of Object.entries(lightsFor(status))) {
-      lit[row] = _resolve(cssVar);
-    }
-    const key = Object.keys(ROWS).map((r) => r + '=' + (lit[r] || '')).join(' ');
-    _show(key, 'data:image/svg+xml,' + encodeURIComponent(svg(lit)));
+    const colour = _resolve(colourFor(status));
+    _show(colour, 'data:image/svg+xml,' + encodeURIComponent(svg(colour)));
   }
 
   /** The tab has no session (on) or has one again (off). */
@@ -145,5 +97,5 @@ const Favicon = (() => {
     if (_landing) _show(null, DEFAULT_HREF);
   }
 
-  return { update, setLanding, lightsFor, svg };
+  return { update, setLanding, colourFor, svg };
 })();

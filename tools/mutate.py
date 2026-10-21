@@ -3419,71 +3419,63 @@ CLIQUEUE_CHAT_MUTATIONS = [
 
 # The tab's icon shows the session's state.  tests/favicon.test.js.
 FAVICON_MUTATIONS = [
-    ("working lights the wrong LED",
-     "    if (cls === 'working')         lit.top = '--indicator-working';",
-     "    if (cls === 'working')         lit.middle = '--indicator-working';"),
+    ("an error is not red",
+     "    if (cls === 'error' || cls === 'shutdown') return '--system-error';",
+     "    if (cls === 'shutdown') return '--system-error';"),
 
-    ("compacting is lit in working's green",
-     "    else if (cls === 'compacting') lit.top = '--indicator-compacting';",
-     "    else if (cls === 'compacting') lit.top = '--indicator-working';"),
-
-    ("compacting lights nothing",
-     "    else if (cls === 'compacting') lit.top",
-     "    else if (cls === 'compacting-no') lit.top"),
-
-    ("an error lights nothing",
-     "    else if (cls === 'error')      lit.top",
-     "    else if (cls === 'error-no')      lit.top"),
-
-    ("background tasks show only when idle -- compacting during bg-wait shows one light",
-     "    if (s.bg_count > 0 || cls === 'bg-wait') lit.middle",
-     "    if (cls === 'bg-wait') lit.middle"),
-
-    ("an older hub's bg-wait shows nothing",
-     "    if (s.bg_count > 0 || cls === 'bg-wait') lit.middle",
-     "    if (s.bg_count > 0) lit.middle"),
-
-    ("background tasks and the loop share a position",
-     "cls === 'bg-wait') lit.middle = '--indicator-bg-wait';",
-     "cls === 'bg-wait') lit.bottom = '--indicator-bg-wait';"),
-
-    ("a scheduled loop is never shown",
-     "    if (typeof s.wakeup_at === 'number')     lit.bottom",
-     "    if (false)     lit.bottom"),
-
-    ("idle's grey is lit beside another light",
-     "    if (!lit.top && !lit.middle && !lit.bottom) lit.top = '--indicator-idle';",
-     "    if (!lit.top) lit.top = '--indicator-idle';"),
-
-    ("idle lights nothing",
-     "    if (!lit.top && !lit.middle && !lit.bottom) lit.top = '--indicator-idle';\n",
-     ""),
-
-    ("a dropped connection lights one yellow, the same as compacting",
-     "    if (cls === 'reconnecting') return _all('--system-warning');",
-     "    if (cls === 'reconnecting') return { top: '--system-warning' };"),
+    ("giving up is not red",
+     "    if (cls === 'error' || cls === 'shutdown') return '--system-error';",
+     "    if (cls === 'error') return '--system-error';"),
 
     ("reconnecting is red, though its text is yellow",
-     "    if (cls === 'reconnecting') return _all('--system-warning');",
-     "    if (cls === 'reconnecting') return _all('--system-error');"),
+     "    if (cls === 'reconnecting') return '--system-warning';",
+     "    if (cls === 'reconnecting') return '--system-error';"),
 
     ("a dropped connection still shows what was last known",
-     "    if (cls === 'reconnecting') return _all('--system-warning');\n",
+     "    if (cls === 'reconnecting') return '--system-warning';\n",
      ""),
-
-    ("giving up is yellow, though its text is red",
-     "    if (cls === 'shutdown')     return _all('--system-error');",
-     "    if (cls === 'shutdown')     return _all('--system-warning');"),
 
     ("connecting reads as idle",
      "    if (cls === 'connecting')   return",
      "    if (cls === 'connecting-no')   return"),
 
+    ("compacting is green",
+     "    if (cls === 'compacting')   return '--indicator-compacting';",
+     "    if (cls === 'compacting')   return '--indicator-working';"),
+
+    ("compacting during bg-wait is purple",
+     "    if (cls === 'compacting')   return '--indicator-compacting';\n",
+     ""),
+
+    ("purple takes precedence over green",
+     "    if (cls === 'working')      return '--indicator-working';",
+     "    if (cls === 'working' && !(s.bg_count > 0)) return '--indicator-working';"),
+
+    ("working reads as idle",
+     "    if (cls === 'working')      return '--indicator-working';\n",
+     ""),
+
+    ("background tasks show only in bg-wait",
+     "    if (s.bg_count > 0 || cls === 'bg-wait' || typeof s.wakeup_at === 'number') {",
+     "    if (cls === 'bg-wait' || typeof s.wakeup_at === 'number') {"),
+
+    ("an older hub's bg-wait shows nothing",
+     "    if (s.bg_count > 0 || cls === 'bg-wait' || typeof s.wakeup_at === 'number') {",
+     "    if (s.bg_count > 0 || typeof s.wakeup_at === 'number') {"),
+
+    ("a scheduled loop is never shown",
+     "    if (s.bg_count > 0 || cls === 'bg-wait' || typeof s.wakeup_at === 'number') {",
+     "    if (s.bg_count > 0 || cls === 'bg-wait') {"),
+
+    ("idle is not grey",
+     "    return '--indicator-idle';",
+     "    return '--indicator-working';"),
+
     ("compacting has no colour when the theme gives none",
      "    '--indicator-compacting': '#e5e510',\n",
      ""),
 
-    ("the theme is ignored: the lights are always the default colours",
+    ("the theme is ignored: the dot is always the default colours",
      "    return COLOUR.test(v) ? v : FALLBACK[cssVar];",
      "    return FALLBACK[cssVar];"),
 
@@ -3491,27 +3483,31 @@ FAVICON_MUTATIONS = [
      "    return COLOUR.test(v) ? v : FALLBACK[cssVar];",
      "    return v || FALLBACK[cssVar];"),
 
+    ("the dot is a small one again",
+     "cx=\"32\" cy=\"32\" r=\"28\"",
+     "cx=\"32\" cy=\"32\" r=\"8\""),
+
+    ("a pale dot has no rim to stand out by",
+     " stroke=\"#000\" stroke-opacity=\".35\" stroke-width=\"4\"",
+     ""),
+
     ("the icon is rewritten on every status snapshot",
      "    if (key === _key) return;\n",
      ""),
 
-    ("a light going out does not change the icon",
-     "    const key = Object.keys(ROWS).map((r) => r + '=' + (lit[r] || '')).join(' ');",
-     "    const key = 'lit';"),
+    ("a new colour does not change the icon",
+     "    _show(colour, 'data:image/svg+xml,'",
+     "    _show('dot', 'data:image/svg+xml,'"),
 
-    ("lit LEDs are drawn off and off ones lit",
-     "      if (colour) {",
-     "      if (!colour) {"),
-
-    ("a tab with no session still lights up",
+    ("a tab with no session still shows a dot",
      "    if (_landing) return;\n",
      ""),
 
-    ("landing leaves the last session's light on",
+    ("landing leaves the last session's dot",
      "    if (_landing) _show(null, DEFAULT_HREF);",
      "    if (_landing) {}"),
 
-    ("a tab that attaches again stays dark",
+    ("a tab that attaches again keeps the app's icon",
      "    _landing = !!on;",
      "    _landing = _landing || !!on;"),
 ]
