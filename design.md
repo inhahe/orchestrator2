@@ -4742,18 +4742,21 @@ Now a run copies the project and works there:
   sweep was killed mid-mutation, so the source beside it may be a mutant. A
   run refuses to start until that is resolved.
 - **A mutant that would fail everywhere is not run:** a Python mutant that
-  does not parse, or that uses a name pyflakes finds undefined in it but not
-  in the original, fails every test that loads the file, so its being caught
-  proves nothing. It is reported as a survivor, with the reason. Eight of the
+  does not compile (compiled, not only parsed: a `break` outside a loop
+  parses), or that uses a name pyflakes finds undefined in it but not in the
+  original, fails every test that loads the file, so its being caught proves
+  nothing. It is reported as a survivor, with the reason. Eight of the
   project's own mutants were like that when this was added (2026-10-21), one
-  of them hiding an untested fallback. Without pyflakes only the parse check
-  runs, and the sweep says so. JavaScript mutants are not checked.
+  of them hiding an untested fallback. Without pyflakes only the compile check
+  runs, and the sweep says so. A target whose own source does not compile has
+  its mutants run unchecked, and the run goes on. JavaScript mutants are not
+  checked.
 
 The suite does not depend on which drive it runs from. One test did (it
 expected `D:` in a path Windows resolves against the *current* drive), and was
-fixed so that it could run from the copy. `tests/test_mutate_tool.py` (20)
+fixed so that it could run from the copy. `tests/test_mutate_tool.py` (22)
 drives the tool against small throwaway projects. Its mutation target,
-`mutate-tool` (23), sweeps the tool itself.
+`mutate-tool` (25), sweeps the tool itself.
 
 ---
 

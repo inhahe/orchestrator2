@@ -384,8 +384,7 @@ def test_python_compiles_each_run_from_the_source(mutate, tmp_path, monkeypatch)
 # --- mutants that would fail wherever they ran -------------------------------------
 #
 # Their catch says nothing about what they claim to break: a SyntaxError or a
-# NameError fails every test that loads the file.  Found 2026-10-21 in eight of
-# the project's own: six did not parse, two called a name nothing defined.
+# NameError fails every test that loads the file.
 
 def _sweep_one(mutate, tmp_path, monkeypatch, mutation, *, src="calc.py",
                text=None):
@@ -405,7 +404,36 @@ def test_a_mutant_that_does_not_parse_is_not_run(mutate, tmp_path, monkeypatch,
                       ("add is cut short", "    return a + b\n", "    return a +\n"))
     out = capsys.readouterr().out
     assert len(seen) == 1, "the mutant was run"
-    assert "survivor: one: add is cut short  [mutant does not parse" in out, out
+    assert "survivor: one: add is cut short  [mutant does not compile" in out, out
+
+
+def test_a_mutant_only_the_compiler_rejects_is_not_run(mutate, tmp_path,
+                                                       monkeypatch, capsys):
+    # It parses: 'break' outside a loop is the compiler's error.
+    seen = _sweep_one(mutate, tmp_path, monkeypatch,
+                      ("add stops early", "    return a + b\n", "    break\n"))
+    out = capsys.readouterr().out
+    assert len(seen) == 1, "the mutant was run"
+    assert "[mutant does not compile: 'break' outside loop" in out, out
+
+
+def test_a_target_that_does_not_compile_does_not_end_the_run(mutate, tmp_path,
+                                                             monkeypatch, capsys):
+    # Its tests passed without loading it, so its mutants run unchecked, and
+    # the targets after it still run.
+    project = _project(tmp_path / "proj")
+    (project / "broken.py").write_bytes(b"def broken(:\n    X = 1\n")
+    _target(mutate, monkeypatch, project, {
+        "broken": ("broken.py", "tests/test_calc.py",
+                   [("x moves", "    X = 1\n", "    X = 2\n")], "pytest"),
+        "calc": ("calc.py", "tests/test_calc.py", MUTATIONS[:1], "pytest"),
+    })
+    seen = _recorder(mutate, monkeypatch, "broken.py")
+    mutate.main(["mutate.py"])
+    out = capsys.readouterr().out
+    assert "broken.py does not compile" in out, out
+    assert "=== calc:" in out, "the run ended at the target that does not compile"
+    assert len(seen) == 4, "a mutant was not run"
 
 
 def test_a_mutant_naming_something_undefined_is_not_run(mutate, tmp_path,

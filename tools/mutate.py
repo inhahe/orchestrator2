@@ -93,6 +93,12 @@ compiles the source as it stands (see ``run``).  A <source>.mutbak left in the
 project is from the old in-place sweep killed mid-mutation, and the source
 beside it may still be a mutant; a run refuses to start until it is dealt
 with.
+
+**A Python mutant that would fail everywhere is not run.**  One that does not
+compile, or that uses a name pyflakes finds undefined in it but not in the
+original, fails every test that loads the file, so its being caught would
+prove nothing about what it claims to break.  It is reported as a survivor,
+with the reason (``_fails_everywhere``).
 """
 import ast
 import importlib.util
@@ -5750,9 +5756,19 @@ MUTATE_TOOL_MUTATIONS = [
      "            why = _fails_everywhere(mutant, src_rel, undefined) if py else None\n",
      "            why = None\n"),
 
-    ("a mutant that does not parse is run like any other",
-     '        return f"mutant does not parse: {exc.msg}, line {exc.lineno}"\n',
+    ("a mutant that does not compile is run like any other",
+     '        return f"mutant does not compile: {exc.msg}, line {exc.lineno}"\n',
      "        return None\n"),
+
+    ("a mutant only the compiler rejects (a break outside a loop) is run",
+     '    compile(tree, filename, "exec")\n',
+     ""),
+
+    ("a target that does not compile ends the whole run",
+     "                  \"so its mutants are run unchecked\")\n"
+     "            py = False\n",
+     "                  \"so its mutants are run unchecked\")\n"
+     "            raise\n"),
 
     ("a mutant naming something undefined is run like any other",
      "    return f\"mutant names undefined {', '.join(new)}\" if new else None\n",
@@ -8114,10 +8130,10 @@ def run(runner: str, test_rel: str, root: Path, timeout: float = 300.0, *,
     """True only if the suite *passed*.  A mutant that makes it hang has not
     survived -- it just failed slowly, so a timeout is a False, not a stall.
 
-    A mutant that makes the source unimportable is also caught: pytest exits
-    non-zero on a collection error, which is what a syntax-breaking mutation
-    produces.  That is a weaker kill than a failing assertion, so the mutations
-    above are written to stay syntactically valid wherever they can be.
+    A JavaScript mutant that does not parse fails here too, which counts as
+    a catch though it proves nothing; a Python one never gets here
+    (``_fails_everywhere``).  So the mutations above are written to stay
+    valid code.
 
     Python runs with PYTHONDONTWRITEBYTECODE.  The copy has no __pycache__ and
     none is written, so each run compiles the source as it stands.  Python
@@ -8154,15 +8170,24 @@ def _print_safely(text: str) -> None:
 
 def _undefined_names(text: str, filename: str) -> set[str] | None:
     """The names Python source *text* uses but never defines, per pyflakes,
-    or None when pyflakes is not installed.  Raises SyntaxError when *text*
-    does not parse."""
+    or None when that was not checked: pyflakes is not installed, or failed.
+
+    Raises SyntaxError when *text* does not compile.  Compiled, not only
+    parsed: a ``break`` outside a loop, a ``return`` outside a function and
+    the like parse, and fail only in the compiler.
+    """
     tree = ast.parse(text, filename)
+    compile(tree, filename, "exec")
     try:
         from pyflakes import checker, messages
     except ImportError:
         return None
-    return {m.message_args[0]
-            for m in checker.Checker(tree, filename=filename).messages
+    try:
+        found = checker.Checker(tree, filename=filename).messages
+    except Exception as exc:              # its bug, not the mutant's
+        print(f"    pyflakes failed on {filename} ({exc!r}); not checked")
+        return None
+    return {m.message_args[0] for m in found
             if isinstance(m, messages.UndefinedName)}
 
 
@@ -8179,7 +8204,7 @@ def _fails_everywhere(mutant: str, filename: str,
     try:
         now = _undefined_names(mutant, filename)
     except SyntaxError as exc:
-        return f"mutant does not parse: {exc.msg}, line {exc.lineno}"
+        return f"mutant does not compile: {exc.msg}, line {exc.lineno}"
     new = sorted((now or set()) - (undefined or set()))
     return f"mutant names undefined {', '.join(new)}" if new else None
 
@@ -8198,13 +8223,22 @@ def sweep(label: str, src_rel: str, test_rel: str, mutations,
     crlf = b"\r\n" in raw
     # Anchors are written with \n, so match against the text the same way.
     original = raw.decode("utf-8").replace("\r\n", "\n")
-    py = src_rel.endswith(".py")
-    undefined = _undefined_names(original, src_rel) if py else None
 
     print(f"\n=== {label}: {src_rel} x {test_rel} ===")
     if not run(runner, test_rel, root, show_failure=True):
         print("BASELINE FAILS -- fix that first")
         return ["<baseline failure>"]
+    py = src_rel.endswith(".py")
+    undefined = None
+    if py:
+        try:
+            undefined = _undefined_names(original, src_rel)
+        except SyntaxError as exc:
+            # Its tests passed without compiling it, so nothing can tell a
+            # mutant that does not compile from one that does.
+            print(f"{src_rel} does not compile ({exc.msg}, line {exc.lineno}), "
+                  "so its mutants are run unchecked")
+            py = False
 
     survivors = []
     try:
