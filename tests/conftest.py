@@ -10,9 +10,10 @@ what made every session opened in this directory refuse an identity.  Tests
 that want a registry get their own via ``ORCH2_AGENT_DB``; this makes that the
 default rather than something each file has to remember.
 
-**No test inherits a name from the developer's shell** (``ORCH2_AGENT_NAME``,
-``CLAUDE_CODE_SESSION_NAME``): ``parse_args`` consumes the first, and a
-session running this suite from its Bash tool carries the second.
+**No test inherits a name or a compaction from the developer's shell**
+(``ORCH2_AGENT_NAME``, ``CLAUDE_CODE_SESSION_NAME``,
+``config.CLI_COMPACTION_VARS``): ``parse_args`` consumes the first, and a
+session running this suite from its Bash tool carries the others.
 
 **No test inherits another's account.**  ``account.adopt_from_environment``
 makes the process's account module state and takes ``CLAUDE_CONFIG_DIR`` out
@@ -39,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import account  # noqa: E402
 import session  # noqa: E402
+from config import CLI_COMPACTION_VARS  # noqa: E402
 import wakeup_store  # noqa: E402
 
 
@@ -49,6 +51,8 @@ def _private_agent_registry(monkeypatch, tmp_path_factory):
         str(tmp_path_factory.mktemp("agent-registry") / "agents.db"))
     monkeypatch.delenv("ORCH2_AGENT_NAME", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_SESSION_NAME", raising=False)
+    for var in CLI_COMPACTION_VARS:
+        monkeypatch.delenv(var, raising=False)
 
 
 _SUITE_ACCOUNT = os.environ.get("CLAUDE_CONFIG_DIR")

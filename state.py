@@ -107,51 +107,20 @@ def _get(obj: Any, key: str, default: int = 0) -> int:
     return val if isinstance(val, (int, float)) else default
 
 
-def extract_context_tokens(
-    usage: dict[str, Any] | None,
-    model_usage: dict[str, Any] | None,
-) -> int:
-    """Sum input + cache_read + cache_creation tokens.
+def call_context_tokens(usage: dict[str, Any] | None) -> int:
+    """The size of the context one API call was sent, from that call's
+    *usage* (an ``AssistantMessage``'s): its input tokens, cached or not.
+    0 for a message no call produced (the CLI's own, which carry zeros).
 
-    The SDK may provide data in ``usage`` (snake_case or camelCase) or in
-    ``model_usage`` (keyed by model name, camelCase values).  Try all
-    shapes and return the first non-zero total found.
-
-    Handles both plain dicts and SDK Pydantic-style objects.
+    Not a ``ResultMessage``'s: the CLI adds every call of the turn into that
+    one, so it grows with the number of calls, not with the context.  It is
+    also the count the CLI compacts by.
     """
-    if usage is not None:
-        # Try snake_case first (Anthropic API native).
-        total = (
-            _get(usage, "input_tokens")
+    if not usage:
+        return 0
+    return (_get(usage, "input_tokens")
             + _get(usage, "cache_read_input_tokens")
-            + _get(usage, "cache_creation_input_tokens")
-        )
-        if total:
-            return total
-        # Try camelCase (CLI / SDK wrapper).
-        total = (
-            _get(usage, "inputTokens")
-            + _get(usage, "cacheReadInputTokens")
-            + _get(usage, "cacheCreationInputTokens")
-        )
-        if total:
-            return total
-    if model_usage is not None:
-        values = (
-            model_usage.values()
-            if isinstance(model_usage, dict)
-            else []
-        )
-        total = 0
-        for mu in values:
-            total += (
-                _get(mu, "inputTokens")
-                + _get(mu, "cacheReadInputTokens")
-                + _get(mu, "cacheCreationInputTokens")
-            )
-        if total:
-            return total
-    return 0
+            + _get(usage, "cache_creation_input_tokens"))
 
 
 def humanize_size(text: str) -> str:
@@ -662,7 +631,9 @@ class State:
     # otherwise -- the two registries name sessions independently.
     agent_registry_name: str | None = None
 
-    # Metrics
+    # Metrics.  The context as the main thread's latest API call saw it
+    # (call_context_tokens): 0 until the first one, and again after a
+    # compaction, until the next.
     context_tokens: int = 0
     # The session's cost: the CLI's running total, plus what the CLIs before
     # it spent that it does not count (take_cost, carry_cost).  The mark is
@@ -724,9 +695,7 @@ class State:
 
     # Turn/compact state
     last_result_subtype: str | None = None
-    last_compact_trigger: str | None = None
     compact_during_last_turn: bool = False
-    last_compact_turn: int | None = None
     # A compact-induced ResultMessage suppresses run_turn's turn_end on the
     # assumption that a post-compact ghost turn will own it.  When no ghost
     # turn follows (the turn genuinely ended at compaction), this holds the

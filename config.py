@@ -240,6 +240,53 @@ def default_compact_at(model: str | None) -> int:
     return DEFAULT_COMPACT_THRESHOLD
 
 
+# How the CLI turns its auto-compact settings into a threshold, read from
+# Claude Code 2.1.280.  It fires when the context reaches
+#
+#     W - CLI_SUMMARY_RESERVE - CLI_COMPACT_BUFFER
+#
+# where W is ``CLAUDE_CODE_AUTO_COMPACT_WINDOW`` (accepted from
+# CLI_WINDOW_MIN to CLI_WINDOW_MAX, and capped at the model's own window).
+# The reserve is the room it keeps for the summary's output (less only for a
+# model whose output limit is lower, which no current model's is).
+# ``CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`` can only lower the threshold, to that
+# percentage of ``W - CLI_SUMMARY_RESERVE``.
+CLI_SUMMARY_RESERVE = 20_000
+CLI_COMPACT_BUFFER = 13_000
+CLI_WINDOW_MIN = 100_000
+CLI_WINDOW_MAX = 1_000_000
+# The variables compaction_env sets.  A session that does not set them must
+# not inherit them either: see SDKBridge._make_options.
+CLI_COMPACTION_VARS = ("CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+                       "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")
+
+
+def compaction_env(compact_at: int, auto_compact: bool) -> dict[str, str]:
+    """The environment that makes a session's CLI compact at *compact_at*
+    context tokens, or, with *auto_compact* False, nothing: the CLI then
+    compacts at its own default, near the end of the model's window.
+
+    Exact up to ``CLI_WINDOW_MAX - CLI_SUMMARY_RESERVE - CLI_COMPACT_BUFFER``
+    (967k); above it, the CLI fires at 967k.  Below ``CLI_WINDOW_MIN`` less
+    the same (67k), the smallest window is still too large, and the
+    percentage override lowers the threshold the rest of the way.  A model
+    whose window is smaller than the one asked for compacts at its own
+    window's threshold, as it would without orchestrator2.
+    """
+    if not auto_compact:
+        return {}
+    window = compact_at + CLI_SUMMARY_RESERVE + CLI_COMPACT_BUFFER
+    window = max(CLI_WINDOW_MIN, min(window, CLI_WINDOW_MAX))
+    env = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(window)}
+    if window - CLI_SUMMARY_RESERVE - CLI_COMPACT_BUFFER > compact_at:
+        # The CLI takes floor(effective * pct / 100): half a token over, so
+        # that the rounding of the percentage cannot land it one below.
+        effective = window - CLI_SUMMARY_RESERVE
+        env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = repr(
+            100 * (compact_at + 0.5) / effective)
+    return env
+
+
 # ---------------------------------------------------------------------------
 # Live model list (Anthropic /v1/models) with hardcoded fallback
 # ---------------------------------------------------------------------------
@@ -501,10 +548,8 @@ class Config:
     allowed_tools: list[str] = field(default_factory=list)
     disallowed_tools: list[str] = field(default_factory=list)
 
-    # Context / compaction
+    # Context / compaction.  The CLI does the compacting: see compaction_env.
     compact_at: int = DEFAULT_COMPACT_THRESHOLD
-    no_compact: bool = True            # True = orchestrator auto-compact disabled
-    compact_cooldown_turns: int = 3
     max_context_tokens: int = 0        # 0 = disabled
     auto_compact: bool = False
     # Whether --compact-at, and --auto-compact or --no-compact, were given on
@@ -760,8 +805,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
         type=_positive_int,
         default=None,
         help=(
-            f"Force /compact when context tokens exceed this. Default derived "
-            f"from model: {DEFAULT_COMPACT_THRESHOLD_1M} for 1M-context, "
+            f"With --auto-compact, the CLI compacts when the context reaches "
+            f"this many tokens. Default derived from model: "
+            f"{DEFAULT_COMPACT_THRESHOLD_1M} for 1M-context, "
             f"{DEFAULT_COMPACT_THRESHOLD} otherwise."
         ),
     )
@@ -774,20 +820,15 @@ def parse_args(argv: list[str] | None = None) -> Config:
         # Set here, on the first action with this dest: argparse takes the
         # default from that one.
         default=None,
-        help="Enable the orchestrator's auto-compact check (off by default).",
+        help="Have the CLI compact at --compact-at (off by default).",
     )
     ap.add_argument(
         "--no-compact",
         dest="no_compact",
         action="store_true",
         default=None,
-        help="(Default.) Disable the orchestrator's auto-compact entirely.",
-    )
-    ap.add_argument(
-        "--compact-cooldown-turns",
-        type=int,
-        default=3,
-        help="After auto-compact, skip compact check for this many turns. Default 3.",
+        help="(Default.) Leave the CLI to compact at its own default, near "
+             "the end of the model's context window.",
     )
     ap.add_argument(
         "--max-context-tokens",
@@ -1226,11 +1267,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
         allowed_tools=list(args.allowed_tool),
         disallowed_tools=list(args.disallowed_tool),
         compact_at=compact_at,
-        no_compact=no_compact,
         auto_compact=not no_compact,
         compact_at_given=args.compact_at is not None,
         auto_compact_given=args.no_compact is not None,
-        compact_cooldown_turns=args.compact_cooldown_turns,
         max_context_tokens=args.max_context_tokens,
         status_url=args.status_url,
         show_thinking=args.show_thinking,

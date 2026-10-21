@@ -1,40 +1,54 @@
 # Known issues / tech debt — orchestrator2
 
-## The context count is a running total, so `--auto-compact` compacts every few turns — OPEN (found 2026-10-21)
+## The context count was a running total, so `--auto-compact` compacted every few turns — FIXED (2026-10-21)
 
-`state.context_tokens` is taken from `ResultMessage.usage` (falling back to
+`state.context_tokens` was taken from `ResultMessage.usage` (falling back to
 `model_usage`) by `extract_context_tokens` (state.py), at sdk_bridge.py's two
 `ResultMessage` handlers. The CLI builds that `usage` by adding up every API
 call's usage (`accumulateUsage` on each `message_stop`, QueryEngine.ts in
 claude-code-mod); `model_usage` is a total for the whole session. The figure
-grows with the number of API calls, not with the size of the context. The
-log's `compact_boundary received: ... pre_tokens=` shows that figure (see
+grew with the number of API calls, not with the size of the context. The
+log's `compact_boundary received: ... pre_tokens=` showed that figure (see
 below) and reached 110,583,841 on 2026-10-20, far beyond any context window.
 
 Consequence: with `--auto-compact --compact-at 300000`, as the SlateOS lanes
-run, the count passes the threshold after nearly every turn. The check near
-the end of the turn loop in sdk_bridge.py then sends `/compact` every
-`compact_cooldown_turns + 1` turns, however small the context really is. The
-CLI's own auto-compact still runs at its default threshold too.
+ran from 2026-10-12, the count passed the threshold after nearly every turn.
+The check near the end of the turn loop then sent `/compact` every
+`compact_cooldown_turns + 1` (4) turns, however small the context really was.
+The `--max-context-tokens` trim read the same count, and the status bar showed
+it. The CLI's own auto-compact still ran at its default threshold too.
 
-A second bug in the same place: the `compact_boundary` handler reads
+A second bug in the same place: the `compact_boundary` handler read
 `msg.compact_metadata`, but the SDK's `SystemMessage` has only `subtype` and
-`data`, so the metadata is never found. Every boundary is logged and shown as
+`data`, so the metadata was never found. Every boundary was logged and shown as
 `trigger=sdk`, with orchestrator2's own count in place of the CLI's
 `pre_tokens`.
 
-Proper fix: let the CLI do the compacting. Set `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
-to compact_at + 33,000 in the CLI's environment. The CLI fires at the window
-minus the 20k it reserves for the summary and a 13k buffer; it accepts
-100k–1M. For a compact_at below 67k, add `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`.
-Then remove orchestrator2's own check and cooldown. Changing the threshold
-mid-session then needs a CLI restart, since the environment is fixed when the
-CLI starts. Take the displayed count from the last `AssistantMessage.usage`
-(per call) or `ClaudeSDKClient.get_context_usage()`, which also returns the
-CLI's `autoCompactThreshold`. Read `msg.data["compact_metadata"]` for the
-boundary. Note that CLI 2.1.280 has an `/autocompact` command of its own,
-which writes the `autoCompactWindow` setting; orchestrator2's `/autocompact`
-shadows it.
+> "Want me to make that change?" — "yes"
+
+Fixed by letting the CLI do the compacting (design.md, *The CLI does the
+compacting*). A session with auto-compact on starts its CLI with
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` = compact_at + 33,000, plus
+`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` below 67k (`config.compaction_env`). A
+change restarts the CLI, after any running background tasks. orchestrator2's
+own check, its cooldown and `--compact-cooldown-turns` are gone. The count is
+now the main thread's latest API call's input (`state.call_context_tokens`),
+and the boundary reads `msg.data["compact_metadata"]`.
+`tests/test_cli_compaction.py`; mutation target `compaction-bridge`.
+
+Checked against the real CLI 2.1.280 the same day.
+`ClaudeSDKClient.get_context_usage()` reported `autoCompactThreshold` 300,000,
+160,000 and 950,000 for those thresholds, and 967,000 for anything above.
+Below 67k it reports 67,000, because that report leaves out the percentage
+override, but the trigger applies it. Run with `--debug-to-stderr` on Haiku
+with a threshold of 40,000, the CLI logged `autocompact: ... level=compact`
+once the context passed 40k, and compacted (`trigger: auto`) every second
+turn after that.
+
+Still to know: the constants are Claude Code 2.1.280's. If a later CLI changes
+its formula, the threshold drifts silently. `get_context_usage()` is the way
+to check, within the limit above. It costs count-tokens API calls, so nothing
+calls it routinely.
 
 ## A launch that did not choose its session renamed it — FIXED (2026-10-21)
 

@@ -185,14 +185,17 @@ compaction of the session the launch opens or lands on, overriding a
 session already open takes them on its state, where `/autocompact` puts them,
 never on its `Config`, which for the hub's own session is the hub's. Like the
 name, they are never inherited from the hub's launch: a session opened without
-them gets its own model's default threshold and no orchestrator compaction.
+them gets its own model's default threshold with auto-compact off, which
+leaves the CLI to compact at its own default.
 `/move` carries them. A session's own settings -- a launch's or a
 `/autocompact`'s -- live on its State (`_compact_at`, `_auto_compact`), over
 its Config's defaults, and are kept by session id in
 `<account>/orchestrator2/compaction/<id>.json` (`session.save_session_compaction`).
 The first time a State is given an id, `_sync_session_compaction` merges the two
-(the State's winning) onto the State and into the record, off the event loop;
-the bridge reports the id every turn, so it is once per id, not per turn. After
+(the State's winning) onto the State and into the record, off the event loop:
+before the CLI that resumes the id starts (the bridge's `sync_compaction` hook,
+awaited in `connect`), or when a new CLI names a new session. The bridge reports
+the id every turn, so it is once per id, not per turn. After
 that, a launch onto the session or `/autocompact` rewrites the record from the
 State. So a session reopened without its launch -- from the session list,
 revived by a hub restart, after a reboot -- keeps them; a launch that gives
@@ -202,6 +205,33 @@ record speaks for it. The hub's own launch is its own session's: `/resume` and
 `/cwd` in its tab put the next session on that session's record, else the
 defaults. Ending a session's earlier compaction therefore takes `--no-compact`
 (or `/autocompact off`), not just dropping the flags.
+
+**The CLI does the compacting; orchestrator2 only tells it where.** A session
+with auto-compact on starts its CLI with `CLAUDE_CODE_AUTO_COMPACT_WINDOW` set
+to the threshold plus 33k, the room the CLI keeps below its window: 20k for the
+summary's output and a 13k buffer. Below 67k, the smallest window the CLI
+accepts (100k) is too large, and `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` lowers the
+threshold to the exact value (`config.compaction_env`, whose constants are
+Claude Code 2.1.280's). A session with it off gets neither variable, and
+`_make_options` removes them from the hub's own environment, as it does the
+session name, so none is inherited from whatever started the hub. The CLI
+counts the context from each API response, before every call, so it compacts
+mid-turn too. The CLI reads the variables only when it starts, so a change
+reaches it as a new CLI: `/autocompact` (in `server.py`, after
+`try_immediate_command`) and a launch onto an open session put
+`("compaction", "")` on the bridge's event queue. The worker reconnects through
+`_reconnect_or_defer`, only if `_compaction_changed`: the variables differ from
+`_cli_compaction_env`, which is what `connect` started the CLI with.
+
+Until 2026-10-21 orchestrator2 compacted by itself, sending `/compact` between
+turns when `state.context_tokens` passed the threshold. That count was the
+`ResultMessage`'s usage, which the CLI sums over every API call of the turn.
+It reached 110 million on a 1M-token model, so a session with
+`--compact-at 300000` compacted every fourth turn, whatever its size.
+`state.context_tokens` is now the input of the main thread's latest API call
+(`state.call_context_tokens`, taken in `_message_dispatcher` from each
+`AssistantMessage` without a `parent_tool_use_id`); the status bar and the
+`--max-context-tokens` trim read it.
 
 **The hub can refuse a launch** (`"refused": true` in its answer, raised as
 `LaunchRefused` by `_launch_into_hub`), and that stops the launch with an

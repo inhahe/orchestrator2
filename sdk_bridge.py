@@ -89,19 +89,19 @@ from config import (
     WAKEUP_MIN_DELAY,
     WAKEUP_RESOLVED_PROMPT,
     WAKEUP_SENTINELS,
+    CLI_COMPACTION_VARS,
     Config,
-    default_compact_at,
-    model_context_window,
+    compaction_env,
 )
 from state import (
     State,
     addressable_name,
     apply_api_key_source,
     apply_rate_limit_info,
+    call_context_tokens,
     carry_cost,
     cli_bills_key,
     detect_account_info,
-    extract_context_tokens,
     fmt_duration,
     fmt_tok,
     forget_cost,
@@ -892,6 +892,14 @@ class SDKBridge:
         # runs on: the hub remembers the session's API key under the id from
         # that moment (see _take_session_id).
         self.on_session_id: Callable[[str, Config], None] | None = None
+        # Asked, with the Config, about the session a connect is about to
+        # resume, before its CLI starts: returns once the State holds that
+        # session's kept compaction, which the CLI takes from its environment.
+        self.sync_compaction: Callable[[str, Config], Awaitable[None]] | None = None
+        # The compaction variables the running CLI was started with
+        # (connect); compared with the session's own to tell whether a
+        # change needs a new CLI (_compaction_changed).
+        self._cli_compaction_env: dict[str, str] | None = None
         # Told an effort level the CLI refused (_effort_refused), so the hub
         # can drop it from the Config the session is rebuilt from.
         self.on_effort_refused: Callable[[str], None] | None = None
@@ -1184,6 +1192,28 @@ class SDKBridge:
             return self.state.session_id
         return None
 
+    def _compaction(self) -> tuple[int, bool]:
+        """(threshold, on): the session's own compaction -- a launch's or
+        ``/autocompact``'s, on the State -- else its Config's defaults."""
+        return (getattr(self.state, "_compact_at", self.config.compact_at),
+                getattr(self.state, "_auto_compact", self.config.auto_compact))
+
+    def _compaction_env(self) -> dict[str, str]:
+        """The environment that gives the session's CLI its compaction."""
+        return compaction_env(*self._compaction())
+
+    def _compaction_changed(self) -> bool:
+        """Whether the session's compaction is not what its CLI started with,
+        so that only a new CLI would have it.  False before the first CLI,
+        which will start with it anyway."""
+        return (self._cli_compaction_env is not None
+                and self._compaction_env() != self._cli_compaction_env)
+
+    def _compaction_label(self) -> str:
+        """How a reconnect for the session's compaction names itself."""
+        at, on = self._compaction()
+        return f"auto-compact → at {fmt_tok(at)}" if on else "auto-compact → off"
+
     def _make_options(self, resume_id: str | None = None, *,
                       recovering: bool = False) -> ClaudeAgentOptions:
         """Build ``ClaudeAgentOptions`` from config + state.
@@ -1247,6 +1277,18 @@ class SDKBridge:
         # 1h↔5m TTL flip can't produce the "must not come after" API 400.
         if getattr(self.config, "disable_prompt_cache", False):
             kwargs["env"]["DISABLE_PROMPT_CACHING"] = "1"
+
+        # The session's compaction, which the CLI does itself: it reads the
+        # threshold from its environment, and counts the context from each
+        # API response, before every call.  None of the variables when the
+        # session leaves it to the CLI's default -- and none inherited
+        # either, like the name above: a hub started from a session's Bash
+        # tool would otherwise hand that session's threshold to all of its
+        # sessions.  A threshold for every session is set in settings.json
+        # (``autoCompactWindow``), which reaches the CLI however it starts.
+        kwargs["env"].update(self._compaction_env())
+        for var in CLI_COMPACTION_VARS:
+            os.environ.pop(var, None)
 
         # A turn that was cut off mid-flight: finish it, or wait?
         #
@@ -1482,15 +1524,27 @@ class SDKBridge:
                 log.info("session %s keeps its name %r", target[:8], remembered)
             if remembered_labels and not self.state.agent_labels:
                 self.state.agent_labels = dict(remembered_labels)
+        # And its compaction, which the CLI takes from its environment, so it
+        # must be on the State before the CLI starts, not when the CLI names
+        # the session.
+        if target and self.sync_compaction is not None:
+            try:
+                await self.sync_compaction(target, self.config)
+            except Exception:
+                log.warning("could not look up the session's compaction",
+                            exc_info=True)
         options = self._make_options(resume_id, recovering=recovering)
+        self._cli_compaction_env = {
+            k: v for k, v in options.env.items() if k in CLI_COMPACTION_VARS}
         resume_sid = getattr(options, "resume", None)
         log.info(
-            "connect: resume=%s, cwd=%s%s",
+            "connect: resume=%s, cwd=%s%s, compaction=%s",
             getattr(options, 'resume', None),
             getattr(options, 'cwd', None),
             "" if not resume_sid else (
                 ", a cut-off turn is finished" if self._finishing_cut_off_turn
                 else ", a cut-off turn waits"),
+            self._cli_compaction_env or "the CLI's default",
         )
         # NOT consumed here.  It used to be cleared right after building the
         # options ("one-time use"), which meant a first connect that *failed*
@@ -3051,6 +3105,17 @@ class SDKBridge:
     # Message dispatcher
     # ------------------------------------------------------------------
 
+    def _note_context(self, msg: Any) -> None:
+        """Take the session's context size from assistant message *msg*: the
+        input of the API call that produced it.  Every message of a turn
+        passes here, whichever path then renders it.  Not a subagent's, whose
+        context is its own."""
+        if getattr(msg, "parent_tool_use_id", None) is not None:
+            return
+        tokens = call_context_tokens(getattr(msg, "usage", None))
+        if tokens:
+            self.state.context_tokens = tokens
+
     async def _message_dispatcher(self, *, gen: int) -> None:
         """Read SDK messages and route to turn queue or async handler.
 
@@ -3092,6 +3157,8 @@ class SDKBridge:
                         type(msg).__name__, active,
                     )
                     break
+                if isinstance(msg, AssistantMessage):
+                    self._note_context(msg)
                 if active:
                     await self.turn_msg_queue.put(msg)
                 else:
@@ -3327,9 +3394,6 @@ class SDKBridge:
                 state.last_usage = raw_usage
             elif isinstance(raw_model_usage, dict):
                 state.last_usage = raw_model_usage
-            ctx = extract_context_tokens(raw_usage, raw_model_usage)
-            if ctx:
-                state.context_tokens = ctx
             take_cost(state, msg)
             await self._keep_cost()
             subtype = getattr(msg, "subtype", None) or "unknown"
@@ -4448,11 +4512,14 @@ class SDKBridge:
             await self.broadcast({"type": "bg_started", **data})
 
         elif subtype == "compact_boundary":
-            meta = getattr(msg, "compact_metadata", None) or {}
-            trigger = meta.get("trigger", "sdk")
-            pre_tokens = meta.get("pre_tokens", 0) or state.context_tokens
+            # The SDK hands over the CLI's whole message as ``data``: the
+            # metadata is in it, not an attribute of its own.  ``trigger`` is
+            # "auto" or "manual" (a /compact), and ``pre_tokens`` the CLI's
+            # own count of the context it compacted.
+            meta = (getattr(msg, "data", None) or {}).get("compact_metadata") or {}
+            trigger = meta.get("trigger") or "?"
+            pre_tokens = meta.get("pre_tokens") or state.context_tokens
             state.compact_during_last_turn = True
-            state.last_compact_trigger = trigger
             log.warning(
                 "compact_boundary received: trigger=%s pre_tokens=%s during_turn=%s",
                 trigger, pre_tokens, during_turn,
@@ -5219,9 +5286,6 @@ class SDKBridge:
                             state.last_usage = raw_usage
                         elif isinstance(raw_model_usage, dict):
                             state.last_usage = raw_model_usage
-                        ctx = extract_context_tokens(raw_usage, raw_model_usage)
-                        if ctx:
-                            state.context_tokens = ctx
 
                     log.info(
                         "run_turn ResultMessage: subtype=%s compact=%s "
@@ -6202,6 +6266,12 @@ class SDKBridge:
                     "type": "system_msg", "subtype": "info",
                     "data": {"message": f"thinking → {'on' if state.thinking_enabled else 'off'}"},
                 })
+            elif kind == "compaction":
+                # /autocompact, or a launch onto this session, changed it
+                # during the turn; the state already has it.
+                if self._compaction_changed():
+                    reconnect_needed = True
+                    reconnect_reason = self._compaction_label()
             elif kind == "clear-context":
                 await self._clear_context()
                 return await self._await_next_prompt()
@@ -6287,9 +6357,8 @@ class SDKBridge:
             # ResultMessage wins and the normal path drains the queue.  Same
             # keypress, two outcomes — hence draining here too.
             #
-            # We deliberately do *not* fall through to the auto-continue /
-            # compaction logic further down: an interrupted turn must never
-            # auto-resume.
+            # We deliberately do *not* fall through to the logic further
+            # down: an interrupted turn must never auto-resume.
             prompt = await self._pop_queued_prompt()
             if prompt is not None:
                 return prompt
@@ -6338,24 +6407,6 @@ class SDKBridge:
                     "data": {"message": f"Context trimmed → session {new_sid[:8]}"},
                 })
 
-        # --- Auto-compact check ---
-        compact_at = getattr(state, "_compact_at", config.compact_at)
-        auto_compact = getattr(state, "_auto_compact", config.auto_compact)
-        if (
-            auto_compact
-            and state.context_tokens >= compact_at
-            and (
-                state.last_compact_turn is None
-                or state.turns - state.last_compact_turn > config.compact_cooldown_turns
-            )
-        ):
-            state.last_compact_turn = state.turns
-            await self.broadcast({
-                "type": "system_msg", "subtype": "info",
-                "data": {"message": f"Auto-compacting (ctx {fmt_tok(state.context_tokens)} >= {fmt_tok(compact_at)})..."},
-            })
-            return "/compact"
-
         # --- Background tasks running → wait ---
         if self._active_bg_tasks():
             if state.needs_user_attention != "api-error":
@@ -6399,9 +6450,11 @@ class SDKBridge:
 
         Covers the commands the user can fire while idle — before the first
         turn *or* parked between turns: ``/model``, ``/effort``, ``/thinking``,
-        ``/connect``, ``/clear``.  Each updates the relevant state, tells the
-        user, and reconnects so the change takes effect on the already-open SDK
-        connection (model/effort/thinking are fixed at connect time).  Returns
+        ``/autocompact``, ``/connect``, ``/clear``.  Each updates the relevant
+        state, tells the user, and reconnects so the change takes effect on the
+        already-open SDK connection (model/effort/thinking and the compaction
+        are fixed at connect time; ``/autocompact`` reconnects only for a
+        change).  Returns
         True when *kind* was handled, False for anything else so the caller can
         deal with messages / quit / wakeups itself.
 
@@ -6438,6 +6491,12 @@ class SDKBridge:
                                            f"thinking → {'on' if state.thinking_enabled else 'off'}"}})
             await self._reconnect_or_defer(
                 f"thinking → {'on' if state.thinking_enabled else 'off'}")
+            return True
+        if kind == "compaction":
+            # Already on the State, and told by /autocompact; only a new CLI
+            # has it, and only a change needs one.
+            if self._compaction_changed():
+                await self._reconnect_or_defer(self._compaction_label())
             return True
         if kind == "connect":
             if payload == _CONNECT_TRANSPORT_DEAD:
@@ -6627,7 +6686,6 @@ class SDKBridge:
         forget_cost(state)
         state.last_usage = {}
         state.last_result_subtype = None
-        state.last_compact_trigger = None
         state.compact_during_last_turn = False
         state.needs_user_attention = None
         state.recent_turn_ends.clear()

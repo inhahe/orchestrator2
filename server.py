@@ -236,8 +236,9 @@ def _note_session_key(sid: str, cfg: Config) -> None:
 
 
 # A session's own compaction -- what a launch or /autocompact set on it --
-# lives on its State (``_compact_at``, ``_auto_compact``), which is where the
-# bridge's check reads it, over the Config's defaults.  The record on disk
+# lives on its State (``_compact_at``, ``_auto_compact``), over the Config's
+# defaults, and reaches its CLI as environment variables when the CLI starts
+# (``config.compaction_env``).  The record on disk
 # (``session.save_session_compaction``) follows the State: merged with it once
 # per session id, and rewritten when a launch or /autocompact changes it.
 
@@ -247,18 +248,22 @@ def own_compaction(st: Any) -> tuple[int | None, bool | None]:
     return getattr(st, "_compact_at", None), getattr(st, "_auto_compact", None)
 
 
-def _sync_session_compaction(sid: str, cfg: Config, st: Any) -> None:
-    """Session *sid* has just become *st*'s: merge what *st* has set with what
-    the hub kept for *sid*, the State's winning, onto the State and into the
-    record.  Once per id: the bridge reports an id on every turn.
+def _sync_session_compaction(sid: str, cfg: Config, st: Any) -> "asyncio.Task | None":
+    """Session *sid* has become, or is about to become, *st*'s: merge what *st*
+    has set with what the hub kept for *sid*, the State's winning, onto the
+    State and into the record.  Once per id: the bridge reports an id on every
+    turn, and asks before each CLI it starts (``_await_session_compaction``).
 
     A session reopened without its launch gets back what it had; one given
     settings before it had an id (a new session, a trim's or /clear's new
     transcript, a /move's copy) has them kept under the id it gets.  The disk
     is read and written off the event loop; the State takes the kept values
-    when the read returns, except where something set them meanwhile."""
+    when the read returns, except where something set them meanwhile.
+
+    Returns the task doing that on the loop, also kept on *st* for whoever
+    must wait for it; None where there is no loop, and it is done."""
     if getattr(st, "_compaction_sid", None) == sid:
-        return
+        return None
     st._compaction_sid = sid
     own = own_compaction(st)
     config_dir = getattr(cfg, "config_dir", None)
@@ -272,7 +277,9 @@ def _sync_session_compaction(sid: str, cfg: Config, st: Any) -> None:
         return merged
 
     def apply(merged: tuple[int | None, bool | None]) -> None:
-        if getattr(st, "session_id", None) != sid or own_compaction(st) != own:
+        # Not the State's session_id: before a CLI starts, that is still the
+        # session it is leaving, or none.
+        if getattr(st, "_compaction_sid", None) != sid or own_compaction(st) != own:
             return  # left for another session, or set again since
         if merged[0] is not None:
             st._compact_at = merged[0]
@@ -284,9 +291,29 @@ def _sync_session_compaction(sid: str, cfg: Config, st: Any) -> None:
     except RuntimeError:
         apply(merge())
         return
-    fut = loop.run_in_executor(None, merge)
-    fut.add_done_callback(
-        lambda f: apply(f.result()) if not f.cancelled() and f.exception() is None else None)
+
+    async def merge_off_the_loop() -> None:
+        try:
+            apply(await asyncio.to_thread(merge))
+        except Exception:
+            log.warning("session %s: its kept compaction could not be merged",
+                        sid[:8], exc_info=True)
+
+    task = loop.create_task(merge_off_the_loop())
+    st._compaction_merge = task
+    return task
+
+
+async def _await_session_compaction(sid: str, cfg: Config, st: Any) -> None:
+    """Every bridge's ``sync_compaction``: return once *st* holds what the hub
+    kept for session *sid*, which its next CLI is about to resume.  The CLI
+    takes its compaction from its environment, when it starts.
+
+    Waits without cancelling the merge if the connect is cancelled: the
+    merge's result is still the session's."""
+    task = _sync_session_compaction(sid, cfg, st) or getattr(st, "_compaction_merge", None)
+    if task is not None and not task.done():
+        await asyncio.wait({task})
 
 
 def _launch_compaction_to_state(cfg: Config, st: Any) -> None:
@@ -309,7 +336,9 @@ def _on_session_id(sid: str, cfg: Config, st: Any = None) -> None:
 
 def _new_bridge(cfg: Config, st: State, broadcaster: Any) -> "SDKBridge":
     """An SDKBridge for one of the hub's runtimes, which remembers its
-    sessions' keys and compaction (``_on_session_id``).
+    sessions' keys and compaction (``_on_session_id``), and starts each CLI
+    with the compaction kept for the session it resumes
+    (``_await_session_compaction``).
 
     Imports sdk_bridge, which pulls in claude_agent_sdk and mcp: the first
     call, from ``_deferred_bridge_startup``, is kept off the hot path.
@@ -317,6 +346,7 @@ def _new_bridge(cfg: Config, st: State, broadcaster: Any) -> "SDKBridge":
     from sdk_bridge import SDKBridge
     br = SDKBridge(config=cfg, state=st, broadcaster=broadcaster)
     br.on_session_id = lambda sid, id_cfg: _on_session_id(sid, id_cfg, st)
+    br.sync_compaction = lambda sid, id_cfg: _await_session_compaction(sid, id_cfg, st)
     br.on_effort_refused = lambda level: _drop_refused_effort(br, level)
     return br
 
@@ -1857,7 +1887,8 @@ async def _create_runtime(
       switch the launch gave this session (``--compact-at``,
       ``--auto-compact``/``--no-compact``), set on its State.  None: not
       given, so what the session kept from before (``_sync_session_compaction``),
-      else no orchestrator compaction at the default for its model.
+      else auto-compact off at the default for its model, which leaves the
+      CLI to compact at its own default.
     * ``seed_id`` — the on-disk session to open, when the caller has already
       decided it from the arguments above: the launch API, which has checked
       that session's name, must open that session and not whichever one is
@@ -1937,14 +1968,13 @@ async def _create_runtime(
     overrides["api_key"] = _session_key(seed_id, api_key)
     # Compaction: the Config's is the default, set every time like the name --
     # the hub's --compact-at and --auto-compact were its own launch's, for its
-    # session: the threshold for this session's model, and no orchestrator
-    # compaction (Claude Code's own, near the context limit, still happens).
-    # What this launch gives goes on the State below, as the session's own,
-    # and what the session kept from before joins it when it gets its id
-    # (``_sync_session_compaction``).
+    # session: the threshold for this session's model, and auto-compact off,
+    # which leaves the CLI to compact at its own default, near the context
+    # limit.  What this launch gives goes on the State below, as the
+    # session's own, and what the session kept from before joins it before
+    # its CLI starts (``_sync_session_compaction``).
     overrides["compact_at"] = default_compact_at(model or config.model)
     overrides["auto_compact"] = False
-    overrides["no_compact"] = True
     overrides["compact_at_given"] = overrides["auto_compact_given"] = False
     cfg = dataclasses.replace(config, **overrides)
     # The state reads the account details from the session's own config dir
@@ -3146,7 +3176,7 @@ async def _reconfigure(
     # own, kept by its id, else at the defaults.
     if not _picker_mode:
         overrides.update(compact_at=default_compact_at(config.model), auto_compact=False,
-                         no_compact=True, compact_at_given=False, auto_compact_given=False)
+                         compact_at_given=False, auto_compact_given=False)
     config = dataclasses.replace(config, **overrides)
 
     # --- Reinitialise state + bridge ---
@@ -3661,6 +3691,7 @@ async def _session_launch(body: dict[str, Any]) -> dict[str, Any]:
         # when the session is already live.  Reconnect the bridge so the
         # new options are picked up by the SDK immediately.
         need_reconnect = False
+        compaction_given = False
         if model and existing.state is not None and existing.state.model != model:
             existing.state.model = model
             need_reconnect = True
@@ -3670,9 +3701,10 @@ async def _session_launch(body: dict[str, Any]) -> dict[str, Any]:
                 existing.state.effort = new_effort
                 need_reconnect = True
         # Compaction likewise, on the session alone -- where /autocompact
-        # puts it, and what the bridge reads after every turn, so no
-        # reconnect; not its Config, which for the hub's own session is
-        # the hub's and would reach every session opened after.
+        # puts it -- not its Config, which for the hub's own session is the
+        # hub's and would reach every session opened after.  Its CLI takes
+        # it by restarting, which the bridge does only if it changed, and
+        # not under running background tasks (``_reconnect_or_defer``).
         if existing.state is not None:
             if compact_at:
                 existing.state._compact_at = compact_at  # type: ignore[attr-defined]
@@ -3688,6 +3720,7 @@ async def _session_launch(body: dict[str, Any]) -> dict[str, Any]:
                     await asyncio.to_thread(
                         save_session_compaction, sid, *own_compaction(existing.state),
                         getattr(existing.config, "config_dir", None))
+                compaction_given = True
         # Same reasoning as model/effort: the launcher asked for a bell
         # set, so honour it on the session it actually lands on.  No
         # reconnect needed — bell_events is read at ring time.
@@ -3753,6 +3786,10 @@ async def _session_launch(body: dict[str, Any]) -> dict[str, Any]:
             # session shows "idle" while ignoring input.  See known-issues.md
             # "worker killed by cross-task SDK disconnect".
             existing.bridge.event_queue.put_nowait(("connect", ""))
+        elif compaction_given and existing.bridge is not None:
+            # A reconnect for anything else starts the CLI with the new
+            # compaction too; alone, it restarts the CLI only if it changed.
+            existing.bridge.event_queue.put_nowait(("compaction", ""))
         # And its prompt.  The launch asked for this session to be sent
         # it, and the session happens to be open already, so it is queued
         # like a prompt typed there: sent when the session is next free,
@@ -5598,6 +5635,10 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
                     "status": state_to_status_dict(state, config),
                     "panels": panels,
                 })
+            if result.state_updates and {"auto_compact", "compact_at"} & result.state_updates.keys():
+                # /autocompact: the CLI takes it by restarting, when the
+                # worker gets to it (``SDKBridge._compaction_changed``).
+                bridge.event_queue.put_nowait(("compaction", ""))
             if result.forward_to_sdk and result.forward_payload:
                 if kind == "rename":
                     await _forward_cli_command(rt, result.forward_payload)

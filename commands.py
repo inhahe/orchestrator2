@@ -737,28 +737,34 @@ def _remember_compaction(state: State, config: Config) -> None:
                                      getattr(config, "config_dir", None))
 
 
+_COMPACT_OFF = "OFF: the CLI compacts at its own default"
+
+
 def _cmd_autocompact(payload: str, state: State, config: Config) -> CommandResult:
+    """Show or set the session's compaction.  The CLI does the compacting, at
+    the threshold its environment gives it, so a change reaches it as a new
+    CLI: the hub tells the bridge, which restarts it (``"compaction"``)."""
     p = payload.strip().lower()
     if not p:
         # The session's own values first: a launch or /autocompact N sets
         # them on the session, over the hub's.
         on = getattr(state, "_auto_compact", config.auto_compact)
         at = getattr(state, "_compact_at", config.compact_at)
-        status = f"ON (at ~{at} tok)" if on else "OFF"
-        return CommandResult(messages=[_msg(f"auto-compact: {status}")])
+        status = f"ON: the CLI compacts at ~{at} tok" if on else _COMPACT_OFF
+        return CommandResult(messages=[_msg(f"auto-compact {status}")])
     if p in ("on", "true", "enable", "1"):
         state._auto_compact = True  # type: ignore[attr-defined]
         _remember_compaction(state, config)
         at = getattr(state, "_compact_at", config.compact_at)
         return CommandResult(
-            messages=[_msg(f"auto-compact ON (at ~{at} tok)")],
+            messages=[_msg(f"auto-compact ON: the CLI compacts at ~{at} tok")],
             state_updates={"auto_compact": True},
         )
     if p in ("off", "false", "disable", "0"):
         state._auto_compact = False  # type: ignore[attr-defined]
         _remember_compaction(state, config)
         return CommandResult(
-            messages=[_msg("auto-compact OFF")],
+            messages=[_msg(f"auto-compact {_COMPACT_OFF}")],
             state_updates={"auto_compact": False},
         )
     try:
@@ -771,7 +777,7 @@ def _cmd_autocompact(payload: str, state: State, config: Config) -> CommandResul
     state._auto_compact = True  # type: ignore[attr-defined]
     _remember_compaction(state, config)
     return CommandResult(
-        messages=[_msg(f"auto-compact threshold → ~{n} tok (ON)")],
+        messages=[_msg(f"auto-compact ON: the CLI compacts at ~{n} tok")],
         state_updates={"auto_compact": True, "compact_at": n},
     )
 

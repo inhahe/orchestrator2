@@ -6311,6 +6311,117 @@ COMPACTION_SERVER_MUTATIONS = [
     ("a move carries the defaults as the session's own",
      "        \"compact_at\": own_compaction(st)[0],\n",
      "        \"compact_at\": getattr(rt.config, \"compact_at\", None),\n"),
+
+    ("a launch onto an open session leaves its CLI on the old threshold",
+     "        elif compaction_given and existing.bridge is not None:\n",
+     "        elif False:\n"),
+
+    ("a session's kept compaction applies only once the CLI has named it",
+     "        if getattr(st, \"_compaction_sid\", None) != sid or own_compaction(st) != own:\n",
+     "        if getattr(st, \"session_id\", None) != sid or own_compaction(st) != own:\n"),
+
+    ("a merge already under way is not waited for",
+     "    task = _sync_session_compaction(sid, cfg, st) or getattr(st, \"_compaction_merge\", None)\n",
+     "    task = _sync_session_compaction(sid, cfg, st)\n"),
+]
+
+# The CLI compacts, at the session's threshold, which it reads from its
+# environment when it starts (2026-10-21: orchestrator2's own compaction ran
+# on a count that was the sum of a turn's API calls).
+# tests/test_cli_compaction.py; design.md, "The CLI does the compacting".
+COMPACTION_CONFIG_MUTATIONS = [
+    ("auto-compact off still sets the threshold",
+     "    if not auto_compact:\n        return {}\n",
+     ""),
+
+    ("a window outside what the CLI accepts",
+     "    window = max(CLI_WINDOW_MIN, min(window, CLI_WINDOW_MAX))\n",
+     ""),
+
+    ("no percentage below the smallest window",
+     "    if window - CLI_SUMMARY_RESERVE - CLI_COMPACT_BUFFER > compact_at:\n",
+     "    if False:\n"),
+
+    ("the percentage can round a token below the threshold",
+     "            100 * (compact_at + 0.5) / effective)\n",
+     "            100 * compact_at / effective)\n"),
+]
+
+COMPACTION_BRIDGE_MUTATIONS = [
+    ("the CLI is not given the session's threshold",
+     "        kwargs[\"env\"].update(self._compaction_env())\n",
+     ""),
+
+    ("a threshold the hub inherited reaches a session without one",
+     "        for var in CLI_COMPACTION_VARS:\n            os.environ.pop(var, None)\n",
+     ""),
+
+    ("the CLI starts before the session's kept threshold is known",
+     "        if target and self.sync_compaction is not None:\n",
+     "        if False:\n"),
+
+    ("what the CLI started with is not recorded",
+     "        self._cli_compaction_env = {\n"
+     "            k: v for k, v in options.env.items() if k in CLI_COMPACTION_VARS}\n",
+     "        self._cli_compaction_env = {}\n"),
+
+    ("an unchanged threshold restarts the CLI",
+     "        return (self._cli_compaction_env is not None\n"
+     "                and self._compaction_env() != self._cli_compaction_env)\n",
+     "        return self._cli_compaction_env is not None\n"),
+
+    ("a CLI that has not started yet is restarted",
+     "        return (self._cli_compaction_env is not None\n                and ",
+     "        return (True\n                and "),
+
+    ("a change made during a turn is not applied",
+     "                if self._compaction_changed():\n                    reconnect_needed = True\n",
+     "                if False:\n                    reconnect_needed = True\n"),
+
+    ("a change made while idle is not applied",
+     "            if self._compaction_changed():\n"
+     "                await self._reconnect_or_defer(self._compaction_label())\n",
+     "            if False:\n"
+     "                await self._reconnect_or_defer(self._compaction_label())\n"),
+
+    ("a change restarts the CLI under running background tasks",
+     "                await self._reconnect_or_defer(self._compaction_label())\n",
+     "                await self.reconnect()\n"),
+
+    ("the context is never counted",
+     "                if isinstance(msg, AssistantMessage):\n"
+     "                    self._note_context(msg)\n",
+     ""),
+
+    ("the calls of a turn are added up again",
+     "            self.state.context_tokens = tokens\n",
+     "            self.state.context_tokens += tokens\n"),
+
+    ("a subagent's context is taken for the session's",
+     "        if getattr(msg, \"parent_tool_use_id\", None) is not None:\n            return\n",
+     ""),
+
+    ("a message no call produced zeroes the count",
+     "        if tokens:\n            self.state.context_tokens = tokens\n",
+     "        self.state.context_tokens = tokens\n"),
+
+    ("the boundary's metadata is looked for where it is not",
+     "            meta = (getattr(msg, \"data\", None) or {}).get(\"compact_metadata\") or {}\n",
+     "            meta = getattr(msg, \"compact_metadata\", None) or {}\n"),
+]
+
+COMPACTION_HUB_MUTATIONS = [
+    ("the bridge cannot ask for a session's kept threshold",
+     "    br.sync_compaction = lambda sid, id_cfg: _await_session_compaction(sid, id_cfg, st)\n",
+     ""),
+
+    ("/autocompact does not reach the CLI",
+     "                bridge.event_queue.put_nowait((\"compaction\", \"\"))\n",
+     ""),
+
+    ("/autocompact restarts the CLI when it only showed the setting",
+     "            if result.state_updates and {\"auto_compact\", \"compact_at\"} & result.state_updates.keys():\n",
+     "            if True:\n"),
 ]
 
 # A launch's ANTHROPIC_API_KEY bills the session that launch opens and no other
@@ -7323,6 +7434,12 @@ TARGETS = {
                        SESSIONKEY_CMD_MUTATIONS, "pytest"),
     "compaction-server": ("server.py", "tests/test_compact_at_per_session.py",
                           COMPACTION_SERVER_MUTATIONS, "pytest"),
+    "compaction-config": ("config.py", "tests/test_cli_compaction.py",
+                          COMPACTION_CONFIG_MUTATIONS, "pytest"),
+    "compaction-bridge": ("sdk_bridge.py", "tests/test_cli_compaction.py",
+                          COMPACTION_BRIDGE_MUTATIONS, "pytest"),
+    "compaction-hub": ("server.py", "tests/test_cli_compaction.py",
+                       COMPACTION_HUB_MUTATIONS, "pytest"),
     "account-server": ("server.py", "tests/test_session_account.py",
                        ACCOUNT_SERVER_MUTATIONS, "pytest"),
     "account-move": ("server.py", "tests/test_move_stops_original.py",
