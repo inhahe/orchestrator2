@@ -1865,8 +1865,8 @@ LOSTBG_MUTATIONS = [
 
     ("the loss is sent to the model as a prompt again, which sets an opened "
      "session working -- the 2026-09-29 report",
-     '            f"next prompt it gets."\n        ))\n        return len(labels)',
-     '            f"next prompt it gets."\n        ))\n'
+     '            f"prompt."\n        ))\n        return len(labels)',
+     '            f"prompt."\n        ))\n'
      '        self.state.queued_prompts.appendleft("[orchestrator2] lost tasks")\n'
      '        return len(labels)'),
 
@@ -3143,6 +3143,37 @@ LIMITRESUME_MODULE_MUTATIONS = [
     ("a clock time already past today is taken as today's",
      "            if when_ <= base:\n                when_ += timedelta(days=1)\n",
      ""),
+]
+
+# What the CLI carries to the next message on resume is shown with it.
+# tests/test_carried_notifications.py, tests/test_cut_off_turn.py.
+CARRIED_MUTATIONS = [
+    ("a resume never looks for what the CLI carried",
+     "        self._carried_unseen = bool(resume_sid)\n",
+     ""),
+
+    ("the first prompt after opening is shown without what went with it",
+     "            await self._show_carried(during_turn=True)\n",
+     ""),
+
+    ("a turn the CLI starts first never shows it",
+     "        await self._show_carried(during_turn=False)\n        return True\n",
+     "        return True\n"),
+
+    ("it is shown again with every prompt",
+     "        self._carried_unseen = False\n        jsonl = self._jsonl_for(self.state.session_id)",
+     "        jsonl = self._jsonl_for(self.state.session_id)"),
+]
+
+CARRIED_HISTORY_MUTATIONS = [
+    ("history drops it, as it dropped every task notification",
+     "        if is_carried_notification(rec) and isinstance(msg, dict):",
+     "        if False:"),
+
+    ("one an earlier turn already took is shown as if it went with this one",
+     '        if rec.get("type") == "assistant":\n            break\n'
+     "        if is_carried_notification(rec):",
+     "        if is_carried_notification(rec):"),
 ]
 
 # /resume <id|title> from any tab, in any directory and account.
@@ -7401,6 +7432,11 @@ TARGETS = {
                            LIMITRESUME_SERVER_MUTATIONS, "pytest"),
     "limitresume-module": ("limit_resume.py", "tests/test_resume_after_limit.py",
                            LIMITRESUME_MODULE_MUTATIONS, "pytest"),
+    "carried": ("sdk_bridge.py",
+                "tests/test_carried_notifications.py tests/test_cut_off_turn.py",
+                CARRIED_MUTATIONS, "pytest"),
+    "carried-history": ("session.py", "tests/test_carried_notifications.py",
+                        CARRIED_HISTORY_MUTATIONS, "pytest"),
     "resumeanywhere": ("server.py", "tests/test_launch_resume.py",
                        RESUMEANYWHERE_MUTATIONS, "pytest"),
     "asleep-server": ("server.py", "tests/test_asleep_tab.py",

@@ -2000,8 +2000,24 @@ that attaches later: the one that opened the session often is not there yet (a
 connect replaces them, and the next turn — ours or a ghost turn — clears them,
 since from then on they are history.
 
-Tests: `tests/test_lost_bg_tasks.py`, `tests/test_cut_off_turn.py`; mutation
-targets `lostbg`, `lostbg-session`, `cutoff-bridge`, `cutoff-server`.
+**What the CLI tells the model is shown with the prompt it goes with.**
+Reported 2026-10-21: the notice says the session "is told along with the next
+prompt it gets", and the "You" line of that prompt showed only what was typed.
+The CLI's report is a `<task-notification>` user record it writes into the
+conversation on resume with `queueTranscriptOnly` (measured on 2.1.301: written
+13 s before the next prompt), so it reaches the model as part of that prompt's
+request; and history drops every `<task-notification>`. Such a record
+(`session.is_carried_notification`) is now drawn as an injected prompt under
+`CARRIED_NOTE` — in history where it sits, and live by `_show_carried` at the
+first turn after a resuming connect (`_carried_unseen`), right after that
+turn's prompt, or at a ghost turn's start when the CLI's own turn takes it
+first. Only those after the model last spoke are shown live
+(`carried_notifications`): an earlier one went with an earlier turn.
+
+Tests: `tests/test_lost_bg_tasks.py`, `tests/test_cut_off_turn.py`,
+`tests/test_carried_notifications.py`; mutation targets `lostbg`,
+`lostbg-session`, `cutoff-bridge`, `cutoff-server`, `carried`,
+`carried-history`.
 
 ## 6y. A resume that cannot happen
 

@@ -488,6 +488,42 @@ def read_tail(jsonl: Path, tail_bytes: int = CUT_OFF_TAIL_BYTES
     return records, start
 
 
+#: What history and the live chat put above a notification Claude Code carried
+#: into the conversation without a turn of its own (below).
+CARRIED_NOTE = ("Claude Code added this to the conversation when the session "
+                "was opened; it goes to the session with the next message:")
+
+
+def is_carried_notification(rec: dict) -> bool:
+    """Whether *rec* is a notification the CLI carried into the conversation
+    without starting a turn for it (``queueTranscriptOnly``) -- on resume, its
+    report of the background tasks the previous process left unfinished.  It
+    reaches the model with whatever is sent next, so that message is not
+    quite what the user typed; this is what makes the difference visible."""
+    origin = rec.get("origin")
+    return (rec.get("type") == "user" and rec.get("queueTranscriptOnly") is True
+            and isinstance(origin, dict) and origin.get("kind") == "task-notification")
+
+
+def carried_text(rec: dict) -> str:
+    """How a carried notification is shown: what the model gets, under a
+    line saying where it came from."""
+    return f"{CARRIED_NOTE}\n\n{_record_text(rec.get('message'))}"
+
+
+def carried_notifications(records: list[dict]) -> list[str]:
+    """The carried notifications (:func:`is_carried_notification`) at the end
+    of *records* that no turn has taken yet -- those after the model last
+    spoke -- as :func:`carried_text`, oldest first."""
+    found: list[str] = []
+    for rec in reversed(records):
+        if rec.get("type") == "assistant":
+            break
+        if is_carried_notification(rec):
+            found.append(carried_text(rec))
+    return found[::-1]
+
+
 def cut_off_turn(jsonl: Path, *,
                  tail_bytes: int = CUT_OFF_TAIL_BYTES,
                  tail: tuple[list[dict], int] | None = None) -> dict | None:
@@ -2683,6 +2719,18 @@ def render_session_history(
                         "is_history": True,
                     })
                     rendered += 1
+            continue
+
+        # --- A notification the CLI carried to the next message ---
+        # Its text is a ``<task-notification>``, which is otherwise not shown;
+        # this one went to the model with the user's next message.
+        if is_carried_notification(rec) and isinstance(msg, dict):
+            messages.append({
+                "type": "injected_prompt",
+                "content": carried_text(rec),
+                "is_history": True,
+            })
+            rendered += 1
             continue
 
         # --- User messages ---

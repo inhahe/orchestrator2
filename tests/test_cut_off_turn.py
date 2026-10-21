@@ -647,6 +647,13 @@ def test_a_tab_that_attaches_later_is_told(monkeypatch):
 # What else a connect reads from the transcript's end, in the same read
 # --------------------------------------------------------------------------
 
+def test_a_resume_leaves_what_the_cli_carried_to_be_shown(opened):
+    """tests/test_carried_notifications.py: the first turn after it shows
+    the notifications the CLI carried into the conversation."""
+    opened(DONE)
+    assert opened.bridge._carried_unseen is True
+
+
 def test_opening_a_session_a_limit_stopped_schedules_its_resume(opened):
     """tests/test_resume_after_limit.py, through a real connect."""
     import limit_resume

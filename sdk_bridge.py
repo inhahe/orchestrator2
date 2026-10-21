@@ -136,6 +136,7 @@ from session import (
     _classify_user_text,
     _bg_task_label,
     SESSION_NOTE_PREFIX,
+    carried_notifications,
     cut_off_turn,
     describe_cut_off_turn,
     read_tail,
@@ -989,6 +990,10 @@ class SDKBridge:
         self._limit_attempts = 0
         # The reset last hinted at when the option is off, so it is said once.
         self._limit_hinted_for: int | None = None
+        # Set by a connect that resumed a session: the CLI may have carried
+        # notifications into its conversation, which the next turn takes
+        # (_show_carried).
+        self._carried_unseen = False
         # Deferred ``bg-done`` bell.  See _arm_bg_done_bell().
         self._bg_done_bell_task: asyncio.Task | None = None
         # Set the moment we learn the CLI subprocess is gone (dispatcher crash,
@@ -1867,6 +1872,7 @@ class SDKBridge:
         # background tasks that died with its last process, a turn left
         # waiting, a usage limit it is waiting on.  Replaced on every connect.
         await self._announce_on_open(resume_sid, cut_off, limit_stop)
+        self._carried_unseen = bool(resume_sid)
 
         # The connect worked, so the requested resume has been honoured and is
         # spent.  Later reconnects resume ``state.session_id`` explicitly (see
@@ -2748,7 +2754,8 @@ class SDKBridge:
             f"{len(labels)} background task{plural} {was} running when this "
             f"session was cut off ({shown}). Their results are lost; whether "
             f"they finished is unknown. The session is told along with the "
-            f"next prompt it gets."
+            f"next prompt it gets, and what it is told is shown with that "
+            f"prompt."
         ))
         return len(labels)
 
@@ -4502,7 +4509,37 @@ class SDKBridge:
             })
         except Exception as exc:
             log.warning("ghost-turn status_update broadcast failed: %r", exc)
+        await self._show_carried(during_turn=False)
         return True
+
+    async def _show_carried(self, *, during_turn: bool) -> None:
+        """Show what the CLI carried into the conversation on resume, at the
+        first turn after the connect -- the turn that takes it to the model.
+
+        On resume the CLI reports the background tasks the previous process
+        left unfinished as a notification of its own, written into the
+        conversation without a turn (``session.is_carried_notification``).
+        It goes to the model with the next message, so that message is not
+        only what the user typed -- and nothing showed it, live or in
+        history.  Read from the transcript, where the CLI wrote it on resume.
+        """
+        if not self._carried_unseen:
+            return
+        self._carried_unseen = False
+        jsonl = self._jsonl_for(self.state.session_id)
+        if jsonl is None:
+            return
+        try:
+            records, _start = await asyncio.to_thread(read_tail, jsonl)
+        except Exception:
+            log.debug("could not read what the CLI carried", exc_info=True)
+            return
+        for text in carried_notifications(records):
+            log.info("showing a notification the CLI carried (%d chars)", len(text))
+            try:
+                await self._broadcast_injected_prompt(text, during_turn=during_turn)
+            except Exception as exc:
+                log.warning("carried-notification broadcast failed: %r", exc)
 
     async def _announce_resumed_interrupted_turn(self) -> None:
         """Say out loud that the CLI is finishing an old turn by itself.
@@ -5492,6 +5529,7 @@ class SDKBridge:
             )
 
             await self.broadcast({"type": "turn_start", "prompt": prompt_text})
+            await self._show_carried(during_turn=True)
             # Flip the toolbar to "working" immediately instead of waiting up to
             # ~2s for the next status-ticker cycle (state.busy is already True).
             await self._broadcast_status()

@@ -39,6 +39,18 @@ from `SDKBridge._take_session_id`). Test:
 `test_a_new_session_id_takes_the_schedules_with_it`; mutation targets
 `limitresume` (both moves) and `recstore`.
 
+## What the CLI tells the model on resume was never shown — FIXED (2026-10-21)
+
+Reported: the lost-task notice said the session "is told along with the next
+prompt it gets", and that prompt's "You" line showed only what was typed. The
+CLI writes its report as a `<task-notification>` with `queueTranscriptOnly`
+into the conversation on resume, and it reaches the model with the next
+request; history dropped every `<task-notification>`, and nothing showed it
+live. Now drawn as an injected prompt, live after the first prompt (or ghost
+turn) after a resume, and in history (design.md, "Background work that died
+with the session"). `tests/test_carried_notifications.py`; mutation targets
+`carried`, `carried-history`.
+
 ## `--resume`'s "pick one by id" said it needed --cwd and --config-dir — FIXED (2026-10-21)
 
 When several sessions shared a title and the launch had fixed neither
