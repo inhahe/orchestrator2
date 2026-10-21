@@ -70,8 +70,15 @@ Three layers, deliberately separated:
 - **State lives on the server.** The browser is a renderer. A tab can be closed
   and reopened at any point and gets a full replay (`history`) plus a status
   snapshot; nothing is lost.
-- **Immediate commands are synchronous.** `/help`, `/cls`, `/status` etc. must
-  return without touching the SDK or awaiting I/O, so they work mid-turn.
+- **Immediate commands never touch the SDK, and never stall the loop.**
+  `/help`, `/cls`, `/status` etc. are synchronous handlers, so they work
+  mid-turn. The few that wait on I/O are named in
+  `commands.OFF_LOOP_COMMANDS`: `/history` and `/export` read a whole
+  transcript, and `/login` and `/logout` run `claude auth`.
+  `run_immediate_command` runs those in a worker thread, so the other sessions
+  keep running meanwhile. They may read `state` but never write it: the one
+  write `/login` needs (clearing `auth_error` once a sign-in has launched) is
+  done by the hub, on the loop, when it sees `login_launched`.
 - **The SDK connection is owned by the worker task.** `bridge.connect()`,
   `disconnect()` and `reconnect()` may only be called *from* `worker_loop`'s
   task. Anything else — a route handler, a timer, an `asyncio.create_task` —

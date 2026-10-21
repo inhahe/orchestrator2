@@ -7464,6 +7464,50 @@ LAUNCHLOG_SERVER_MUTATIONS = [
 ]
 
 
+# Slow slash commands off the event loop, and /logout's exit status
+# (tests/test_off_loop_commands.py).
+OFFLOOP_CMD_MUTATIONS = [
+    ("the slow commands run on the event loop again, so one transcript read "
+     "stalls every session on the hub",
+     "    if kind in OFF_LOOP_COMMANDS:\n",
+     "    if False:\n"),
+
+    ("every command runs in a worker thread, the ones that write state "
+     "included",
+     "    if kind in OFF_LOOP_COMMANDS:\n",
+     "    if True:\n"),
+
+    ("a misspelt name leaves its command on the loop",
+     '"login", "logout"})',
+     '"login", "logout", "histroy"})'),
+
+    ("/login clears the expired-login flag itself, from a worker thread",
+     '    what = ""\n    if ok and method == "console":\n',
+     '    if ok:\n        state.auth_error = False\n'
+     '    what = ""\n    if ok and method == "console":\n'),
+
+    ("a failed logout says Signed out",
+     "    if done.returncode != 0:\n",
+     "    if False:\n"),
+
+    ("a failed logout that printed nothing says nothing about why",
+     '               or f"`claude auth logout` exited {done.returncode}")',
+     '               or "")'),
+]
+
+OFFLOOP_SERVER_MUTATIONS = [
+    ("the hub runs the slow commands inline again",
+     "        result = await run_immediate_command(kind, payload, state, config)\n",
+     "        from commands import try_immediate_command\n"
+     "        result = try_immediate_command(kind, payload, state, config)\n"),
+
+    ("a sign-in that launched leaves the expired-login flag set",
+     "                # Optimistic: a fresh 401 sets it again.\n"
+     "                state.auth_error = False\n",
+     ""),
+]
+
+
 TARGETS = {
     "chat": ("static/chat.js", "tests/hidden_window.test.js",
              CHAT_MUTATIONS, "node"),
@@ -7709,6 +7753,10 @@ TARGETS = {
                       ONESOCKET_APP_MUTATIONS, "node"),
     "mutate-tool": ("tools/mutate.py", "tests/test_mutate_tool.py",
                     MUTATE_TOOL_MUTATIONS, "pytest"),
+    "offloop": ("commands.py", "tests/test_off_loop_commands.py",
+                OFFLOOP_CMD_MUTATIONS, "pytest"),
+    "offloop-server": ("server.py", "tests/test_off_loop_commands.py",
+                       OFFLOOP_SERVER_MUTATIONS, "pytest"),
     "holders": ("proc_guard.py", "tests/test_proc_guard.py",
                 HOLDERS_MUTATIONS, "pytest"),
     "sessionjob": ("proc_guard.py", "tests/test_session_job.py",

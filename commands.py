@@ -7,6 +7,8 @@ original orchestrator, adapted for the web: commands return structured
 
 from __future__ import annotations
 
+import asyncio
+import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -267,6 +269,27 @@ def try_immediate_command(
     return handler(payload, state, config)
 
 
+#: Commands whose handlers wait on a ``claude auth`` subprocess or read a whole
+#: transcript, for seconds on a large one.  Run on the event loop, they would
+#: stall every session on the hub meanwhile, so ``run_immediate_command`` runs
+#: them in a worker thread.  That is safe only because they read ``state`` and
+#: never write it: a handler added here must keep to that.
+OFF_LOOP_COMMANDS = frozenset({"history", "export", "login", "logout"})
+
+
+async def run_immediate_command(
+    kind: str,
+    payload: str,
+    state: State,
+    config: Config,
+) -> CommandResult | None:
+    """``try_immediate_command``, with the slow handlers off the event loop."""
+    if kind in OFF_LOOP_COMMANDS:
+        return await asyncio.to_thread(try_immediate_command, kind, payload,
+                                       state, config)
+    return try_immediate_command(kind, payload, state, config)
+
+
 def get_command_completions() -> list[str]:
     """Return all slash command names for tab-complete."""
     return sorted(SLASH_COMMANDS)
@@ -442,9 +465,6 @@ def _cmd_login(payload: str, state: State, config: Config) -> CommandResult:
     ok, msg = auth.launch_login(method=method, config_dir=cfg_dir)
     hint = ("The current session's login has expired — "
             if state.auth_error and method == "claudeai" else "")
-    if ok and state.auth_error:
-        # Optimistically clear the sticky flag; a fresh 401 will re-set it.
-        state.auth_error = False
     what = ""
     if ok and method == "console":
         what = (" Signing in replaces this account's current login, a Claude "
@@ -460,7 +480,9 @@ def _cmd_login(payload: str, state: State, config: Config) -> CommandResult:
                 "here, then run /connect." if ok else "")},
         }],
         # Tell the caller to watch for the async browser-OAuth completion and
-        # then refresh the account info / status bar.
+        # then refresh the account info / status bar.  The caller also clears
+        # state.auth_error on seeing it: this handler runs off the event loop
+        # (OFF_LOOP_COMMANDS), so it must not write state itself.
         login_launched=method if ok else None,
     )
 
@@ -469,24 +491,23 @@ def _cmd_logout(_payload: str, _state: State, config: Config) -> CommandResult:
     """Sign this runtime's account out of Claude (scoped to its config dir)."""
     cli = auth.find_claude_cli()
     if not cli:
-        return CommandResult(messages=[{
-            "type": "system_msg", "subtype": "error",
-            "data": {"message": "could not find the `claude` CLI to log out."},
-        }])
-    import subprocess
+        return CommandResult(messages=[_msg(
+            "could not find the `claude` CLI to log out.", level="error")])
     env = child_env(getattr(config, "config_dir", None))
     try:
-        subprocess.run([cli, "auth", "logout"], capture_output=True,
-                       text=True, timeout=20, env=env)
+        done = subprocess.run([cli, "auth", "logout"], capture_output=True,
+                              text=True, timeout=20, env=env)
     except (OSError, subprocess.SubprocessError) as exc:
-        return CommandResult(messages=[{
-            "type": "system_msg", "subtype": "error",
-            "data": {"message": f"logout failed: {exc}"},
-        }])
-    return CommandResult(messages=[{
-        "type": "system_msg", "subtype": "info",
-        "data": {"message": "Signed out. Run /login to sign in again."},
-    }])
+        return CommandResult(messages=[_msg(f"logout failed: {exc}",
+                                            level="error")])
+    if done.returncode != 0:
+        # The CLI says "Failed to log out." on stderr and exits 1.
+        why = ((done.stderr or "").strip() or (done.stdout or "").strip()
+               or f"`claude auth logout` exited {done.returncode}")
+        return CommandResult(messages=[_msg(f"logout failed: {why}",
+                                            level="error")])
+    return CommandResult(messages=[_msg(
+        "Signed out. Run /login to sign in again.")])
 
 
 def _cmd_debug(_payload: str, state: State, _config: Config) -> CommandResult:

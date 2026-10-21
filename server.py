@@ -132,7 +132,7 @@ from commands import (
     classify,
     format_mcp_status,
     get_command_completions,
-    try_immediate_command,
+    run_immediate_command,
 )
 from tool_manager import format_tool_header
 from theme import (
@@ -5926,7 +5926,7 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             await _refresh_models_for_show()
 
         # Try immediate command.
-        result = try_immediate_command(kind, payload, state, config)
+        result = await run_immediate_command(kind, payload, state, config)
         if result is not None:
             for m in result.messages:
                 await send_to(ws, m)
@@ -5945,6 +5945,8 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
                     # a prompt nobody has echoed yet.
                     await _enqueue_prompt(rt, result.forward_payload)
             if result.login_launched:
+                # Optimistic: a fresh 401 sets it again.
+                state.auth_error = False
                 # Browser OAuth completes asynchronously; watch for it, then
                 # refresh the account field / status bar for this runtime.
                 asyncio.create_task(_watch_login(rt, result.login_launched))
