@@ -196,11 +196,15 @@ def test_the_hub_opens_the_session_under_it(monkeypatch, tmp_path):
 
 
 class _LiveBridge:
-    def __init__(self):
+    def __init__(self, state=None):
         self.adopted: list[str] = []
         self.adopted_labels: list[dict] = []
         self.event_queue = asyncio.Queue()
         self.config = None
+        self.state = state
+
+    # The real rule for the name an open session goes by: it reads only state.
+    _addressable_name = SDKBridge._addressable_name
 
     async def adopt_agent_name(self, name):
         self.adopted.append(name)
@@ -210,16 +214,22 @@ class _LiveBridge:
 
 
 def _land(monkeypatch, body, *, current_name=None, current_labels=None,
-          cli_path=None, open_=True):
+          cli_path=None, open_=True, title=None, live_title=None,
+          pending_rename=None):
     """A launch at session "sid-live", which is also its directory's most
     recent -- open in the hub if *open_*, else closed.  Without "resume" in
     *body*, the launch reaches it by continuing the most recent session.
+
+    *title* is the title a person gave it, on disk; an open session has
+    *live_title* loaded, or a /rename still to apply (*pending_rename*).
 
     Returns the hub's answer, the open runtime (None if closed) and what
     ``_create_runtime`` was asked for, once per session it was asked to open.
     """
     monkeypatch.setattr(server, "find_most_recent_session_for_cwd",
                         lambda cwd, config_dir=None: Path("sid-live.jsonl"))
+    monkeypatch.setattr(server, "read_human_title",
+                        lambda sid, config_dir=None: title if sid == "sid-live" else None)
     monkeypatch.setattr(server, "config", parse_args([]))
     created: list[dict] = []
 
@@ -234,8 +244,11 @@ def _land(monkeypatch, body, *, current_name=None, current_labels=None,
         st.session_id = "sid-live"
         st.agent_name = current_name
         st.agent_labels = dict(current_labels or {})
+        st.human_title = live_title
+        st.human_title_sid = "sid-live" if live_title else None
+        st.pending_rename = pending_rename
         cfg = parse_args(["--cli-path", cli_path] if cli_path else [])
-        br = _LiveBridge()
+        br = _LiveBridge(st)
         br.config = cfg
         rt = types.SimpleNamespace(rid="R1", state=st, config=cfg, bridge=br)
     monkeypatch.setattr(server, "runtimes", {"R1": rt} if rt else {})
@@ -346,6 +359,56 @@ def test_a_launch_that_names_its_session_renames_it(monkeypatch):
     assert rt.bridge.adopted == ["Lane-E"]
 
 
+# A session nobody gave an agent name goes by the title a person gave it
+# (/rename): that is its ListAgents name, and naming it renames that title.
+# The lanes were titled "OS A" ... "OS F" long before any had a name.
+
+def test_nor_one_that_goes_by_its_title(monkeypatch):
+    res, rt, _created = _land(monkeypatch, {"agent_name": "Lane-A"},
+                              live_title="OS E")
+
+    assert res["refused"] is True and "'OS E'" in res["error"]
+    assert rt.bridge.adopted == []
+
+
+def test_nor_a_closed_one_titled_on_disk(monkeypatch):
+    res, _rt, created = _land(monkeypatch, {"agent_name": "Lane-A"},
+                              open_=False, title="OS E")
+
+    assert res["refused"] is True and "'OS E'" in res["error"]
+    assert created == []
+
+
+def test_an_open_one_whose_title_is_not_loaded_yet_goes_by_the_disk(monkeypatch):
+    """Its bridge reads the title when it first connects."""
+    res, _rt, _created = _land(monkeypatch, {"agent_name": "Lane-A"},
+                               title="OS E")
+
+    assert res["refused"] is True
+
+
+def test_a_rename_waiting_for_its_session_counts_too(monkeypatch):
+    res, _rt, _created = _land(monkeypatch, {"agent_name": "Lane-A"},
+                               pending_rename="OS E")
+
+    assert res["refused"] is True and "'OS E'" in res["error"]
+
+
+def test_a_title_that_is_the_name_asked_for_is_no_rename(monkeypatch):
+    res, rt, _created = _land(monkeypatch, {"agent_name": "Lane-E"},
+                              live_title="Lane-E")
+
+    assert res["ok"] is True and rt.bridge.adopted == ["Lane-E"]
+
+
+def test_a_titled_session_named_with_resume_is_renamed(monkeypatch):
+    res, _rt, created = _land(monkeypatch,
+                              {"agent_name": "Lane-E", "resume": "sid-live"},
+                              open_=False, title="OS E")
+
+    assert res["ok"] is True and created[0]["agent_name"] == "Lane-E"
+
+
 def test_the_hub_logs_what_became_of_each_launch(monkeypatch, caplog):
     """It used to log a session it opened, and nothing about a launch that
     landed on one already open -- the case where a name was overwritten."""
@@ -391,6 +454,7 @@ def test_two_launches_of_one_closed_session_open_it_once(monkeypatch):
     find the session closed and open it twice, on one transcript."""
     monkeypatch.setattr(server, "find_most_recent_session_for_cwd",
                         lambda cwd, config_dir=None: Path("sid-live.jsonl"))
+    monkeypatch.setattr(server, "read_human_title", lambda sid, config_dir=None: None)
     monkeypatch.setattr(server, "config", parse_args([]))
     monkeypatch.setattr(server, "runtimes", {})
     created: list[str] = []
@@ -403,7 +467,7 @@ def test_two_launches_of_one_closed_session_open_it_once(monkeypatch):
         rid = f"R{len(created) + 1}"
         created.append(rid)
         server.runtimes[rid] = types.SimpleNamespace(
-            rid=rid, state=st, config=parse_args([]), bridge=_LiveBridge())
+            rid=rid, state=st, config=parse_args([]), bridge=_LiveBridge(st))
         return server.runtimes[rid]
 
     monkeypatch.setattr(server, "_create_runtime", fake_create_runtime)
@@ -439,10 +503,13 @@ class _FellThrough(Exception):
     pass
 
 
-def _launch(monkeypatch, tmp_path, argv, *, hub):
+def _launch(monkeypatch, tmp_path, argv, *, hub, title=None):
     """Run main() on *argv* with a hub that answers *hub* (None: no hub),
-    stopping wherever it would start a server of its own."""
+    stopping wherever it would start a server of its own.  Every session's
+    title on disk is *title*."""
     log = tmp_path / "launch-error.log"
+    monkeypatch.setattr(server, "read_human_title",
+                        lambda sid, config_dir=None: title)
     monkeypatch.setattr(server, "config", None)       # main() rebinds it
     cfg = parse_args(["--cwd", str(tmp_path), *argv])
     monkeypatch.setattr(server, "_parse_args_or_report", lambda: cfg)
@@ -501,6 +568,17 @@ def test_but_starts_one_for_a_session_named_as_asked(monkeypatch, tmp_path):
                             hub=None)
 
     assert isinstance(reached, _FellThrough)
+
+
+def test_nor_a_session_it_would_open_that_goes_by_its_title(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "find_most_recent_session_for_cwd",
+                        lambda cwd, config_dir=None: Path("sid-live.jsonl"))
+
+    stopped, log = _launch(monkeypatch, tmp_path, ["--agent-name", "Lane-A"],
+                           hub=None, title="OS E")
+
+    assert isinstance(stopped, SystemExit) and stopped.code == 2, "it went on"
+    assert "'OS E'" in log.read_text(encoding="utf-8")
 
 
 def test_nor_one_replacing_a_new_conversation(monkeypatch, tmp_path):

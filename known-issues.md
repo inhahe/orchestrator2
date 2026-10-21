@@ -21,6 +21,10 @@ same thing in a second hub. A launch that is about to start its own hub
 checks the session it would open the same way. With `--resume`, a name
 renames the session on purpose, as before. design.md §9a.
 
+A session with no agent name but a title a person gave it (`/rename`) counts
+as named too (asked for 2026-10-21, "fix the remaining gap"). Its title is
+its `ListAgents` name, and naming it would rename that title.
+
 ### What became of a launch was not in the log
 
 Earlier the same evening, the same six launches ran with `--resume "OS A"`

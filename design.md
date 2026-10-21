@@ -4144,9 +4144,16 @@ name over at all. Now:
   session in its directory, and which session that is depends on which one
   last wrote to disk. A name given with such a launch describes the session
   the user meant, which need not be the one reached. So if that session
-  already has a different name (live in `state.agent_name`, or remembered in
-  `session_names`), the launch is refused, with neither the name nor anything
-  else it brought applied. The error names the session, its name and
+  already goes by a different name, the launch is refused, with neither the
+  name nor anything else it brought applied. The name a session goes by is
+  whatever renaming it would replace, which is its `ListAgents` name. For an
+  open session, that is `SDKBridge._addressable_name` (agent name, else a
+  pending `/rename`, else the title a person gave it). For a closed session,
+  or an open one whose title is not loaded yet, it is `_standing_name`: the
+  name remembered in `session_names`, else `session.read_human_title`, which
+  is never the AI summary. A session with only a title counts because naming
+  it renames that title (`adopt_agent_name` hands the CLI `/rename`). The
+  lanes had been titled "OS A" … "OS F" long before any had an agent name. The error names the session, its name and
   `--resume`. Found 2026-10-20: six lane launches from one directory, with no
   `--resume` and on an account holding two of the lanes, renamed those two
   over and over, ending with Lane E's session called Lane-D. The check runs in

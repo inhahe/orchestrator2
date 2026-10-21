@@ -4120,24 +4120,24 @@ AGENTNAME_SERVER_MUTATIONS = [
      ""),
 
     ('a launch that did not choose its session renames it anyway',
-     '    if refusal:\n        log.warning(',
-     '    if False:\n        log.warning('),
+     '        if refusal:\n            log.warning(',
+     '        if False:\n            log.warning('),
 
     ('a launch that named its session is refused too',
-     'explicit=bool(resume), cwd=cwd or config.cwd)',
-     'explicit=False, cwd=cwd or config.cwd)'),
+     '    checks_name = bool(agent_name and target_sid and not resume)\n',
+     '    checks_name = bool(agent_name and target_sid)\n'),
 
     ('the name remembered for a closed session is not consulted',
-     '    remembered = (await asyncio.to_thread(_remembered_name, target_sid)\n',
-     '    remembered = (None\n'),
+     '    return _remembered_name(sid) or _human_title(sid, config_dir)\n',
+     '    return _human_title(sid, config_dir)\n'),
 
     ('an unnamed session a launch continued is refused its name',
-     '    if explicit or not sid or not requested or not current or current == requested:\n',
-     '    if explicit or not sid or not requested or current == requested:\n'),
+     '    if not sid or not requested or not current or current == requested:\n',
+     '    if not sid or not requested or current == requested:\n'),
 
     ("a session's own name again counts as a rename",
-     '    if explicit or not sid or not requested or not current or current == requested:\n',
-     '    if explicit or not sid or not requested or not current:\n'),
+     '    if not sid or not requested or not current or current == requested:\n',
+     '    if not sid or not requested or not current:\n'),
 
     ('the hub opens whichever session is most recent by then',
      'auto_compact=auto_compact, seed_id=target_sid)',
@@ -4166,6 +4166,26 @@ AGENTNAME_SERVER_MUTATIONS = [
     ('a launch that raises in the hub is not logged',
      '        return await _session_launch(body)\n    except Exception as exc:\n',
      '        return await _session_launch(body)\n    except ZeroDivisionError as exc:\n'),
+
+    ('a title on disk is not a name',
+     '    return _remembered_name(sid) or _human_title(sid, config_dir)\n',
+     '    return _remembered_name(sid)\n'),
+
+    ('an open session goes by its agent name alone',
+     '        live = (existing.bridge._addressable_name()\n',
+     '        live = (existing.state.agent_name\n'),
+
+    ('what is on disk is not consulted for an open session',
+     '        refusal = _rename_refusal(target_sid, live or standing, agent_name,\n',
+     '        refusal = _rename_refusal(target_sid, live, agent_name,\n'),
+
+    ('the title is read from nowhere',
+     '        return read_human_title(sid, config_dir)\n',
+     '        return None\n'),
+
+    ("a launch starting its own hub ignores the session's title",
+     '        _refusal = _rename_refusal(_sid, _standing_name(_sid, config.config_dir),\n',
+     '        _refusal = _rename_refusal(_sid, _remembered_name(_sid),\n'),
 ]
 
 AGENTNAME_CFG_MUTATIONS = [

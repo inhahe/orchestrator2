@@ -114,6 +114,7 @@ from session import (
     load_persisted_queue,
     load_session_compaction,
     normalize_path_for_compare,
+    read_human_title,
     read_session_title,
     render_session_history,
     resolve_session_ref,
@@ -389,29 +390,49 @@ def _remembered_name(sid: str | None) -> str | None:
         return None
 
 
+def _human_title(sid: str | None, config_dir: str | None) -> str | None:
+    """The title a person gave session *sid* (``/rename``), never the AI
+    summary; None if it has none, or its transcript cannot be read."""
+    if not sid:
+        return None
+    try:
+        return read_human_title(sid, config_dir)
+    except Exception:
+        log.warning("could not read the title of session %s", sid, exc_info=True)
+        return None
+
+
+def _standing_name(sid: str | None, config_dir: str | None) -> str | None:
+    """The name session *sid* goes by, as far as the disk says: the agent
+    name remembered for it, else the title a person gave it.  The same order
+    ``SDKBridge._addressable_name`` gives an open session's ``ListAgents``
+    name, which is what renaming the session would change."""
+    return _remembered_name(sid) or _human_title(sid, config_dir)
+
+
 def _rename_refusal(sid: str | None, current: str | None,
-                    requested: str | None, *, explicit: bool,
-                    cwd: str) -> str | None:
-    """Why a launch may not open session *sid* as the agent *requested*.
+                    requested: str | None, *, cwd: str) -> str | None:
+    """Why a launch that did not choose its session may not open session
+    *sid* as the agent *requested*.
 
-    *current* is the agent name the session already has -- live, else
-    remembered.  *explicit* says the launch chose the session itself
-    (``--resume``, or a picker); otherwise it is continuing the most recent
-    session in *cwd*.  Returns None when the launch may go ahead.
+    For a launch without ``--resume`` (or a picker), which continues the
+    most recent session in *cwd*.  *current* is the name that session
+    already goes by (``_standing_name``, or an open session's own).
+    Returns None when the launch may go ahead.
 
-    Only a launch that did not choose its session is refused.  One that did
-    and also gives a name means to rename that session, which is how a
-    misnamed one is put right.  Without --resume, which session the launch
-    reaches depends on which one wrote to disk last, so a name given with it
-    describes the session the user *meant*, which need not be this one --
-    and renaming this one would take it away from the agent it is.
+    Which session such a launch reaches depends on which one wrote to disk
+    last, so a name given with it describes the session the user *meant*,
+    which need not be this one; renaming this one would take its name from
+    it, and with it everything addressed to that name.  A launch that chose
+    its session and gives a name means to rename it -- how a misnamed one
+    is put right -- so its callers do not ask.
     """
     requested = (requested or "").strip()
     current = (current or "").strip()
-    if explicit or not sid or not requested or not current or current == requested:
+    if not sid or not requested or not current or current == requested:
         return None
     return (f"Not opened: without --resume, this launch continued the most "
-            f"recent session in {cwd}, {sid}, which is already the agent "
+            f"recent session in {cwd}, {sid}, which is already named "
             f"'{current}', and it asked for '{requested}'. To open the "
             f"session that is '{requested}', give its id or title with "
             f"--resume; to rename this one, name it with --resume.")
@@ -3605,28 +3626,31 @@ async def _session_launch(body: dict[str, Any]) -> dict[str, Any]:
     # What the launch asked for, on the line that says what became of it.
     asked = (f"cwd={cwd or config.cwd} account={config_dir} resume={resume} "
              f"no_continue={no_continue} name={agent_name}")
-    # The name the registry remembers for a session the launch did not
-    # choose, which it may therefore not rename (_rename_refusal).  Read
-    # before the open sessions are searched: no await may come between that
-    # search and the reuse or the new runtime below, or two launches of one
-    # closed session would both find it closed and open it twice.
-    remembered = (await asyncio.to_thread(_remembered_name, target_sid)
-                  if agent_name and target_sid and not resume else None)
+    # A launch that did not choose its session may not rename it
+    # (_rename_refusal), so the name the session goes by on disk is read
+    # first: before the open sessions are searched, since no await may come
+    # between that search and the reuse or the new runtime below, or two
+    # launches of one closed session would both find it closed and open it
+    # twice.
+    checks_name = bool(agent_name and target_sid and not resume)
+    standing = (await asyncio.to_thread(_standing_name, target_sid, config_dir)
+                if checks_name else None)
     existing = next(
         (r for r in runtimes.values()
          if target_sid and getattr(r.state, "session_id", None) == target_sid),
         None,
     )
     # Before anything else is applied, so that a refused launch changes
-    # nothing -- not even the key below.  An open session's name is its live
-    # one.
-    live_name = (getattr(existing.state, "agent_name", None)
-                 if existing is not None else None)
-    refusal = _rename_refusal(target_sid, live_name or remembered, agent_name,
-                              explicit=bool(resume), cwd=cwd or config.cwd)
-    if refusal:
-        log.warning("hub launch (%s): refused: %s", asked, refusal)
-        return {"ok": False, "error": refusal, "refused": True}
+    # nothing -- not even the key below.  An open session goes by the name
+    # its bridge gives its CLI, unless that is not known yet.
+    if checks_name:
+        live = (existing.bridge._addressable_name()
+                if existing is not None and existing.bridge is not None else None)
+        refusal = _rename_refusal(target_sid, live or standing, agent_name,
+                                  cwd=cwd or config.cwd)
+        if refusal:
+            log.warning("hub launch (%s): refused: %s", asked, refusal)
+            return {"ok": False, "error": refusal, "refused": True}
     # The launch says what its session is billed to: without a key, that is
     # the account's login, whatever key the session ran with before.
     if target_sid and not api_key:
@@ -7095,9 +7119,8 @@ def main() -> None:
             and not config.start_fresh):
         _sid = _session_to_open(None, config.cwd, config.config_dir,
                                 continue_recent=True)
-        _refusal = _rename_refusal(_sid, _remembered_name(_sid),
-                                   config.agent_name, explicit=False,
-                                   cwd=config.cwd)
+        _refusal = _rename_refusal(_sid, _standing_name(_sid, config.config_dir),
+                                   config.agent_name, cwd=config.cwd)
         if _refusal:
             _stop_launch(_refusal, dialog=config.open_browser)
 

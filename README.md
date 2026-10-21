@@ -619,9 +619,10 @@ to the one session that launch opens — also when the launch joins a hub that i
 already running, and never to the other sessions a hub opens — and the session
 keeps it when reopened from the lobby or after a hub restart. Without
 `--resume`, a launch continues the most recent session in its directory, so if
-that session already has a **different** name the launch is refused, rather
-than taking the session from the agent it is. The error says which session it
-reached. To open a particular agent's session, or to rename one on purpose,
+that session already goes by a **different** name the launch is refused,
+rather than taking that name from it. Its name is its agent name, or for a
+session without one, the title you gave it with `/rename`. The error says which
+session the launch reached. To open a particular agent's session, or to rename one on purpose,
 name the session with `--resume`. It is also the
 name other Claude sessions see in `ListAgents`; a session without one is listed
 by its title (`/rename`). Use letters, digits, `.`, `-` and `_` (`Lane-D`, not
