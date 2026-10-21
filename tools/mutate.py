@@ -5246,13 +5246,14 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
      "    if len(usable) == 1:\n        return _follow(usable[0])\n",
      ""),
 
-    ("a given directory is not respected",
-     "              if (not cfg.cwd_given or _same_path(s.get(\"cwd\"), cfg.cwd))\n",
-     "              if True\n"),
+    ("a directory given refuses a session elsewhere rather than follow it",
+     "        if where and not _same_path(where, cfg.cwd):\n",
+     "        if where and not _same_path(where, cfg.cwd) and not cfg.cwd_given:\n"),
 
-    ("a chosen account is not respected",
-     "              and (not account_given or _same_path(s.get(\"config_dir\"), account))]",
-     "              ]"),
+    ("an account chosen keeps a session on another account where it cannot "
+     "be resumed",
+     "        if not _same_path(s.get(\"config_dir\"), account):\n",
+     "        if not _same_path(s.get(\"config_dir\"), account) and not account_given:\n"),
 
     ("the environment's account is not a choice",
      "        config, config_dir=adopt_from_environment(config.config_dir))\n",
@@ -5279,21 +5280,25 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
      "        return new, f\"{what} is {' and '.join(moved)}: resuming it there.\", None",
      "        return new, None, None"),
 
-    ("an id with a --cwd it is not in goes ahead",
-     "        if cfg.cwd_given and where and not _same_path(where, cfg.cwd):\n",
-     "        if False:\n"),
+    ("the directory given does not pick between several elsewhere",
+     "    if len(usable) > 1 and cfg.cwd_given:\n",
+     "    if False:\n"),
+
+    ("a directory given that holds none of them leaves none to pick",
+     "                  if _same_path(s.get(\"cwd\"), cfg.cwd)] or usable\n",
+     "                  if _same_path(s.get(\"cwd\"), cfg.cwd)]\n"),
 
     ("an id is not followed to its directory",
-     "        return _follow({\"session_id\": ref, \"cwd\": where, \"config_dir\": account,",
-     "        return _follow({\"session_id\": ref, \"cwd\": None, \"config_dir\": account,"),
+     "        return _follow({\"session_id\": ref, \"cwd\": find_session_cwd(ref, account),\n",
+     "        return _follow({\"session_id\": ref, \"cwd\": None,\n"),
 
     ("an id on another account is not recognised",
      "    holders = [s for s in _all() if s[\"session_id\"] == ref]\n",
      "    holders = []\n"),
 
-    ("an id on another account is followed past a chosen account",
-     "        if account_given:\n            s = holders[0]\n",
-     "        if False:\n            s = holders[0]\n"),
+    ("the account given does not pick between several elsewhere",
+     "    if len(usable) > 1 and account_given:\n",
+     "    if False:\n"),
 
     ("an id nobody has is taken for a title",
      "    if _UUID_RE.fullmatch(ref):\n",
@@ -5307,9 +5312,10 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
      "        here_all = resumable_sessions(cfg.cwd, account)\n",
      "        here_all = []\n"),
 
-    ("the one flag it needs is not named",
-     "            lines.append(f\"Resume it with {' '.join(need)}.\" if need else\n",
-     "            lines.append(\"Resume it by its id (--resume <id>).\" if need else\n"),
+    ("a list of several asks for flags an id does not need",
+     "        lines.append(f\"Resume one by its id ({how} <id>).\")\n",
+     "        lines.append(f\"Resume one by its id ({how} <id>), with the --cwd \"\n"
+     "                     \"and --config-dir it needs.\")\n"),
 
     ("the picker is settled as a title",
      "    if not ref or ref == _PICKER_SENTINEL:\n        return cfg, None, None\n",

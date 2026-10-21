@@ -154,16 +154,17 @@ def test_a_title_in_another_directory_is_followed_there(machine):
     assert "OS F old 2" in note and machine.os in note
 
 
-def test_not_when_the_directory_was_asked_for(machine):
+def test_and_from_a_directory_given_too(machine):
+    """A launcher that passes --cwd every time.  The CLI resumes a session
+    only in its own directory, so the --cwd could only have refused it."""
     _session(machine.default, machine.os, IDLE, "OS F old 2")
 
     cfg, note, err = _settle(_cfg(machine, machine.orch, "OS F old 2", cwd_given=True))
 
-    assert err is not None and note is None
-    assert f"No session in {machine.orch} is called 'OS F old 2'" in err
-    assert IDLE in err and machine.os in err, "it does not say where it is"
-    assert f'Resume it with --cwd "{machine.os}".' in err
-    assert cfg.resume == "OS F old 2"
+    assert err is None
+    assert cfg.resume == IDLE
+    assert cfg.cwd == str(Path(machine.os).resolve())
+    assert "OS F old 2" in note and machine.os in note
 
 
 def test_a_title_on_another_account_is_followed_there(machine):
@@ -176,27 +177,44 @@ def test_a_title_on_another_account_is_followed_there(machine):
     assert ".claude-work" in note
 
 
-def test_not_when_the_account_was_chosen(machine):
+def test_and_from_an_account_chosen_too(machine):
+    """Its transcript is in its own account's tree, so the one chosen could
+    only have refused it."""
     _session(machine.other, machine.os, MOVED, "OS F old")
 
-    _cfg_, _note, err = _settle(_cfg(machine, machine.os, "OS F old",
-                                     config_dir=str(machine.default)))
+    cfg, note, err = _settle(_cfg(machine, machine.os, "OS F old",
+                                  config_dir=str(machine.default)))
 
-    assert err is not None and MOVED in err and ".claude-work" in err
-    assert f'Resume it with --config-dir "{machine.other}".' in err
+    assert err is None
+    assert cfg.resume == MOVED and cfg.config_dir == str(machine.other)
+    assert ".claude-work" in note
 
 
-def test_nor_when_the_account_came_from_the_environment(machine, monkeypatch, tmp_path,
-                                                        capsys):
-    """main() adopts the inherited account into the launch's Config, so it
-    counts as chosen, as --config-dir does."""
+def test_and_from_an_account_the_environment_chose(machine, monkeypatch, tmp_path):
+    """main() adopts the inherited account into the launch's Config, as if
+    it had been given with --config-dir."""
     _session(machine.other, machine.os, MOVED, "OS F old")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(machine.default))
 
-    stopped, _log = _main(monkeypatch, _cfg(machine, machine.os, "OS F old"), tmp_path)
+    reached, _log = _main(monkeypatch, _cfg(machine, machine.os, "OS F old"), tmp_path)
 
-    assert isinstance(stopped, SystemExit) and stopped.code == 2
-    assert MOVED in capsys.readouterr().err
+    assert not isinstance(reached, SystemExit), "it stopped"
+    assert server.config.resume == MOVED
+    assert server.config.config_dir == str(machine.other)
+
+
+def test_the_environments_account_picks_between_several(machine, monkeypatch,
+                                                         tmp_path):
+    """Inherited, it is the launch's account all the same: a shell set up
+    for one account resumes that account's session of a shared name."""
+    _session(machine.default, machine.os, LIVE, "OS F")
+    _session(machine.other, machine.os, MOVED, "OS F")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(machine.other))
+
+    reached, _log = _main(monkeypatch, _cfg(machine, machine.orch, "OS F"), tmp_path)
+
+    assert not isinstance(reached, SystemExit), "it stopped"
+    assert server.config.resume == MOVED
 
 
 def test_one_session_under_two_accounts_is_still_one(machine):
@@ -260,6 +278,43 @@ def test_several_elsewhere_are_listed_not_guessed_between(machine):
 
     assert cfg.resume == "OS F"
     assert LIVE in err and MOVED in err and "--resume <id>" in err
+    assert "--cwd" not in err and "--config-dir" not in err, \
+        "an id is followed anywhere, so neither is needed"
+
+
+def test_several_elsewhere_the_directory_given_picks_one(machine, tmp_path):
+    third = tmp_path / "third"
+    third.mkdir()
+    _session(machine.default, machine.os, LIVE, "OS F")
+    _session(machine.other, str(third), MOVED, "OS F")
+
+    cfg, _note, err = _settle(_cfg(machine, str(third), "OS F", cwd_given=True))
+
+    assert err is None and cfg.resume == MOVED
+    assert cfg.config_dir == str(machine.other)
+
+
+def test_a_directory_given_with_none_of_them_leaves_the_account_to_pick(machine):
+    """A launcher's --cwd is usually just where it was run: holding none of
+    them, it must not keep the account from choosing."""
+    _session(machine.default, machine.os, LIVE, "OS F")
+    _session(machine.other, machine.os, MOVED, "OS F")
+
+    cfg, _note, err = _settle(_cfg(machine, machine.orch, "OS F", cwd_given=True,
+                                   config_dir=str(machine.other)))
+
+    assert err is None and cfg.resume == MOVED
+
+
+def test_several_elsewhere_the_account_given_picks_one(machine):
+    _session(machine.default, machine.os, LIVE, "OS F")
+    _session(machine.other, machine.os, MOVED, "OS F")
+
+    cfg, _note, err = _settle(_cfg(machine, machine.orch, "OS F",
+                                   config_dir=str(machine.other)))
+
+    assert err is None and cfg.resume == MOVED
+    assert cfg.cwd == str(Path(machine.os).resolve())
 
 
 # --------------------------------------------------------------------------
@@ -313,14 +368,15 @@ def test_an_id_in_its_own_directory_is_left_alone(machine):
     assert (cfg.resume, cfg.cwd, note, err) == (IDLE, machine.os, None, None)
 
 
-def test_an_id_with_a_directory_it_is_not_in_is_refused(machine):
-    """The CLI looks for the transcript only under the launch directory."""
+def test_an_id_is_followed_from_a_directory_given_too(machine):
+    """The CLI looks for the transcript only under the launch directory, so
+    the launch goes to the session's."""
     _session(machine.default, machine.os, IDLE)
 
-    _cfg_, _note, err = _settle(_cfg(machine, machine.orch, IDLE, cwd_given=True))
+    cfg, note, err = _settle(_cfg(machine, machine.orch, IDLE, cwd_given=True))
 
-    assert "resumed only from its own directory" in err
-    assert f'--cwd "{machine.os}"' in err
+    assert err is None and cfg.resume == IDLE
+    assert cfg.cwd == str(Path(machine.os).resolve()) and machine.os in note
 
 
 def test_an_id_on_another_account_is_followed_there(machine):
@@ -331,13 +387,14 @@ def test_an_id_on_another_account_is_followed_there(machine):
     assert err is None and cfg.config_dir == str(machine.other)
 
 
-def test_not_when_the_account_was_chosen_for_an_id(machine):
+def test_an_id_is_followed_from_an_account_chosen_too(machine):
     _session(machine.other, machine.os, MOVED)
 
-    _cfg_, _note, err = _settle(_cfg(machine, machine.os, MOVED,
-                                     config_dir=str(machine.default)))
+    cfg, note, err = _settle(_cfg(machine, machine.os, MOVED,
+                                  config_dir=str(machine.default)))
 
-    assert f'--config-dir "{machine.other}"' in err
+    assert err is None and cfg.config_dir == str(machine.other)
+    assert ".claude-work" in note
 
 
 def test_an_id_nobody_has_says_so(machine):

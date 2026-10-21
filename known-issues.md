@@ -1,5 +1,23 @@
 # Known issues / tech debt — orchestrator2
 
+## `--resume` refused a session in another directory when `--cwd` was given — FIXED (2026-10-21)
+
+> "this contradicts what you said earlier, that a resume can be done from any
+> folder or account"
+
+A launch with `--cwd "D:\visual studio projects" --resume "OS A c"` stopped
+with "No session in D:\visual studio projects is called 'OS A c'", naming the
+one session of that name, in `C:\visual studio projects\os`, and saying to
+resume it with that `--cwd`. `_settle_launch_resume` followed a session to its
+own directory and account only when the launch had chosen neither, and a
+launcher passes `--cwd` every time; an account from `CLAUDE_CONFIG_DIR`
+counted as chosen too. `/resume` in a tab passes neither, which is why it
+worked from anywhere. The refusals protected nothing: the CLI resumes a
+session only in its own directory, under its own account. Now a launch always
+follows it there and says so, and a given `--cwd` or account only picks
+between several sessions of one name. Tests: `tests/test_launch_resume.py`;
+mutation target `launchresume-server`.
+
 ## A session locked out by a usage limit read "idle" — FIXED (2026-10-21)
 
 `run_turn` clears a rate-limit rejection on the first `AssistantMessage` of a

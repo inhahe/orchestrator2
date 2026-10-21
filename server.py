@@ -6571,8 +6571,8 @@ def _settle_launch_resume(cfg: Config, *, how: str = "--resume",
 
     Returns ``(config, note, error)``.  ``config`` is what to launch with: the
     session's id in place of its title, and the session's own directory and
-    account when the launch did not ask for others.  ``note`` is a line to
-    print on the way.  ``error`` means the launch must not go ahead.
+    account.  ``note`` is a line to print on the way.  ``error`` means the
+    launch must not go ahead.
 
     Reported 2026-09-27: ``py server.py --resume "OS F old 2"``, run from the
     orchestrator2 checkout, printed "Joined running orchestrator2 hub on port
@@ -6588,13 +6588,16 @@ def _settle_launch_resume(cfg: Config, *, how: str = "--resume",
     * Several there: an error naming each, when it was last active, and any
       session of that name elsewhere, which is not one of them.
     * None there: every directory and account on this machine is searched.
-      Exactly one session of that name, and the launch follows it -- to its
-      directory unless ``--cwd`` was given, to its account unless one was
-      chosen -- and says so.  Otherwise an error saying where each session of
-      that name is, or what the launch directory does have.
+      Exactly one session of that name, and the launch follows it to its
+      directory and account, and says so.  Several: the ``--cwd`` or account
+      the launch was given picks between them, if it settles it.  Otherwise
+      an error saying where each session of that name is, or what the launch
+      directory does have.
 
     An id is followed the same way; the terminal picker has always done that
-    ("resume is cwd-scoped").
+    ("resume is cwd-scoped").  A session is followed whatever ``--cwd`` or
+    account the launch was given: the CLI resumes one only in its own
+    directory, under its own account, so they could only have refused it.
 
     *how* is the command the messages tell the user to use: ``--resume`` for
     a launch, ``/resume`` in a tab (``_handle_resume``).  *home_account* is
@@ -6620,14 +6623,14 @@ def _settle_launch_resume(cfg: Config, *, how: str = "--resume",
         new = dataclasses.replace(cfg, resume=s["session_id"])
         moved = []
         where = s.get("cwd")
-        if where and not _same_path(where, cfg.cwd) and not cfg.cwd_given:
+        if where and not _same_path(where, cfg.cwd):
             if not Path(where).is_dir():
                 return cfg, None, (
                     f"Session {s['session_id']} is in {where}, which does not "
                     f"exist on this machine any more.")
             new = dataclasses.replace(new, cwd=str(Path(where).resolve()))
             moved.append(f"in {where}")
-        if not _same_path(s.get("config_dir"), account) and not account_given:
+        if not _same_path(s.get("config_dir"), account):
             new = dataclasses.replace(new, config_dir=s["config_dir"])
             moved.append(f"on account {Path(s['config_dir']).name}")
         if not moved:
@@ -6637,24 +6640,10 @@ def _settle_launch_resume(cfg: Config, *, how: str = "--resume",
 
     # --- An id ---
     if find_session_dir(ref, account) is not None:
-        where = find_session_cwd(ref, account)
-        if cfg.cwd_given and where and not _same_path(where, cfg.cwd):
-            # The CLI looks for the transcript only under the launch
-            # directory's project (getProjectDir(getOriginalCwd())).
-            return cfg, None, (
-                f"Session {ref} is in {where}, not {cfg.cwd}, and a session "
-                f"can be resumed only from its own directory. Leave out "
-                f"--cwd, or use --cwd \"{where}\".")
-        return _follow({"session_id": ref, "cwd": where, "config_dir": account,
-                        "title": None})
+        return _follow({"session_id": ref, "cwd": find_session_cwd(ref, account),
+                        "config_dir": account, "title": None})
     holders = [s for s in _all() if s["session_id"] == ref]
     if holders:
-        if account_given:
-            s = holders[0]
-            return cfg, None, (
-                f"Session {ref} is on account {Path(s['config_dir']).name} "
-                f"({s['config_dir']}), not this launch's ({account}). Add "
-                f"--config-dir \"{s['config_dir']}\" to resume it.")
         return _follow(holders[0])
 
     # --- A title: in the launch directory first, as the CLI looks ---
@@ -6683,9 +6672,14 @@ def _settle_launch_resume(cfg: Config, *, how: str = "--resume",
                          f"of those:")
             lines += [_session_line(s, account) for s in others]
         return cfg, None, "\n".join(lines)
-    usable = [s for s in named
-              if (not cfg.cwd_given or _same_path(s.get("cwd"), cfg.cwd))
-              and (not account_given or _same_path(s.get("config_dir"), account))]
+    # Several elsewhere: what the launch was given picks one, if it can.
+    usable = named
+    if len(usable) > 1 and cfg.cwd_given:
+        usable = [s for s in usable
+                  if _same_path(s.get("cwd"), cfg.cwd)] or usable
+    if len(usable) > 1 and account_given:
+        usable = [s for s in usable
+                  if _same_path(s.get("config_dir"), account)] or usable
     if len(usable) == 1:
         return _follow(usable[0])
 
@@ -6694,24 +6688,11 @@ def _settle_launch_resume(cfg: Config, *, how: str = "--resume",
         return cfg, None, f"There is no session {ref} on this machine."
     lines = [f"No session in {cfg.cwd} is called '{ref}'."]
     if named:
+        # Several, and nothing the launch was given settles which.  An id is
+        # followed to its own directory and account (_follow).
         lines.append(f"Sessions called '{ref}':")
         lines += [_session_line(s, account) for s in named]
-        if len(named) == 1:
-            # Ruled out by the --cwd or account the launch asked for.
-            s = named[0]
-            need = []
-            if s.get("cwd") and not _same_path(s["cwd"], cfg.cwd):
-                need.append(f"--cwd \"{s['cwd']}\"")
-            if s.get("config_dir") and not _same_path(s["config_dir"], account):
-                need.append(f"--config-dir \"{s['config_dir']}\"")
-            lines.append(f"Resume it with {' '.join(need)}." if need else
-                         f"Resume it by its id ({how} <id>).")
-        else:
-            # An id is followed to its directory and account (_follow),
-            # unless the launch fixed one of them.
-            lines.append(f"Resume one by its id ({how} <id>)"
-                         + (", with the --cwd and --config-dir it needs"
-                            if cfg.cwd_given or account_given else "") + ".")
+        lines.append(f"Resume one by its id ({how} <id>).")
         return cfg, None, "\n".join(lines)
     similar = [s for s in _all() if s["title"] and want in s["title"].casefold()]
     if similar:

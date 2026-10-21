@@ -336,16 +336,20 @@ that name" meant the first two, and the user renamed the third. Now:
   of that name elsewhere, which "is not one of those".
 - If none there has it, every account's sessions are searched
   (`session.sessions_anywhere`: the lobby's scan, through the title index,
-  0.5 s). If exactly one session has the title, the launch follows it: to its
-  directory unless `--cwd` was given (`Config.cwd_given`), and to its account
-  unless one was chosen (`--config-dir` or `CLAUDE_CONFIG_DIR`). It prints a
-  note saying so, and pins the account. Otherwise the launch stops and says
-  where each session of that name is, or which titles are like it, or what the
-  directory has.
+  0.5 s). If exactly one session has the title, the launch follows it to its
+  directory and account, prints a note saying so, and pins the account. If
+  several do, the `--cwd` the launch was given (`Config.cwd_given`) and then
+  the account it was given (`--config-dir` or `CLAUDE_CONFIG_DIR`) pick between
+  them, each only when it narrows them to some. Otherwise the launch stops and
+  says where each session of that name is, or which titles are like it, or
+  what the directory has.
 - An id is followed the same way. The terminal picker always did this ("resume
-  is cwd-scoped"). An id with a `--cwd` it is not in is refused, because the
-  CLI looks for the transcript only under the launch directory's project
-  (`getProjectDir(getOriginalCwd())`).
+  is cwd-scoped").
+- A session is followed whatever `--cwd` or account the launch was given. The
+  CLI looks for a transcript only under the launch directory's project
+  (`getProjectDir(getOriginalCwd())`), in its own account's tree, so those
+  could only have refused it. Until 2026-10-21 they did, and a launcher that
+  passes `--cwd` every time could not resume a session from another directory.
 
 The error goes to stderr, `launch-error.log` and the `--log-file`
 (`_stop_launch`). A dialog also appears when the console is hidden, or when the
