@@ -95,6 +95,7 @@ from config import (
 )
 from state import (
     State,
+    addressable_name,
     apply_api_key_source,
     apply_rate_limit_info,
     carry_cost,
@@ -1170,8 +1171,7 @@ class SDKBridge:
           on record.  Never the AI summary.
         """
         st = self.state
-        return (st.agent_name or st.pending_rename or st.human_title
-                or "").strip() or None
+        return addressable_name(st.agent_name, st.pending_rename, st.human_title)
 
     def _resume_target(self, resume_id: str | None) -> str | None:
         """The session a connect with *resume_id* will land on, or None for a

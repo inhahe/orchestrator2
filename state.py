@@ -279,6 +279,21 @@ _API_KEY_SOURCE_NAMES = {
 }
 
 
+def addressable_name(agent_name: str | None, pending_rename: str | None,
+                     human_title: str | None) -> str | None:
+    """The name other Claude sessions know a session by, from its parts.
+
+    What ``ListAgents`` shows and ``SendMessage`` addresses, and so what
+    renaming the session would replace.  In order: its explicit agent name
+    (``--agent-name``, or remembered for it), else a ``/rename`` still to be
+    applied, else the title a person gave it -- never the AI summary, which
+    the CLI itself withholds from this role.  The one place this order is
+    written: ``SDKBridge._addressable_name`` hands it to the CLI, and a launch
+    checks it before renaming a session it did not choose.
+    """
+    return (agent_name or pending_rename or human_title or "").strip() or None
+
+
 def billed_to_api_key(state: State) -> bool:
     """True when the session's CLI says it calls the API with an API key."""
     return state.api_key_source not in (None, "none")

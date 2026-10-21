@@ -97,6 +97,7 @@ from config import (
 from state import (
     OWN_KEY_SOURCE,
     State,
+    addressable_name,
     apply_api_key_source,
     billed_to_api_key,
     detect_account_info,
@@ -373,41 +374,41 @@ class LaunchRefused(Exception):
     """
 
 
-def _remembered_name(sid: str | None) -> str | None:
-    """The agent name session *sid* was given, as the registry remembers it.
+def _disk_names(sid: str, config_dir: str | None
+                ) -> tuple[str | None, str | None] | None:
+    """``(agent name remembered for it, title a person gave it)`` for
+    session *sid*, as the disk has them.
 
-    None when it never had one -- or when the registry cannot be read, which
-    is logged but refuses no launch.
+    None when the registry cannot be read: then whether the session has an
+    agent name is not known, and no launch is refused on a guess (logged).
+    A transcript whose title cannot be read just has none.
     """
-    if not sid:
-        return None
     try:
         import agent_comms
-        return agent_comms.session_name(sid)
+        remembered = agent_comms.session_name(sid)
     except Exception:
         log.warning("could not read the agent name remembered for session %s",
                     sid, exc_info=True)
         return None
-
-
-def _human_title(sid: str | None, config_dir: str | None) -> str | None:
-    """The title a person gave session *sid* (``/rename``), never the AI
-    summary; None if it has none, or its transcript cannot be read."""
-    if not sid:
-        return None
     try:
-        return read_human_title(sid, config_dir)
+        title = read_human_title(sid, config_dir)
     except Exception:
         log.warning("could not read the title of session %s", sid, exc_info=True)
-        return None
+        title = None
+    return remembered, title
 
 
-def _standing_name(sid: str | None, config_dir: str | None) -> str | None:
-    """The name session *sid* goes by, as far as the disk says: the agent
-    name remembered for it, else the title a person gave it.  The same order
-    ``SDKBridge._addressable_name`` gives an open session's ``ListAgents``
-    name, which is what renaming the session would change."""
-    return _remembered_name(sid) or _human_title(sid, config_dir)
+def _goes_by(disk: tuple[str | None, str | None], state: Any = None) -> str | None:
+    """The name a session goes by (``state.addressable_name``), from what the
+    disk has (``_disk_names``) and, for an open session, its *state*.
+
+    Part by part, so an open session that has not yet loaded its remembered
+    agent name is not taken for its title.  The title is the disk's: a
+    ``/rename`` made in the session is written there, or is still pending.
+    """
+    remembered, title = disk
+    return addressable_name(getattr(state, "agent_name", None) or remembered,
+                            getattr(state, "pending_rename", None), title)
 
 
 def _rename_refusal(sid: str | None, current: str | None,
@@ -417,8 +418,8 @@ def _rename_refusal(sid: str | None, current: str | None,
 
     For a launch without ``--resume`` (or a picker), which continues the
     most recent session in *cwd*.  *current* is the name that session
-    already goes by (``_standing_name``, or an open session's own).
-    Returns None when the launch may go ahead.
+    already goes by (``_goes_by``).  Returns None when the launch may go
+    ahead.
 
     Which session such a launch reaches depends on which one wrote to disk
     last, so a name given with it describes the session the user *meant*,
@@ -3632,22 +3633,19 @@ async def _session_launch(body: dict[str, Any]) -> dict[str, Any]:
     # between that search and the reuse or the new runtime below, or two
     # launches of one closed session would both find it closed and open it
     # twice.
-    checks_name = bool(agent_name and target_sid and not resume)
-    standing = (await asyncio.to_thread(_standing_name, target_sid, config_dir)
-                if checks_name else None)
+    disk = (await asyncio.to_thread(_disk_names, target_sid, config_dir)
+            if agent_name and target_sid and not resume else None)
     existing = next(
         (r for r in runtimes.values()
          if target_sid and getattr(r.state, "session_id", None) == target_sid),
         None,
     )
     # Before anything else is applied, so that a refused launch changes
-    # nothing -- not even the key below.  An open session goes by the name
-    # its bridge gives its CLI, unless that is not known yet.
-    if checks_name:
-        live = (existing.bridge._addressable_name()
-                if existing is not None and existing.bridge is not None else None)
-        refusal = _rename_refusal(target_sid, live or standing, agent_name,
-                                  cwd=cwd or config.cwd)
+    # nothing -- not even the key below.
+    if disk is not None:
+        refusal = _rename_refusal(
+            target_sid, _goes_by(disk, existing.state if existing is not None else None),
+            agent_name, cwd=cwd or config.cwd)
         if refusal:
             log.warning("hub launch (%s): refused: %s", asked, refusal)
             return {"ok": False, "error": refusal, "refused": True}
@@ -7119,10 +7117,16 @@ def main() -> None:
             and not config.start_fresh):
         _sid = _session_to_open(None, config.cwd, config.config_dir,
                                 continue_recent=True)
-        _refusal = _rename_refusal(_sid, _standing_name(_sid, config.config_dir),
-                                   config.agent_name, cwd=config.cwd)
-        if _refusal:
-            _stop_launch(_refusal, dialog=config.open_browser)
+        _disk = _disk_names(_sid, config.config_dir) if _sid else None
+        if _disk is not None:
+            _refusal = _rename_refusal(_sid, _goes_by(_disk), config.agent_name,
+                                       cwd=config.cwd)
+            if _refusal:
+                _stop_launch(_refusal, dialog=config.open_browser)
+        # The server opens the session that was checked, not whichever one is
+        # most recent by the time it starts (or its --detach child does).
+        if _sid:
+            config = dataclasses.replace(config, resume=_sid)
 
     # --detach: validate everything here (errors visible in terminal),
     # then respawn headless and exit.

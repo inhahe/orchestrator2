@@ -617,20 +617,19 @@ A session's identity is a **name**, not something derived from its account or
 directory: set it with `--agent-name` (or `ORCH2_AGENT_NAME`). The name belongs
 to the one session that launch opens — also when the launch joins a hub that is
 already running, and never to the other sessions a hub opens — and the session
-keeps it when reopened from the lobby or after a hub restart. Without
-`--resume`, a launch continues the most recent session in its directory, so if
-that session already goes by a **different** name the launch is refused,
-rather than taking that name from it. Its name is its agent name, or for a
-session without one, the title you gave it with `/rename`. The error says which
-session the launch reached. To open a particular agent's session, or to rename one on purpose,
-name the session with `--resume`. It is also the
+keeps it when reopened from the lobby or after a hub restart. It is also the
 name other Claude sessions see in `ListAgents`; a session without one is listed
-by its title (`/rename`). Use letters, digits, `.`, `-` and `_` (`Lane-D`, not
-`Lane D`): the registry refuses anything else and says so. If a session starts
-in a directory where several identities are registered and none was given, it
-**refuses and lists them** rather than guessing — adopting the wrong one would
-silently inherit another agent's messages and halt state, and neither session
-could tell.
+by its title (`/rename`). Without `--resume`, a launch continues the most
+recent session in its directory, so if that session already goes by a
+**different** name (its agent name, or its `/rename` title if it has none), the
+launch is refused rather than taking that name from it. The error says which
+session the launch reached. To open a particular agent's session, or to rename
+one on purpose, name the session with `--resume`. Use letters, digits, `.`,
+`-` and `_` (`Lane-D`, not `Lane D`): the registry refuses anything else and
+says so. If a session starts in a directory where several identities are
+registered and none was given, it **refuses and lists them** rather than
+guessing — adopting the wrong one would silently inherit another agent's
+messages and halt state, and neither session could tell.
 
 Sessions can carry free-form **labels** (`--agent-label lane=b
 --agent-label role=reviewer`, repeatable), shown by `agents.py list`. Like the

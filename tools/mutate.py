@@ -4124,12 +4124,12 @@ AGENTNAME_SERVER_MUTATIONS = [
      '        if False:\n            log.warning('),
 
     ('a launch that named its session is refused too',
-     '    checks_name = bool(agent_name and target_sid and not resume)\n',
-     '    checks_name = bool(agent_name and target_sid)\n'),
+     '            if agent_name and target_sid and not resume else None)\n',
+     '            if agent_name and target_sid else None)\n'),
 
     ('the name remembered for a closed session is not consulted',
-     '    return _remembered_name(sid) or _human_title(sid, config_dir)\n',
-     '    return _human_title(sid, config_dir)\n'),
+     '    return addressable_name(getattr(state, "agent_name", None) or remembered,\n',
+     '    return addressable_name(getattr(state, "agent_name", None),\n'),
 
     ('an unnamed session a launch continued is refused its name',
      '    if not sid or not requested or not current or current == requested:\n',
@@ -4152,8 +4152,8 @@ AGENTNAME_SERVER_MUTATIONS = [
      '        except LaunchRefused as exc:\n            rid = None\n        if rid:\n'),
 
     ('a launch starting its own hub renames the session anyway',
-     '        if _refusal:\n            _stop_launch(_refusal, dialog=config.open_browser)\n',
-     '        if False:\n            pass\n'),
+     '            if _refusal:\n                _stop_launch(_refusal, dialog=config.open_browser)\n',
+     '            if False:\n                pass\n'),
 
     ('a restart replacing a new conversation is refused',
      '            and not config.start_fresh):\n',
@@ -4168,24 +4168,40 @@ AGENTNAME_SERVER_MUTATIONS = [
      '        return await _session_launch(body)\n    except ZeroDivisionError as exc:\n'),
 
     ('a title on disk is not a name',
-     '    return _remembered_name(sid) or _human_title(sid, config_dir)\n',
-     '    return _remembered_name(sid)\n'),
+     '                            getattr(state, "pending_rename", None), title)\n',
+     '                            getattr(state, "pending_rename", None), None)\n'),
 
     ('an open session goes by its agent name alone',
-     '        live = (existing.bridge._addressable_name()\n',
-     '        live = (existing.state.agent_name\n'),
+     '                            getattr(state, "pending_rename", None), title)\n',
+     '                            None, title)\n'),
 
     ('what is on disk is not consulted for an open session',
-     '        refusal = _rename_refusal(target_sid, live or standing, agent_name,\n',
-     '        refusal = _rename_refusal(target_sid, live, agent_name,\n'),
+     '            target_sid, _goes_by(disk, existing.state if existing is not None else None),\n',
+     '            target_sid, getattr(existing.state if existing is not None else None, "agent_name", None),\n'),
 
     ('the title is read from nowhere',
-     '        return read_human_title(sid, config_dir)\n',
-     '        return None\n'),
+     '        title = read_human_title(sid, config_dir)\n',
+     '        title = None\n'),
 
     ("a launch starting its own hub ignores the session's title",
-     '        _refusal = _rename_refusal(_sid, _standing_name(_sid, config.config_dir),\n',
-     '        _refusal = _rename_refusal(_sid, _remembered_name(_sid),\n'),
+     '            _refusal = _rename_refusal(_sid, _goes_by(_disk), config.agent_name,\n',
+     '            _refusal = _rename_refusal(_sid, _disk[0], config.agent_name,\n'),
+
+    ('the title outranks the agent name',
+     '    return addressable_name(getattr(state, "agent_name", None) or remembered,\n                            getattr(state, "pending_rename", None), title)\n',
+     '    return addressable_name(title, getattr(state, "pending_rename", None),\n                            getattr(state, "agent_name", None) or remembered)\n'),
+
+    ("an open session's loaded title outranks its remembered name",
+     '    return addressable_name(getattr(state, "agent_name", None) or remembered,\n                            getattr(state, "pending_rename", None), title)\n',
+     '    return (addressable_name(getattr(state, "agent_name", None),\n                             getattr(state, "pending_rename", None),\n                             getattr(state, "human_title", None))\n            or addressable_name(remembered, None, title))\n'),
+
+    ('a registry that cannot be read is taken for no agent name',
+     '                    sid, exc_info=True)\n        return None\n    try:\n',
+     '                    sid, exc_info=True)\n        remembered = None\n    try:\n'),
+
+    ('a launch starting its own hub opens whichever session is most recent then',
+     '            config = dataclasses.replace(config, resume=_sid)\n',
+     '            pass\n'),
 ]
 
 AGENTNAME_CFG_MUTATIONS = [

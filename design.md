@@ -4145,33 +4145,45 @@ name over at all. Now:
   last wrote to disk. A name given with such a launch describes the session
   the user meant, which need not be the one reached. So if that session
   already goes by a different name, the launch is refused, with neither the
-  name nor anything else it brought applied. The name a session goes by is
-  whatever renaming it would replace, which is its `ListAgents` name. For an
-  open session, that is `SDKBridge._addressable_name` (agent name, else a
-  pending `/rename`, else the title a person gave it). For a closed session,
-  or an open one whose title is not loaded yet, it is `_standing_name`: the
-  name remembered in `session_names`, else `session.read_human_title`, which
-  is never the AI summary. A session with only a title counts because naming
-  it renames that title (`adopt_agent_name` hands the CLI `/rename`). The
-  lanes had been titled "OS A" … "OS F" long before any had an agent name. The error names the session, its name and
-  `--resume`. Found 2026-10-20: six lane launches from one directory, with no
-  `--resume` and on an account holding two of the lanes, renamed those two
-  over and over, ending with Lane E's session called Lane-D. The check runs in
-  `/api/session/launch` before anything else, and in `main()` before a launch
-  starts a hub of its own, since that hub would open the same session under
-  the same name. `main()` skips the check when the launch opens a new
-  conversation (`--no-continue`, or `--start-fresh` from ⟳ Restart). A launch
-  that names its session (`--resume`, or a picker) still renames it, which is
-  how a misnamed session is put right. Naming a session that has no name, or
-  giving one its own name again, is no rename. Two constraints in the hub keep
-  the check and the open in agreement:
-  * The registry read (`_remembered_name`, in a thread) comes **before** the
+  name nor anything else it brought applied. The error names the session, its
+  name and `--resume`.
+  * **The name a session goes by** is whatever renaming it would replace,
+    which is its `ListAgents` name. `state.addressable_name` is the one place
+    the order is written: the agent name, else a pending `/rename`, else the
+    title a person gave it (never the AI summary). `SDKBridge._addressable_name`
+    hands that name to the CLI. The launch check (`_goes_by`) fills in the
+    parts from the disk (`_disk_names`: the name remembered in
+    `session_names`, and `session.read_human_title`) and, for an open session,
+    from its state. It combines them part by part, so an open session whose
+    connect has read its title but not yet its remembered name still goes by
+    the name. A session with only a title counts, because naming it renames
+    that title (`adopt_agent_name` hands the CLI `/rename`). The lanes had
+    been titled "OS A" … "OS F" long before any had an agent name.
+  * **A registry that cannot be read refuses nothing.** Whether the session
+    has an agent name is then unknown, and refusing on its title alone could
+    turn an agent away from its own session.
+  * **Where it runs.** The check runs in `/api/session/launch` before anything
+    else. It also runs in `main()` before a launch starts a hub of its own,
+    which would open the same session under the same name, and `main()` then
+    pins that session (`config.resume`) so the server, or its `--detach`
+    child, opens the session that was checked. `main()` skips the check when
+    the launch opens a new conversation (`--no-continue`, or `--start-fresh`
+    from ⟳ Restart).
+  * **What is not a rename.** A launch that names its session (`--resume`, or
+    a picker) still renames it, which is how a misnamed session is put right.
+    Naming a session that goes by no name, or giving one its own name again,
+    is no rename either.
+  * **Two constraints in the hub keep the check and the open in agreement.**
+    First, the disk read (`_disk_names`, in a thread) comes **before** the
     search of the open sessions. The search and the reuse or the new runtime
     have no await between them. If they did, two launches of one closed
     session would both find it closed and open it twice on one transcript.
-  * `_create_runtime` is handed the session that was checked (`seed_id`),
-    rather than looking for the most recent session again. By then another
-    session, named something else, may have written to disk.
+    Second, `_create_runtime` is handed the session that was checked
+    (`seed_id`), rather than looking for the most recent session again. By
+    then another session, named something else, may have written to disk.
+  * Found 2026-10-20: six lane launches from one directory, with no
+    `--resume` and on an account holding two of the lanes, renamed those two
+    over and over, ending with Lane E's session called Lane-D.
 
 **Two live sessions under one name** are possible — an explicit name is taken
 at face value (§3.3) — and used to fail silently and badly. Found 2026-09-24:
