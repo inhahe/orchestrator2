@@ -990,11 +990,16 @@ class SDKBridge:
         self._limit_armed_for: int | None = None
         # Times the pending resume has been put off because a turn was running.
         self._limit_defers = 0
-        # From sending a resume until the turn it starts ends, and the reset it
-        # was sent for: a resume that runs straight back into that limit is
-        # an attempt, and the attempts are bounded (_after_limit_turn).
-        self._limit_resume_sent = False
+        # The reset the last resume was sent for: one that runs straight back
+        # into that limit is an attempt, and the attempts are bounded
+        # (_after_limit_turn).  Which turn is a resume, its prompt says.
         self._limit_sent_for: int | None = None
+        # A resume on the event queue, not yet taken for a turn; and whether
+        # the session carried on meanwhile, which makes it moot (dropped by
+        # _await_next_prompt).  And a resume's turn running.
+        self._limit_resume_queued = False
+        self._limit_resume_moot = False
+        self._limit_resume_running = False
         self._limit_attempts = 0
         # The reset last hinted at when the option is off, so it is said once.
         self._limit_hinted_for: int | None = None
@@ -1529,11 +1534,8 @@ class SDKBridge:
         if not resume_sid:
             return 0
         try:
-            project = find_session_dir(resume_sid,
-                                       getattr(self.config, "config_dir", None))
-            if project is None:
-                return 0
-            return (project / f"{resume_sid}.jsonl").stat().st_size
+            jsonl = self._jsonl_for(resume_sid)
+            return jsonl.stat().st_size if jsonl is not None else 0
         except Exception:
             return 0
 
@@ -1858,8 +1860,10 @@ class SDKBridge:
 
         # What the CLI carried into a resumed conversation goes with the
         # first turn (_show_carried) -- set before the dispatcher starts, as
-        # the CLI's own turn can be the first.
+        # the CLI's own turn can be the first.  And an interrupt of the old
+        # CLI's ghost turn belongs to it.
         self._carried_unseen = bool(resume_sid)
+        self._ghost_interrupted = False
 
         # Start the message dispatcher.  Bump the generation counter
         # so the dispatcher can detect it's been superseded.
@@ -2303,8 +2307,7 @@ class SDKBridge:
         if st.cost_reported is None and st.cost_mark_size is None:
             self._take_kept_cost(sid, cfg_dir)
         restores = restores_saved_cost(version)
-        project = find_session_dir(sid, cfg_dir)
-        jsonl = project / f"{sid}.jsonl" if project is not None else None
+        jsonl = self._jsonl_for(sid)
         size = jsonl.stat().st_size if jsonl is not None else None
         mark = (st.cost_mark_size if st.cost_mark_size is not None
                 and size is not None and st.cost_mark_size <= size else None)
@@ -3003,12 +3006,8 @@ class SDKBridge:
         if not fork_sid or fork_sid == self.state.session_id:
             return
         try:
-            proj = find_session_dir(
-                fork_sid, getattr(self.config, "config_dir", None))
-            if proj is None:
-                return
-            path = proj / f"{fork_sid}.jsonl"
-            if path.exists():
+            path = self._jsonl_for(fork_sid)
+            if path is not None and path.exists():
                 path.unlink()
                 log.info("btw: discarded fork transcript %s", fork_sid[:8])
         except Exception:
@@ -4039,6 +4038,8 @@ class SDKBridge:
         if self._limit_task is not None:
             log.info("limit resume: the session is working again — cancelled")
             self._cancel_limit_resume()
+        if self._limit_resume_queued and not self._limit_resume_running:
+            self._limit_resume_moot = True
         self._limit_attempts = 0
         self._limit_gave_up_for = None
         self._opened_limit_stop = None
@@ -4076,16 +4077,17 @@ class SDKBridge:
             log.debug("could not read the last prompt", exc_info=True)
             return None
 
-    async def _after_limit_turn(self, *, interrupted: bool = False) -> None:
+    async def _after_limit_turn(self, *, sent: bool = False,
+                                interrupted: bool = False) -> None:
         """At the end of every turn, ours or a ghost's: if a usage limit has
         the session stopped, arm a resume -- or, with the option off, say
         once that one could be.
 
-        *interrupted*: the user stopped the turn, and so took the session
-        over.  Nothing is armed, and if the turn was a resume it is not
-        counted as one that ran back into the limit.
+        *sent*: the turn was a resume (its prompt says so; a ghost turn never
+        is).  *interrupted*: the user stopped the turn, and so took the
+        session over.  Nothing is armed, and a resume is not counted as one
+        that ran back into the limit.
         """
-        sent, self._limit_resume_sent = self._limit_resume_sent, False
         if interrupted:
             return
         stop = self._stopped_by_limit()
@@ -4264,6 +4266,9 @@ class SDKBridge:
             if st.busy or st.connecting or self.client is None:
                 self._limit_defers += 1
                 if self._limit_defers > limit_resume.MAX_DEFERS:
+                    # Given up on this reset, as for resumes that keep
+                    # running into the limit: the next turn into it does not
+                    # start another 30 minutes of this.
                     log.warning("limit resume: put off %d times — dropped",
                                 self._limit_defers - 1)
                     self._limit_gave_up_for = self._limit_armed_for
@@ -4294,7 +4299,8 @@ class SDKBridge:
             self._limit_sent_for = self._limit_armed_for
             self._limit_task = None
             self._cancel_limit_resume()
-            self._limit_resume_sent = True
+            self._limit_resume_queued = True
+            self._limit_resume_moot = False
             log.info("limit resume: sending the resume (%d chars, %s)",
                      len(text), "repeats the last prompt" if prompt
                      else "no prompt to repeat")
@@ -4348,7 +4354,10 @@ class SDKBridge:
             await self._broadcast_status()
             return ("Resume after limit: off for this session."
                     + (" The pending resume is cancelled." if had else ""))
-        if self._limit_task is None:
+        # Not while a resume is on its way or running: its own turn's end
+        # schedules the next, with the backoff.
+        if self._limit_task is None and not (self._limit_resume_queued
+                                             or self._limit_resume_running):
             if self._stopped_by_limit() is None and self._opened_limit_stop:
                 self._adopt_limit_stop(self._opened_limit_stop)
             stop = self._stopped_by_limit()
@@ -4517,6 +4526,9 @@ class SDKBridge:
         state.busy = True
         state.turn_started_at = time.monotonic()
         self._ghost_settled.clear()
+        # A new ghost turn is not one the user interrupted earlier: that one's
+        # result may never have arrived (the CLI died first).
+        self._ghost_interrupted = False
         # Reset compact flag — any prior compact has been absorbed by
         # whatever turn just closed; this is a fresh stream.
         state.compact_during_last_turn = False
@@ -5405,6 +5417,9 @@ class SDKBridge:
 
         # Whatever streams from here on was asked for.
         self._unprompted_resume_pending = False
+        # A resume after a usage limit is known by its prompt.
+        is_resume = prompt_text.startswith(limit_resume.PROMPT_PREFIX)
+        self._limit_resume_running = is_resume
         # And what the session had to say when it was opened is now history:
         # a tab attaching from here on is not told it again.
         state.open_notices = []
@@ -5565,7 +5580,6 @@ class SDKBridge:
             )
 
             await self.broadcast({"type": "turn_start", "prompt": prompt_text})
-            await self._show_carried(during_turn=True)
             # Flip the toolbar to "working" immediately instead of waiting up to
             # ~2s for the next status-ticker cycle (state.busy is already True).
             await self._broadcast_status()
@@ -5582,6 +5596,10 @@ class SDKBridge:
                 if _is_transport_death(exc):
                     self._note_transport_death(_exc_reason(exc))
                 raise
+            # After the prompt is out, not before: it is read from the
+            # transcript, which must not hold up the prompt, and what it
+            # finds was written on resume, before this prompt.
+            await self._show_carried(during_turn=True)
 
             while True:
                 # In drain mode (post-interrupt) bound the wait so a CLI
@@ -5992,6 +6010,7 @@ class SDKBridge:
             # ensures state.busy can never get stuck True when the loop
             # has stopped.
             exit_exc = sys.exc_info()[1]
+            self._limit_resume_running = False
             # Captured before the cleanup below nulls it — the two turn_end
             # markers this block can emit both need the turn's start time, and
             # reading it afterwards made every abnormal turn report ``0:00``.
@@ -6097,7 +6116,7 @@ class SDKBridge:
         # Flush any bell that was rung during this turn.
         await self._flush_bell()
 
-        await self._after_limit_turn(interrupted=interrupted)
+        await self._after_limit_turn(sent=is_resume, interrupted=interrupted)
 
         return assistant_text, interrupted
 
@@ -7123,6 +7142,20 @@ class SDKBridge:
             kind, payload = await self.event_queue.get()
 
             if kind == "message":
+                if payload.startswith(limit_resume.PROMPT_PREFIX) \
+                        and self._limit_resume_queued:
+                    self._limit_resume_queued = False
+                    if self._limit_resume_moot:
+                        # The session carried on while it waited here (a
+                        # background task's turn, answered): it would ask a
+                        # working session to pick work back up.
+                        self._limit_resume_moot = False
+                        log.info("limit resume: the session carried on "
+                                 "before the resume went out — not sent")
+                        await self._post_open_notice("info", (
+                            "The resume after the usage limit was not sent: "
+                            "the session carried on before it went out."))
+                        continue
                 self.state.needs_user_attention = None
                 return payload
             if kind == "cli-command":
@@ -7262,7 +7295,7 @@ class SDKBridge:
         self._opened_limit_stop = None
         self._limit_gave_up_for = None
         self._limit_attempts = 0
-        self._limit_resume_sent = False
+        self._limit_resume_queued = self._limit_resume_moot = False
         # ...as does a reconnect we were holding for the background tasks: the
         # settings it carried are applied by the connect() at the bottom.
         self._deferred_reconnect = None

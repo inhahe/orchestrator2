@@ -42,18 +42,20 @@ from typing import Any, Iterator, NamedTuple
 from account import account_dir
 from record_store import RecordStore
 from session import (
-    _COMMAND_RECORD_PREFIXES,
     _USER_RECORD,
     CUT_OFF_TAIL_BYTES,
     LIMIT_RESUME_PROMPT_PREFIX,
     SESSION_NOTE_PREFIX,
     TURN_START_SEARCH_BYTES,
     _classify_user_text,
-    _has_tool_result,
     _is_cli_resume_bookkeeping,
     _local_when,
     _record_text,
+    local_when,
+    parse_iso,
+    peer_name,
     read_tail,
+    user_record_kind,
 )
 
 #: How long after the reset the session is resumed.  The limit is the API's
@@ -157,12 +159,8 @@ def _is_time(v: Any) -> bool:
 
 def _epoch(iso: Any) -> float | None:
     """A transcript timestamp as a Unix time."""
-    if not isinstance(iso, str) or not iso:
-        return None
-    try:
-        return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
+    when_ = parse_iso(iso)
+    return when_.timestamp() if when_ is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -267,22 +265,12 @@ def _compaction_limit_text(rec: dict) -> str | None:
     return text if text.startswith(LIMIT_TEXT_PREFIXES) else None
 
 
-def _passes_by(rec: dict) -> bool:
-    """A user record that arrived while the session was stopped and does not
-    mean it moved on: a background task's notification, a peer's message,
-    something the CLI or a hook added, a local command and its caveat.
-
-    Each of these makes the CLI try a turn, and that turn runs into the limit
-    too -- so they sit between limit errors, and none of them is the user
-    taking the session somewhere else.
-    """
-    origin = rec.get("origin")
-    kind = origin.get("kind") if isinstance(origin, dict) else None
-    if kind and kind != "human":
-        return True
-    if rec.get("isMeta"):
-        return True
-    return _record_text(rec.get("message")).startswith(_COMMAND_RECORD_PREFIXES)
+#: The user records that arrive while a session is stopped and do not mean it
+#: moved on (``session.user_record_kind``): a background task's notification,
+#: a peer's message, whatever the CLI or a hook added, a local command and its
+#: caveat.  Each makes the CLI try a turn, which runs into the limit too, so
+#: they sit between limit errors; none is the user taking the session on.
+_PASSING_KINDS = frozenset({"task", "peer", "other", "meta", "command", "bookkeeping"})
 
 
 def limit_stop_in(jsonl: Path, *,
@@ -349,7 +337,10 @@ def limit_stop_in(jsonl: Path, *,
             continue
         if t == "assistant":
             if not _is_limit_error(rec):
-                break                 # the model's reply, or another error
+                if rec.get("isApiErrorMessage") \
+                        or (rec.get("message") or {}).get("model") == "<synthetic>":
+                    continue          # the CLI's: a dropped connection, say
+                break                 # the model's reply
             q = _quota_of(rec) or {}
             reset = effective_reset(
                 status=q.get("status"), resets_at=q.get("resetsAt"),
@@ -362,9 +353,10 @@ def limit_stop_in(jsonl: Path, *,
                    from_headers)
             continue
         # A user record.
-        if rec.get("isCompactSummary") or _has_tool_result(rec):
+        kind = user_record_kind(rec)
+        if kind in ("summary", "tool_result"):
             break
-        if _passes_by(rec):
+        if kind in _PASSING_KINDS:
             continue
         if found is None:
             return None               # a prompt after the error, unanswered
@@ -374,19 +366,29 @@ def limit_stop_in(jsonl: Path, *,
     return found
 
 
-def _prompt_of(rec: dict) -> str | None:
-    """The text of *rec* if it is a prompt the user gave, else None.
+def _prompt_of(rec: dict) -> tuple[str, str | None] | None:
+    """``(text, sender)`` if *rec* is something the session was asked to do,
+    else None: a prompt the user gave (sender None), or a message another
+    session sent (sender its name) -- for a lane, the peer's message is often
+    the instruction that started the work a limit stopped.
 
-    Not one: anything the CLI, a hook, a task or a peer sent; a command; a
-    tool result; a compaction summary; harness prompts such as a loop's
-    wakeup -- and an earlier resume after a limit, which is what makes a
-    resume that runs into a limit again repeat the user's prompt rather than
+    Not one: a task's notification, anything the CLI or a hook added, a
+    command, a tool result, a compaction summary; harness prompts such as a
+    loop's wakeup -- and an earlier resume after a limit, which is what makes
+    a resume that runs into a limit again repeat the prompt rather than
     itself.  A one-shot session note the hub put in front of a prompt
     (``SDKBridge._with_session_note``) is not part of it.
     """
-    if rec.get("type") != "user" or rec.get("isSidechain") \
-            or rec.get("isCompactSummary") or _has_tool_result(rec) \
-            or _is_cli_resume_bookkeeping(rec) or _passes_by(rec):
+    if rec.get("type") != "user" or rec.get("isSidechain"):
+        return None
+    kind = user_record_kind(rec)
+    if kind == "peer":
+        origin = rec.get("origin") or {}
+        body = origin.get("body")
+        text = (body if isinstance(body, str) and body.strip()
+                else _record_text(rec.get("message"))).strip()
+        return (text, peer_name(rec) or "another session") if text else None
+    if kind != "prompt":
         return None
     text = _record_text(rec.get("message"))
     if text.startswith(SESSION_NOTE_PREFIX) and not text.startswith(PROMPT_PREFIX):
@@ -394,13 +396,15 @@ def _prompt_of(rec: dict) -> str | None:
         text = rest.strip() if sep else text
     if not text or _classify_user_text(text) != "user":
         return None
-    return text
+    return text, None
 
 
 def last_prompt_in(jsonl: Path, *,
                    limit: int = TURN_START_SEARCH_BYTES,
                    chunk: int = CUT_OFF_TAIL_BYTES) -> dict | None:
-    """The last prompt the user gave in *jsonl*: ``{"text", "at"}``, or None.
+    """The last thing *jsonl*'s session was asked to do (:func:`_prompt_of`):
+    ``{"text", "at", "from"}`` -- *from* the sending session's name, or None
+    for the user -- or None.
 
     Read backwards in chunks, at most *limit* bytes: a lane's prompt can be
     hours of tool calls back.  Only user records that are not tool results
@@ -433,9 +437,10 @@ def last_prompt_in(jsonl: Path, *,
                 except ValueError:
                     continue
                 if isinstance(rec, dict):
-                    text = _prompt_of(rec)
-                    if text is not None:
-                        return {"text": text, "at": rec.get("timestamp")}
+                    found = _prompt_of(rec)
+                    if found is not None:
+                        return {"text": found[0], "at": rec.get("timestamp"),
+                                "from": found[1]}
             pos = begin
     return None
 
@@ -445,12 +450,11 @@ def last_prompt_in(jsonl: Path, *,
 # ---------------------------------------------------------------------------
 
 def when(ts: float | None, now: datetime | None = None) -> str | None:
-    """Unix time *ts* as the user's clock reads it, the way session.py writes
-    a transcript's times: "6:00 PM", or "Oct 23, 6:00 PM" on another day."""
+    """Unix time *ts* as the user's clock reads it (``session.local_when``):
+    "6:00 PM", or "Oct 23, 6:00 PM" on another day."""
     if not _is_time(ts):
         return None
-    iso = datetime.fromtimestamp(float(ts), timezone.utc).isoformat()
-    return _local_when(iso, now)
+    return local_when(datetime.fromtimestamp(float(ts), timezone.utc), now)
 
 
 def build_resume_prompt(*, kind: str | None, hit_at: float | None,
@@ -488,12 +492,14 @@ def build_resume_prompt(*, kind: str | None, hit_at: float | None,
                     + f"\n[... {rest} more characters of this prompt are not "
                       f"repeated here]")
         sent = _local_when((prompt or {}).get("at"), now)
-        attr = f' sent="{sent}"' if sent else ""
+        sender = (prompt or {}).get("from")
+        attr = (f' from="{sender}"' if sender else "") + (f' sent="{sent}"' if sent else "")
+        what_ = (f"The last message you were given, from {sender} (another "
+                 f"session), is" if sender else "The last prompt you were given is")
         parts.append(
-            "The last prompt you were given is repeated below, word for word, "
-            "in case compaction has summarised it away. It is a repeat for "
-            "reference, not a new request: do not redo any part of it that is "
-            "already done.")
+            f"{what_} repeated below, word for word, in case compaction has "
+            f"summarised it away. It is a repeat for reference, not a new "
+            f"request: do not redo any part of it that is already done.")
         parts.append(f"<repeated-prompt{attr}>\n{text}\n</repeated-prompt>")
     return "\n\n".join(parts)
 

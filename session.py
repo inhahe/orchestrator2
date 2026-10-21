@@ -645,20 +645,32 @@ def cut_off_turn(jsonl: Path, *,
     return info
 
 
-def _local_when(iso: Any, now: datetime | None = None) -> str | None:
-    """A transcript timestamp as the user's clock reads it: "2:45 AM", or
-    "Sep 28, 7:29 PM" when it was not today."""
+def parse_iso(iso: Any) -> datetime | None:
+    """A transcript timestamp ("2026-10-21T13:34:46.108Z") as a datetime, or
+    None when it is not one."""
     if not isinstance(iso, str) or not iso:
         return None
     try:
-        when = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+        return datetime.fromisoformat(iso.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def local_when(when: datetime, now: datetime | None = None) -> str:
+    """A moment as the user's clock reads it: "2:45 AM", or "Sep 28, 7:29 PM"
+    when it was not today."""
+    when = when.astimezone()
     now = now or datetime.now().astimezone()
     clock = when.strftime("%I:%M %p").lstrip("0")
     if when.date() == now.date():
         return clock
     return f"{when.strftime('%b')} {when.day}, {clock}"
+
+
+def _local_when(iso: Any, now: datetime | None = None) -> str | None:
+    """:func:`local_when` for a transcript timestamp, or None for none."""
+    when = parse_iso(iso)
+    return local_when(when, now) if when is not None else None
 
 
 def describe_cut_off_turn(info: dict, *, now: datetime | None = None) -> str:
@@ -695,6 +707,54 @@ def describe_cut_off_turn(info: dict, *, now: datetime | None = None) -> str:
                    "pick it up where it stopped.")
 
 
+def user_record_kind(rec: dict) -> str:
+    """What a main-chain user record is.  The one place this is decided, for
+    every question asked of a transcript's end -- how a turn began
+    (:func:`_turn_start`), what arrived while a usage limit had the session
+    stopped and what the user last asked (``limit_resume``):
+
+    * ``"summary"`` -- a compaction's summary;
+    * ``"tool_result"`` -- a tool's result;
+    * ``"bookkeeping"`` -- what the CLI writes on a resume
+      (:func:`_is_cli_resume_bookkeeping`);
+    * ``"task"`` -- a background task's notification;
+    * ``"peer"`` -- another session's message (``origin.name`` says whose);
+    * ``"other"`` -- something sent from anywhere else the CLI names
+      (another ``origin``);
+    * ``"meta"`` -- something the CLI or a hook added (``isMeta``): a skill's
+      text, a command's caveat;
+    * ``"command"`` -- a slash command, a local command's output, a ``!`` line;
+    * ``"prompt"`` -- what the user sent.  Harness prompts -- a loop's wakeup,
+      a resume after a usage limit -- are among these: only their text tells
+      them apart (:func:`_classify_user_text`).
+    """
+    if rec.get("isCompactSummary"):
+        return "summary"
+    if _has_tool_result(rec):
+        return "tool_result"
+    if _is_cli_resume_bookkeeping(rec):
+        return "bookkeeping"
+    origin = rec.get("origin")
+    kind = origin.get("kind") if isinstance(origin, dict) else None
+    if kind == "task-notification":
+        return "task"
+    if kind == "peer":
+        return "peer"
+    if rec.get("isMeta"):
+        return "meta"
+    if _record_text(rec.get("message")).startswith(_COMMAND_RECORD_PREFIXES):
+        return "command"
+    if kind and kind != "human":
+        return "other"
+    return "prompt"
+
+
+def peer_name(rec: dict) -> str | None:
+    """Who sent a peer's message (:func:`user_record_kind` ``"peer"``)."""
+    origin = rec.get("origin")
+    return (origin.get("name") or origin.get("from")) if isinstance(origin, dict) else None
+
+
 def _turn_start(rec: dict) -> dict | None:
     """What *rec* says about how its turn began, if it began one.
 
@@ -702,23 +762,20 @@ def _turn_start(rec: dict) -> dict | None:
     output, a tool result, context the CLI added (a skill's text, a compaction
     summary), a local command's output, the CLI's resume bookkeeping.
     """
-    if rec.get("type") != "user" or rec.get("isSidechain") \
-            or rec.get("isCompactSummary") or _has_tool_result(rec) \
-            or _is_cli_resume_bookkeeping(rec):
+    if rec.get("type") != "user" or rec.get("isSidechain"):
         return None
-    origin = rec.get("origin")
-    kind = origin.get("kind") if isinstance(origin, dict) else None
+    kind = user_record_kind(rec)
+    if kind in ("summary", "tool_result", "bookkeeping", "meta"):
+        return None
     found: dict[str, Any] = {"started": rec.get("timestamp")}
-    if kind == "task-notification":
+    if kind == "task":
         found["trigger"] = "task"
     elif kind == "peer":
         found["trigger"] = "peer"
-        found["from"] = origin.get("name") or origin.get("from")
-    elif rec.get("isMeta"):
-        return None
+        found["from"] = peer_name(rec)
     else:
         text = _record_text(rec.get("message"))
-        if text.startswith(_COMMAND_RECORD_PREFIXES):
+        if kind == "command":
             text = _command_line(text) or ""
             if not text:
                 return None

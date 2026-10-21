@@ -597,6 +597,15 @@ def _runtime_for_ws(ws: WebSocket) -> SessionRuntime | None:
     return _ws_runtime.get(ws) or _default_runtime
 
 
+def _live_runtime_for(sid: str | None) -> SessionRuntime | None:
+    """The runtime running session *sid* in this hub, if one is."""
+    if not sid:
+        return None
+    return next((r for r in runtimes.values()
+                 if getattr(getattr(r, "state", None), "session_id", None) == sid),
+                None)
+
+
 def _runtime_by_rid(rid: str | None) -> SessionRuntime | None:
     """Look up a live runtime by its internal ``rid`` (or None)."""
     if not rid:
@@ -2325,8 +2334,7 @@ async def _reopen_for_limit(rec: dict, delay: float) -> None:
             now_rec = limit_resume.load(rec["cwd"], sid)
             if now_rec is None:
                 return
-            if any(getattr(getattr(r, "state", None), "session_id", None) == sid
-                   for r in runtimes.values()):
+            if _live_runtime_for(sid) is not None:
                 log.info("limit reopen: %s is open already — its bridge has it",
                          sid[:8])
                 return
@@ -3817,10 +3825,13 @@ async def _session_launch(body: dict[str, Any]) -> dict[str, Any]:
     # Only for a session this launch opens: one already open has no cut-off
     # turn to finish.
     resume_interrupted_turn = body.get("resume_interrupted_turn") is True
-    # For a session this launch opens, and turned on for one already open:
-    # the launch asked for it.  Not turned off there by a launch that did not
-    # ask, which would undo a /resume-after-limit on typed in its tab.
-    resume_after_limit = body.get("resume_after_limit") is True
+    # For a session this launch opens -- None, from a launch that said
+    # neither, keeps the hub's -- and turned on for one already open: the
+    # launch asked for it.  Never turned off there, which would undo a
+    # /resume-after-limit on typed in its tab.
+    resume_after_limit = body.get("resume_after_limit")
+    if not isinstance(resume_after_limit, bool):
+        resume_after_limit = None
     # The launch's ANTHROPIC_API_KEY, for this session alone (see
     # HANDOVER_KEYS_ENV).
     api_key = body.get("api_key")
@@ -3860,11 +3871,7 @@ async def _session_launch(body: dict[str, Any]) -> dict[str, Any]:
     # twice.
     disk = (await asyncio.to_thread(_disk_names, target_sid, config_dir)
             if agent_name and target_sid and not resume else None)
-    existing = next(
-        (r for r in runtimes.values()
-         if target_sid and getattr(r.state, "session_id", None) == target_sid),
-        None,
-    )
+    existing = _live_runtime_for(target_sid)
     # Before anything else is applied, so that a refused launch changes
     # nothing -- not even the key below.
     if disk is not None:
@@ -3961,7 +3968,7 @@ async def _session_launch(body: dict[str, Any]) -> dict[str, Any]:
                 and existing.state.agent_name != agent_name
                 and existing.bridge is not None):
             await existing.bridge.adopt_agent_name(agent_name)
-        if (resume_after_limit and existing.state is not None
+        if (resume_after_limit is True and existing.state is not None
                 and not existing.state.resume_after_limit
                 and existing.bridge is not None):
             said = await existing.bridge.set_resume_after_limit(True)
@@ -5639,8 +5646,7 @@ async def _open_session(ws: WebSocket, sid: str, *, account: str | None,
     (``_held_elsewhere``), so nothing was opened.  A runtime that cannot be
     created raises.  The session runs in *cwd*, or in its own directory.
     """
-    existing = next((r for r in runtimes.values()
-                     if getattr(r.state, "session_id", None) == sid), None)
+    existing = _live_runtime_for(sid)
     if existing is not None:
         return existing, False, False
     # Gone from disk: without this a stale ?open=<sid> (a browser-restored tab
@@ -5693,8 +5699,7 @@ async def _handle_resume(ws: WebSocket, rt: SessionRuntime, ref: str) -> None:
     if sid == getattr(rt.state, "session_id", None):
         await say("info", "That is the session this tab is on.")
         return
-    live = next((r for r in runtimes.values()
-                 if getattr(r.state, "session_id", None) == sid), None)
+    live = _live_runtime_for(sid)
     if live is not None:
         await _attach_ws(ws, live)
     elif rt is _default_runtime and _same_path(account, tab_account):
@@ -6643,7 +6648,8 @@ def _hub_launch_kwargs(cfg: Config, config_dir: str | None) -> dict[str, Any]:
         "agent_labels": dict(cfg.agent_labels or {}),
         "initial_prompt": cfg.initial_prompt,
         "resume_interrupted_turn": cfg.resume_interrupted_turn,
-        "resume_after_limit": cfg.resume_after_limit,
+        "resume_after_limit": (cfg.resume_after_limit
+                               if cfg.resume_after_limit_given else None),
         "api_key": cfg.api_key,
         # What the launch was given, and only that: a value filled in from a
         # default is not this session's to impose.
@@ -6751,7 +6757,7 @@ def _launch_into_hub(
     agent_labels: dict[str, str] | None = None,
     initial_prompt: str | None = None,
     resume_interrupted_turn: bool = False,
-    resume_after_limit: bool = False,
+    resume_after_limit: bool | None = None,
     api_key: str | None = None,
     compact_at: int | None = None,
     auto_compact: bool | None = None,
@@ -6783,8 +6789,9 @@ def _launch_into_hub(
     this machine, over loopback.  And ``compact_at`` and ``auto_compact``,
     the launch's ``--compact-at`` and ``--auto-compact``/``--no-compact``, so
     that one session can compact earlier than the rest (None: not given).
-    And ``resume_after_limit``, the launch's ``--resume-after-limit``, which
-    also turns it on for a session the hub already has open.
+    And ``resume_after_limit``, the launch's ``--resume-after-limit`` (True)
+    or ``--no-resume-after-limit`` (False), or None for neither, which leaves
+    the hub's; True also turns it on for a session the hub already has open.
     """
     import urllib.request
 
@@ -6801,7 +6808,7 @@ def _launch_into_hub(
         "agent_labels": agent_labels or {},
         "initial_prompt": initial_prompt,
         "resume_interrupted_turn": bool(resume_interrupted_turn),
-        "resume_after_limit": bool(resume_after_limit),
+        "resume_after_limit": resume_after_limit,
         "api_key": api_key,
         "compact_at": compact_at,
         "auto_compact": auto_compact,

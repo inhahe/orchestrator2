@@ -342,10 +342,11 @@ def test_the_last_prompt_is_the_users_not_what_came_after(tmp_path):
         prompt={"text": "the real prompt", "at": None})
     p = _write(tmp_path / "s.jsonl", [
         _prompt("an older prompt", NOW - 2000),
+        _peer(NOW - 1500),
         _prompt("the real prompt", NOW - 1000),
         _tool_use("t1", NOW - 990), _tool_result("t1", NOW - 980),
         _prompt("<command-name>/usage</command-name>", NOW - 970),
-        _notification(NOW - 960), _peer(NOW - 950),
+        _notification(NOW - 960),
         _prompt("This session is being continued from a previous conversation",
                 NOW - 940, isCompactSummary=True),
         _prompt("Autonomous-loop wakeup (scheduled by you). Resume work now",
@@ -354,7 +355,7 @@ def test_the_last_prompt_is_the_users_not_what_came_after(tmp_path):
         _limit(NOW - 910, RESET),
     ])
     found = limit_resume.last_prompt_in(p)
-    assert found == {"text": "the real prompt", "at": _iso(NOW - 1000)}
+    assert found == {"text": "the real prompt", "at": _iso(NOW - 1000), "from": None}
 
 
 def test_a_session_note_is_not_part_of_the_prompt(tmp_path):
@@ -730,7 +731,7 @@ def test_when_due_the_resume_is_sent_repeating_the_prompt(tmp_path, monkeypatch)
     assert "render the flyby" in text
     assert any(m.get("type") == "injected_prompt" and m["content"] == text for m in sent)
     assert limit_resume.load(str(tmp_path), SID) is None
-    assert st.limit_resume_at is None and br._limit_resume_sent is True
+    assert st.limit_resume_at is None and br._limit_resume_queued is True
 
 
 def test_a_resume_waits_for_a_running_turn(tmp_path, monkeypatch):
@@ -758,8 +759,8 @@ def _resumes_into_the_limit(br, reset, n):
         for _ in range(n):
             br._adopt_limit_stop({"resets_at": reset, "kind": "five_hour",
                                   "hit_at": None})
-            br._limit_resume_sent, br._limit_sent_for = True, reset
-            await br._after_limit_turn()
+            br._limit_sent_for = reset
+            await br._after_limit_turn(sent=True)
             dues.append(br.state.limit_resume_at)
             _stop_timers(br)
         return dues
@@ -815,8 +816,8 @@ def test_an_interrupted_resume_is_not_an_attempt(tmp_path, monkeypatch):
 
     async def go():
         br._adopt_limit_stop({"resets_at": int(NOW) - 5, "kind": None, "hit_at": None})
-        br._limit_resume_sent, br._limit_sent_for = True, int(NOW) - 5
-        await br._after_limit_turn(interrupted=True)
+        br._limit_sent_for = int(NOW) - 5
+        await br._after_limit_turn(sent=True, interrupted=True)
 
     asyncio.run(go())
     assert br._limit_task is None and br._limit_attempts == 0
@@ -830,8 +831,8 @@ def test_a_later_limit_starts_the_count_again(tmp_path, monkeypatch):
     async def go():
         br._limit_attempts = 3
         br._adopt_limit_stop({"resets_at": RESET, "kind": "seven_day", "hit_at": None})
-        br._limit_resume_sent, br._limit_sent_for = True, int(NOW) - 5
-        await br._after_limit_turn()
+        br._limit_sent_for = int(NOW) - 5
+        await br._after_limit_turn(sent=True)
         try:
             assert br._limit_attempts == 0
             assert st.limit_resume_at == RESET + limit_resume.MARGIN_S
@@ -1179,7 +1180,7 @@ def test_the_command_answers_status_to_the_asker_and_changes_to_all(tmp_path, mo
 def test_the_hand_over_includes_it(monkeypatch):
     kw = server._hub_launch_kwargs(parse_args(["--resume-after-limit"]), None)
     assert kw["resume_after_limit"] is True
-    assert server._hub_launch_kwargs(parse_args([]), None)["resume_after_limit"] is False
+    assert server._hub_launch_kwargs(parse_args([]), None)["resume_after_limit"] is None
 
 
 def test_a_launch_says_for_its_own_session(monkeypatch, tmp_path):
@@ -1371,7 +1372,6 @@ def test_a_login_meanwhile_does_not_drop_the_resume(tmp_path, monkeypatch):
     async def go():
         br._adopt_limit_stop({"resets_at": int(NOW) - 5, "kind": "five_hour",
                               "hit_at": None})
-        br._limit_resume_sent = False
         await br._arm_limit_resume(br._stopped_by_limit())
         task = br._limit_task
         reset_rate_limit(st)                  # a /login in another tab
@@ -1527,3 +1527,169 @@ def test_a_reopened_session_someone_is_watching_takes_no_place(tmp_path, monkeyp
     monkeypatch.setattr(server, "_limit_reopen_lock", None)
     asyncio.run(server._reopen_for_limit(limit_resume.load(str(tmp_path), SID), 0.0))
     assert [o["resume"] for o in opened] == [SID]
+
+
+# ---------------------------------------------------------------------------
+# The Fable review
+# ---------------------------------------------------------------------------
+
+def test_a_peers_message_that_came_last_is_what_is_repeated(tmp_path):
+    """Review: a lane whose work another session assigned had an older,
+    unrelated prompt of the user's repeated as the one to pick back up."""
+    p = _write(tmp_path / "s.jsonl", [
+        _prompt("set up the repo", NOW - 3000),
+        _prompt("Another Claude session sent a message: ...", NOW - 1000, isMeta=True,
+                origin={"kind": "peer", "name": "Lane-A",
+                        "body": "port the scheduler to the new IPC and test it"}),
+        _limit(NOW - 900, RESET)])
+    found = limit_resume.last_prompt_in(p)
+    assert found["text"] == "port the scheduler to the new IPC and test it"
+    assert found["from"] == "Lane-A"
+    text = limit_resume.build_resume_prompt(kind=None, hit_at=None, resets_at=None,
+                                            prompt=found)
+    assert 'from="Lane-A"' in text and "from Lane-A (another session)" in text
+
+
+def test_another_cli_error_after_the_limit_is_looked_past(tmp_path):
+    """Review: a task's turn failing on a dropped connection while the session
+    was stopped read as the session having moved on, and its record went."""
+    err = _limit(NOW - 100, RESET, text="API Error: Connection error.")
+    err["error"] = "unknown"
+    err.pop("quotaLimits")
+    p = _write(tmp_path / "s.jsonl", [_prompt("go", NOW - 900), _limit(NOW - 800, RESET),
+                                      _notification(NOW - 120), err])
+    stop = limit_resume.limit_stop_in(p)
+    assert stop is not None and stop["resets_at"] == RESET
+
+
+def test_only_the_resumes_own_turn_counts_as_its_outcome(tmp_path, monkeypatch):
+    """Review: the flag that said "a resume was sent" was taken by whichever
+    turn ended first -- a background task's included."""
+    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+
+    async def go():
+        br._adopt_limit_stop({"resets_at": int(NOW) - 5, "kind": None, "hit_at": None})
+        br._limit_sent_for = int(NOW) - 5
+        br._limit_resume_queued = True        # a resume waits on the queue
+        await br._after_limit_turn()          # ...and a ghost turn ends first
+        try:
+            assert br._limit_attempts == 0, "the ghost turn was charged as the resume"
+        finally:
+            _stop_timers(br)
+
+    asyncio.run(go())
+
+
+def test_a_resume_that_became_moot_is_not_sent(tmp_path, monkeypatch):
+    """Review: a ghost turn answered while the resume waited on the queue,
+    and the resume still went out, into a session already working."""
+    br, st, sent = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+    resume = limit_resume.build_resume_prompt(kind=None, hit_at=None,
+                                              resets_at=None, prompt=None)
+
+    async def go():
+        br._limit_resume_queued = True
+        br.event_queue.put_nowait(("message", resume))
+        br._note_limit_over()                 # the model answered meanwhile
+        br.event_queue.put_nowait(("message", "the user's own"))
+        return await br._await_next_prompt()
+
+    assert asyncio.run(go()) == "the user's own"
+    assert "was not sent" in _texts(sent)
+
+
+def test_a_resume_still_wanted_goes_out(tmp_path, monkeypatch):
+    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+    resume = limit_resume.build_resume_prompt(kind=None, hit_at=None,
+                                              resets_at=None, prompt=None)
+
+    async def go():
+        br._limit_resume_queued = True
+        br.event_queue.put_nowait(("message", resume))
+        return await br._await_next_prompt()
+
+    assert asyncio.run(go()) == resume
+    assert br._limit_resume_queued is False
+
+
+def test_on_while_the_resume_runs_arms_nothing_more(tmp_path, monkeypatch):
+    """Review: a second timer, armed while the resume's own turn ran, fired
+    with no backoff and burned an attempt."""
+    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+    br._adopt_limit_stop({"resets_at": int(NOW) - 5, "kind": None, "hit_at": None})
+
+    async def go():
+        br._limit_resume_running = True
+        await br.set_resume_after_limit(True)
+        assert br._limit_task is None
+        br._limit_resume_running, br._limit_resume_queued = False, True
+        await br.set_resume_after_limit(True)
+        assert br._limit_task is None
+
+    asyncio.run(go())
+
+
+def test_an_old_ghost_interrupt_does_not_outlive_its_turn(tmp_path, monkeypatch):
+    """Review: an interrupt whose result never came (the CLI died) left the
+    flag set, and a later ghost turn into the limit armed nothing."""
+    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+
+    async def go():
+        br._ghost_interrupted = True          # from a ghost turn long gone
+        await br._handle_async_message(_event(RESET, "seven_day"))
+        await br._handle_async_message(AssistantMessage(
+            content=[TextBlock(text="You've hit your weekly limit")],
+            model="<synthetic>", error="rate_limit"))
+        await br._handle_async_message(_result())
+        try:
+            assert br._limit_task is not None
+        finally:
+            _stop_timers(br)
+
+    asyncio.run(go())
+
+
+def test_a_launch_without_the_flag_takes_the_hubs_setting(monkeypatch, tmp_path):
+    """Review: it handed over False, which overrode a hub started with it."""
+    assert server._hub_launch_kwargs(parse_args([]), None)["resume_after_limit"] is None
+    assert server._hub_launch_kwargs(parse_args(["--no-resume-after-limit"]),
+                                     None)["resume_after_limit"] is False
+    got = {}
+
+    class _RT:
+        rid = "R7"
+
+    async def create(**kw):
+        got.update(kw)
+        return _RT()
+
+    monkeypatch.setattr(server, "_create_runtime", create)
+    monkeypatch.setattr(server, "config", parse_args([]))
+    for body, want in (({}, None), ({"resume_after_limit": None}, None),
+                       ({"resume_after_limit": True}, True),
+                       ({"resume_after_limit": False}, False),
+                       ({"resume_after_limit": "yes"}, None)):
+        got.clear()
+        asyncio.run(server.api_session_launch({"cwd": str(tmp_path),
+                                               "no_continue": True, **body}))
+        assert got["resume_after_limit"] is want, body
+
+
+def test_a_resumes_turn_into_the_same_limit_is_counted(tmp_path, monkeypatch):
+    """Through run_turn: its prompt says it is a resume."""
+    br, st, _ = _bridge(tmp_path, monkeypatch, "--resume-after-limit")
+    reset = int(NOW) - 5
+    resume = limit_resume.build_resume_prompt(kind=None, hit_at=None,
+                                              resets_at=reset, prompt=None)
+
+    async def go():
+        br._adopt_limit_stop({"resets_at": reset, "kind": None, "hit_at": None})
+        br._limit_sent_for = reset
+        br.client = _Client(br, reset, event=False)
+        await br.run_turn(resume)
+        try:
+            assert br._limit_attempts == 1
+        finally:
+            _stop_timers(br)
+
+    asyncio.run(go())

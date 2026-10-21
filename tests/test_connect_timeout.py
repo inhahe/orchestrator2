@@ -419,6 +419,7 @@ from types import SimpleNamespace                   # noqa: E402
 def _sizer(tmp_path, config_dir=None):
     """``_resume_jsonl_size`` bound to a minimal fake bridge."""
     me = SimpleNamespace(config=SimpleNamespace(config_dir=config_dir))
+    me._jsonl_for = lambda sid: sdk_bridge.SDKBridge._jsonl_for(me, sid)
     return lambda sid: sdk_bridge.SDKBridge._resume_jsonl_size(me, sid)
 
 

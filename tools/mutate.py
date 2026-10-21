@@ -1239,7 +1239,7 @@ LOOP_MUTATIONS = [
 LOOP_SERVER_MUTATIONS = [
     ("/loop off is only reported to the tab that typed it",
      "        was = bridge.stop_loop()\n"
-     "        await broadcast({",
+     "        await bridge.broadcast({",
      "        was = bridge.stop_loop()\n"
      "        await send_to(ws, {"),
 
@@ -1256,12 +1256,12 @@ LOOP_SERVER_MUTATIONS = [
     ("one tab asking for status interrupts every other tab",
      '        await send_to(ws, {"type": "system_msg", "subtype": "info",\n'
      '                           "data": {"message": _fmt(bridge.loop_status())}})',
-     '        await broadcast({"type": "system_msg", "subtype": "info",\n'
+     '        await bridge.broadcast({"type": "system_msg", "subtype": "info",\n'
      '                         "data": {"message": _fmt(bridge.loop_status())}})'),
 
     ("arming is only reported to the tab that typed it",
      "        d = bridge.start_loop(WAKEUP_DEFAULT_DELAY)\n"
-     '        await broadcast({"type": "system_msg", "subtype": "info",\n'
+     '        await bridge.broadcast({"type": "system_msg", "subtype": "info",\n'
      '                         "data": {"message": f"Wakeup loop armed: fires in {d:.0f}s."}})',
      "        d = bridge.start_loop(WAKEUP_DEFAULT_DELAY)\n"
      '        await send_to(ws, {"type": "system_msg", "subtype": "info",\n'
@@ -1329,15 +1329,15 @@ IDLE_MUTATIONS = [
      ""),
 
     ("a working session is torn down mid-turn again",
-     "    if busy or bg or waiting:",
+     "    if busy or bg or waiting or resuming or connecting:",
      "    if False:"),
 
     ("background tasks do not count as work in progress",
-     "    if busy or bg or waiting:",
-     "    if busy:"),
+     "    if busy or bg or waiting or resuming or connecting:",
+     "    if busy or waiting or resuming or connecting:"),
 
     ("nothing is ever torn down, because everything counts as busy",
-     "    if busy or bg or waiting:",
+     "    if busy or bg or waiting or resuming or connecting:",
      "    if True:"),
 
     ("a deferred teardown does not re-arm, so the session is never reaped",
@@ -2330,8 +2330,8 @@ FORKSKIP_MUTATIONS = [
 WAKEUPIDLE_MUTATIONS = [
     ("a session waiting on a wakeup is reaped between loop iterations, "
      "cancelling the loop outright -- the reported bug, restored",
-     "    if busy or bg or waiting:",
-     "    if busy or bg:"),
+     "    if busy or bg or waiting or resuming or connecting:",
+     "    if busy or bg or resuming or connecting:"),
 
     ("a stale past wakeup pins the runtime forever on a schedule nothing will "
      "honour",
@@ -2371,8 +2371,8 @@ WAKEUPIDLE_MUTATIONS = [
      "        _teardown_reasons.popitem(last=True)"),
 
     ('an idle reap is reported as an ordinary close, hiding the five-minute rule the user did not know about',
-     '    await _teardown_runtime(\n        rt, reason=f"was closed after {timeout // 60} minutes with no tab "\n                   f"connected")',
-     '    await _teardown_runtime(rt)'),
+     '    await _teardown_runtime(\n        rt, reason=f"was closed after {timeout // 60} minutes with no tab "\n                   f"connected", idle=True)',
+     '    await _teardown_runtime(rt, idle=True)'),
 ]
 
 
@@ -2692,21 +2692,6 @@ SESSIONNAME_MUTATIONS = [
      "unnamed session",
      '        os.environ.pop("CLAUDE_CODE_SESSION_NAME", None)\n',
      ""),
-
-    ("a blank title is passed as the name",
-     "        return (st.agent_name or st.pending_rename or st.human_title\n"
-     '                or "").strip() or None',
-     "        return (st.agent_name or st.pending_rename or st.human_title\n"
-     "                or None)"),
-
-    ("a /rename made before the session existed never names the CLI",
-     "        return (st.agent_name or st.pending_rename or st.human_title\n",
-     "        return (st.agent_name or st.human_title\n"),
-
-    ("a session's own --agent-name is not its address, so the two registries "
-     "disagree about who it is",
-     "        return (st.agent_name or st.pending_rename or st.human_title\n",
-     "        return (st.pending_rename or st.human_title\n"),
 
     ("a hub restart, which resumes through the initial resume id, brings the "
      "CLI up without its name",
@@ -3046,6 +3031,23 @@ RECSTORE_MUTATIONS = [
      '        self.update({**rec, "session_id": new_id})\n'),
 ]
 
+# The name other sessions address a session by (state.addressable_name).
+# tests/test_session_name.py.
+SESSIONNAME_STATE_MUTATIONS = [
+    ("a blank title is passed as the name",
+     '    return (agent_name or pending_rename or human_title or "").strip() or None',
+     "    return (agent_name or pending_rename or human_title or None)"),
+
+    ("a /rename made before the session existed never names the CLI",
+     '    return (agent_name or pending_rename or human_title or "").strip() or None',
+     '    return (agent_name or human_title or "").strip() or None'),
+
+    ("a session's own --agent-name is not its address, so the two registries "
+     "disagree about who it is",
+     '    return (agent_name or pending_rename or human_title or "").strip() or None',
+     '    return (pending_rename or human_title or "").strip() or None'),
+]
+
 # --resume-after-limit (design.md 6h).  tests/test_resume_after_limit.py.
 LIMITRESUME_BRIDGE_MUTATIONS = [
     ("the CLI's own limit message is taken for the model answering, wiping "
@@ -3114,6 +3116,31 @@ LIMITRESUME_BRIDGE_MUTATIONS = [
      "                self._ghost_interrupted = True\n",
      ""),
 
+    ("a resume's own turn is not known for one, so a resume running back "
+     "into its limit is never counted",
+     "        is_resume = prompt_text.startswith(limit_resume.PROMPT_PREFIX)",
+     "        is_resume = False"),
+
+    ("a resume that became moot on the queue is sent anyway",
+     "                    if self._limit_resume_moot:",
+     "                    if False:"),
+
+    ("the model answering never makes a queued resume moot",
+     "        if self._limit_resume_queued and not self._limit_resume_running:\n"
+     "            self._limit_resume_moot = True",
+     "        pass"),
+
+    ("/resume-after-limit on while the resume runs arms a second one",
+     "        if self._limit_task is None and not (self._limit_resume_queued\n"
+     "                                             or self._limit_resume_running):",
+     "        if self._limit_task is None:"),
+
+    ("an old ghost interrupt outlives its turn and stops a later resume",
+     "        # A new ghost turn is not one the user interrupted earlier: that one's\n"
+     "        # result may never have arrived (the CLI died first).\n"
+     "        self._ghost_interrupted = False\n",
+     ""),
+
     ("a reopened session rings the launch's bell, not the one /bell set",
      '                      "bell_on": " ".join(sorted(st.bell_events)) or "none"},',
      '                      "bell_on": getattr(cfg, "bell_on", None)},'),
@@ -3141,6 +3168,15 @@ LIMITRESUME_SERVER_MUTATIONS = [
     ("a resume due in a moment is closed only to be reopened",
      "                and resume_at - time.time() < timeout)",
      "                and False)"),
+
+    ("a launch that says nothing hands over 'off', overriding the hub",
+     '        "resume_after_limit": (cfg.resume_after_limit\n'
+     '                               if cfg.resume_after_limit_given else None),',
+     '        "resume_after_limit": cfg.resume_after_limit,'),
+
+    ("the hub takes a launch that said nothing for one that turned it off",
+     "    if not isinstance(resume_after_limit, bool):\n        resume_after_limit = None",
+     "    if not isinstance(resume_after_limit, bool):\n        resume_after_limit = False"),
 
     ("one record that cannot be scheduled stops the restore of the rest",
      "        try:\n            _schedule_limit_reopen(rec)\n        except Exception:",
@@ -3180,6 +3216,16 @@ LIMITRESUME_MODULE_MUTATIONS = [
      "hub's restore",
      '            and _count(rec.get("reopens")) and _count(rec.get("attempts")))',
      "            and True)"),
+
+    ("another error of the CLI's after the limit reads as the session moving on",
+     '                if rec.get("isApiErrorMessage") \\\n'
+     '                        or (rec.get("message") or {}).get("model") == "<synthetic>":\n'
+     "                    continue          # the CLI's: a dropped connection, say\n",
+     ""),
+
+    ("a peer's message that set the work is passed over for an older prompt",
+     '    if kind == "peer":',
+     "    if False:"),
 
     ("a clock time already past today is taken as today's",
      "            if when_ <= base:\n                when_ += timedelta(days=1)\n",
@@ -3752,8 +3798,9 @@ LOOPKEEP_BRIDGE_MUTATIONS = [
      "        if True:\n            clear_wakeup("),
 
     ("stop() drops what it was told on the way to _shutdown",
-     "        await asyncio.shield(self._shutdown(hub_exiting=hub_exiting))\n",
-     "        await asyncio.shield(self._shutdown())\n"),
+     "        await asyncio.shield(self._shutdown(hub_exiting=hub_exiting,\n"
+     "                                            idle_teardown=idle_teardown))\n",
+     "        await asyncio.shield(self._shutdown(idle_teardown=idle_teardown))\n"),
 ]
 
 LOOPKEEP_SERVER_MUTATIONS = [
@@ -3777,8 +3824,8 @@ LOOPKEEP_SERVER_MUTATIONS = [
      "        await bridge.stop()\n"),
 
     ("closing a session from the lobby keeps its loop, so it comes back",
-     "            await rt.bridge.stop()\n        except asyncio.CancelledError:",
-     "            await rt.bridge.stop(hub_exiting=True)\n        except asyncio.CancelledError:"),
+     "            await rt.bridge.stop(idle_teardown=idle)\n        except asyncio.CancelledError:",
+     "            await rt.bridge.stop(hub_exiting=True, idle_teardown=idle)\n        except asyncio.CancelledError:"),
 
     ("/quit keeps the session's loop, so it comes back",
      "            await bridge.stop()\n"
@@ -4348,8 +4395,8 @@ AGENTNAME_SERVER_MUTATIONS = [
      '    if not sid or not requested or not current:\n'),
 
     ('the hub opens whichever session is most recent by then',
-     'auto_compact=auto_compact, seed_id=target_sid)',
-     'auto_compact=auto_compact)'),
+     'auto_compact=auto_compact, seed_id=target_sid,',
+     'auto_compact=auto_compact,'),
 
     ('a refusal reads as a hub that could not open the session',
      '    if isinstance(data, dict) and not data.get("ok") and data.get("refused"):\n',
@@ -5729,8 +5776,8 @@ CUTOFF_SESSION_MUTATIONS = [
      "                continue"),
 
     ("a skill's text behind its command is taken for the prompt",
-     "    elif rec.get(\"isMeta\"):\n        return None\n    else:",
-     "    else:"),
+     "    if kind in (\"summary\", \"tool_result\", \"bookkeeping\", \"meta\"):",
+     "    if kind in (\"summary\", \"tool_result\", \"bookkeeping\"):"),
 
     ("a command's line is shown as its raw record",
      "            text = _command_line(text) or \"\"",
@@ -5741,14 +5788,12 @@ CUTOFF_SESSION_MUTATIONS = [
      "    if False:\n        found = _turn_start_before(jsonl, start)"),
 
     ("a compaction summary is taken for the prompt",
-     "    if rec.get(\"type\") != \"user\" or rec.get(\"isSidechain\") \\\n"
-     "            or rec.get(\"isCompactSummary\") or _has_tool_result(rec) \\\n",
-     "    if rec.get(\"type\") != \"user\" or rec.get(\"isSidechain\") \\\n"
-     "            or _has_tool_result(rec) \\\n"),
+     "    if rec.get(\"isCompactSummary\"):\n        return \"summary\"\n",
+     ""),
 
     ("a subagent's record is taken for the session's",
-     "        if not isinstance(rec, dict) or rec.get(\"isSidechain\"):\n            continue",
-     "        if not isinstance(rec, dict):\n            continue"),
+     "        if isinstance(rec, dict) and not rec.get(\"isSidechain\") \\\n",
+     "        if isinstance(rec, dict) \\\n"),
 
     ("the notice does not say what to do",
      "    return text + (\" It won't carry on by itself: send ",
@@ -5850,9 +5895,8 @@ CUTOFF_SERVER_MUTATIONS = [
      ""),
 
     ("the flag is not put on the wire",
-     "        \"resume_interrupted_turn\": bool(resume_interrupted_turn),\n"
-     "        \"api_key\": api_key,\n",
-     "        \"api_key\": api_key,\n"),
+     "        \"resume_interrupted_turn\": bool(resume_interrupted_turn),\n",
+     ""),
 
     ("the hub ignores the launch's flag",
      "    resume_interrupted_turn = body.get(\"resume_interrupted_turn\") is True",
@@ -7476,6 +7520,8 @@ TARGETS = {
     "recstore": ("record_store.py",
                  "tests/test_wakeup_store.py tests/test_resume_after_limit.py",
                  RECSTORE_MUTATIONS, "pytest"),
+    "sessionname-state": ("state.py", "tests/test_session_name.py",
+                          SESSIONNAME_STATE_MUTATIONS, "pytest"),
     "limitresume": ("sdk_bridge.py", "tests/test_resume_after_limit.py",
                     LIMITRESUME_BRIDGE_MUTATIONS, "pytest"),
     "limitresume-server": ("server.py", "tests/test_resume_after_limit.py",

@@ -2548,9 +2548,11 @@ records when the rejection began (`rate_limit_hit_at`) and its window
 
 **Off by default**, for the reason in §6e: a session that starts working with
 nobody having typed anything was the whole complaint there. On with
-`--resume-after-limit` (for every session a hub opens, or the one a launch
-opens when it joins a hub; a launch joining a hub that already has the session
-open turns it on there, but never off), or per session with
+`--resume-after-limit` (for every session a hub opens; a launch joining a
+hub hands over only what it said -- `--resume-after-limit` or
+`--no-resume-after-limit` for the session it opens, nothing for neither, so
+that session takes the hub's -- and with it turns it on for a session the hub
+already has open, but never off), or per session with
 `/resume-after-limit on|off`, on `State.resume_after_limit`. `/move` carries it
 to the copy. With it off, the first limit a session hits — live or found on
 open, while it still holds — says once that `/resume-after-limit on` would
@@ -2574,8 +2576,13 @@ minute after the reset. When due, `_limit_resume_timer` waits a minute at a
 time (`MAX_DEFERS` 30, then drops it, and says so) while a turn runs, a
 connect is in flight or there is no CLI; reads the last prompt; checks again,
 since the read took time; and then does what a wakeup does: an
-`injected_prompt` broadcast and `("message", text)` on the event queue. A
-resume that runs straight back into the *same* reset is an attempt: the next
+`injected_prompt` broadcast and `("message", text)` on the event queue.
+If the model answers while it waits there (a background task's turn), it is
+moot, and `_await_next_prompt` drops it and says so rather than ask a working
+session to pick its work back up; and `/resume-after-limit on` arms nothing
+while a resume is queued or running. A
+resume that runs straight back into the *same* reset is an attempt -- which turn is a resume, its prompt says, so a background
+task's turn ending first is not taken for it; the next
 waits 2, 4, 8, 16 minutes, and after `MAX_ATTEMPTS` (5) the session stops
 resuming by itself, says so, and remembers the reset it gave up on
 (`_limit_gave_up_for`), so the next notification's turn into it does not start
@@ -2591,8 +2598,10 @@ of, so it is not repeated.) It says which limit stopped the session and when,
 that nobody typed it, to pick the work back up and check what is done before
 redoing anything, and that whatever arrived meanwhile is in the conversation
 (the CLI drops its synthetic error messages from the API request, so those
-notifications reach the model as user messages). Then the user's last prompt,
-word for word, in `<repeated-prompt sent="…">`, framed as a repeat and not a
+notifications reach the model as user messages). Then the last thing the session was asked to do,
+word for word -- the user's last prompt, or another session's message when
+that came later (a lane's work is often assigned by a peer), with who sent
+it -- in `<repeated-prompt sent="…">`, framed as a repeat and not a
 new request; capped at `REPEAT_MAX_CHARS` (20,000). Repeated every time, as
 asked. Measured on this machine's transcripts (2.1.280 and 2.1.301): an
 auto-compaction keeps word for word only the turn's in-flight tail
@@ -2603,10 +2612,10 @@ current prompt is always sent, even after a compaction" does not hold mid-turn,
 and a long turn's prompt is very likely only in a summary by the time a limit
 stops it; the rolling trim of `--max-context-tokens` can drop it too. The
 repeat is not safe from the *next* compaction either, but that summary is
-written with the prompt in full and recent. The last prompt is the last user
-record that is a typed prompt (no `origin`, or a human one; not meta, a
-command, a tool result, a compaction summary or harness text), read backwards
-in 2 MB chunks for up to 32 MB.
+written with the prompt in full and recent. It is the last user record that is
+a typed prompt or a peer's message (`session.user_record_kind`, the one
+classifier of user records that `_turn_start` uses too; not harness text),
+read backwards in 2 MB chunks for up to 32 MB.
 
 **On open.** `connect()` reads the transcript's end once (`session.read_tail`,
 `_read_open_tail`) for both `cut_off_turn` and `limit_resume.limit_stop_in`,
@@ -2614,8 +2623,9 @@ before the new CLI writes anything, and `_announce_on_open` hands the second
 to `_limit_on_open`, which can never fail the connect. A transcript's last word
 is a limit when, looking back past what arrives while a session is stopped —
 notifications, peers' messages, meta and command records and their output,
-the CLI's resume bookkeeping, queue operations — the first thing found is a
-limit error or a `/compact` that ran into one, with a reset that can be read.
+the CLI's resume bookkeeping, queue operations, the CLI's other errors (a
+dropped connection) — the first thing found is a limit error or a `/compact`
+that ran into one, with a reset that can be read.
 A typed prompt after it, or any reply, means the session moved on. The latest
 report decides the reset (a later limit is the one that holds), but a reset
 read from text (`reset_from_text`, the CLI's `formatResetTime` forms, in the

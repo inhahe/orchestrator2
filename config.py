@@ -663,7 +663,10 @@ class Config:
     resume_interrupted_turn: bool = False
     # A session a usage limit stops carries on by itself once the limit has
     # reset (limit_resume.py, SDKBridge._arm_limit_resume).  Off: it waits.
+    # And whether the launch said either way, which is all a launch that
+    # joins a hub hands over: not saying leaves the hub's setting.
     resume_after_limit: bool = False
+    resume_after_limit_given: bool = False
     agent_name: str | None = None          # cross-account agent identity (agent-comms spec §3)
     # One-shot note prepended to the next prompt (see SDKBridge._with_session_note).
     session_note: str | None = None
@@ -1223,7 +1226,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--resume-after-limit",
         dest="resume_after_limit",
         action="store_true",
-        default=False,
+        # None, not False: a launch must tell "not given" from "turned off"
+        # to hand over only what it was given.  Resolved below.
+        default=None,
         help=(
             "When a usage limit (the 5-hour session limit, a weekly limit) "
             "stops a session, have it carry on by itself a minute after the "
@@ -1232,15 +1237,17 @@ def parse_args(argv: list[str] | None = None) -> Config:
             "stopped by a limit when it is opened, unless the reset is more "
             "than 12 hours past.  A session waiting on a reset survives the "
             "idle teardown and a hub restart.  Applies to every session a hub "
-            "opens when the hub is started with it, or to the one session a "
-            "launch opens when it joins a running hub; /resume-after-limit "
-            "turns it on or off for one session."
+            "opens when the hub is started with it.  A launch that joins a "
+            "running hub with it (or with --no-resume-after-limit) sets it for "
+            "the session it opens, and without either leaves the hub's; "
+            "/resume-after-limit turns it on or off for one session."
         ),
     )
     ap.add_argument(
         "--no-resume-after-limit",
         dest="resume_after_limit",
         action="store_false",
+        default=None,
         help="The default: a session a usage limit stops waits for you.",
     )
     ap.add_argument(
@@ -1364,7 +1371,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         external_password=args.external_password,
         external_access=args.external_access,
         resume_interrupted_turn=args.resume_interrupted_turn,
-        resume_after_limit=args.resume_after_limit,
+        resume_after_limit=bool(args.resume_after_limit),
+        resume_after_limit_given=args.resume_after_limit is not None,
         agent_name=_launch_agent_name(args.agent_name),
         session_note=args.session_note,
         agent_labels=_parse_labels(args.agent_label),

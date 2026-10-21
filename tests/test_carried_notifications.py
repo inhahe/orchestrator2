@@ -173,3 +173,20 @@ def test_a_transcript_that_cannot_be_found_never_stops_the_prompt(tmp_path, monk
     br._carried_unseen = True
     asyncio.run(br.run_turn("continue"))
     assert queried == ["continue"]
+
+
+def test_the_prompt_goes_out_before_the_transcript_is_read(tmp_path, monkeypatch):
+    """Review: the read sat between showing the prompt and sending it, a
+    visible stall on a large transcript after every reconnect."""
+    br, sent = _bridge(tmp_path, monkeypatch, [_reply(), _carried()])
+
+    class _Marking(_Client):
+        async def query(self, prompt):
+            sent.append({"type": "_query"})
+            await super().query(prompt)
+
+    br.client = _Marking(br)
+    br._carried_unseen = True
+    asyncio.run(br.run_turn("continue"))
+    kinds = [m["type"] for m in sent if m["type"] in ("turn_start", "_query", "injected_prompt")]
+    assert kinds == ["turn_start", "_query", "injected_prompt"]
