@@ -30,5 +30,21 @@ const Util = (() => {
     return `${h}:${m}:${String(s).padStart(2, '0')}`;
   }
 
-  return { formatDuration };
+  /**
+   * The CSS variable each status state (``busy_class``) is written in: by
+   * the status bar's state text, and by the tab icon's dot (favicon.js),
+   * which must agree with it.  A state not here (idle) is written in the
+   * default text colour.
+   */
+  const STATE_COLOUR_VARS = {
+    working:      '--indicator-working',
+    connecting:   '--indicator-connecting',
+    reconnecting: '--system-warning',
+    shutdown:     '--system-error',
+    error:        '--system-error',
+    'bg-wait':    '--indicator-bg-wait',
+    compacting:   '--indicator-compacting',
+  };
+
+  return { formatDuration, STATE_COLOUR_VARS };
 })();

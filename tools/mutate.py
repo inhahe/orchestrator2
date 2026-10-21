@@ -3419,53 +3419,23 @@ CLIQUEUE_CHAT_MUTATIONS = [
 
 # The tab's icon shows the session's state.  tests/favicon.test.js.
 FAVICON_MUTATIONS = [
-    ("an error is not red",
-     "    if (cls === 'error' || cls === 'shutdown') return '--system-error';",
-     "    if (cls === 'shutdown') return '--system-error';"),
-
-    ("giving up is not red",
-     "    if (cls === 'error' || cls === 'shutdown') return '--system-error';",
-     "    if (cls === 'error') return '--system-error';"),
-
-    ("reconnecting is red, though its text is yellow",
-     "    if (cls === 'reconnecting') return '--system-warning';",
-     "    if (cls === 'reconnecting') return '--system-error';"),
-
-    ("a dropped connection still shows what was last known",
-     "    if (cls === 'reconnecting') return '--system-warning';\n",
-     ""),
-
-    ("connecting reads as idle",
-     "    if (cls === 'connecting')   return",
-     "    if (cls === 'connecting-no')   return"),
-
-    ("compacting is green",
-     "    if (cls === 'compacting')   return '--indicator-compacting';",
-     "    if (cls === 'compacting')   return '--indicator-working';"),
-
-    ("compacting during bg-wait is purple",
-     "    if (cls === 'compacting')   return '--indicator-compacting';\n",
+    ("the status bar's state is ignored",
+     "    if (stateVar) return stateVar;\n",
      ""),
 
     ("purple takes precedence over green",
-     "    if (cls === 'working')      return '--indicator-working';",
-     "    if (cls === 'working' && !(s.bg_count > 0)) return '--indicator-working';"),
+     "    if (stateVar) return stateVar;\n"
+     "    if (s.bg_count > 0 || typeof s.wakeup_at === 'number') return '--indicator-bg-wait';\n",
+     "    if (s.bg_count > 0 || typeof s.wakeup_at === 'number') return '--indicator-bg-wait';\n"
+     "    if (stateVar) return stateVar;\n"),
 
-    ("working reads as idle",
-     "    if (cls === 'working')      return '--indicator-working';\n",
-     ""),
-
-    ("background tasks show only in bg-wait",
-     "    if (s.bg_count > 0 || cls === 'bg-wait' || typeof s.wakeup_at === 'number') {",
-     "    if (cls === 'bg-wait' || typeof s.wakeup_at === 'number') {"),
-
-    ("an older hub's bg-wait shows nothing",
-     "    if (s.bg_count > 0 || cls === 'bg-wait' || typeof s.wakeup_at === 'number') {",
-     "    if (s.bg_count > 0 || typeof s.wakeup_at === 'number') {"),
+    ("background tasks while idle show nothing",
+     "    if (s.bg_count > 0 || typeof s.wakeup_at === 'number') return '--indicator-bg-wait';",
+     "    if (typeof s.wakeup_at === 'number') return '--indicator-bg-wait';"),
 
     ("a scheduled loop is never shown",
-     "    if (s.bg_count > 0 || cls === 'bg-wait' || typeof s.wakeup_at === 'number') {",
-     "    if (s.bg_count > 0 || cls === 'bg-wait') {"),
+     "    if (s.bg_count > 0 || typeof s.wakeup_at === 'number') return '--indicator-bg-wait';",
+     "    if (s.bg_count > 0) return '--indicator-bg-wait';"),
 
     ("idle is not grey",
      "    return '--indicator-idle';",
@@ -3491,8 +3461,12 @@ FAVICON_MUTATIONS = [
      " stroke=\"#000\" stroke-opacity=\".35\" stroke-width=\"4\"",
      ""),
 
+    ("the rim is drawn but cannot be seen",
+     "stroke-opacity=\".35\"",
+     "stroke-opacity=\"0\""),
+
     ("the icon is rewritten on every status snapshot",
-     "    if (key === _key) return;\n",
+     "    if (colour === _key) return;\n",
      ""),
 
     ("a new colour does not change the icon",
@@ -3510,6 +3484,38 @@ FAVICON_MUTATIONS = [
     ("a tab that attaches again keeps the app's icon",
      "    _landing = !!on;",
      "    _landing = _landing || !!on;"),
+]
+
+# The colour each state is written in, shared by the status bar and the tab
+# icon.  tests/favicon.test.js.
+FAVICON_UTIL_MUTATIONS = [
+    ("reconnecting is in connecting's colour, not its text's",
+     "    reconnecting: '--system-warning',",
+     "    reconnecting: '--indicator-connecting',"),
+
+    ("connecting is in compacting's colour",
+     "    connecting:   '--indicator-connecting',",
+     "    connecting:   '--indicator-compacting',"),
+
+    ("giving up is yellow, though its text is red",
+     "    shutdown:     '--system-error',",
+     "    shutdown:     '--system-warning',"),
+
+    ("an error reads as idle",
+     "    error:        '--system-error',\n",
+     ""),
+
+    ("working reads as idle",
+     "    working:      '--indicator-working',\n",
+     ""),
+
+    ("compacting is green",
+     "    compacting:   '--indicator-compacting',",
+     "    compacting:   '--indicator-working',"),
+
+    ("an older hub's bg-wait reads as idle",
+     "    'bg-wait':    '--indicator-bg-wait',\n",
+     ""),
 ]
 
 FAVICON_STATUS_MUTATIONS = [
@@ -6431,6 +6437,41 @@ COMPACTION_HUB_MUTATIONS = [
      ""),
 ]
 
+# A path option whose closing quote a backslash escaped ("%cd%" at a drive's
+# root) is refused as it is read; a restart passes the launch's --cwd on as it
+# resolved.  tests/test_cwd_arg.py.
+CWD_CONFIG_MUTATIONS = [
+    ("--cwd is not checked",
+     "        \"--cwd\",\n        type=_unmangled_path,\n",
+     "        \"--cwd\",\n"),
+
+    ("--config-dir is not checked",
+     "        \"--config-dir\",\n        type=_unmangled_path,\n",
+     "        \"--config-dir\",\n"),
+
+    ("--log-file is not checked",
+     "        \"--log-file\",\n        type=_unmangled_path,\n",
+     "        \"--log-file\",\n"),
+
+    ("--cli-path is not checked",
+     "        \"--cli-path\",\n        type=_unmangled_path,\n",
+     "        \"--cli-path\",\n"),
+
+    ("a quote is refused where it is part of a name",
+     "    if os.name == \"nt\" and '\"' in text:",
+     "    if '\"' in text:"),
+]
+
+CWD_SERVER_MUTATIONS = [
+    ("the launch command keeps --cwd as typed",
+     "            out += [\"--cwd\", cwd]\n",
+     "            out += [\"--cwd\", argv[i + 1]]\n"),
+
+    ("--cwd= keeps its value as typed",
+     "        out.append(\"--cwd=\" + cwd if a.startswith(\"--cwd=\") else a)",
+     "        out.append(a)"),
+]
+
 COMPACTION_CMD_MUTATIONS = [
     ("/autocompact hides that the CLI has yet to take it",
      "    if cli is not None and compaction_env(*cli) != compaction_env(at, on):\n",
@@ -7248,6 +7289,8 @@ TARGETS = {
                       CLIQUEUE_CHAT_MUTATIONS, "node"),
     "favicon": ("static/favicon.js", "tests/favicon.test.js",
                 FAVICON_MUTATIONS, "node"),
+    "favicon-util": ("static/util.js", "tests/favicon.test.js",
+                     FAVICON_UTIL_MUTATIONS, "node"),
     "favicon-status": ("static/status.js", "tests/reconnect_on_show.test.js",
                        FAVICON_STATUS_MUTATIONS, "node"),
     "favicon-lobby": ("static/lobby.js", "tests/reconnect_on_show.test.js",
@@ -7459,6 +7502,10 @@ TARGETS = {
                        COMPACTION_HUB_MUTATIONS, "pytest"),
     "compaction-cmd": ("commands.py", "tests/test_cli_compaction.py",
                        COMPACTION_CMD_MUTATIONS, "pytest"),
+    "cwd-config": ("config.py", "tests/test_cwd_arg.py",
+                   CWD_CONFIG_MUTATIONS, "pytest"),
+    "cwd-server": ("server.py", "tests/test_cwd_arg.py",
+                   CWD_SERVER_MUTATIONS, "pytest"),
     "account-server": ("server.py", "tests/test_session_account.py",
                        ACCOUNT_SERVER_MUTATIONS, "pytest"),
     "account-move": ("server.py", "tests/test_move_stops_original.py",

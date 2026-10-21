@@ -3282,6 +3282,24 @@ async def api_shutdown() -> dict[str, Any]:
 
 
 @_route("post", "/api/restart")
+def _with_launch_cwd(argv: list[str], cwd: str) -> list[str]:
+    """*argv*, the launch command, with its ``--cwd`` value replaced by *cwd*,
+    the absolute directory it resolved to at launch.  ``api_restart`` copies
+    the launch command, and a relative ``--cwd`` there (``--cwd .``) would be
+    resolved again against wherever the hub is by then."""
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--cwd" and i + 1 < len(argv):
+            out += ["--cwd", cwd]
+            i += 2
+            continue
+        out.append("--cwd=" + cwd if a.startswith("--cwd=") else a)
+        i += 1
+    return out
+
+
 async def api_restart() -> dict[str, Any]:
     """Restart the whole server process in place (kill + relaunch).
 
@@ -7029,6 +7047,8 @@ def main() -> None:
     # Via _parse_args_or_report so a bad flag cannot fail silently under the
     # tray launcher — see _report_launch_failure.
     config = _parse_args_or_report()
+    if config.cwd_given:
+        sys.argv[:] = _with_launch_cwd(sys.argv, config.cwd)
 
     # This launch's API key is the session's it opens (see HANDOVER_KEYS_ENV),
     # and a restarting hub's are the sessions' it handed over.

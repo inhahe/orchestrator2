@@ -2778,27 +2778,33 @@ variables it consumes, so themes never require CSS edits.
 
 Asked for so that a session can be read from the tab strip without switching
 to it. A tab viewing a session shows **one dot filling the icon**, in the
-colour the status bar writes the session's state in. `Status.update` hands
-every snapshot to `Favicon.update`. When several states hold at once, the
-first of these wins (`Favicon.colourFor`):
+colour the status bar writes its state in. `Status.update` hands every
+snapshot to `Favicon.update`. The table of which CSS variable each state
+(`busy_class`) is written in is `Util.STATE_COLOUR_VARS`, shared by the status
+bar's text and the dot so the two cannot disagree:
 
-| Dot | Meaning |
+| Dot | State |
 |---|---|
-| red | an error (rate limited, not authed, api error, open elsewhere), or disconnected for good / the server shut down |
-| yellow | compacting, or not connected: connecting, or disconnected and reconnecting |
-| green | working |
-| purple | background tasks running (`bg_count`, so during a turn too), or a loop scheduled (`wakeup_at`) |
-| grey | idle |
+| red | `error` (rate limited, not authed, api error, open elsewhere), `shutdown` (disconnected for good, or the server shut down) |
+| yellow | `compacting`, `connecting`, `reconnecting` |
+| green | `working` |
+| purple | `bg-wait` |
+| grey | `idle`, but purple while background tasks run (`bg_count`) or a loop is scheduled (`wakeup_at`), which the status bar shows in fields of their own |
 
-So a turn with background tasks running is green ("green takes precedence over
-purple", as asked), and compacting during bg-wait is yellow. The dot replaced
-a rack of three small LEDs, one fact each, which could show several states at
-once but could not be read at the size of a tab icon: *"the browser icons are
-hard to see the status lights in. change them to a dot showing red, green or
-yellow."* What the dot gives up is telling apart states that share a colour:
-compacting and a dropped connection are both yellow, and an error and a
-server that has gone are both red. The status bar still says which. The dot
-has a dark rim, so a pale colour stays visible on a pale tab strip.
+The status bar shows one state, and the hub chooses it (`state_to_status_dict`),
+so the dot needs no precedence of its own: a turn with background tasks
+running is `working`, green ("green takes precedence over purple", as asked),
+and compacting during bg-wait is `compacting`, yellow. The hub's order also
+means the dot is purple, not red, for an auth error, an API error or a session
+open elsewhere while background tasks run, because the status bar then shows
+`bg-wait` too; only rate limiting outranks them.
+
+The dot replaced a rack of three small LEDs, one fact each, which could show
+several states at once but could not be read at the size of a tab icon. What
+the dot gives up is telling apart states that share a colour: compacting and a
+dropped connection are both yellow, and an error and a server that has gone
+are both red. The status bar still says which. The dot has a dark rim, so a
+pale colour stays visible on a pale tab strip.
 
 - **Colours are read, not copied.** `getComputedStyle` on the page's CSS
   variables resolves through `var()` chains (checked in Edge), so a theme that
@@ -2819,13 +2825,13 @@ Limit: a background tab that the browser has *frozen* runs no script, so its
 icon catches up only when the tab is shown. A throttled tab still handles
 socket messages, and so still updates.
 
-Pinned by `tests/favicon.test.js` (26: each state alone, the precedence among
-them, not connected, the dot's size and rim, the theme, sanitising, rewrite
-suppression, the lobby) and seven tests in `reconnect_on_show.test.js` that
-drive the real page: status updates, green over purple, a dropped socket, an
-exhausted reconnect, a closed session. Mutation targets are `favicon`
-(`favicon.js` × 23), `favicon-status` and `favicon-lobby` (the two wiring
-lines).
+Pinned by `tests/favicon.test.js` (27: each state alone and with others, not
+connected, each state's own variable under a theme that tells them apart, the
+dot's size and rim, sanitising, rewrite suppression, the lobby) and seven tests
+in `reconnect_on_show.test.js` that drive the real page: status updates, green
+over purple, a dropped socket, an exhausted reconnect, a closed session.
+Mutation targets are `favicon` (`favicon.js` × 16), `favicon-util` (the shared
+table × 7), `favicon-status` and `favicon-lobby` (the two wiring lines).
 
 ### A sent prompt is tracked by id, not by "did anything come back"
 

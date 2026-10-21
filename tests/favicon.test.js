@@ -1,11 +1,9 @@
 /* The tab's icon shows the session's state, as one dot.
  *
- * The icon is a dot filling it, in the colour the status bar writes the
- * state in, so the state reads from the tab strip; when several states hold
- * at once, the first of red, yellow, green, purple, grey wins.  Asked
- * 2026-10-21, after an icon of three small LEDs proved hard to read: "change
- * them to a dot showing red, green or yellow. (green takes precedence over
- * purple.)"
+ * The icon is a dot filling it, readable at 16 pixels, in the colour the
+ * status bar writes the state in; an idle session waiting on background tasks
+ * or a loop is purple.  Asked 2026-10-21: "change them to a dot showing red,
+ * green, yellow or purple. (green takes precedence over purple.)"
  *
  * These drive static/favicon.js on its own.  That the page wires it up -- the
  * status bar feeding it, the lobby switching it off -- is checked in
@@ -17,7 +15,9 @@ const path = require('path');
 const { JSDOM } = require('jsdom');
 
 const STATIC = path.join(__dirname, '..', 'static');
-const FAVICON_JS = fs.readFileSync(path.join(STATIC, 'favicon.js'), 'utf8');
+// util.js first, as the page loads it: it holds the state colour table.
+const FAVICON_JS = fs.readFileSync(path.join(STATIC, 'util.js'), 'utf8') + '\n'
+  + fs.readFileSync(path.join(STATIC, 'favicon.js'), 'utf8');
 
 let failures = 0;
 let ran = 0;
@@ -80,11 +80,15 @@ function circles(svg) {
   });
 }
 
+const PARSER = new (new JSDOM('').window.DOMParser)();
+
 /* The dot's colour.  Checks the icon is that one dot and nothing else. */
 function dot(svg) {
-  const all = circles(svg);
-  assert(all.length === 1, `${all.length} shapes, not one dot`);
-  return all[0].fill;
+  const root = PARSER.parseFromString(svg, 'image/svg+xml').documentElement;
+  const shapes = [...root.children].map((e) => e.nodeName);
+  assert(shapes.length === 1 && shapes[0] === 'circle',
+         `the icon holds ${shapes.join(', ') || 'nothing'}, not one dot`);
+  return circles(svg)[0].fill;
 }
 
 function shown(status, theme) {
@@ -184,7 +188,7 @@ test('nothing else shows while not connected: it is not known', () => {
 // ---- the dot ---------------------------------------------------------------
 
 test('the dot fills the icon', () => {
-  // Three 16-pixel LEDs could not be read from the tab strip.
+  // It must read at 16 pixels, the size of a tab's icon.
   const p = page();
   p.F.update({ busy_class: 'working' });
   const c = circles(p.svg)[0];
@@ -196,7 +200,8 @@ test('the dot has a dark rim, for a pale colour on a pale tab strip', () => {
   const p = page();
   p.F.update({ busy_class: 'compacting' });
   const c = circles(p.svg)[0];
-  assert(c.stroke === '#000' && Number(c['stroke-width']) > 0, JSON.stringify(c));
+  assert(c.stroke === '#000' && Number(c['stroke-width']) > 0
+         && Number(c['stroke-opacity'] ?? 1) > 0, JSON.stringify(c));
 });
 
 // ---- colours come from the theme --------------------------------------
@@ -208,6 +213,31 @@ test('the dot is the theme\'s colour, not a fixed one', () => {
      { '--indicator-bg-wait': 'rgb(200, 100, 250)' });
   is({ busy_class: 'compacting' }, '#aabb00', 'themed compacting',
      { '--indicator-compacting': '#aabb00' });
+});
+
+test('each state is in its own variable, as its text is', () => {
+  // The default theme gives several of them one yellow or one red, so only
+  // a theme that tells them apart shows a state read from the wrong one.
+  const theme = {
+    '--indicator-working': '#000001', '--indicator-connecting': '#000002',
+    '--system-warning': '#000003', '--system-error': '#000004',
+    '--indicator-bg-wait': '#000005', '--indicator-compacting': '#000006',
+    '--indicator-idle': '#000007',
+  };
+  const expected = [
+    [{ busy_class: 'working' }, '#000001'],
+    [{ busy_class: 'connecting' }, '#000002'],
+    [{ busy_class: 'reconnecting' }, '#000003'],
+    [{ busy_class: 'error' }, '#000004'],
+    [{ busy_class: 'shutdown' }, '#000004'],
+    [{ busy_class: 'bg-wait' }, '#000005'],
+    [{ busy_class: 'idle', bg_count: 1 }, '#000005'],
+    [{ busy_class: 'compacting' }, '#000006'],
+    [{ busy_class: 'idle' }, '#000007'],
+  ];
+  for (const [status, colour] of expected) {
+    is(status, colour, status.busy_class + (status.bg_count ? ' + bg' : ''), theme);
+  }
 });
 
 test('a theme value that is not a colour never reaches the icon', () => {

@@ -232,6 +232,23 @@ def _positive_int(text: str) -> int:
     return n
 
 
+def _unmangled_path(text: str) -> str:
+    """An argparse type for a path option: *text* as given, unless, on
+    Windows, it has a quote in it, which no Windows path has.  There a quote
+    means the command line had a backslash right before a closing quote --
+    "%cd%" at the root of a drive is "C:\\", and "%~dp0" always ends in one --
+    which escapes the quote, so the value swallowed the arguments after it.
+    A type, so the refusal comes as the value is read, before argparse
+    stumbles over what was left of those arguments."""
+    if os.name == "nt" and '"' in text:
+        raise argparse.ArgumentTypeError(
+            f'{text!r} has a quote in it: a backslash right before a closing '
+            f'quote, as in "%cd%" at the root of a drive (C:\\), escaped the '
+            f'quote and swallowed the arguments after it. Leave the backslash '
+            f'off, or for the directory you are in use --cwd .')
+    return text
+
+
 def default_compact_at(model: str | None) -> int:
     """Pick a sensible auto-compact trigger based on the selected model."""
     window = model_context_window(model)
@@ -794,10 +811,12 @@ def parse_args(argv: list[str] | None = None) -> Config:
     )
     ap.add_argument(
         "--cwd",
+        type=_unmangled_path,
         default=None,
         help=(
             "Working directory Claude operates in. Default: the directory "
-            "you launch from, or the resumed session's own directory."
+            "you launch from, or the resumed session's own directory. "
+            "--cwd . is the directory you launch from even when resuming."
         ),
     )
     ap.add_argument(
@@ -1021,6 +1040,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     # -- Claude Code CLI --
     ap.add_argument(
         "--cli-path",
+        type=_unmangled_path,
         default=None,
         metavar="PATH",
         help=(
@@ -1035,6 +1055,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     # -- Config directory --
     ap.add_argument(
         "--config-dir",
+        type=_unmangled_path,
         default=None,
         metavar="PATH",
         help=(
@@ -1051,6 +1072,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     )
     ap.add_argument(
         "--log-file",
+        type=_unmangled_path,
         default=None,
         metavar="PATH",
         help="Write all log output to PATH (appends). Useful for diagnosing crashes when the terminal closes.",
@@ -1235,18 +1257,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
     )
 
     args = ap.parse_args(argv)
-
-    # No Windows path contains a quote.  One here is a command line whose
-    # backslash came right before a closing quote -- --cwd "%cd%" at the root
-    # of a drive, "C:\" -- which escapes the quote, so this value swallowed
-    # the arguments after it.  Said plainly rather than run in a directory
-    # named after them.
-    if args.cwd is not None and '"' in args.cwd:
-        ap.error(
-            f'--cwd got {args.cwd!r}, which has a quote in it: a backslash '
-            f'right before a closing quote, as in --cwd "%cd%" at the root of '
-            f'a drive (C:\\), escaped the quote and swallowed the arguments '
-            f'after it. Use --cwd . for the directory you are in.')
 
     # --list-models: print available models and exit.  Prefer the live list
     # from the API; fall back to the hardcoded set if it can't be fetched.

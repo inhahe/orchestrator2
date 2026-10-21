@@ -15,19 +15,6 @@ const Status = (() => {
   let elToggleCount;
   let elCollapseCheck;
 
-  // CSS class → colour mapping for the state text.
-  const _stateColors = {
-    working:      'var(--indicator-working)',
-    connecting:   'var(--indicator-connecting)',
-    reconnecting: 'var(--system-warning)',
-    shutdown:     'var(--system-error)',
-    error:        'var(--system-error)',
-    'bg-wait':    'var(--indicator-bg-wait)',
-    compacting:   'var(--indicator-compacting)',
-    waiting:      'var(--system-waiting)',
-    done:         'var(--system-done)',
-  };
-
   // This tab's last session title, for a reload of it (see update()).
   const TITLE_KEY = 'orch2.title';
 
@@ -155,8 +142,8 @@ const Status = (() => {
   function update(status) {
     if (!status) return;
 
-    // The tab's icon lights up for the state too, so a background tab can be
-    // read from the tab strip.  First, so no early return below can skip it.
+    // The tab's icon shows the state too, so a background tab can be read
+    // from the tab strip.  First, so no early return below can skip it.
     // `typeof`, not `window.Favicon`: a top-level const is not a property of
     // window, so that check would be false in a real browser.
     if (typeof Favicon !== 'undefined') Favicon.update(status);
@@ -186,7 +173,8 @@ const Status = (() => {
 
     _set(elIndicator, 'title', stateLabel);
     _set(elState, 'title', stateLabel);
-    const stateColor = _stateColors[cls] || '';
+    const stateVar = Util.STATE_COLOUR_VARS[cls];
+    const stateColor = stateVar ? `var(${stateVar})` : '';
     if (_prev.stateColor !== stateColor) {
       elState.style.color = stateColor;
       _prev.stateColor = stateColor;
