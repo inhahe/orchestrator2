@@ -14,8 +14,8 @@ launcher passes `--cwd` every time; an account from `CLAUDE_CONFIG_DIR`
 counted as chosen too. `/resume` in a tab passes neither, which is why it
 worked from anywhere. The refusals protected nothing: the CLI resumes a
 session only in its own directory, under its own account. Now a launch always
-follows it there and says so, and a given `--cwd` or account only picks
-between several sessions of one name. Tests: `tests/test_launch_resume.py`;
+follows it there and says so. Between several sessions of one name, the
+launch's account and then its directory choose. Tests: `tests/test_launch_resume.py`;
 mutation target `launchresume-server`.
 
 ## A session locked out by a usage limit read "idle" — FIXED (2026-10-21)

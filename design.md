@@ -338,11 +338,12 @@ that name" meant the first two, and the user renamed the third. Now:
   (`session.sessions_anywhere`: the lobby's scan, through the title index,
   0.5 s). If exactly one session has the title, the launch follows it to its
   directory and account, prints a note saying so, and pins the account. If
-  several do, the `--cwd` the launch was given (`Config.cwd_given`) and then
-  the account it was given (`--config-dir` or `CLAUDE_CONFIG_DIR`) pick between
-  them, each only when it narrows them to some. Otherwise the launch stops and
-  says where each session of that name is, or which titles are like it, or
-  what the directory has.
+  several do, the launch's own account (given with `--config-dir` or
+  `CLAUDE_CONFIG_DIR`, or the default) and then its directory, given or not,
+  pick between them, each only when some match. The account first: a `--cwd`
+  is often only where a launcher ran, and an account is chosen. Still
+  several, the launch stops and lists them. None: it says which titles are
+  like it, or what the directory has.
 - An id is followed the same way. The terminal picker always did this ("resume
   is cwd-scoped").
 - A session is followed whatever `--cwd` or account the launch was given. The
@@ -350,12 +351,16 @@ that name" meant the first two, and the user renamed the third. Now:
   (`getProjectDir(getOriginalCwd())`), in its own account's tree, so those
   could only have refused it. Until 2026-10-21 they did, and a launcher that
   passes `--cwd` every time could not resume a session from another directory.
+  The one exception: where a CLI started in the launch's directory would find
+  the transcript anyway, the launch stays. A transcript copied there by hand
+  still records the directory it came from.
 
 The error goes to stderr, `launch-error.log` and the `--log-file`
 (`_stop_launch`). A dialog also appears when the console is hidden, or when the
-launch has `--open`, since no tab is coming. ⟳ Restart drops the launch's `--cwd` when it resumes a session: after
-`/cwd` or `/resume` that `--cwd` names the wrong directory, and the new
-process follows the session to its own. `--detach` hands its child the
+launch has `--open`, since no tab is coming. ⟳ Restart drops the launch's `--cwd` when it resumes a session. The new
+process follows the session to its own directory anyway, and after `/cwd` or
+`/resume` that `--cwd` can name a directory since deleted, which would stop
+the new process first. `--detach` hands its child the
 account the launch followed. In a session, `/resume <title>` that several
 sessions share now says so, listing them, instead of "session not found".
 
@@ -364,10 +369,11 @@ sessions share now says so, listing them, instead of "session not found".
 any directory ... maybe also ... from any claude account"). It worked only in
 the hub's own session, only on its account, and found a title only in that
 session's directory; from any other tab it said "Use Sessions". Now it runs the
-launch's resolver, `_settle_launch_resume(how="/resume")`, on the tab's
-session's directory and account (`home_account`) with neither fixed, so an id
-is followed anywhere, a title is found there first and then anywhere, and a
-title several sessions share is answered with the list. The hub's own session, given one on
+launch's resolver, `_settle_launch_resume(how="/resume")`, with the tab's
+session's Config as a launch's, so an id is followed anywhere, a title is
+found in the tab's directory and account first and then anywhere, the tab's
+account and directory pick between several, and a title they do not settle
+is answered with the list. The hub's own session, given one on
 its own account, still switches in place (`_reconfigure`), stopping the one it
 left. Any other tab, or a session on another account (a runtime runs on one
 account for life), opens it as the session list does — or goes to it, when

@@ -5247,13 +5247,19 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
      ""),
 
     ("a directory given refuses a session elsewhere rather than follow it",
-     "        if where and not _same_path(where, cfg.cwd):\n",
-     "        if where and not _same_path(where, cfg.cwd) and not cfg.cwd_given:\n"),
+     "        if where and not _same_path(where, cfg.cwd) and not found_here:\n",
+     "        if where and not _same_path(where, cfg.cwd) and not found_here"
+     " and not cfg.cwd_given:\n"),
 
-    ("an account chosen keeps a session on another account where it cannot "
-     "be resumed",
-     "        if not _same_path(s.get(\"config_dir\"), account):\n",
-     "        if not _same_path(s.get(\"config_dir\"), account) and not account_given:\n"),
+    ("a transcript copied into the launch's directory is sent back to the one "
+     "it records, where the CLI will not find it",
+     "        if where and not _same_path(where, cfg.cwd) and not found_here:\n",
+     "        if where and not _same_path(where, cfg.cwd):\n"),
+
+    ("a session on another account is resumed on the launch's, where it "
+     "cannot be",
+     "            new = dataclasses.replace(new, config_dir=s[\"config_dir\"])\n",
+     "            pass\n"),
 
     ("the environment's account is not a choice",
      "        config, config_dir=adopt_from_environment(config.config_dir))\n",
@@ -5280,25 +5286,46 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
      "        return new, f\"{what} is {' and '.join(moved)}: resuming it there.\", None",
      "        return new, None, None"),
 
-    ("the directory given does not pick between several elsewhere",
-     "    if len(usable) > 1 and cfg.cwd_given:\n",
-     "    if False:\n"),
+    ("the launch's account does not pick between several elsewhere",
+     "                  if _same_path(s.get(\"config_dir\"), account)] or usable\n",
+     "                  if True] or usable\n"),
+
+    ("the launch's directory does not pick between several elsewhere",
+     "                  if _same_path(s.get(\"cwd\"), cfg.cwd)] or usable\n",
+     "                  if True] or usable\n"),
+
+    ("a launcher's habitual directory outranks the account chosen",
+     "                  if _same_path(s.get(\"config_dir\"), account)] or usable\n"
+     "    if len(usable) > 1:\n"
+     "        usable = [s for s in usable\n"
+     "                  if _same_path(s.get(\"cwd\"), cfg.cwd)] or usable\n",
+     "                  if _same_path(s.get(\"cwd\"), cfg.cwd)] or usable\n"
+     "    if len(usable) > 1:\n"
+     "        usable = [s for s in usable\n"
+     "                  if _same_path(s.get(\"config_dir\"), account)] or usable\n"),
+
+    ("a list of several names those already ruled out",
+     "        lines += [_session_line(s, account) for s in usable]\n",
+     "        lines += [_session_line(s, account) for s in named]\n"),
 
     ("a directory given that holds none of them leaves none to pick",
      "                  if _same_path(s.get(\"cwd\"), cfg.cwd)] or usable\n",
      "                  if _same_path(s.get(\"cwd\"), cfg.cwd)]\n"),
 
     ("an id is not followed to its directory",
-     "        return _follow({\"session_id\": ref, \"cwd\": find_session_cwd(ref, account),\n",
-     "        return _follow({\"session_id\": ref, \"cwd\": None,\n"),
+     "                        \"cwd\": recorded_cwd(project / f\"{ref}.jsonl\")})\n",
+     "                        \"cwd\": None})\n"),
 
     ("an id on another account is not recognised",
-     "    holders = [s for s in _all() if s[\"session_id\"] == ref]\n",
+     "    holders = ([s for s in _all() if s[\"session_id\"] == ref]\n"
+     "               if _UUID_RE.fullmatch(ref) else [])\n",
      "    holders = []\n"),
 
-    ("the account given does not pick between several elsewhere",
-     "    if len(usable) > 1 and account_given:\n",
-     "    if False:\n"),
+    ("a title is looked up as an id across the machine before the launch "
+     "directory is looked in",
+     "               if _UUID_RE.fullmatch(ref) else [])\n",
+     "               if True else [])\n"),
+
 
     ("an id nobody has is taken for a title",
      "    if _UUID_RE.fullmatch(ref):\n",

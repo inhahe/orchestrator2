@@ -115,8 +115,10 @@ from session import (
     load_persisted_queue,
     load_session_compaction,
     normalize_path_for_compare,
+    project_dir_for_cwd,
     read_human_title,
     read_session_title,
+    recorded_cwd,
     render_session_history,
     resolve_session_ref,
     resumable_sessions,
@@ -3495,10 +3497,10 @@ async def api_restart() -> dict[str, Any]:
     # Rebuild argv from our own launch command, normalising the bits that
     # must change for an in-place restart.
     argv = sys.argv
-    # The session the restart resumes.  Its own directory is where it has to
-    # be resumed from, so the launch's --cwd is dropped with it: after /cwd
-    # or /resume it names the wrong directory, and the new process follows
-    # the session to the right one (_settle_launch_resume).
+    # The session the restart resumes.  The new process follows it to its own
+    # directory (_settle_launch_resume), so the launch's --cwd is dropped with
+    # it: after /cwd or /resume it can name a directory since deleted, which
+    # would stop the new process before it got that far.
     sid = state.session_id if state is not None else None
     # A primary with no session id yet is a new conversation, and so is its
     # replacement, in the directory the primary is in now: continuing the most
@@ -5771,10 +5773,10 @@ async def _handle_resume(ws: WebSocket, rt: SessionRuntime, ref: str) -> None:
     chat.
     """
     tab_account = str(account_dir(getattr(rt.config, "config_dir", None)))
-    cfg = dataclasses.replace(rt.config, resume=ref, cwd_given=False, config_dir=None)
+    cfg = dataclasses.replace(rt.config, resume=ref)
     try:
         found, note, err = await asyncio.to_thread(functools.partial(
-            _settle_launch_resume, cfg, how="/resume", home_account=tab_account))
+            _settle_launch_resume, cfg, how="/resume"))
     except Exception as exc:
         log.exception("/resume %s: could not look it up", ref)
         err, found, note = f"Couldn't look for that session: {exc}", None, None
@@ -6564,8 +6566,7 @@ def _session_line(s: dict[str, Any], account: str, *, title: bool = False) -> st
     return line
 
 
-def _settle_launch_resume(cfg: Config, *, how: str = "--resume",
-                          home_account: str | None = None
+def _settle_launch_resume(cfg: Config, *, how: str = "--resume"
                           ) -> tuple[Config, str | None, str | None]:
     """Settle ``--resume <title|id>`` before the launch goes anywhere.
 
@@ -6589,28 +6590,27 @@ def _settle_launch_resume(cfg: Config, *, how: str = "--resume",
       session of that name elsewhere, which is not one of them.
     * None there: every directory and account on this machine is searched.
       Exactly one session of that name, and the launch follows it to its
-      directory and account, and says so.  Several: the ``--cwd`` or account
-      the launch was given picks between them, if it settles it.  Otherwise
-      an error saying where each session of that name is, or what the launch
-      directory does have.
+      directory and account, and says so.  Several: those on the launch's
+      account, then those in its directory, are preferred, each only when
+      some are.  Still several: an error listing them.  None: what the
+      launch directory does have.
 
     An id is followed the same way; the terminal picker has always done that
     ("resume is cwd-scoped").  A session is followed whatever ``--cwd`` or
     account the launch was given: the CLI resumes one only in its own
-    directory, under its own account, so they could only have refused it.
+    directory, under its own account, so those could only have refused it.
+    Except that the launch stays where a CLI started in its directory would
+    find the transcript anyway: one copied there by hand still records the
+    directory it came from.
 
     *how* is the command the messages tell the user to use: ``--resume`` for
-    a launch, ``/resume`` in a tab (``_handle_resume``).  *home_account* is
-    the account to look in first, when that is not ``cfg``'s and the session
-    may be followed out of it: a tab's own.
+    a launch, ``/resume`` in a tab (``_handle_resume``).
     """
     ref = (cfg.resume or "").strip()
     if not ref or ref == _PICKER_SENTINEL:
         return cfg, None, None
-    # main() has adopted an inherited CLAUDE_CONFIG_DIR into cfg.config_dir,
-    # so an account from the environment counts as chosen too.
-    account_given = bool(cfg.config_dir)
-    account = str(account_dir(home_account or cfg.config_dir))
+    # main() has adopted an inherited CLAUDE_CONFIG_DIR into cfg.config_dir.
+    account = str(account_dir(cfg.config_dir))
     everything: list[dict[str, Any]] | None = None
 
     def _all() -> list[dict[str, Any]]:
@@ -6623,7 +6623,9 @@ def _settle_launch_resume(cfg: Config, *, how: str = "--resume",
         new = dataclasses.replace(cfg, resume=s["session_id"])
         moved = []
         where = s.get("cwd")
-        if where and not _same_path(where, cfg.cwd):
+        found_here = (project_dir_for_cwd(cfg.cwd, s.get("config_dir"))
+                      / f"{s['session_id']}.jsonl").is_file()
+        if where and not _same_path(where, cfg.cwd) and not found_here:
             if not Path(where).is_dir():
                 return cfg, None, (
                     f"Session {s['session_id']} is in {where}, which does not "
@@ -6639,10 +6641,14 @@ def _settle_launch_resume(cfg: Config, *, how: str = "--resume",
         return new, f"{what} is {' and '.join(moved)}: resuming it there.", None
 
     # --- An id ---
-    if find_session_dir(ref, account) is not None:
-        return _follow({"session_id": ref, "cwd": find_session_cwd(ref, account),
-                        "config_dir": account, "title": None})
-    holders = [s for s in _all() if s["session_id"] == ref]
+    project = find_session_dir(ref, account)
+    if project is not None:
+        return _follow({"session_id": ref, "config_dir": account, "title": None,
+                        "cwd": recorded_cwd(project / f"{ref}.jsonl")})
+    # Elsewhere only if it is shaped like one: for a title, the whole-machine
+    # scan waits until the launch directory has been looked in.
+    holders = ([s for s in _all() if s["session_id"] == ref]
+               if _UUID_RE.fullmatch(ref) else [])
     if holders:
         return _follow(holders[0])
 
@@ -6672,14 +6678,16 @@ def _settle_launch_resume(cfg: Config, *, how: str = "--resume",
                          f"of those:")
             lines += [_session_line(s, account) for s in others]
         return cfg, None, "\n".join(lines)
-    # Several elsewhere: what the launch was given picks one, if it can.
+    # Several elsewhere: the launch's account, then its directory, picks one
+    # if it can.  The account first: a --cwd is often only where a launcher
+    # ran, and an account is chosen.
     usable = named
-    if len(usable) > 1 and cfg.cwd_given:
-        usable = [s for s in usable
-                  if _same_path(s.get("cwd"), cfg.cwd)] or usable
-    if len(usable) > 1 and account_given:
+    if len(usable) > 1:
         usable = [s for s in usable
                   if _same_path(s.get("config_dir"), account)] or usable
+    if len(usable) > 1:
+        usable = [s for s in usable
+                  if _same_path(s.get("cwd"), cfg.cwd)] or usable
     if len(usable) == 1:
         return _follow(usable[0])
 
@@ -6687,11 +6695,15 @@ def _settle_launch_resume(cfg: Config, *, how: str = "--resume",
     if _UUID_RE.fullmatch(ref):
         return cfg, None, f"There is no session {ref} on this machine."
     lines = [f"No session in {cfg.cwd} is called '{ref}'."]
-    if named:
-        # Several, and nothing the launch was given settles which.  An id is
-        # followed to its own directory and account (_follow).
+    if usable:
+        # Several, and the launch's account and directory do not settle
+        # which.  An id is followed to its own directory and account
+        # (_follow).
         lines.append(f"Sessions called '{ref}':")
-        lines += [_session_line(s, account) for s in named]
+        lines += [_session_line(s, account) for s in usable]
+        if len(usable) < len(named):
+            lines.append(f"(and {len(named) - len(usable)} more on other "
+                         "accounts or in other directories)")
         lines.append(f"Resume one by its id ({how} <id>).")
         return cfg, None, "\n".join(lines)
     similar = [s for s in _all() if s["title"] and want in s["title"].casefold()]

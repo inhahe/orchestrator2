@@ -544,8 +544,8 @@ class Config:
     allow_duplicate_session: bool = False
     cwd: str = "."
     # Whether ``cwd`` came from --cwd rather than the directory the launch ran
-    # in.  A ``--resume`` of a session that lives in another directory follows
-    # it there only when the directory was not asked for.
+    # in.  A given one is made absolute in the launch command, which a
+    # restart copies (``server._with_launch_cwd``).
     cwd_given: bool = False
     # Workaround for a bundled-CLI prompt-cache bug: when the 1h-vs-5m
     # cache_control TTL flips mid-session (e.g. rate-limit overage toggles
@@ -815,8 +815,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         default=None,
         help=(
             "Working directory Claude operates in. Default: the directory "
-            "you launch from, or the resumed session's own directory. "
-            "--cwd . is the directory you launch from even when resuming."
+            "you launch from. A --resume'd session runs in its own "
+            "directory regardless."
         ),
     )
     ap.add_argument(

@@ -23,10 +23,11 @@ that session, and without ``--open`` no tab was opened; the launch printed
 "(session s12)" and nothing that led to it.
 
 Now the launch settles ``--resume`` first (``server._settle_launch_resume``).
-It follows a session it can find to its directory and account, unless those
-were asked for.  Otherwise it stops with an error naming each candidate: id,
-last activity, directory, account.  A launch that joins a hub prints the
-session's address.
+It follows a session it can find to its directory and account, whatever
+``--cwd`` or account it was given; between several of one name, its account
+and then its directory choose.  Otherwise it stops with an error naming each
+candidate: id, last activity, directory, account.  A launch that joins a hub
+prints the session's address.
 """
 
 from __future__ import annotations
@@ -134,6 +135,20 @@ def test_the_one_in_the_launch_directory_wins(machine):
     assert (cfg.resume, cfg.cwd, note, err) == (LIVE, machine.os, None, None)
 
 
+def test_a_title_in_the_launch_directory_searches_no_further(machine, monkeypatch):
+    """Every account's sessions are scanned only when the launch's own
+    directory, on its own account, has none of that name (half a second)."""
+    _session(machine.default, machine.os, LIVE, "OS F")
+
+    def scanned():
+        raise AssertionError("searched the whole machine")
+
+    monkeypatch.setattr(server, "sessions_anywhere", scanned)
+    cfg, _note, err = _settle(_cfg(machine, machine.os, "OS F"))
+
+    assert err is None and cfg.resume == LIVE
+
+
 def test_a_title_elsewhere_matches_in_any_case(machine):
     _session(machine.default, machine.os, IDLE, "OS F old 2")
 
@@ -217,13 +232,17 @@ def test_the_environments_account_picks_between_several(machine, monkeypatch,
     assert server.config.resume == MOVED
 
 
-def test_one_session_under_two_accounts_is_still_one(machine):
+def test_one_session_under_two_accounts_is_still_one(machine, tmp_path):
     """The same transcript, id and all, in both accounts' trees (a file copied
-    by hand) is one session to follow, not "several"."""
+    by hand) is one session to follow, not "several".  Launched on a third
+    account, so neither copy is preferred as the launch's own."""
     _session(machine.default, machine.os, IDLE, "OS F old 2")
     _session(machine.other, machine.os, IDLE, "OS F old 2")
+    third = tmp_path / "home" / ".claude-third"
+    (third / "projects").mkdir(parents=True)
 
-    cfg, _note, err = _settle(_cfg(machine, machine.orch, "OS F old 2"))
+    cfg, _note, err = _settle(_cfg(machine, machine.orch, "OS F old 2",
+                                   config_dir=str(third)))
 
     assert err is None and cfg.resume == IDLE
 
@@ -271,7 +290,8 @@ def test_and_one_on_another_account_is_said_not_to_be_one_of_them(machine):
 
 
 def test_several_elsewhere_are_listed_not_guessed_between(machine):
-    _session(machine.default, machine.os, LIVE, "OS F")
+    """Neither on the launch's account nor in its directory."""
+    _session(machine.other, machine.os, LIVE, "OS F")
     _session(machine.other, machine.os, MOVED, "OS F")
 
     cfg, _note, err = _settle(_cfg(machine, machine.orch, "OS F"))
@@ -282,16 +302,54 @@ def test_several_elsewhere_are_listed_not_guessed_between(machine):
         "an id is followed anywhere, so neither is needed"
 
 
-def test_several_elsewhere_the_directory_given_picks_one(machine, tmp_path):
+def test_several_elsewhere_the_launchs_account_picks_one(machine):
+    """Given or not: the account a launch runs on is the one it means."""
+    _session(machine.default, machine.os, LIVE, "OS F")
+    _session(machine.other, machine.os, MOVED, "OS F")
+
+    cfg, _note, err = _settle(_cfg(machine, machine.orch, "OS F"))
+
+    assert err is None and cfg.resume == LIVE
+
+
+@pytest.mark.parametrize("given", [True, False], ids=["--cwd", "no --cwd"])
+def test_several_elsewhere_the_launchs_directory_picks_one(machine, tmp_path, given):
+    """`--cwd .` and no --cwd are the same directory, and choose alike."""
     third = tmp_path / "third"
     third.mkdir()
-    _session(machine.default, machine.os, LIVE, "OS F")
+    _session(machine.other, machine.os, LIVE, "OS F")
     _session(machine.other, str(third), MOVED, "OS F")
 
-    cfg, _note, err = _settle(_cfg(machine, str(third), "OS F", cwd_given=True))
+    cfg, _note, err = _settle(_cfg(machine, str(third), "OS F", cwd_given=given))
 
     assert err is None and cfg.resume == MOVED
     assert cfg.config_dir == str(machine.other)
+
+
+def test_the_launchs_account_outranks_its_directory(machine, tmp_path):
+    """A --cwd is often only where a launcher ran; an account is chosen."""
+    third = tmp_path / "third"
+    third.mkdir()
+    _session(machine.default, str(third), LIVE, "OS F")
+    _session(machine.other, machine.os, MOVED, "OS F")
+
+    cfg, _note, err = _settle(_cfg(machine, str(third), "OS F", cwd_given=True,
+                                   config_dir=str(machine.other)))
+
+    assert err is None and cfg.resume == MOVED
+
+
+def test_a_list_of_several_names_only_those_still_in_play(machine, tmp_path):
+    third = tmp_path / "third"
+    third.mkdir()
+    _session(machine.default, machine.os, LIVE, "OS F")
+    _session(machine.default, str(third), IDLE, "OS F")
+    _session(machine.other, machine.os, MOVED, "OS F")
+
+    _cfg_, _note, err = _settle(_cfg(machine, machine.orch, "OS F"))
+
+    assert LIVE in err and IDLE in err and MOVED not in err
+    assert "1 more on other accounts or in other directories" in err
 
 
 def test_a_directory_given_with_none_of_them_leaves_the_account_to_pick(machine):
@@ -387,6 +445,19 @@ def test_an_id_on_another_account_is_followed_there(machine):
     assert err is None and cfg.config_dir == str(machine.other)
 
 
+def test_a_transcript_copied_into_the_launchs_directory_resumes_there(machine):
+    """It still records the directory it was copied from, where the CLI
+    would not find it."""
+    copy = _session(machine.default, machine.orch, IDLE)
+    copy.write_text(copy.read_text(encoding="utf-8").replace(
+        json.dumps(str(machine.orch))[1:-1], json.dumps(machine.os)[1:-1]),
+        encoding="utf-8")
+
+    cfg, note, err = _settle(_cfg(machine, machine.orch, IDLE, cwd_given=True))
+
+    assert (cfg.resume, cfg.cwd, note, err) == (IDLE, machine.orch, None, None)
+
+
 def test_an_id_is_followed_from_an_account_chosen_too(machine):
     _session(machine.other, machine.os, MOVED)
 
@@ -467,6 +538,35 @@ def test_following_an_account_pins_it_for_the_launch(machine, monkeypatch, tmp_p
     assert server.config.config_dir == str(machine.other)
     # ...and the environment carries none, for no CLI to inherit.
     assert "CLAUDE_CONFIG_DIR" not in os.environ
+
+
+def test_a_launch_joining_a_hub_hands_over_the_account_it_inherited(
+        machine, monkeypatch, tmp_path):
+    """From a shell set up for one account, the session opens on that account
+    in the hub it joins, whatever account that hub works in."""
+    _session(machine.other, machine.os, MOVED, "OS F old")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(machine.other))
+    handed = []
+
+    class _Joined(Exception):
+        pass
+
+    def launch(_port, **kw):
+        handed.append(kw)
+        raise _Joined
+
+    monkeypatch.setattr(server, "config", None)       # main() rebinds it
+    monkeypatch.setattr(server, "_parse_args_or_report",
+                        lambda: _cfg(machine, machine.os, "OS F old"))
+    monkeypatch.setattr(server, "LAUNCH_ERROR_LOG", str(tmp_path / "e.log"))
+    monkeypatch.setenv("ORCH2_NO_DIALOG", "1")
+    monkeypatch.setattr(server, "_probe_hub", lambda _port: {"pid": 1})
+    monkeypatch.setattr(server, "_launch_into_hub", launch)
+    with pytest.raises(_Joined):
+        server.main()
+
+    assert handed[0]["config_dir"] == str(machine.other)
+    assert handed[0]["resume"] == MOVED
 
 
 def test_joining_says_where_the_session_is(monkeypatch, capsys):
@@ -801,8 +901,17 @@ def test_resume_in_the_hubs_session_of_another_accounts_opens_it(machine, monkey
     assert [o["config_dir"] for o in got.opened] == [str(machine.other)]
 
 
-def test_resume_names_the_sessions_sharing_a_title(machine, monkeypatch):
+def test_resume_prefers_the_tabs_account_among_several(machine, monkeypatch):
+    """As a launch prefers its own."""
     _session(machine.default, machine.os, LIVE, "OS F")
+    _session(machine.other, machine.os, OTHER, "OS F")
+    rt, got = _tab(machine, monkeypatch, primary=False)
+    _resume(rt, "OS F")
+    assert [o["resume"] for o in got.opened] == [LIVE]
+
+
+def test_resume_names_the_sessions_sharing_a_title(machine, monkeypatch):
+    _session(machine.other, machine.os, LIVE, "OS F")
     _session(machine.other, machine.os, OTHER, "OS F")
     rt, got = _tab(machine, monkeypatch, primary=False)
     _resume(rt, "OS F")

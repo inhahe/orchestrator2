@@ -899,9 +899,12 @@ def find_session_cwd(session_id: str, config_dir: str | None = None) -> str | No
     project_dir = find_session_dir(session_id, config_dir)
     if project_dir is None:
         return None
-    info = _parse_session_info(
-        project_dir / f"{session_id}.jsonl", project_dir.name
-    )
+    return recorded_cwd(project_dir / f"{session_id}.jsonl")
+
+
+def recorded_cwd(jsonl: Path) -> str | None:
+    """The directory transcript *jsonl* records its session working in."""
+    info = _parse_session_info(jsonl, jsonl.parent.name)
     return info.get("cwd") if info else None
 
 
