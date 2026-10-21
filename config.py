@@ -1236,6 +1236,18 @@ def parse_args(argv: list[str] | None = None) -> Config:
 
     args = ap.parse_args(argv)
 
+    # No Windows path contains a quote.  One here is a command line whose
+    # backslash came right before a closing quote -- --cwd "%cd%" at the root
+    # of a drive, "C:\" -- which escapes the quote, so this value swallowed
+    # the arguments after it.  Said plainly rather than run in a directory
+    # named after them.
+    if args.cwd is not None and '"' in args.cwd:
+        ap.error(
+            f'--cwd got {args.cwd!r}, which has a quote in it: a backslash '
+            f'right before a closing quote, as in --cwd "%cd%" at the root of '
+            f'a drive (C:\\), escaped the quote and swallowed the arguments '
+            f'after it. Use --cwd . for the directory you are in.')
+
     # --list-models: print available models and exit.  Prefer the live list
     # from the API; fall back to the hardcoded set if it can't be fetched.
     if args.list_models:

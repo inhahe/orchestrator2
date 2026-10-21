@@ -31,10 +31,10 @@ To pay per token with an Anthropic API key instead of a Claude subscription, for
 From the project directory you want Claude to work in:
 
 ```bash
-python server.py --cwd "%cd%" --open
+python server.py --cwd . --open
 ```
 
-- `--cwd "%cd%"` — the working directory Claude operates in (defaults to the current directory).
+- `--cwd .` — the working directory Claude operates in: here, the one you are in. Not `--cwd "%cd%"`: at the root of a drive that is `"C:\"`, whose backslash escapes the closing quote, and the arguments after it are swallowed (orchestrator2 refuses the result).
 - `--open` — open the browser automatically. Otherwise browse to the printed URL (default `http://localhost:8420`; it auto-picks a free port if 8420 is taken). A launch that joins a hub that is already running prints its session's own address (`http://localhost:8420/?rid=s12`), and opens it only with `--open`.
 
 The server starts serving and the browser opens **immediately**; the status bar shows **`connecting…`** while the Claude SDK finishes loading in the background, then flips to `idle` when it's ready to take your first message.
@@ -54,7 +54,7 @@ Sessions are stored the same way Claude Code stores them — under `<config-dir>
 
 ```bash
 pip install -r requirements.txt
-python server.py --cwd "%cd%" --open
+python server.py --cwd . --open
 ```
 
 ## Running Multiple Sessions (central hub)
@@ -318,7 +318,7 @@ A session can be billed per token to an Anthropic API key instead of a Claude su
 
 ```bat
 set ANTHROPIC_API_KEY=sk-ant-api03-...
-python server.py --cwd "%cd%" --open
+python server.py --cwd . --open
 ```
 
 That works whether the launch starts the hub or joins one already running; a joining launch hands the key to the hub on this machine. The key belongs to the session, not to the tab showing it, and the hub keeps it with the session while it runs: closed and reopened from the session list, switched back to with `/resume`, moved with `/move`, or brought back by ⟳ Restart, the session still has it. A tab that switches to another session with `/resume` or `/cwd` leaves the key behind, and the session it switches to runs with its own key, if it has one. A session started fresh with `/clear` keeps the key, as the same launch's work. The key is held in memory only, never written to disk, so after the hub shuts down, launch the session with the key again. `/apikey` says whether a session has a key of its own, and `/apikey off` drops it; the session then reconnects on its account's login. Launching the session again without `ANTHROPIC_API_KEY` set does the same: a launch says what its session is billed to, so one without a key takes the session off the key it had, open or closed.
