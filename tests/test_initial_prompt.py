@@ -460,7 +460,7 @@ class _FakeBridge:
     async def start(self):
         pass
 
-    async def stop(self):
+    async def stop(self, **_kw):
         pass
 
 

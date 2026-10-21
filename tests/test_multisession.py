@@ -66,7 +66,7 @@ class FakeBridge:
         self.entered = False
         self.stopped = False
 
-    async def stop(self) -> None:
+    async def stop(self, **_kw) -> None:
         self.entered = True
         await asyncio.sleep(0)      # a real stop() yields; so must this one
         self.stopped = True
@@ -468,7 +468,7 @@ def test_viewers_are_evacuated_before_the_bridge_is_stopped():
     order: list[str] = []
 
     class SlowBridge(FakeBridge):
-        async def stop(self) -> None:
+        async def stop(self, **_kw) -> None:
             order.append("bridge-stopped")
             await super().stop()
 

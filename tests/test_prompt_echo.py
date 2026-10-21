@@ -60,7 +60,7 @@ class FakeBridge:
         await self._rt.broadcast({"type": "turn_end", "subtype": "success",
                                   "duration": "0:26:41", "turns": 102})
 
-    async def stop(self) -> None:
+    async def stop(self, **_kw) -> None:
         pass
 
     def drained(self) -> list[tuple[str, str]]:

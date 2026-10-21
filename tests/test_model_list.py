@@ -313,7 +313,7 @@ class _FakeBridge:
     async def flush_pending_turn_end(self):
         pass
 
-    async def stop(self):
+    async def stop(self, **_kw):
         pass
 
 

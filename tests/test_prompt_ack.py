@@ -67,7 +67,7 @@ class FakeBridge:
     async def flush_pending_turn_end(self) -> None:
         pass
 
-    async def stop(self) -> None:
+    async def stop(self, **_kw) -> None:
         self.stopped = True
 
 

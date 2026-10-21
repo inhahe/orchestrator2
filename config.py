@@ -92,7 +92,7 @@ SLASH_COMMANDS = [
     "/models",
     "/btw", "/graphify", "/autocompact", "/max-context", "/recycle", "/bell", "/mcp",
     "/collapse", "/collapse-threshold", "/show-thinking",
-    "/queue", "/loop", "/quit", "/exit",
+    "/queue", "/loop", "/resume-after-limit", "/quit", "/exit",
     "/quit!", "/exit!",
 ]
 
@@ -661,6 +661,9 @@ class Config:
     # SDKBridge._make_options).  A CLI that dies under a running turn always
     # has the turn finished by its replacement.
     resume_interrupted_turn: bool = False
+    # A session a usage limit stops carries on by itself once the limit has
+    # reset (limit_resume.py, SDKBridge._arm_limit_resume).  Off: it waits.
+    resume_after_limit: bool = False
     agent_name: str | None = None          # cross-account agent identity (agent-comms spec §3)
     # One-shot note prepended to the next prompt (see SDKBridge._with_session_note).
     session_note: str | None = None
@@ -1217,6 +1220,30 @@ def parse_args(argv: list[str] | None = None) -> Config:
              "by itself.",
     )
     ap.add_argument(
+        "--resume-after-limit",
+        dest="resume_after_limit",
+        action="store_true",
+        default=False,
+        help=(
+            "When a usage limit (the 5-hour session limit, a weekly limit) "
+            "stops a session, have it carry on by itself a minute after the "
+            "limit resets, with a prompt that says so and repeats the last "
+            "prompt it was given.  Also picks up a session that was already "
+            "stopped by a limit when it is opened, unless the reset is more "
+            "than 12 hours past.  A session waiting on a reset survives the "
+            "idle teardown and a hub restart.  Applies to every session a hub "
+            "opens when the hub is started with it, or to the one session a "
+            "launch opens when it joins a running hub; /resume-after-limit "
+            "turns it on or off for one session."
+        ),
+    )
+    ap.add_argument(
+        "--no-resume-after-limit",
+        dest="resume_after_limit",
+        action="store_false",
+        help="The default: a session a usage limit stops waits for you.",
+    )
+    ap.add_argument(
         "--external-access",
         choices=EXTERNAL_ACCESS_CHOICES,
         default=None,
@@ -1337,6 +1364,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         external_password=args.external_password,
         external_access=args.external_access,
         resume_interrupted_turn=args.resume_interrupted_turn,
+        resume_after_limit=args.resume_after_limit,
         agent_name=_launch_agent_name(args.agent_name),
         session_note=args.session_note,
         agent_labels=_parse_labels(args.agent_label),

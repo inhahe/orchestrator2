@@ -53,7 +53,7 @@ class _Bridge:
         self.events = events
         self.armed: list[tuple[float, str]] = []
 
-    async def stop(self):
+    async def stop(self, **_kw):
         self.events.append("stop")
 
     def _arm_wakeup(self, delay, prompt):

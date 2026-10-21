@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
 import bg_stall
+import limit_resume
 import wakeup_store
 from urllib.parse import unquote
 
@@ -1740,6 +1741,8 @@ async def lifespan(app: FastAPI):
     # Bring back any loop that was scheduled when the hub last stopped.  In the
     # background: it opens CLIs, and the hub must be serving before it does.
     asyncio.create_task(_resurrect_scheduled_wakeups(), name="wakeup-restore")
+    # And any session that was waiting on a usage limit's reset.
+    asyncio.create_task(_restore_limit_resumes(), name="limit-resume-restore")
 
     # Keep the live model-list cache warm off the event loop so /model (which
     # runs on the loop) can read it without blocking on a network call.
@@ -1861,6 +1864,7 @@ async def _create_runtime(
     compact_at: int | None = None,
     auto_compact: bool | None = None,
     seed_id: str | None = None,
+    resume_after_limit: bool | None = None,
 ) -> SessionRuntime:
     """Spin up a fresh live session runtime (config clone + state + bridge).
 
@@ -1883,6 +1887,10 @@ async def _create_runtime(
     * ``resume_interrupted_turn`` — whether opening the session finishes a
       turn its last process cut off.  None keeps the hub's setting.  ``/move``
       passes True: the move itself cut that turn, and the copy carries on.
+    * ``resume_after_limit`` — whether a usage limit that stops the session is
+      followed by a resume once it resets (``--resume-after-limit``).  None
+      keeps the hub's setting.  ``/move`` passes the original's, and the
+      reopen of a session that was waiting on a limit passes True.
     * ``api_key`` — this session's own API key (the launch's
       ``ANTHROPIC_API_KEY``).  Without one, a session the hub remembers a
       key for (``_session_api_keys``) gets that; a launch without a key has
@@ -1946,6 +1954,8 @@ async def _create_runtime(
         initial_prompt if initial_prompt and initial_prompt.strip() else None)
     if resume_interrupted_turn is not None:
         overrides["resume_interrupted_turn"] = bool(resume_interrupted_turn)
+    if resume_after_limit is not None:
+        overrides["resume_after_limit"] = bool(resume_after_limit)
     # Per-session CLI. Lets one session run a newer Claude Code (for a model
     # the bundled one refuses) while everything else stays on the bundled
     # binary -- which matters when the newer CLI is `latest` rather than
@@ -2252,10 +2262,105 @@ def _rearm_restored_wakeup(rt: SessionRuntime, rec: dict, delay: float,
     }), name=f"wakeup-restore-notice-{rt.rid}")
 
 
+# ---------------------------------------------------------------------------
+# Sessions waiting on a usage limit (--resume-after-limit)
+# ---------------------------------------------------------------------------
+#
+# A session stopped by a usage limit waits for the reset in its own bridge
+# (SDKBridge._arm_limit_resume).  This covers it not being open when it comes
+# due: closed by the idle teardown, which does not keep a CLI running for the
+# hours or days a limit can last, or by the hub going down.  The record
+# (limit_resume.py) says which session and when; the hub reopens it then, and
+# its bridge reads the transcript to decide whether anything is left to do.
+
+#: The pending reopen for each session id, at most one.
+_limit_reopen_tasks: dict[str, asyncio.Task] = {}
+#: Reopens go one at a time, this far apart: every session on an account
+#: comes due at the same moment, and each is a CLI and a transcript load.
+LIMIT_REOPEN_STAGGER_S = 10.0
+_limit_reopen_lock: asyncio.Lock | None = None
+
+
+def _schedule_limit_reopen(rec: dict) -> None:
+    """Reopen *rec*'s session when it comes due, unless the record says it
+    should not be (limit_resume.plan_reopen), when the record is dropped."""
+    sid = rec.get("session_id") or ""
+    plan = limit_resume.plan_reopen(rec)
+    if not plan.reopen:
+        log.info("limit reopen: dropping %s — %s", sid[:8], plan.reason)
+        limit_resume.clear(rec.get("cwd", ""), sid)
+        return
+    old = _limit_reopen_tasks.pop(sid, None)
+    if old is not None and not old.done() and old is not asyncio.current_task():
+        old.cancel()
+    _limit_reopen_tasks[sid] = asyncio.create_task(
+        _reopen_for_limit(rec, plan.delay), name=f"limit-reopen-{sid[:8]}")
+    log.info("limit reopen: %s scheduled (%s)", sid[:8], plan.reason)
+
+
+async def _reopen_for_limit(rec: dict, delay: float) -> None:
+    """Wait *delay* seconds, then open *rec*'s session if it is still
+    waiting and not open already.  The bridge does the rest on connect."""
+    global _limit_reopen_lock
+    sid = rec["session_id"]
+    try:
+        await asyncio.sleep(delay)
+        if _limit_reopen_lock is None:
+            _limit_reopen_lock = asyncio.Lock()
+        async with _limit_reopen_lock:
+            # Read again: since it was scheduled the session may have been
+            # resumed, cancelled, opened by someone, or put off.
+            now_rec = limit_resume.load(rec["cwd"], sid)
+            if now_rec is None:
+                return
+            if any(getattr(getattr(r, "state", None), "session_id", None) == sid
+                   for r in runtimes.values()):
+                log.info("limit reopen: %s is open already — its bridge has it",
+                         sid[:8])
+                return
+            if now_rec["due_at"] > time.time() + 1:
+                _schedule_limit_reopen(now_rec)
+                return
+            rt = await _create_runtime(
+                cwd=now_rec["cwd"], resume=sid,
+                config_dir=now_rec.get("config_dir") or None,
+                resume_after_limit=True)
+            log.warning("limit reopen: reopened %s as %s to resume it after "
+                        "its usage limit", sid[:8], rt.rid)
+            # Nobody is watching it, so it closes again once it is done.
+            _maybe_start_idle_timer(rt)
+            await asyncio.sleep(LIMIT_REOPEN_STAGGER_S)
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        log.exception("limit reopen: could not reopen %s", sid[:8])
+    finally:
+        if _limit_reopen_tasks.get(sid) is asyncio.current_task():
+            _limit_reopen_tasks.pop(sid, None)
+
+
+async def _restore_limit_resumes() -> None:
+    """At the hub's start: schedule every session that was waiting on a usage
+    limit when the hub last went down.  The primary, which the start resumes
+    itself, is found open when it comes due, and its bridge has it."""
+    try:
+        records = list(limit_resume.iter_records())
+    except Exception:
+        log.exception("limit reopen: could not read the records")
+        return
+    for rec in records:
+        _schedule_limit_reopen(rec)
+
+
 async def _teardown_runtime(rt: SessionRuntime, *, force: bool = False,
                             reason: str = "was closed",
-                            viewer_message: str | None = None) -> None:
+                            viewer_message: str | None = None,
+                            idle: bool = False) -> None:
     """Stop a runtime's bridge and drop it from the registry.
+
+    *idle* is the idle timer's teardown, which keeps a resume waiting on a
+    usage limit for the hub to reopen the session when it is due
+    (``SDKBridge.stop``, ``_schedule_limit_reopen``).
 
     The default runtime is the process's primary session and is never torn
     down by the *automatic* paths (the idle timer) — the server-level
@@ -2302,7 +2407,7 @@ async def _teardown_runtime(rt: SessionRuntime, *, force: bool = False,
     await _evacuate_viewers(rt, viewer_message)
     if rt.bridge is not None:
         try:
-            await rt.bridge.stop()
+            await rt.bridge.stop(idle_teardown=idle)
         except asyncio.CancelledError:
             # Not caught by ``except Exception`` — it is a BaseException — and a
             # task that ends *cancelled* raises no asyncio warning either, so
@@ -2561,11 +2666,25 @@ async def _idle_teardown_after(rt: SessionRuntime, timeout: int) -> None:
     # runtime forever on a schedule nothing will honour.
     wake = getattr(st, "wakeup_at", None) if st is not None else None
     waiting = isinstance(wake, (int, float)) and wake > time.time()
-    if busy or bg or waiting:
+    # A resume after a usage limit is the other way round: one due hours
+    # away is better waited for closed (the record reopens the session), but
+    # one due before the next look would only close a session to reopen it.
+    # And a session still connecting -- a large one reopened for that resume,
+    # say -- is about to do something.
+    resume_at = getattr(st, "limit_resume_at", None) if st is not None else None
+    resuming = (isinstance(resume_at, (int, float))
+                and resume_at - time.time() < timeout)
+    connecting = bool(getattr(st, "connecting", False)) if st is not None else False
+    if busy or bg or waiting or resuming or connecting:
         if busy:
             why = "working"
         elif bg:
             why = f"running {bg} background task(s)"
+        elif connecting:
+            why = "connecting"
+        elif resuming:
+            why = (f"resuming after a usage limit in "
+                   f"{max(0, int(resume_at - time.time()))}s")
         else:
             why = f"waiting on a wakeup in {int(wake - time.time())}s"
         log.info("runtime %s idle for %ds but still %s — deferring teardown",
@@ -2574,9 +2693,16 @@ async def _idle_teardown_after(rt: SessionRuntime, timeout: int) -> None:
         _maybe_start_idle_timer(rt, departing=None)
         return
     log.info("runtime %s idle for %ds — tearing down", rt.rid, timeout)
+    cwd = getattr(getattr(rt, "config", None), "cwd", None)
+    sid = getattr(st, "session_id", None) if st is not None else None
     await _teardown_runtime(
         rt, reason=f"was closed after {timeout // 60} minutes with no tab "
-                   f"connected")
+                   f"connected", idle=True)
+    # A session waiting on a usage limit's reset is closed rather than kept
+    # with a CLI running for hours, and reopened when it is due.
+    rec = limit_resume.load(cwd, sid) if cwd and sid else None
+    if rec is not None:
+        _schedule_limit_reopen(rec)
 
 
 # ---------------------------------------------------------------------------
@@ -3648,6 +3774,10 @@ async def _session_launch(body: dict[str, Any]) -> dict[str, Any]:
     # Only for a session this launch opens: one already open has no cut-off
     # turn to finish.
     resume_interrupted_turn = body.get("resume_interrupted_turn") is True
+    # For a session this launch opens, and turned on for one already open:
+    # the launch asked for it.  Not turned off there by a launch that did not
+    # ask, which would undo a /resume-after-limit on typed in its tab.
+    resume_after_limit = body.get("resume_after_limit") is True
     # The launch's ANTHROPIC_API_KEY, for this session alone (see
     # HANDOVER_KEYS_ENV).
     api_key = body.get("api_key")
@@ -3788,6 +3918,12 @@ async def _session_launch(body: dict[str, Any]) -> dict[str, Any]:
                 and existing.state.agent_name != agent_name
                 and existing.bridge is not None):
             await existing.bridge.adopt_agent_name(agent_name)
+        if (resume_after_limit and existing.state is not None
+                and not existing.state.resume_after_limit
+                and existing.bridge is not None):
+            said = await existing.bridge.set_resume_after_limit(True)
+            await existing.broadcast({"type": "system_msg", "subtype": "info",
+                                      "data": {"message": said}})
         if need_reconnect and existing.bridge is not None:
             # Route the reconnect through the worker's event queue rather
             # than ``asyncio.create_task(bridge.reconnect())``.  A reconnect
@@ -3828,7 +3964,8 @@ async def _session_launch(body: dict[str, Any]) -> dict[str, Any]:
                                    initial_prompt=initial_prompt,
                                    resume_interrupted_turn=resume_interrupted_turn,
                                    api_key=api_key, compact_at=compact_at,
-                                   auto_compact=auto_compact, seed_id=target_sid)
+                                   auto_compact=auto_compact, seed_id=target_sid,
+                                   resume_after_limit=resume_after_limit)
     except Exception as exc:
         log.exception("hub launch (%s) failed", asked)
         return {"ok": False, "error": str(exc)}
@@ -4760,6 +4897,24 @@ async def _handle_loop(ws: WebSocket, bridge, payload: str) -> None:
                      "data": {"message": f"Wakeup loop armed: fires in {d:.0f}s{note}."}})
 
 
+async def _handle_resume_after_limit(ws: WebSocket, bridge, payload: str) -> None:
+    """``/resume-after-limit [on|off]`` -- whether this session carries on by
+    itself once a usage limit that stopped it resets.  On or off is broadcast,
+    since it changes what the session does next; the status only to *ws*."""
+    arg = (payload or "").strip().lower()
+    if arg in ("", "status", "show"):
+        await send_to(ws, {"type": "system_msg", "subtype": "info",
+                           "data": {"message": bridge.limit_resume_status()}})
+        return
+    if arg in ("on", "off"):
+        said = await bridge.set_resume_after_limit(arg == "on")
+        await bridge.broadcast({"type": "system_msg", "subtype": "info",
+                         "data": {"message": said}})
+        return
+    await send_to(ws, {"type": "system_msg", "subtype": "error",
+                       "data": {"message": "usage: /resume-after-limit [on|off]"}})
+
+
 async def _send_initial_state(ws: WebSocket) -> None:
     """Send session history, status, panels, and completions on attach.
 
@@ -5056,7 +5211,8 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
                 agent_labels=carry["agent_labels"],
                 resume_interrupted_turn=True, api_key=carry["api_key"],
                 compact_at=carry["compact_at"],
-                auto_compact=carry["auto_compact"])
+                auto_compact=carry["auto_compact"],
+                resume_after_limit=carry["resume_after_limit"])
         except Exception:
             log.exception("move: could not reopen the original session")
             await send_to(ws, {"type": "move_error", "message": (
@@ -5144,7 +5300,8 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
             session_note=note, agent_name=carry["agent_name"],
             agent_labels=carry["agent_labels"],
             resume_interrupted_turn=True, api_key=carry["api_key"],
-            compact_at=carry["compact_at"], auto_compact=carry["auto_compact"])
+            compact_at=carry["compact_at"], auto_compact=carry["auto_compact"],
+            resume_after_limit=carry["resume_after_limit"])
     except Exception as exc:
         log.exception("move: failed to start runtime for copied session")
         await _move_failed(f"Couldn't start the moved session: {exc}")
@@ -5218,6 +5375,10 @@ def _move_carry(rt: SessionRuntime, cwd: str, sid: str) -> dict[str, Any]:
         # which is on its state; what it did not set stays the default.
         "compact_at": own_compaction(st)[0],
         "auto_compact": own_compaction(st)[1],
+        # And carries on after a usage limit, or not, as it did.  The copy's
+        # transcript ends where the original's did, so a copy of a session
+        # waiting on a limit is found waiting on it when it opens.
+        "resume_after_limit": bool(getattr(st, "resume_after_limit", False)),
     }
 
 
@@ -5570,6 +5731,10 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
 
         if kind == "loop":
             await _handle_loop(ws, bridge, payload)
+            return
+
+        if kind == "resume-after-limit":
+            await _handle_resume_after_limit(ws, bridge, payload)
             return
 
         if kind in ("quit", "force-quit"):
@@ -6351,6 +6516,7 @@ def _hub_launch_kwargs(cfg: Config, config_dir: str | None) -> dict[str, Any]:
         "agent_labels": dict(cfg.agent_labels or {}),
         "initial_prompt": cfg.initial_prompt,
         "resume_interrupted_turn": cfg.resume_interrupted_turn,
+        "resume_after_limit": cfg.resume_after_limit,
         "api_key": cfg.api_key,
         # What the launch was given, and only that: a value filled in from a
         # default is not this session's to impose.
@@ -6458,6 +6624,7 @@ def _launch_into_hub(
     agent_labels: dict[str, str] | None = None,
     initial_prompt: str | None = None,
     resume_interrupted_turn: bool = False,
+    resume_after_limit: bool = False,
     api_key: str | None = None,
     compact_at: int | None = None,
     auto_compact: bool | None = None,
@@ -6489,6 +6656,8 @@ def _launch_into_hub(
     this machine, over loopback.  And ``compact_at`` and ``auto_compact``,
     the launch's ``--compact-at`` and ``--auto-compact``/``--no-compact``, so
     that one session can compact earlier than the rest (None: not given).
+    And ``resume_after_limit``, the launch's ``--resume-after-limit``, which
+    also turns it on for a session the hub already has open.
     """
     import urllib.request
 
@@ -6505,6 +6674,7 @@ def _launch_into_hub(
         "agent_labels": agent_labels or {},
         "initial_prompt": initial_prompt,
         "resume_interrupted_turn": bool(resume_interrupted_turn),
+        "resume_after_limit": bool(resume_after_limit),
         "api_key": api_key,
         "compact_at": compact_at,
         "auto_compact": auto_compact,

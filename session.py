@@ -2035,6 +2035,11 @@ def describe_integrity_problem(report: dict[str, Any]) -> str:
 # Session info parsing
 # ---------------------------------------------------------------------------
 
+#: How a prompt from ``--resume-after-limit`` begins.  Owned by
+#: ``limit_resume`` (as ``PROMPT_PREFIX``) and defined here only because that
+#: module imports this one.
+LIMIT_RESUME_PROMPT_PREFIX = "[orchestrator2] The usage limit has reset"
+
 # Content prefixes the Claude Code harness uses for synthetic prompts
 # it feeds to the model.  These are indistinguishable from user-typed
 # prompts at the JSONL field-shape level (same ``type:"user"`` record,
@@ -2070,6 +2075,10 @@ _HARNESS_INJECTED_PREFIXES = (
     # — accepted tradeoff: custom text only shows as injected on the live
     # path, not on replay.
     "Autonomous-loop wakeup (scheduled by you)",
+    # The prompt that carries a session on once a usage limit resets
+    # (limit_resume.build_resume_prompt).  Also what keeps a resume that runs
+    # into the limit again from being taken for the user's last prompt.
+    LIMIT_RESUME_PROMPT_PREFIX,
 )
 
 # XML-wrapped CLI internals that the user shouldn't see at all.

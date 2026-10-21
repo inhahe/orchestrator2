@@ -1,5 +1,26 @@
 # Known issues / tech debt — orchestrator2
 
+## A session locked out by a usage limit read "idle" — FIXED (2026-10-21)
+
+`run_turn` clears a rate-limit rejection on the first `AssistantMessage` of a
+turn, as proof that the API took the request (the 2026-07-22 fix for a stale
+"rate limited" after `/login`, below). When a usage limit stops a turn, the
+CLI sends the `RateLimitEvent` that sets the rejection and its reset time, and
+then, a moment later, its own synthetic message ("You've hit your session
+limit · resets 9pm", `model: "<synthetic>"`, `error: "rate_limit"`). That
+message counted as the API taking the request, so the rejection and its reset
+time were wiped as soon as they arrived. The status bar showed "rate limited"
+for a moment and then "idle" until the reset, and nothing held the reset time.
+Every later hit left it that way: the CLI sends the event only when its limit
+state changes. Found while building `--resume-after-limit` (design.md §6h),
+which needs that time.
+
+Fixed by `SDKBridge._note_assistant_message`, which books the limit message as
+the limit and anything else as the model answering. It runs on the ghost-turn
+path too, which never cleared a stale rejection at all.
+`tests/test_resume_after_limit.py::test_the_limit_message_does_not_wipe_the_rejection`
+fails with `'allowed' == 'rejected'` when the old behaviour is put back.
+
 ## `/loop`'s messages went to every tab of every session — FIXED (2026-10-21)
 
 `_handle_loop` in server.py sent "Wakeup loop stopped" and "armed" with the

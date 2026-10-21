@@ -20,6 +20,7 @@ import time
 import traceback
 from collections import deque
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
@@ -115,6 +116,7 @@ from state import (
     take_cost,
 )
 from wakeup_store import clear_wakeup, save_wakeup
+import limit_resume
 from btw import (
     build_btw_options,
     btw_prompt,
@@ -136,6 +138,7 @@ from bg_stall import (
 from session import (
     _classify_user_text,
     _bg_task_label,
+    _local_when,
     cut_off_turn,
     describe_cut_off_turn,
     describe_resumable_sessions,
@@ -655,6 +658,11 @@ _AUTH_BANNER_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: How the CLI's synthetic message for a usage limit that stopped a turn
+#: begins (``rateLimitMessages.getLimitReachedText``).  Only the error states:
+#: its warnings ("You've used 90% ...") end no turn.
+LIMIT_MESSAGE_PREFIXES = ("You've hit your", "You're out of extra usage")
+
 
 def detect_api_error(msg: Any, assistant_text: str) -> tuple[str | None, str | None]:
     """Detect a turn that ended in an API error.
@@ -965,6 +973,25 @@ class SDKBridge:
         # Set by ScheduleWakeup(stop=true) or /loop off, so the UI can say the
         # loop was stopped rather than merely "nothing armed".
         self._loop_stopped = False
+        # --resume-after-limit; see _arm_limit_resume.  The usage limit the
+        # session last ran into -- {"resets_at", "kind", "hit_at"} -- from the
+        # CLI reporting it until the model next says anything, which is what
+        # shows the limit is over.
+        self._limit_hit: dict | None = None
+        self._limit_task: asyncio.Task | None = None
+        # The reset the pending resume waits for, so another turn running into
+        # the same limit (a background task finishing, say) leaves it be.
+        self._limit_armed_for: int | None = None
+        # Times the pending resume has been put off because a turn was running.
+        self._limit_defers = 0
+        # From sending a resume until the turn it starts ends, and the reset it
+        # was sent for: a resume that runs straight back into that limit is
+        # an attempt, and the attempts are bounded (_after_limit_turn).
+        self._limit_resume_sent = False
+        self._limit_sent_for: int | None = None
+        self._limit_attempts = 0
+        # The reset last hinted at when the option is off, so it is said once.
+        self._limit_hinted_for: int | None = None
         # Deferred ``bg-done`` bell.  See _arm_bg_done_bell().
         self._bg_done_bell_task: asyncio.Task | None = None
         # Set the moment we learn the CLI subprocess is gone (dispatcher crash,
@@ -1615,6 +1642,11 @@ class SDKBridge:
         cut_off: dict | None = None
         if resume_sid and not self._finishing_cut_off_turn:
             cut_off = await asyncio.to_thread(self._read_cut_off_turn, resume_sid)
+        # And whether a usage limit stopped it (--resume-after-limit), read at
+        # the same moment for the same reason.
+        limit_stop: dict | None = None
+        if resume_sid:
+            limit_stop = await asyncio.to_thread(self._read_limit_stop, resume_sid)
 
         # If a previous dispatcher task is somehow still alive (e.g.
         # connect() was called without disconnect() — should be
@@ -1827,9 +1859,9 @@ class SDKBridge:
                             name="session-integrity")
 
         # What the session it opened has to tell whoever looks at it: the
-        # background tasks that died with its last process, and a turn left
-        # waiting.  Replaced on every connect.
-        await self._announce_on_open(resume_sid, cut_off)
+        # background tasks that died with its last process, a turn left
+        # waiting, a usage limit it is waiting on.  Replaced on every connect.
+        await self._announce_on_open(resume_sid, cut_off, limit_stop)
 
         # The connect worked, so the requested resume has been honoured and is
         # spent.  Later reconnects resume ``state.session_id`` explicitly (see
@@ -2646,7 +2678,8 @@ class SDKBridge:
             return None
 
     async def _announce_on_open(self, resume_sid: str | None,
-                                cut_off: dict | None) -> None:
+                                cut_off: dict | None,
+                                limit_stop: dict | None = None) -> None:
         """What the session this connect opened has to tell whoever looks.
 
         The background tasks its last process left running, and -- when this
@@ -2656,6 +2689,10 @@ class SDKBridge:
         waits for the user.  Reported 2026-09-29: a resumed session "would
         often start working automatically", and a message from here, sent as
         a prompt of its own, was one of the things that started it.
+
+        The one exception is asked for: a session --resume-after-limit is on
+        for, found stopped by a usage limit, is scheduled to carry on once it
+        resets (*limit_stop*, see _limit_on_open), and says so.
         """
         self.state.open_notices = []
         await self._report_lost_bg_tasks(resume_sid)
@@ -2665,6 +2702,8 @@ class SDKBridge:
                 cut_off.get("stopped"), cut_off.get("phase"),
                 cut_off.get("tool") or "-")
             await self._post_open_notice("warning", describe_cut_off_turn(cut_off))
+        if resume_sid:
+            await self._limit_on_open(resume_sid, limit_stop)
 
     async def _report_lost_bg_tasks(self, resume_sid: str | None) -> int:
         """Tell the user that the session being opened lost its background work.
@@ -3271,6 +3310,10 @@ class SDKBridge:
             # False means a live run_turn owns this message.
             if not await self._begin_ghost_turn_if_needed():
                 return
+            # A background task's turn runs into a usage limit like any
+            # other, and a reply in one ends the limit like any other.
+            if self._note_assistant_message(msg):
+                await self._broadcast_status()
 
             for block in msg.content:
                 if isinstance(block, TextBlock):
@@ -3893,6 +3936,404 @@ class SDKBridge:
         self.event_queue.put_nowait(("message", prompt))
 
     # ------------------------------------------------------------------
+    # --resume-after-limit
+    # ------------------------------------------------------------------
+    #
+    # A usage limit ends a turn with a synthetic assistant message -- the
+    # CLI's "You've hit your session limit · resets 9pm" -- just after a
+    # RateLimitEvent saying when.  Every turn after it runs into the same
+    # limit, whatever starts it (a background task finishing, a peer, the
+    # user), until it resets.  With the option on, the session is sent a
+    # prompt once it has: limit_resume.build_resume_prompt.  The schedule is
+    # mirrored to disk so the hub can reopen the session if it is closed in
+    # the meantime by the idle teardown or a restart (server.py).
+
+    @staticmethod
+    def _is_limit_message(msg: Any) -> bool:
+        """Whether an AssistantMessage is the CLI saying a usage limit stopped
+        the turn.  By the SDK's ``error`` field; by the text of the CLI's
+        synthetic message, for an SDK without the field."""
+        if getattr(msg, "error", None) == "rate_limit":
+            return True
+        if getattr(msg, "model", None) != "<synthetic>":
+            return False
+        text = "".join(getattr(b, "text", "") or ""
+                       for b in (getattr(msg, "content", None) or []))
+        return text.lstrip().startswith(LIMIT_MESSAGE_PREFIXES)
+
+    def _note_assistant_message(self, msg: Any) -> bool:
+        """Book what an assistant message says about usage limits.
+
+        The CLI's limit message records the limit.  Anything else is the model
+        answering, which proves the API took the request: the limit is over,
+        and a rejection still on the State is stale (one carried over from
+        before a ``/login`` to another account, say).  True when that cleared
+        one, so the caller refreshes the status bar.
+
+        The limit message is not an answer.  It used to be taken for one, so
+        the rejection the RateLimitEvent had set a moment before -- and its
+        reset time -- was wiped as the message arrived, and the session read
+        "idle" while it was locked out.
+        """
+        if self._is_limit_message(msg):
+            self._note_limit_hit()
+            return False
+        self._note_limit_over()
+        st = self.state
+        if st.rate_limit_status != "rejected":
+            return False
+        st.rate_limit_status = "allowed"
+        st.rate_limit_resets_at = None
+        st.rate_limit_reset_bell_fired = False
+        return True
+
+    def _note_limit_hit(self) -> None:
+        """A usage limit stopped this turn: remember which, and until when.
+
+        The reset comes from the RateLimitEvent the CLI sends just before its
+        message.  The CLI sends one only when the limit *changes*, so a
+        session whose CLI started already limited may have none; the turn's
+        end reads the transcript then (_after_limit_turn).
+        """
+        st = self.state
+        reset = limit_resume.effective_reset(
+            status=st.rate_limit_status, resets_at=st.rate_limit_resets_at,
+            overage_resets_at=st.rate_limit_overage_resets_at)
+        first = (self._limit_hit or {}).get("hit_at")
+        self._limit_hit = {
+            "resets_at": reset,
+            "kind": st.rate_limit_type if reset else None,
+            # When it stopped: the first of a run of these, not the latest.
+            "hit_at": first or datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _note_limit_over(self) -> None:
+        """The model has answered, so whatever limit stopped the session is
+        over -- someone carried it on -- and nothing is left to resume."""
+        if self._limit_hit is None and self._limit_task is None:
+            return
+        if self._limit_task is not None:
+            log.info("limit resume: the session is working again — cancelled")
+        self._limit_hit = None
+        self._limit_attempts = 0
+        self._cancel_limit_resume()
+
+    def _session_jsonl(self) -> Path | None:
+        """This session's transcript, or None if it cannot be found."""
+        sid = self.state.session_id
+        if not sid:
+            return None
+        project = find_session_dir(sid, getattr(self.config, "config_dir", None))
+        return project / f"{sid}.jsonl" if project is not None else None
+
+    def _read_limit_stop(self, sid: str) -> dict | None:
+        """:func:`limit_resume.limit_stop_in` for *sid*'s transcript."""
+        try:
+            project = find_session_dir(sid, getattr(self.config, "config_dir", None))
+            if project is None:
+                return None
+            return limit_resume.limit_stop_in(project / f"{sid}.jsonl")
+        except Exception:
+            log.debug("could not tell whether %s was stopped by a limit",
+                      sid[:8], exc_info=True)
+            return None
+
+    def _read_last_prompt(self) -> dict | None:
+        """:func:`limit_resume.last_prompt_in` for this session's transcript."""
+        try:
+            jsonl = self._session_jsonl()
+            return limit_resume.last_prompt_in(jsonl) if jsonl else None
+        except Exception:
+            log.debug("could not read the last prompt", exc_info=True)
+            return None
+
+    async def _after_limit_turn(self) -> None:
+        """At the end of every turn, ours or a ghost's: if a usage limit
+        stopped it, arm a resume -- or, with the option off, say once that
+        one is available."""
+        sent, self._limit_resume_sent = self._limit_resume_sent, False
+        hit = self._limit_hit
+        if hit is None:
+            if sent:
+                self._limit_attempts = 0     # the resume worked
+            return
+        if not hit.get("resets_at") and self.state.session_id:
+            found = await asyncio.to_thread(self._read_limit_stop,
+                                            self.state.session_id)
+            if found:
+                hit.update(resets_at=found["resets_at"], kind=found["kind"])
+        reset = hit.get("resets_at")
+        if not reset:
+            log.warning("limit resume: a usage limit stopped the turn, but "
+                        "nothing says when it resets — not scheduling a resume")
+            return
+        if not self.state.resume_after_limit:
+            await self._hint_limit_resume(reset)
+            return
+        if sent:
+            # The resume ran straight back into a limit.  The same one means
+            # it was too early (the API is the judge of when a window has
+            # rolled over); a later one is the next limit, a weekly one after
+            # the session limit say, and starts the count again.
+            if reset <= (self._limit_sent_for or 0):
+                self._limit_attempts += 1
+            else:
+                self._limit_attempts = 0
+            if self._limit_attempts >= limit_resume.MAX_ATTEMPTS:
+                await self._give_up_limit_resume(hit)
+                return
+        await self._arm_limit_resume(hit)
+
+    async def _hint_limit_resume(self, reset: int) -> None:
+        """With the option off, say once per limit that it could carry on."""
+        if self._limit_hinted_for == reset:
+            return
+        self._limit_hinted_for = reset
+        try:
+            await self.broadcast({"type": "system_msg", "subtype": "info",
+                                  "data": {"message": (
+                f"The limit resets at {limit_resume.when(reset)}. "
+                f"/resume-after-limit on would have this session carry on by "
+                f"itself then.")}})
+        except Exception as exc:
+            log.warning("limit-resume hint failed: %r", exc)
+
+    async def _give_up_limit_resume(self, hit: dict) -> None:
+        """Stop resuming a session that keeps running straight into its limit."""
+        n = self._limit_attempts
+        self._limit_attempts = 0
+        self._cancel_limit_resume()
+        log.warning("limit resume: %d resumes in a row ran into the limit — "
+                    "giving up", n)
+        await self._post_open_notice("warning", (
+            f"This session was resumed {n} times after its "
+            f"{limit_resume.limit_name(hit.get('kind'))} reset, and each time "
+            f"ran straight back into a usage limit, so it has stopped "
+            f"resuming by itself. Send “continue” when the limit "
+            f"allows, or /resume-after-limit on to try again."))
+
+    async def _arm_limit_resume(self, hit: dict, *, earliest: float = 0.0,
+                                opened: bool = False) -> None:
+        """Schedule the resume after the limit *hit* describes, and say so.
+
+        Due a minute after the reset (``MARGIN_S``); no sooner than *earliest*
+        (an opened session settles first); and, after resumes that ran back
+        into the limit, no sooner than a doubling wait.  A resume already
+        waiting on the same reset is left alone, so the same limit reported
+        by several turns is announced once.  *opened* words the notice for a
+        session that was stopped before this connect.
+        """
+        reset = int(hit["resets_at"])
+        if self._limit_task is not None and self._limit_armed_for == reset:
+            return
+        now = time.time()
+        n = self._limit_attempts
+        floor = limit_resume.RETRY_S * 2 ** (n - 1) if n else 0.0
+        due = max(reset + limit_resume.MARGIN_S, now + floor, earliest)
+        self._cancel_limit_resume(forget=False)
+        self._limit_armed_for = reset
+        self._limit_defers = 0
+        self.state.limit_resume_at = due
+        limit_resume.save(self.config.cwd, self.state.session_id, due_at=due,
+                          resets_at=reset,
+                          config_dir=getattr(self.config, "config_dir", None))
+        self._limit_task = asyncio.create_task(
+            self._limit_resume_timer(due - now), name="limit-resume")
+        log.info("limit resume: armed for %s (reset %s, attempt %d)",
+                 limit_resume.when(due), limit_resume.when(reset), n)
+        limit = limit_resume.limit_name(hit.get("kind"))
+        at = limit_resume.when(due)
+        if n:
+            text = (f"The resume ran straight back into the {limit} "
+                    f"({n} of {limit_resume.MAX_ATTEMPTS}); trying again at {at}.")
+        elif opened:
+            stopped = _local_when(hit.get("hit_at"))
+            text = (f"This session was stopped by the {limit}"
+                    + (f" at {stopped}" if stopped else "")
+                    + (f", which resets at {limit_resume.when(reset)}"
+                       if reset > now else
+                       f", which reset at {limit_resume.when(reset)}")
+                    + f". It carries on by itself at {at}, with a prompt that "
+                      f"says so (--resume-after-limit).")
+        else:
+            text = (f"The {limit} resets at {limit_resume.when(reset)}. This "
+                    f"session carries on by itself at {at}, with a prompt that "
+                    f"says so (--resume-after-limit).")
+        await self._post_open_notice(
+            "info", text + " /resume-after-limit off cancels it.")
+        await self._broadcast_status()
+
+    def _cancel_limit_resume(self, *, forget: bool = True) -> None:
+        """Cancel a pending resume (idempotent).  *forget* erases the record
+        too, which is right except when the hub is going down or the idle
+        teardown is closing the session: the record is how the hub reopens
+        it.  Never cancels the calling task (see _cancel_wakeup)."""
+        t, self._limit_task = self._limit_task, None
+        self._limit_armed_for = None
+        self.state.limit_resume_at = None
+        if forget:
+            limit_resume.clear(self.config.cwd, self.state.session_id)
+        if t is None or t.done():
+            return
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        if t is not current:
+            t.cancel()
+
+    async def _limit_resume_timer(self, delay: float) -> None:
+        """Wait *delay* seconds, then send the resume as a turn of its own."""
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        while not self.stop_event.is_set():
+            st = self.state
+            if self._limit_hit is None:
+                return                       # the session has moved on
+            # A turn is running, or there is no CLI to send to.  A turn means
+            # the session is working: if it is only a background task's turn
+            # running into the limit again, it ends and this tries again.
+            if st.busy or st.connecting or self.client is None:
+                self._limit_defers += 1
+                if self._limit_defers > limit_resume.MAX_DEFERS:
+                    log.warning("limit resume: put off %d times — dropped",
+                                self._limit_defers - 1)
+                    self._limit_task = None
+                    self._cancel_limit_resume()
+                    await self._post_open_notice("warning", (
+                        f"The resume after the usage limit was put off for "
+                        f"{int(limit_resume.MAX_DEFERS * limit_resume.DEFER_S // 60)} "
+                        f"minutes, because the session was busy or had no "
+                        f"CLI to send it to, so it was dropped. Send "
+                        f"“continue” to carry it on."))
+                    return
+                st.limit_resume_at = time.time() + limit_resume.DEFER_S
+                try:
+                    await asyncio.sleep(limit_resume.DEFER_S)
+                except asyncio.CancelledError:
+                    return
+                continue
+            hit = dict(self._limit_hit)
+            prompt = await asyncio.to_thread(self._read_last_prompt)
+            # The read took time; whatever happened meanwhile wins.
+            if self.stop_event.is_set() or self._limit_hit is None \
+                    or st.busy or st.connecting:
+                continue
+            text = limit_resume.build_resume_prompt(
+                kind=hit.get("kind"), hit_at=hit.get("hit_at"),
+                resets_at=hit.get("resets_at"), prompt=prompt)
+            self._limit_sent_for = self._limit_armed_for
+            self._limit_task = None
+            self._cancel_limit_resume()
+            self._limit_resume_sent = True
+            log.info("limit resume: sending the resume (%d chars, %s)",
+                     len(text), "repeats the last prompt" if prompt
+                     else "no prompt to repeat")
+            try:
+                await self._broadcast_injected_prompt(text, during_turn=False)
+            except Exception as exc:
+                log.warning("limit-resume broadcast failed: %r", exc)
+            self.event_queue.put_nowait(("message", text))
+            return
+
+    def limit_resume_status(self) -> str:
+        """What ``/resume-after-limit`` says on its own."""
+        on = self.state.resume_after_limit
+        hit = self._limit_hit if (self._limit_hit or {}).get("resets_at") else None
+        limit = limit_resume.limit_name((hit or {}).get("kind"))
+        if self._limit_task is not None and self.state.limit_resume_at:
+            return (f"Resume after limit: on. Stopped by the {limit}; carries "
+                    f"on by itself at "
+                    f"{limit_resume.when(self.state.limit_resume_at)}. "
+                    f"/resume-after-limit off cancels it.")
+        reset = limit_resume.when(hit["resets_at"]) if hit else None
+        if hit and on:
+            # It gave up, or the reset was too long past when it was opened.
+            return (f"Resume after limit: on, but nothing is scheduled. The "
+                    f"session was stopped by the {limit} (reset {reset}); "
+                    f"/resume-after-limit on schedules a resume.")
+        if hit:
+            return (f"Resume after limit: off for this session. It was stopped "
+                    f"by the {limit} (reset {reset}); /resume-after-limit on "
+                    f"carries it on.")
+        if on:
+            return ("Resume after limit: on. No usage limit has stopped this "
+                    "session; if one does, it carries on by itself once the "
+                    "limit resets.")
+        return "Resume after limit: off for this session."
+
+    async def set_resume_after_limit(self, on: bool) -> str:
+        """``/resume-after-limit on|off`` for this session; returns what to
+        say.  Turning it on while a limit has the session stopped schedules
+        the resume at once -- even when the reset is long past, since that is
+        being asked -- and the schedule's own notice says when."""
+        self.state.resume_after_limit = on
+        if not on:
+            had = self._limit_task is not None
+            self._limit_attempts = 0
+            self._cancel_limit_resume()
+            await self._broadcast_status()
+            return ("Resume after limit: off for this session."
+                    + (" The pending resume is cancelled." if had else ""))
+        hit = self._limit_hit
+        if self._limit_task is None and hit and hit.get("resets_at"):
+            self._limit_attempts = 0
+            await self._arm_limit_resume(
+                hit, earliest=time.time() + limit_resume.SETTLE_S)
+            return "Resume after limit: on for this session."
+        return self.limit_resume_status()
+
+    async def _limit_on_open(self, sid: str, stop: dict | None) -> None:
+        """What a connect found at the end of *sid*'s transcript.
+
+        A session this hub scheduled a resume for (the record) has the option
+        on, whatever the hub was started with: it is being reopened for that.
+        A record whose session has moved on since -- carried on somewhere
+        else -- is dropped.  A session the option is on for, found stopped by
+        a limit, is resumed: at the reset, or shortly if that has passed --
+        unless it passed more than ``LATE_S`` ago, when it only says so.
+        """
+        rec = limit_resume.load(self.config.cwd, sid)
+        if rec is not None:
+            self.state.resume_after_limit = True
+        if stop is None:
+            if rec is not None:
+                log.info("limit resume: %s moved on since it was scheduled — "
+                         "dropped", sid[:8])
+                limit_resume.clear(self.config.cwd, sid)
+            return
+        if self._limit_hit is None:
+            self._limit_hit = dict(stop)
+        now = time.time()
+        reset = stop["resets_at"]
+        st = self.state
+        if reset > now and st.rate_limit_status != "rejected":
+            # A fresh CLI has said nothing yet; the transcript is the CLI's
+            # own word on it, and the status bar should not say "idle".
+            st.rate_limit_status = "rejected"
+            st.rate_limit_resets_at = reset
+            st.rate_limit_type = stop.get("kind")
+        if not st.resume_after_limit:
+            if reset > now:
+                await self._hint_limit_resume(reset)
+            return
+        if now - reset > limit_resume.LATE_S:
+            limit_resume.clear(self.config.cwd, sid)
+            log.info("limit resume: %s reset %s — too long ago to resume by "
+                     "itself", sid[:8], limit_resume.when(reset))
+            await self._post_open_notice("info", (
+                f"This session was stopped by the "
+                f"{limit_resume.limit_name(stop.get('kind'))}, which reset at "
+                f"{limit_resume.when(reset)}: too long ago for it to carry on "
+                f"by itself. Send “continue” to pick it up, or "
+                f"/resume-after-limit on."))
+            return
+        await self._arm_limit_resume(self._limit_hit, opened=True,
+                                     earliest=now + limit_resume.SETTLE_S)
+
+    # ------------------------------------------------------------------
     # Deferred bg-done bell
     # ------------------------------------------------------------------
 
@@ -4083,6 +4524,8 @@ class SDKBridge:
             })
         except Exception as exc:
             log.warning("ghost-turn status_update broadcast failed: %r", exc)
+
+        await self._after_limit_turn()
 
         # If the user queued a prompt while this ghost turn was running,
         # server.py saw state.busy == True and routed it to
@@ -5057,11 +5500,9 @@ class SDKBridge:
                     # account switch).  Clear it now so the status flips from
                     # "rate limited" straight to "working" instead of waiting
                     # for the next RateLimitEvent/ResultMessage to report
-                    # status="allowed" partway through the turn.
-                    if state.rate_limit_status == "rejected":
-                        state.rate_limit_status = "allowed"
-                        state.rate_limit_resets_at = None
-                        state.rate_limit_reset_bell_fired = False
+                    # status="allowed" partway through the turn.  The CLI's
+                    # own limit message is not content: see the helper.
+                    if self._note_assistant_message(msg):
                         await self._broadcast_status()
                     model_id = getattr(msg, "model", None)
                     if model_id and not state.active_model:
@@ -5529,6 +5970,8 @@ class SDKBridge:
 
         # Flush any bell that was rung during this turn.
         await self._flush_bell()
+
+        await self._after_limit_turn()
 
         return assistant_text, interrupted
 
@@ -6687,6 +7130,11 @@ class SDKBridge:
         state = self.state
         # A scheduled wakeup belongs to the session we're wiping — drop it.
         self._cancel_wakeup()
+        # So does a resume after a usage limit, and what is known of the limit.
+        self._cancel_limit_resume()
+        self._limit_hit = None
+        self._limit_attempts = 0
+        self._limit_resume_sent = False
         # ...as does a reconnect we were holding for the background tasks: the
         # settings it carried are applied by the connect() at the bottom.
         self._deferred_reconnect = None
@@ -7239,7 +7687,8 @@ class SDKBridge:
         except Exception:
             log.debug("agent deregistration failed", exc_info=True)
 
-    async def stop(self, *, hub_exiting: bool = False) -> None:
+    async def stop(self, *, hub_exiting: bool = False,
+                   idle_teardown: bool = False) -> None:
         """Gracefully shut down.
 
         *hub_exiting* says the whole hub is going down, as opposed to this one
@@ -7253,6 +7702,12 @@ class SDKBridge:
         (Shut down / ⟳ Restart, both of which stop every session cleanly)
         silently ended every loop, and the restore -- built for exactly "you
         restart the hub to pick up a change" -- only ever worked after a crash.
+
+        A resume waiting on a usage limit's reset survives *idle_teardown*
+        too: the idle timer closes a session no tab is watching, and one
+        waiting hours or days for a limit is better closed than kept with a
+        CLI running, so the hub reopens it when it is due (server.py).  Every
+        other stop is the user leaving the session, and ends it.
 
         **Shielded**, so a cancellation aimed at whoever called us cannot leave
         a ``claude.exe`` running.  Shutdown here is not a request that can be
@@ -7268,14 +7723,17 @@ class SDKBridge:
         The caller still sees the cancellation — the shield re-raises it — but
         the teardown itself runs to completion in the background.
         """
-        await asyncio.shield(self._shutdown(hub_exiting=hub_exiting))
+        await asyncio.shield(self._shutdown(hub_exiting=hub_exiting,
+                                            idle_teardown=idle_teardown))
 
-    async def _shutdown(self, *, hub_exiting: bool = False) -> None:
+    async def _shutdown(self, *, hub_exiting: bool = False,
+                        idle_teardown: bool = False) -> None:
         """The actual shutdown sequence.  Never raises; see :meth:`stop`."""
         try:
             self.stop_event.set()
             self._cancel_compact_turn_end_timer()
             self._cancel_wakeup(forget=not hub_exiting)
+            self._cancel_limit_resume(forget=not (hub_exiting or idle_teardown))
             self._cancel_bg_done_bell()
             # Leave the registry before the slow part of the teardown: a clean
             # exit should not look "live" to a sibling for the seconds it takes

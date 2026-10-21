@@ -313,7 +313,7 @@ def test_a_session_still_stopping_does_not_remember_its_key_again(monkeypatch):
     class _Stopping:
         on_session_id = staticmethod(server._note_session_key)
 
-        async def stop(self):
+        async def stop(self, **_kw):
             # The launch, mid-stop; then the cut turn's result.
             server._session_api_keys.pop("sid-9", None)
             if self.on_session_id is not None:
@@ -366,7 +366,7 @@ def test_closing_a_session_remembers_its_key(monkeypatch):
                         state=st, rid="R9")
 
     class _Bridge:
-        async def stop(self):
+        async def stop(self, **_kw):
             pass
 
     rt.bridge = _Bridge()
@@ -640,7 +640,7 @@ class _QuietBridge:
     async def start(self):
         pass
 
-    async def stop(self):
+    async def stop(self, **_kw):
         pass
 
 

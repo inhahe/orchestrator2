@@ -184,6 +184,9 @@ def classify(line: str) -> tuple[str, str]:
         # unlike /queue it is handled in server.py rather than by the immediate
         # dispatch table below.
         return "loop", arg
+    if cmd == "resume-after-limit":
+        # The bridge's too: it arms or cancels the resume.
+        return "resume-after-limit", arg
     if cmd == "graphify":
         sub = arg.split(None, 1)[0].lower() if arg.strip() else ""
         if sub in _GRAPHIFY_CLI_SUBCOMMANDS:
@@ -308,6 +311,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         ("/autocompact [on|off|N]",      "auto-compact threshold"),
         ("/max-context [off|N]",         "cap context tokens"),
         ("/loop [off|on|<seconds>]",     "show/stop/arm the self-paced wakeup loop"),
+        ("/resume-after-limit [on|off]", "carry on by itself once a usage limit that stopped it resets"),
         ("/recycle [now|off|<GiB>]",     "swap the CLI subprocess for a fresh one (reclaims its memory leak)"),
         ("/bell ...",                    "ring on these events (see /bell for details)"),
         ("/mcp [reconnect|enable|disable <server>]", "list/manage MCP servers"),

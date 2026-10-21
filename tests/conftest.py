@@ -24,8 +24,9 @@ suite found it, so the environment is the account, as for a tool.
 whichever one the shell running the suite is on, and a test whose bridge is
 told a session id saved that session's cost under its ``orchestrator2``
 folder, where the hub would read it back as a real session's -- and a
-wakeup filed there would be armed by the real hub.  A test that names an
-account of its own (a ``tmp_path``) still gets that one.
+wakeup filed there would be armed by the real hub, as a session waiting on a
+usage limit would be reopened by it.  A test that names an account of its own
+(a ``tmp_path``) still gets that one.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import account  # noqa: E402
 import session  # noqa: E402
 from config import CLI_COMPACTION_VARS  # noqa: E402
+import limit_resume  # noqa: E402
 import wakeup_store  # noqa: E402
 
 
@@ -110,6 +112,16 @@ def _no_hub_state_in_a_real_account(monkeypatch, tmp_path_factory):
         return spare_dir() / "wakeups" if _is_real_account(d.parent.parent) else d
 
     monkeypatch.setattr(wakeup_store, "_state_dir", wakeups_dir)
+
+    # Sessions waiting on a usage limit, which a real hub would reopen.
+    real_limits = limit_resume._state_dir
+
+    def limits_dir() -> Path:
+        d = real_limits()
+        return (spare_dir() / "limit-resumes"
+                if _is_real_account(d.parent.parent) else d)
+
+    monkeypatch.setattr(limit_resume, "_state_dir", limits_dir)
 
 
 @pytest.fixture

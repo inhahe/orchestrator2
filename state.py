@@ -396,11 +396,13 @@ def apply_rate_limit_info(state: State, info: Any) -> None:
         util = info.get("utilization")
         status = info.get("status")
         resets_at = info.get("resets_at")
+        overage_resets_at = info.get("overage_resets_at")
     else:
         rl_type = getattr(info, "rate_limit_type", None)
         util = getattr(info, "utilization", None)
         status = getattr(info, "status", None)
         resets_at = getattr(info, "resets_at", None)
+        overage_resets_at = getattr(info, "overage_resets_at", None)
     if rl_type in SUBSCRIPTION_RL_TYPES and not billed_to_api_key(state):
         state.is_subscription = True
     if isinstance(util, (int, float)) and isinstance(rl_type, str):
@@ -410,6 +412,11 @@ def apply_rate_limit_info(state: State, info: Any) -> None:
             state.rate_limit_reset_bell_fired = False
             ring_bell(state, "rate-hit")
         state.rate_limit_status = status
+        if status == "rejected":
+            state.rate_limit_type = rl_type if isinstance(rl_type, str) else None
+            state.rate_limit_overage_resets_at = (
+                int(overage_resets_at)
+                if isinstance(overage_resets_at, (int, float)) else None)
     if isinstance(resets_at, (int, float)):
         state.rate_limit_resets_at = int(resets_at)
 
@@ -436,6 +443,8 @@ def reset_rate_limit(state: State) -> bool:
     )
     state.rate_limit_status = None
     state.rate_limit_resets_at = None
+    state.rate_limit_type = None
+    state.rate_limit_overage_resets_at = None
     state.rate_limit_reset_bell_fired = False
     state.rate_limit_utils.clear()
     return changed
@@ -836,7 +845,18 @@ class State:
     rate_limit_utils: dict[str, float] = field(default_factory=dict)
     rate_limit_status: str | None = None
     rate_limit_resets_at: int | None = None
+    # Which window a rejection is for (the CLI's ``rateLimitType``, e.g.
+    # "five_hour"), so the session can say which limit stopped it.
+    rate_limit_type: str | None = None
+    rate_limit_overage_resets_at: int | None = None
     rate_limit_reset_bell_fired: bool = False
+
+    # --resume-after-limit, for this session: /resume-after-limit changes it.
+    resume_after_limit: bool = False
+    # When the session will be resumed after the limit that stopped it, as a
+    # wall-clock epoch for the status bar's label (the timer is the
+    # bridge's); None when nothing is pending.
+    limit_resume_at: float | None = None
 
     # Web transport — connected client IDs (supports multiple browser tabs)
     connected_clients: set[str] = field(default_factory=set)
@@ -870,6 +890,7 @@ def init_state_from_config(config: Config) -> State:
         bell_events=parse_bell_events(config.bell_on),
         agent_name=getattr(config, "agent_name", None),
         agent_labels=dict(getattr(config, "agent_labels", None) or {}),
+        resume_after_limit=bool(getattr(config, "resume_after_limit", False)),
     )
     if getattr(config, "api_key", None):
         # A session given its own key is billed to it, whatever its account
@@ -907,8 +928,13 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         and state.rate_limit_resets_at
         and state.rate_limit_resets_at > now_ts
     )
+    # A resume pending after a usage limit (--resume-after-limit).  On the
+    # label rather than a field of its own: it is what the session will do
+    # next, and the state is where one looks for that.
+    resumes = (f" · resumes {fmt_reset_time(int(state.limit_resume_at))}"
+               if state.limit_resume_at else "")
     if rate_limited:
-        busy_label = "rate limited"
+        busy_label = "rate limited" + resumes
         busy_class = "error"
     elif state.connecting:
         if state.connect_started_at is not None:
@@ -969,7 +995,8 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         busy_label = "already open elsewhere"
         busy_class = "error"
     else:
-        busy_label = "idle"
+        # The minute between a limit's reset and the resume that follows it.
+        busy_label = "idle" + resumes
         busy_class = "idle"
     busy_since = (round(time.time() - (time.monotonic() - since_mono))
                   if since_mono is not None else None)

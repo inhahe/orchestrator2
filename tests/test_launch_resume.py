@@ -513,7 +513,7 @@ class _QuietBridge:
     async def start(self):
         pass
 
-    async def stop(self):
+    async def stop(self, **_kw):
         pass
 
 
@@ -553,7 +553,7 @@ def test_a_session_whose_directory_is_gone_resumes_where_the_tab_is(machine, mon
 class _RunningBridge(_QuietBridge):
     stopped = False
 
-    async def stop(self):
+    async def stop(self, **_kw):
         _RunningBridge.stopped = True
 
 
