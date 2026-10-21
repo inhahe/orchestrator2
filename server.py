@@ -4729,7 +4729,7 @@ async def _handle_loop(ws: WebSocket, bridge, payload: str) -> None:
 
     if arg in ("off", "stop", "cancel", "end", "0"):
         was = bridge.stop_loop()
-        await broadcast({
+        await bridge.broadcast({
             "type": "system_msg", "subtype": "info",
             "data": {"message": (
                 "Wakeup loop stopped — no further scheduled prompts will be "
@@ -4740,7 +4740,7 @@ async def _handle_loop(ws: WebSocket, bridge, payload: str) -> None:
 
     if arg in ("on", "start"):
         d = bridge.start_loop(WAKEUP_DEFAULT_DELAY)
-        await broadcast({"type": "system_msg", "subtype": "info",
+        await bridge.broadcast({"type": "system_msg", "subtype": "info",
                          "data": {"message": f"Wakeup loop armed: fires in {d:.0f}s."}})
         return
 
@@ -4756,7 +4756,7 @@ async def _handle_loop(ws: WebSocket, bridge, payload: str) -> None:
     if abs(d - seconds) > 0.5:
         note = (f" (clamped from {seconds:.0f}s to the tool's documented "
                 f"{WAKEUP_MIN_DELAY:.0f}-{WAKEUP_MAX_DELAY:.0f}s range)")
-    await broadcast({"type": "system_msg", "subtype": "info",
+    await bridge.broadcast({"type": "system_msg", "subtype": "info",
                      "data": {"message": f"Wakeup loop armed: fires in {d:.0f}s{note}."}})
 
 

@@ -487,12 +487,14 @@ def _run_loop_cmd_ch(br, payload):
         channels.append("broadcast")
         sent.append(m)
 
-    orig_send, orig_bcast = server.send_to, server.broadcast
-    server.send_to, server.broadcast = fake_send_to, fake_broadcast
+    # The session's own broadcast, not the hub's, which reaches every tab of
+    # every session.
+    orig_send, orig_bcast = server.send_to, br.broadcast
+    server.send_to, br.broadcast = fake_send_to, fake_broadcast
     try:
         asyncio.run(server._handle_loop(WS(), br, payload))
     finally:
-        server.send_to, server.broadcast = orig_send, orig_bcast
+        server.send_to, br.broadcast = orig_send, orig_bcast
     text = " | ".join(m.get("data", {}).get("message", "") for m in sent)
     return text, channels
 
@@ -620,10 +622,10 @@ def test_loop_off_is_broadcast_not_whispered(bridge):
     async def fake_send_to(_ws, m):
         seen.append("send_to")
 
-    orig_send, orig_bcast = server.send_to, server.broadcast
-    server.send_to, server.broadcast = fake_send_to, fake_broadcast
+    orig_send, orig_bcast = server.send_to, br.broadcast
+    server.send_to, br.broadcast = fake_send_to, fake_broadcast
     try:
         asyncio.run(server._handle_loop(object(), br, "off"))
     finally:
-        server.send_to, server.broadcast = orig_send, orig_bcast
+        server.send_to, br.broadcast = orig_send, orig_bcast
     assert "broadcast" in seen

@@ -1,5 +1,15 @@
 # Known issues / tech debt — orchestrator2
 
+## `/loop`'s messages went to every tab of every session — FIXED (2026-10-21)
+
+`_handle_loop` in server.py sent "Wakeup loop stopped" and "armed" with the
+module-level `broadcast`, which reaches every tab connected to the hub, in
+every session. design.md §2 counts cross-session leakage as a bug. It now uses
+the session's own broadcast (`bridge.broadcast`, which is `rt.broadcast`). The
+tests in `tests/test_loop_control.py` that check the channel used to patch the
+hub-wide `broadcast`, so they passed against the leak. They now watch the
+session's broadcast, and five of them fail when the hub-wide one is put back.
+
 ## A deferred `/model` can lose a finished background task's notification — OPEN (found 2026-10-21)
 
 `/model`, `/effort` and `/thinking` issued while a background task runs are

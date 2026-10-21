@@ -664,7 +664,7 @@ both directions of every rule).
 | `/autocompact [on\|off\|N]` | Show or set the session's auto-compact (see `--compact-at`). The CLI reads it only when it starts, so a change takes effect from the session's next turn, which restarts the CLI first; until then the answer also says what the CLI still has. Claude Code's own `/autocompact`, which changes its `autoCompactWindow` setting, is not reachable from here |
 | `/max-context [off\|N]` | Cap context tokens |
 | `/loop` | Show whether a self-paced wakeup loop is armed, when it next fires, and how many times it has been deferred because a turn was running |
-| `/loop off` | Stop it (`stop`, `cancel`, `end` and `0` all work). Broadcast to every tab, since it changes what the session does next |
+| `/loop off` | Stop it (`stop`, `cancel`, `end` and `0` all work). Said to every tab on this session, since it changes what the session does next |
 | `/loop on` / `/loop <seconds>` | Arm one yourself, clamped to the 60–3600s range the `ScheduleWakeup` tool documents (it tells you when it clamped) |
 | `/recycle` | Report CLI subprocess memory, threshold and recycle count |
 | `/recycle now` | Recycle the CLI subprocess immediately (waits for a quiet moment if busy) |
