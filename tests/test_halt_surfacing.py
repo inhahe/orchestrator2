@@ -134,9 +134,12 @@ def test_a_conversation_told_before_its_first_session_id_keeps_it(tmp_path):
 
 
 @pytest.mark.parametrize("ends", ["clear", "another CLI session"])
-def test_a_halt_queued_for_a_conversation_that_ended_is_not_told_twice(tmp_path, ends):
+def test_a_halt_queued_for_a_conversation_that_ended_is_not_told_twice(tmp_path, monkeypatch, ends):
     """Queued, not yet delivered, when the conversation ended: delivered to
-    the next one, which is then told under its own key, it would be twice."""
+    the next one, which is then told under its own key, it would be twice --
+    in two wordings, since time passes between them and the age is in it."""
+    ages = iter(f"{n} minutes ago" for n in range(1, 100))
+    monkeypatch.setattr(ac, "age_text", lambda t, now=None: next(ages))
     st, poll = _bridge_and_poll(tmp_path)
     ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
     st.queued_prompts.append("carry on with the build")
