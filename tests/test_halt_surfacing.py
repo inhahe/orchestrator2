@@ -1,34 +1,21 @@
-"""A halt nobody is left to lift must be recognisable as one.
+"""A halt nobody is left to lift must be recognisable as one: orchestrator2's half.
 
 Nothing lifts a halt but an explicit act (spec §6.4).  So a halt whose raiser
 has gone -- finished, or moved to another machine along with the project it
 protected -- stays up, and every new session on the machine is told to stop,
-until somebody notices.  What lets somebody notice:
-
-* the halt prompt gives the halt's **age**, and says when its **raiser is not
-  registered as running** here, with how to lift it if the operator says so;
-* the lobby shows **every halt in force**, with a **Lift** button;
-* every command a session is told to run works **from the session's own
-  directory**, which is any project on the machine, not this one.
-
-Every lift a prompt or the CLI offers names **one halt, by id**.  A scope
-lift takes every halt in the scope with it -- one still protecting live work,
-too -- and the hint ``check-halt`` printed used to be a bare
-``agents.py lift``, whose default scope (repo) does not touch the machine
-halts ``check-halt --scope repo`` also reports.
+until somebody notices.  The prompt that says how old the halt is, and that
+its raiser is gone, is agent-comms' (``agent_comms.halt_prompt``, tested
+there).  What is left here: that the prompt a session queues carries it, and
+that the lobby shows **every halt in force**, with a **Lift** button.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import shlex
-import subprocess
 import sys
 import time
 from pathlib import Path
-
-import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -39,158 +26,6 @@ from sdk_bridge import SDKBridge  # noqa: E402
 
 DAY = 86400.0
 GONE = "not registered as running on this machine"
-
-
-@pytest.fixture
-def conn():
-    c = ac.connect()
-    yield c
-    c.close()
-
-
-def _run_printed(command: str, cwd: Path) -> subprocess.CompletedProcess:
-    """Run a command line exactly as a prompt printed it, from *cwd*.
-
-    Only ``python`` is swapped for this interpreter: which one is on PATH is
-    the machine's business, while the path after it is what is under test.
-    """
-    argv = shlex.split(command)
-    assert argv[0] == "python", command
-    return subprocess.run([sys.executable, *argv[1:]], cwd=str(cwd),
-                          capture_output=True, text=True, timeout=180)
-
-
-def _line_with(text: str, word: str) -> str:
-    """The command line in *text* that runs *word*, as printed."""
-    for line in text.splitlines():
-        if f"agents.py\" {word}" in line:
-            return line[line.index("python "):].strip()
-    raise AssertionError(f"no {word} command in:\n{text}")
-
-
-def _another_project(tmp_path: Path) -> Path:
-    d = tmp_path / "foobar2000"
-    d.mkdir(exist_ok=True)
-    return d
-
-
-# ---------------------------------------------------------------------------
-# The registry's answers
-# ---------------------------------------------------------------------------
-
-def test_halts_in_force_lists_every_scope_oldest_first(conn):
-    now = time.time()
-    m = ac.raise_halt("move", by="lane-f", scope_kind="machine", conn=conn,
-                      now=now - 3 * DAY)
-    r = ac.raise_halt("repair", by="lane-a", scope_kind="repo",
-                      scope_value="D:/os", conn=conn, now=now - DAY)
-    gone = ac.raise_halt("old", by="lane-b", scope_kind="machine", conn=conn,
-                         now=now - 5 * DAY)
-    ac.lift_halt(halt_id=gone, conn=conn)
-    assert [h.id for h in ac.halts_in_force(conn=conn)] == [m, r]
-
-
-def test_a_live_raiser_is_running(conn):
-    ac.register("lane-f", cwd="D:/os", session_id="s", conn=conn)
-    ac.raise_halt("x", by="lane-f", scope_kind="machine", conn=conn)
-    assert ac.raiser_running(ac.active_halt(conn=conn), conn=conn) is True
-
-
-def test_a_raiser_whose_heartbeat_stopped_is_not_running(conn):
-    ac.register("lane-f", cwd="D:/os", session_id="s", conn=conn,
-                now=time.time() - 10 * ac.AGENT_TTL)
-    ac.raise_halt("x", by="lane-f", scope_kind="machine", conn=conn)
-    assert ac.raiser_running(ac.active_halt(conn=conn), conn=conn) is False
-
-
-def test_a_raiser_that_left_the_registry_is_not_running(conn):
-    """The case that happened: a clean exit deletes the registration."""
-    ac.raise_halt("x", by="lane-f", scope_kind="machine", conn=conn)
-    assert ac.raiser_running(ac.active_halt(conn=conn), conn=conn) is False
-
-
-@pytest.mark.parametrize("by", [ac.OPERATOR, ac.UNKNOWN_AGENT])
-def test_a_halt_no_agent_raised_has_no_raiser_to_ask_about(conn, by):
-    """Saying "the operator is not running" would be nonsense."""
-    ac.raise_halt("x", by=by, scope_kind="machine", conn=conn)
-    assert ac.raiser_running(ac.active_halt(conn=conn), conn=conn) is None
-
-
-@pytest.mark.parametrize("ago, text", [
-    (30, "30s ago"), (600, "10m ago"), (5 * 3600, "5.0h ago"),
-    (4 * DAY, "4 days ago")])
-def test_age_text(ago, text):
-    assert ac.age_text(1_000_000.0 - ago, now=1_000_000.0) == text
-
-
-def test_the_cli_command_names_the_real_script_by_absolute_path():
-    cmd = ac.cli_command("check-halt", "--scope", "machine")
-    script = Path(shlex.split(cmd)[1])
-    assert script.is_absolute(), cmd
-    assert script.is_file(), cmd
-    assert script.resolve() == (ROOT / "tools" / "agents.py").resolve()
-
-
-# ---------------------------------------------------------------------------
-# The prompt a session is shown
-# ---------------------------------------------------------------------------
-
-def _halt(**over) -> ac.Halt:
-    fields = dict(id=7, scope_kind="machine", scope_value="",
-                  raised_by="Lane-F", raised_at=1_000_000.0 - 4 * DAY,
-                  reason="PC migration")
-    fields.update(over)
-    return ac.Halt(**fields)
-
-
-def test_the_prompt_says_how_old_the_halt_is():
-    text = SDKBridge._halt_prompt(_halt(), True, now=1_000_000.0)
-    assert "4 days ago" in text, text
-    assert "PC migration" in text and "Lane-F" in text
-
-
-def test_the_prompt_says_when_the_raiser_has_gone():
-    text = SDKBridge._halt_prompt(_halt(), False, now=1_000_000.0)
-    assert f"Lane-F, which raised it, is {GONE}" in text, text
-
-
-def test_the_lift_offered_is_this_one_halt_by_id():
-    text = SDKBridge._halt_prompt(_halt(), False, now=1_000_000.0)
-    assert ac.cli_command("lift", "--id", "7") in text, text
-    assert "--scope" not in _line_with(text, "lift"), "offered a scope lift"
-
-
-@pytest.mark.parametrize("running", [True, None])
-def test_the_prompt_says_nothing_of_a_raiser_that_is_running_or_is_nobody(running):
-    text = SDKBridge._halt_prompt(_halt(), running, now=1_000_000.0)
-    assert GONE not in text, text
-    assert 'agents.py" lift' not in text, "invited a lift nobody needs"
-
-
-def test_the_check_command_in_the_prompt_runs_from_another_project(tmp_path):
-    """The prompt reaches sessions in every project, and ``tools/agents.py``
-    exists in only one of them."""
-    ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
-    text = SDKBridge._halt_prompt(ac.active_halt(), False)
-    p = _run_printed(_line_with(text, "check-halt"), _another_project(tmp_path))
-    assert p.returncode == 1, p.stdout + p.stderr
-    assert "HALT IN FORCE" in p.stderr
-
-
-def test_the_lift_in_the_prompt_lifts_that_halt_and_spares_a_live_one(tmp_path):
-    """Two machine halts: Lane-F's, forgotten, and Lane-A's, protecting work
-    still running.  Lifting the first must not lift the second."""
-    ac.register("Lane-A", cwd=str(tmp_path), session_id="sa")
-    old = ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine",
-                        now=time.time() - 4 * DAY)
-    live = ac.raise_halt("repairing the index", by="Lane-A",
-                         scope_kind="machine")
-    text = SDKBridge._halt_prompt(ac.active_halt(), False)
-    assert ac.active_halt().id == old
-    p = _run_printed(_line_with(text, "lift"), _another_project(tmp_path))
-    assert p.returncode == 0, p.stdout + p.stderr
-    assert [h.id for h in ac.halts_in_force()] == [live], \
-        "the lift took the live halt with it"
 
 
 def _bridge_and_poll(tmp_path):
@@ -250,57 +85,11 @@ def test_a_prompt_that_fails_to_build_leaves_the_halt_to_tell(tmp_path,
 
     def boom(*_a, **_k):
         raise OSError("localtime")
-    monkeypatch.setattr(SDKBridge, "_halt_prompt", staticmethod(boom))
+    monkeypatch.setattr(ac, "halt_prompt", boom)
     poll()
     assert list(st.queued_prompts) == []
     assert ac.pending_halt_for("lane-b") is not None, \
         "marked delivered without being told: it is lost for good"
-
-
-# ---------------------------------------------------------------------------
-# The CLI
-# ---------------------------------------------------------------------------
-
-def _check_halt(scope: str, cwd: Path) -> subprocess.CompletedProcess:
-    return _run_printed(ac.cli_command("check-halt", "--scope", scope), cwd)
-
-
-def test_check_halts_lift_hint_lifts_a_machine_halt_seen_from_a_repo(tmp_path):
-    """``check-halt --scope repo`` reports a machine halt; the lift it then
-    prints must be one that lifts it."""
-    ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
-    p = _check_halt("repo", tmp_path)
-    assert p.returncode == 1, p.stdout + p.stderr
-    q = _run_printed(_line_with(p.stderr, "lift"), _another_project(tmp_path))
-    assert q.returncode == 0, q.stdout + q.stderr
-    assert ac.halt_in_force() is False, "the printed hint lifted nothing"
-
-
-def test_check_halts_lift_hint_spares_another_halt(tmp_path):
-    first = ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine",
-                          now=time.time() - 4 * DAY)
-    second = ac.raise_halt("repair", by="Lane-A", scope_kind="machine")
-    p = _check_halt("machine", tmp_path)
-    assert f"halt      : {first}" in p.stderr, p.stderr
-    _run_printed(_line_with(p.stderr, "lift"), tmp_path)
-    assert [h.id for h in ac.halts_in_force()] == [second]
-
-
-def test_check_halt_gives_the_age_and_the_raisers_absence(tmp_path):
-    ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine",
-                  now=time.time() - 4 * DAY)
-    p = _check_halt("machine", tmp_path)
-    assert "4 days ago" in p.stderr, p.stderr
-    assert GONE in p.stderr, p.stderr
-
-
-def test_the_lift_halt_prints_works_from_another_project(tmp_path):
-    p = _run_printed(ac.cli_command("halt", "migration", "--scope", "machine"),
-                     tmp_path)
-    assert p.returncode == 0, p.stdout + p.stderr
-    q = _run_printed(_line_with(p.stdout, "lift"), _another_project(tmp_path))
-    assert q.returncode == 0, q.stdout + q.stderr
-    assert ac.halt_in_force() is False, q.stdout
 
 
 # ---------------------------------------------------------------------------

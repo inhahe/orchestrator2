@@ -1597,7 +1597,9 @@ async def _tick_runtime(rt: SessionRuntime) -> bool:
         _mirror_at = _now
         try:
             import agent_comms as _ac
-            added, removed = await asyncio.to_thread(_ac.mirror_peer_registries)
+            # This hub's own account may live outside ~/.claude*.
+            dirs = _ac.config_dirs([hub_account()])
+            added, removed = await asyncio.to_thread(_ac.mirror_peer_registries, dirs)
             if added or removed:
                 log.info("peer registry mirror: +%d -%d", added, removed)
         except Exception:

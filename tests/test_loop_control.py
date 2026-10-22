@@ -62,7 +62,7 @@ from state import (                                            # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _isolated_store(tmp_path, monkeypatch):
-    monkeypatch.setenv("ORCH2_AGENT_DB", str(tmp_path / "agents.db"))
+    monkeypatch.setenv("AGENT_COMMS_DB", str(tmp_path / "agents.db"))
     yield
 
 

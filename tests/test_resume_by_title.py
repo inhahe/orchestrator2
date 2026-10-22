@@ -272,34 +272,6 @@ def test_it_is_not_reported_as_a_session_that_does_not_exist(monkeypatch):
 # Two sessions under one name
 # --------------------------------------------------------------------------
 
-def test_a_closing_session_leaves_anothers_registration_alone():
-    """The report's second fault: the empty Lane-A session's teardown deleted
-    the registration the real one was using."""
-    agent_comms.register("Lane-A", cwd="E:\\os", session_id=LANE)
-
-    agent_comms.deregister("Lane-A", session_id="the-empty-one")
-
-    assert agent_comms.find_agent("Lane-A") is not None
-
-
-def test_a_closing_session_still_removes_its_own():
-    agent_comms.register("Lane-A", cwd="E:\\os", session_id=LANE)
-
-    agent_comms.deregister("Lane-A", session_id=LANE)
-
-    assert agent_comms.find_agent("Lane-A") is None
-
-
-def test_an_entry_made_before_the_session_had_an_id_is_still_its_own():
-    """A new session registers before its first turn gives it an id; if it
-    closes before a heartbeat records the id, the entry still reads ''."""
-    agent_comms.register("Lane-A", cwd="E:\\os", session_id=None)
-
-    agent_comms.deregister("Lane-A", session_id=LANE)
-
-    assert agent_comms.find_agent("Lane-A") is None
-
-
 def _bridge(argv=(), session_id=LANE):
     cfg = parse_args(list(argv))
     st = init_state_from_config(cfg)

@@ -427,7 +427,7 @@ const Status = (() => {
     }
     if (!reg) {
       parts.push('Not in the orchestrator2 agent registry, so it receives no '
-                 + 'halts and tools/agents.py cannot message it.');
+                 + 'halts and the agent-comms command line cannot message it.');
     } else if (reg !== name) {
       parts.push('In the orchestrator2 agent registry it is "' + reg + '".');
     }

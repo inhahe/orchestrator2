@@ -57,7 +57,7 @@ SETTLE = 0.2
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch, tmp_path):
     monkeypatch.setattr(sdk_bridge, "TURN_END_SETTLE_S", SETTLE)
-    monkeypatch.setenv("ORCH2_AGENT_DB", str(tmp_path / "agents.db"))
+    monkeypatch.setenv("AGENT_COMMS_DB", str(tmp_path / "agents.db"))
     monkeypatch.delenv("ORCH2_AGENT_NAME", raising=False)
 
 

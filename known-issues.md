@@ -51,8 +51,9 @@ relative path that exists only in this project, and `check-halt`'s bare
 the halt is machine-wide. Every lift offered is now one halt, by id
 (`agents.py lift --id N`). See design.md §9a, "A halt nobody is left to
 lift". Tests: `tests/test_halt_surfacing.py`, `tests/lobby_halts.test.js`;
-mutation targets `halt-comms`, `halt-prompt`, `halt-cli`, `halt-server`,
-`halt-lobby`.
+mutation targets `halt-server`, `halt-lobby` (and, since the code moved to the
+agent-comms package on 2026-10-22, `halt-comms`, `halt-prompt` and `halt-cli`
+there).
 
 ## `--resume` refused a session in another directory when `--cwd` was given — FIXED (2026-10-21)
 

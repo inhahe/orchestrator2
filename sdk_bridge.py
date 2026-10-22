@@ -60,18 +60,25 @@ try:
 except ImportError:
     ThinkingBlock = None  # type: ignore[assignment]
 
-# The cross-account agent registry (specs/agent-comms-spec.md).  Optional on
-# purpose: a coordination convenience must never be the reason a session
-# refuses to run, so every call site degrades to a no-op when it is absent.
+# The cross-account agent registry: the agent-comms package (its docs/spec.md).
+# Optional on purpose: a coordination convenience must never be the reason a
+# session refuses to run, so every call site degrades to a no-op when it is
+# absent.
 try:
     import agent_comms
 except Exception:  # pragma: no cover - defensive
     agent_comms = None  # type: ignore[assignment]
 
-try:
-    import agent_tools
-except Exception:  # pragma: no cover - defensive
-    agent_tools = None  # type: ignore[assignment]
+def halt_server_config() -> dict[str, Any]:
+    """The ``mcp_servers`` entry for agent-comms' halt tools: its stdio server,
+    run by this interpreter, which has the package."""
+    exe = sys.executable
+    if os.path.basename(exe).lower().startswith("pythonw"):
+        console = os.path.join(os.path.dirname(exe), "python" + os.path.splitext(exe)[1])
+        if os.path.exists(console):
+            exe = console   # a server needs its stdio, which pythonw's may not be
+    return {"type": "stdio", "command": exe, "args": ["-m", "agent_comms.server"]}
+
 
 #: How often to look for pending agent traffic.  Not every tick: the ticker
 #: runs per runtime every 2 s and this touches a shared SQLite store that
@@ -1492,13 +1499,12 @@ class SDKBridge:
         # and lifting a halt must be *discoverable in the tool list*, because
         # an agent cannot use what it does not know exists -- while messaging
         # deliberately gets no new tool, since ListAgents/SendMessage already
-        # advertise it and only needed the registry scope widened.
-        if agent_tools is not None and "mcp_servers" not in kwargs:
-            srv = agent_tools.build_server(
-                identity_getter=lambda: self.agent_identity,
-                cwd_getter=lambda: getattr(self.config, "cwd", ""))
-            if srv is not None:
-                servers["agent-halt"] = srv
+        # advertise it and only needed the registry scope widened.  The tools
+        # are agent-comms' own MCP server, the one any Claude Code session can
+        # have; it learns which agent it works for from the registration this
+        # bridge makes, by the session's id.
+        if agent_comms is not None and "mcp_servers" not in kwargs:
+            servers["agent-halt"] = halt_server_config()
         if servers:
             kwargs["mcp_servers"] = servers
 
@@ -7586,8 +7592,8 @@ class SDKBridge:
                 "data": {"message": (
                     f"{exc}.\n\nOther Claude sessions still see this session "
                     f"as {explicit!r} in ListAgents, but it is not in the "
-                    f"orchestrator2 agent registry, so tools/agents.py cannot "
-                    f"message or halt it.  A name like "
+                    f"orchestrator2 agent registry, so the agent-comms command "
+                    f"line cannot message or halt it.  A name like "
                     f"{re.sub(r'[^A-Za-z0-9._-]+', '-', explicit or '')!r} "
                     f"works in both."
                 )},
@@ -7680,19 +7686,12 @@ class SDKBridge:
         out: list[str] = []
         conn = agent_comms.connect()
         try:
-            halt = agent_comms.pending_halt_for(ident, repo=self._agent_repo,
-                                                conn=conn)
-            if halt is not None:
-                # The text first: marking it delivered is what stops it being
-                # offered again, so anything that fails after that loses it.
-                try:
-                    running = agent_comms.raiser_running(halt, conn=conn)
-                except Exception:
-                    running = None      # unknown: the halt is still told
-                    log.debug("could not ask after halt %s's raiser",
-                              halt.id, exc_info=True)
-                text = self._halt_prompt(halt, running)
-                agent_comms.mark_halt_delivered(halt.id, ident, conn=conn)
+            # The same words, and the same order -- the text built before the
+            # halt is marked delivered -- as the hook that tells a session no
+            # program like this one runs.
+            text = agent_comms.take_pending_halt(ident, repo=self._agent_repo,
+                                                 conn=conn)
+            if text is not None:
                 out.append(text)
             msgs = agent_comms.pending_messages(
                 ident, repo=self._agent_repo, cwd=cwd, conn=conn)
@@ -7717,42 +7716,6 @@ class SDKBridge:
         finally:
             conn.close()
         return out
-
-    @staticmethod
-    def _halt_prompt(halt, raiser_running: bool | None,
-                     now: float | None = None) -> str:
-        """The prompt that tells this session's agent about *halt*.
-
-        *raiser_running* is :func:`agent_comms.raiser_running`'s answer for
-        it.  The age is always given, and a raiser that has gone is said out
-        loud, so the agent passes on to the operator what makes a forgotten
-        halt recognisable as one.
-        """
-        scope = halt.scope_kind
-        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(halt.raised_at))
-        text = (
-            f"[agent-comms] HALT raised by {halt.raised_by} ({scope} scope) "
-            f"{agent_comms.age_text(halt.raised_at, now)}, at {stamp}: "
-            f"{halt.reason}\n\n"
-            f"Stop taking new work. Finish or safely abandon what you are "
-            f"holding, commit and push it, and do not start another long "
-            f"task. The halt stays in force until it is lifted explicitly — "
-            f"check with:\n"
-            f"  {agent_comms.cli_command('check-halt', '--scope', scope)}\n"
-            f"Reply to the operator confirming you have stopped."
-        )
-        if raiser_running is False:
-            # By id: LiftHalt and `lift --scope` take every halt in the scope,
-            # including any another agent raised for work still running.
-            text += (
-                f"\n\n{halt.raised_by}, which raised it, is not registered as "
-                f"running on this machine, so nobody may be left to lift it. "
-                f"Tell the operator that, and how old the halt is. If the "
-                f"operator says its reason has passed, lift this one halt "
-                f"with:\n"
-                f"  {agent_comms.cli_command('lift', '--id', str(halt.id))}"
-            )
-        return text
 
     async def _warn_if_name_in_use(self, ident: str) -> None:
         """Say so when another live session already answers to *ident*.

@@ -581,18 +581,23 @@ if you'd rather not wait. Any reconnect that does orphan tasks now says which.
 
 Several Claude sessions can now address each other **across accounts** — the
 session registry was scoped per `CLAUDE_CONFIG_DIR`, so sessions under
-different accounts were mutually invisible to one another.
+different accounts were mutually invisible to one another. The registry, the
+messages and the halts are the [agent-comms](https://github.com/inhahe/agent-comms)
+package, which orchestrator2 requires (`requirements.txt`); it also works in
+Claude Code sessions orchestrator2 does not run.
 
 ```
-python tools/agents.py list                        # live sessions, all accounts
-python tools/agents.py send "stop soon" --to lane-b
-python tools/agents.py broadcast "tree is moving"  # everyone in this repo
-python tools/agents.py halt "migrating to E:"      # ask everyone to stop
-python tools/agents.py lift                        # explicit, never a timer
-python tools/agents.py lift --scope machine        # ... every machine-wide one
-python tools/agents.py lift --id 7                 # ... just halt 7
-python tools/agents.py check-halt --scope repo     # 0 = clear, non-zero = halted
+python -m agent_comms list                        # live sessions, all accounts
+python -m agent_comms send "stop soon" --to lane-b
+python -m agent_comms broadcast "tree is moving"  # everyone in this repo
+python -m agent_comms halt "migrating to E:"      # ask everyone to stop
+python -m agent_comms lift                        # explicit, never a timer
+python -m agent_comms lift --scope machine        # ... every machine-wide one
+python -m agent_comms lift --id 7                 # ... just halt 7
+python -m agent_comms check-halt --scope repo     # 0 = clear, non-zero = halted
 ```
+
+(`python tools/agents.py …`, the old path, still runs the same command line.)
 
 Agents themselves need none of that: their existing `ListAgents` and
 `SendMessage` tools now simply work across accounts. The registry the CLI uses
@@ -604,7 +609,8 @@ every config directory, which makes the tool description agents already have
 `ListAgents` went from 1 peer to 4.
 
 Agents can also raise and lift a halt through `RaiseHalt` / `LiftHalt`, which
-appear in their tool list.
+appear in their tool list: agent-comms' MCP server, which orchestrator2 gives
+every session it runs.
 
 The commands above are the operator/script surface. Messages arrive at the
 addressee's **next turn boundary**, as a queued prompt — never mid-turn, so
@@ -646,7 +652,7 @@ guessing — adopting the wrong one would silently inherit another agent's
 messages and halt state, and neither session could tell.
 
 Sessions can carry free-form **labels** (`--agent-label lane=b
---agent-label role=reviewer`, repeatable), shown by `agents.py list`. Like the
+--agent-label role=reviewer`, repeatable), shown by `python -m agent_comms list`. Like the
 name, they belong to the one session the launch opens and stay with it when it
 is reopened. They exist
 because a listing of names and start times meant one agent had to be identified
@@ -655,7 +661,7 @@ made the same one-line fix on different trees with nothing able to notice. The
 registry never interprets a label — "lane" is your word, not its. `list` also
 warns outright when two live sessions share a directory.
 
-`agents.py status <id>` answers the question a bare "sent OK" cannot:
+`python -m agent_comms status <id>` answers the question a bare "sent OK" cannot:
 **queued** (nobody has been shown it — wait), **delivered** (it has been read;
 silence now means read-and-not-acted-on — chase it), or **expired**. It also
 records whether the addressee was even up when you sent it, since a message
@@ -668,7 +674,7 @@ misreading, or wrong. There is deliberately no way to mark a message
 "operator-originated": such a flag would not be verifiable either, and would be
 worse than nothing because it would look like authority.
 
-`python tools/agents.py --self-test` exercises the whole thing (31 fixtures,
+`python -m agent_comms --self-test` exercises the whole thing (31 fixtures,
 both directions of every rule).
 
 ### Display

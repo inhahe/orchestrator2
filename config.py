@@ -687,11 +687,10 @@ def _launch_agent_name(flag: str | None) -> str | None:
 
     The variable is **consumed**, not just read.  Left in the environment it
     would be inherited by every CLI this process starts, and so by every
-    session's own processes: ``tools/agents.py`` there defaults to it as the
-    caller's identity (another session's inbox), and a hub an agent starts for
-    a test would parse it as *its* name and take over the registration.  That
-    is the hub-wide naming ``--agent-name`` used to have, through the back
-    door.  A blank value means "not given", as it does for the flag.
+    session's own processes: a hub an agent starts for a test would parse it
+    as *its* name and take over the registration.  That is the hub-wide
+    naming ``--agent-name`` used to have, through the back door.  A blank
+    value means "not given", as it does for the flag.
     """
     env = os.environ.pop("ORCH2_AGENT_NAME", None)
     return (flag or "").strip() or (env or "").strip() or None
@@ -1155,7 +1154,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         metavar="KEY=VALUE",
         help=(
             "Attach a label to the registry entry of the session this launch "
-            "opens; repeatable. Shown by `tools/agents.py list`, so a peer can "
+            "opens; repeatable. Shown by `python -m agent_comms list`, so a peer can "
             "tell which session is which without messaging it to find out. The "
             "registry never interprets these -- e.g. --agent-label lane=b "
             "--agent-label role=reviewer.  Per session, like --agent-name: "

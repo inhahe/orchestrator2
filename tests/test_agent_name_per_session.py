@@ -17,7 +17,7 @@ the session keeps it when it comes back without the flag.  Asked for
 the same fault and gets the same treatment ("yes, do both"): a hub started
 with ``--agent-label lane=b`` put lane=b on every session it opened.
 
-The registry here is a real one in a temp directory (``ORCH2_AGENT_DB``), so
+The registry here is a real one in a temp directory (``AGENT_COMMS_DB``), so
 these run the real resolve/register/name code rather than stubs of it.
 """
 
@@ -47,7 +47,7 @@ ENV = "CLAUDE_CODE_SESSION_NAME"
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch, tmp_path):
     """A private registry, and no names leaking in from the developer's shell."""
-    monkeypatch.setenv("ORCH2_AGENT_DB", str(tmp_path / "agents.db"))
+    monkeypatch.setenv("AGENT_COMMS_DB", str(tmp_path / "agents.db"))
     monkeypatch.delenv("ORCH2_AGENT_NAME", raising=False)
     monkeypatch.delenv(ENV, raising=False)
 
@@ -898,83 +898,6 @@ def test_the_same_before_the_session_exists(monkeypatch):
 # The record itself
 # --------------------------------------------------------------------------
 
-def test_the_record_round_trips_and_the_newest_wins():
-    agent_comms.name_session("sid-1", "Lane-C")
-    agent_comms.name_session("sid-1", "Lane-D")
-
-    assert agent_comms.session_name("sid-1") == "Lane-D"
-
-
-def test_the_record_ignores_blanks():
-    agent_comms.name_session("sid-1", "   ")
-    agent_comms.name_session("", "Lane-D")
-
-    assert agent_comms.session_name("sid-1") is None
-    assert agent_comms.session_name("") is None
-
-
-def test_a_blank_write_does_not_erase_what_was_remembered():
-    """Nothing to say is not "forget": the upsert would otherwise replace the
-    session's name and labels with nothing."""
-    agent_comms.name_session("sid-1", "Lane-D", labels={"lane": "d"})
-
-    agent_comms.name_session("sid-1", "  ", labels={})
-
-    assert agent_comms.session_naming("sid-1") == ("Lane-D", {"lane": "d"})
-
-
-def test_it_outlives_the_registration():
-    """The whole reason it is not a column of ``agents``: that row is deleted
-    on a clean exit."""
-    agent_comms.register("Lane-D", cwd="C:\\w", session_id="sid-1")
-    agent_comms.name_session("sid-1", "Lane-D")
-
-    agent_comms.deregister("Lane-D")
-
-    assert agent_comms.session_name("sid-1") == "Lane-D"
-
-
-def _old_store(path, schema):
-    import sqlite3
-    old = sqlite3.connect(str(path))
-    old.executescript(schema)
-    old.commit()
-    old.close()
-
-
-def test_an_existing_registry_gains_the_table(tmp_path):
-    """Stores written before this existed must just work."""
-    path = tmp_path / "old.db"
-    before = agent_comms._SCHEMA.split("-- The name and labels a session")[0]
-    assert "session_names" not in before
-    _old_store(path, before)
-
-    conn = agent_comms.connect(path)
-    try:
-        agent_comms.name_session("sid-1", "Lane-D", labels={"lane": "d"}, conn=conn)
-        assert agent_comms.session_naming("sid-1", conn=conn) == ("Lane-D", {"lane": "d"})
-    finally:
-        conn.close()
-
-
-def test_a_table_from_before_labels_gains_the_column(tmp_path):
-    """Not hypothetical: the machine's real registry has exactly this table,
-    created by a test run on the day names were added (2026-09-22), before
-    labels were -- CREATE TABLE IF NOT EXISTS would leave it as it is."""
-    path = tmp_path / "old.db"
-    before = agent_comms._SCHEMA.split("-- The name and labels a session")[0]
-    _old_store(path, before + (
-        "CREATE TABLE session_names (session_id TEXT PRIMARY KEY, "
-        "name TEXT NOT NULL, named_at REAL NOT NULL);"))
-
-    conn = agent_comms.connect(path)
-    try:
-        agent_comms.name_session("sid-1", "Lane-D", labels={"lane": "d"}, conn=conn)
-        assert agent_comms.session_naming("sid-1", conn=conn) == ("Lane-D", {"lane": "d"})
-    finally:
-        conn.close()
-
-
 # --------------------------------------------------------------------------
 # --agent-label: the same, for labels
 # --------------------------------------------------------------------------
@@ -1173,8 +1096,3 @@ def test_labels_for_a_running_session_are_published_at_once():
     assert labels.get("lane") == "d" and labels.get("role") == "reviewer"
     assert agent_comms.session_naming("sid-1")[1] == {"lane": "d", "role": "reviewer"}
 
-
-def test_a_label_only_record_is_not_a_name():
-    agent_comms.name_session("sid-1", None, labels={"lane": "d"})
-
-    assert agent_comms.session_name("sid-1") is None

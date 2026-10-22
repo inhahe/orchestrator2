@@ -133,7 +133,7 @@ Three layers, deliberately separated:
 | `copy_session_tui.py` | The full-screen `textual` wizards (`--resume` / `--copy` picker, standalone copy wizard). The only module that needs `textual` |
 | `static/` | Frontend ES modules — see §7 |
 | `tests/` | Pytest suite (offline; no real SDK) |
-| `tools/` | Diagnostics run by hand, not part of the suite: `measure_tab_cpu.py`, `probe_mutations.py`, `probe_animations.py`, `profile_idle_tab.py` (against a live hub; see §7 "An idle tab must cost nothing"), `probe_lobby_card.py` (renders the lobby's cards standalone and measures the title box — jsdom does no layout; §8), `probe_mobile_sidebar.py` (loads the real page at a phone viewport against a live hub and measures whether the panels are reachable; §8), `mutate.py` (the mutation sweep; §10), `agents.py` (cross-account agent CLI; §9a). The Playwright ones need the D: interpreter |
+| `tools/` | Diagnostics run by hand, not part of the suite: `measure_tab_cpu.py`, `probe_mutations.py`, `probe_animations.py`, `profile_idle_tab.py` (against a live hub; see §7 "An idle tab must cost nothing"), `probe_lobby_card.py` (renders the lobby's cards standalone and measures the title box — jsdom does no layout; §8), `probe_mobile_sidebar.py` (loads the real page at a phone viewport against a live hub and measures whether the panels are reachable; §8), `mutate.py` (the mutation sweep; §10), `agents.py` (the old path to agent-comms' command line, `python -m agent_comms`; §9a). The Playwright ones need the D: interpreter |
 
 ---
 
@@ -4383,20 +4383,33 @@ minutes.
 
 ---
 
-## 9a. Cross-account agent comms (`agent_comms.py`, `tools/agents.py`)
+## 9a. Cross-account agent comms (the agent-comms package)
 
-Implements `specs/agent-comms-spec.md`. Several Claude sessions work one
-machine and one repository at once and **cannot address each other**, because
-the session registry is scoped per `CLAUDE_CONFIG_DIR` and they run under
-different accounts. That scoping *is* the bug, so the store here is
-deliberately machine-wide and outside any config directory:
-`%LOCALAPPDATA%/orchestrator2/agents.db`, SQLite in WAL mode because concurrent
-writers from different accounts are a hard requirement.
+Several Claude sessions work one machine and one repository at once and
+**cannot address each other**, because the session registry is scoped per
+`CLAUDE_CONFIG_DIR` and they run under different accounts. The fix is the
+[agent-comms](https://github.com/inhahe/agent-comms) package, which
+orchestrator2 requires: a machine-wide registry, messages and halts; its command
+line, `python -m agent_comms` (`check-halt` among it, the hard layer of a halt);
+the halt tools `RaiseHalt` and `LiftHalt`, an MCP server; the mirror that makes
+`ListAgents` cross accounts; and a hook that tells a Claude Code session
+orchestrator2 does not run about a halt. It grew here, as `agent_comms.py`,
+`agent_tools.py` and `tools/agents.py`, and was moved out on 2026-10-22 so that
+sessions orchestrator2 does not run can have it too. Its `design.md` and
+`docs/spec.md` carry that design: the store, why identity is assigned and an
+ambiguous one refused rather than guessed, why a halt is not a message and never
+expires, repository scope keyed on git's common directory, the surfacing rules,
+and a halt nobody is left to lift. `tools/agents.py` stays as the old path to
+the same command line, for the command lines already shown to sessions.
 
-**Identity is assigned, not derived.** Every derivation breaks in some
-topology — by account when two agents share one, by cwd when two share a
-directory, by pid when a session restarts — so it is a name, like a hostname,
-set with `--agent-name` / `ORCH2_AGENT_NAME` and stable across restarts.
+This section is orchestrator2's side: naming each session, registering it,
+delivering to it at turn boundaries, the tools it is given, and the lobby.
+
+**Identity is a name, set per launch** with `--agent-name` (or
+`ORCH2_AGENT_NAME`) and stable across restarts; agent-comms' `resolve_identity`
+decides it, and a session in a directory with several registered identities and
+no name is refused one rather than given a guess. A refusal is not fatal: the
+session runs, it is simply not addressable, and says so.
 
 **A name belongs to one session, not to the hub.** It used to be the hub's:
 `Config.agent_name` was parsed once, for the hub process, `_create_runtime`
@@ -4409,8 +4422,7 @@ name over at all. Now:
 * `parse_args` resolves `--agent-name`, else `ORCH2_AGENT_NAME`, for the
   launch that was given it, and **consumes** the variable
   (`_launch_agent_name`): left in the environment, every CLI the hub starts
-  would inherit it — `tools/agents.py` in every session defaulting to that
-  inbox, and a test hub an agent starts claiming the identity.
+  would inherit it — a test hub an agent starts claiming the identity.
 * `_create_runtime` sets `agent_name` on every runtime it builds, from its own
   argument — never the hub's. `_hub_launch_kwargs` hands it over, and
   `/api/session/launch` passes it on; a launch that lands on a session already
@@ -4498,7 +4510,7 @@ session as `Lane-A`, and when the empty one was torn down for idleness its
 `deregister` deleted the shared row, leaving the lane session out of the
 registry while it went on believing it was in. Three things now:
 
-* `agent_comms.deregister(identity, session_id=…)` deletes the row only while
+* agent-comms' `deregister(identity, session_id=…)` deletes the row only while
   it is still that session's (or has no session id yet); the bridge always
   passes its own.
 * A heartbeat that finds no row (`heartbeat()` returns False) restores it
@@ -4510,19 +4522,11 @@ registry while it went on believing it was in. Three things now:
   purpose is legitimate — but it is no longer silent.
 
 Tests never touch the machine's registry: `tests/conftest.py` points
-`ORCH2_AGENT_DB` at a temp file for every test. Before it, a test that only
+`AGENT_COMMS_DB` at a temp file for every test. Before it, a test that only
 meant to exercise a connect reached the real store — which is how that store
 got a `session_names` table on the day the table was written, and very
 probably how it got the two `orchestrator2` identities that one process
 registered seven seconds apart on 2026-09-06 and never heartbeated.
-
-`resolve_identity()` implements the spec's table, and the row that matters is
-the refusal: a fresh session in a directory with several registered identities
-**refuses and lists them** rather than guessing. Adopting the wrong one
-inherits another agent's message queue and halt state, and neither agent can
-detect it — the wrong one is told to stop and the right one never is. A
-refusal is not fatal: the session runs, it is simply not addressable, and says
-so.
 
 **Delivery is the hard part, not transport.** A file-based scheme already
 existed and still failed: a message sat in the addressee's own working tree for
@@ -4536,60 +4540,18 @@ The ticker (not just `_between_turns`) drives it because an *idle* agent is at
 a turn boundary too; delivering only between turns would leave a halt
 undelivered until the agent happened to do something.
 
-**Halt is not a message.** Informational input gets deprioritised by an agent
-mid-task, so the enforcement primitive is shared state with two layers: soft,
-announced once per agent as a queued prompt; and hard, via
+The halt's text, and its once-only record, are agent-comms'
+(`take_pending_halt`): the text is built before the halt is marked told, so a
+failure in between loses nothing, and the same words reach a session whether
+this bridge tells it or the package's hook does. The hook skips a session
+registered here, so nothing is told twice.
 
-```
-python tools/agents.py check-halt --scope repo    # 0 = clear, non-zero = halted
-```
+**A halt nobody is left to lift** is recognisable as one: the prompt says how
+old the halt is and whether its raiser is still registered here, and offers
+the lift of that one halt by id (agent-comms' `halt_prompt`; its design.md
+tells the 2026-10-17 halt that made this necessary). orchestrator2 adds the
+lobby:
 
-which an expensive operation calls before starting. The system never tries to
-classify which processes are long-running — the operation about to spend three
-hours is the one that knows, and it alone knows where its safe abort points
-are. It is cooperative: something that does not check cannot be stopped, and
-that limit is deliberate.
-
-Two asymmetries are load-bearing. Registrations and messages **expire** (a
-crashed session listed forever would make identity adoption unsafe); a halt
-**never** does, because one that timed out would clear itself in the middle of
-the maintenance it protects. And announcing a halt to an agent must not consume
-it: the soft layer is per-agent, the hard layer stays in force until lifted
-explicitly.
-
-`repo` scope is keyed on git's **common** directory, not the toplevel, so all
-worktrees of one repository share a halt — which is the motivating case, three
-lanes in three worktrees.
-
-### A halt nobody is left to lift
-
-The other side of "never on a timer": a halt whose raiser has gone stays up.
-On 2026-10-17 Lane-F raised a machine halt for a PC migration and then moved,
-with SlateOS, to the new PC. Nothing here lifted it, and over four days every
-new session on this machine (20 of them) opened to "HALT … stop taking new
-work". What made it hard to see was that the halt prompt was identical on day
-four and on day one. Three things now make such a halt recognisable as one,
-none of which lifts anything by itself:
-
-* **The prompt says how old the halt is, and whether its raiser is still
-  here.** `agent_comms.raiser_running()` answers from the registry: `True` for
-  a live registration, `False` for a stale heartbeat or no registration (a
-  clean exit deletes the row), and `None` for a halt no agent raised
-  (`OPERATOR`, `UNKNOWN_AGENT`). On `False`, `SDKBridge._halt_prompt` says
-  so, asks the agent to tell the operator, and gives the lift to use if the
-  operator says the reason has passed. `False` is a fact about this
-  registry, not a verdict, and is worded as one ("is not registered as
-  running on this machine"): a raiser may stop along with everyone else while
-  the maintenance runs, and a session outside orchestrator2 that raised one
-  under a name with the CLI was never registered at all. The prompt's text is
-  built **before** the halt is marked delivered, since marking it is what
-  stops it being offered again; a raiser lookup that fails leaves the note
-  out rather than the halt.
-* **Every lift a prompt or the CLI offers is one halt, by id**
-  (`agents.py lift --id N`; `halt` and `check-halt` print the id). A scope
-  lift, which `LiftHalt` and `lift --scope` are, takes every halt in the
-  scope with it, including one another agent raised for work still running,
-  and a repo-scope one resolves the repository from wherever it is pasted.
 * **The lobby lists every halt in force, each with a Lift button.**
   `session_list` carries `halts` (`server._halts_payload`, from
   `agent_comms.halts_in_force()`), the fast landing payload included, for the
@@ -4600,15 +4562,6 @@ none of which lifts anything by itself:
   mouseup loses the click; their text is written only when it changes, so a
   refresh does not end a selection. Each halt's `age` is worded by the hub,
   so a browser whose clock is off cannot contradict the prompt.
-* **Every command a session is told to run works from its own directory.**
-  The prompt used to say `python tools/agents.py check-halt`, a relative path
-  that exists only in this project, while the sessions told to run it work in
-  every project on the machine. `agent_comms.cli_command()` builds it from
-  `AGENTS_CLI`, absolute (by `abspath`, not `resolve`, which turns a drive
-  that is a share into its UNC path) and in forward slashes. `check-halt`'s
-  own lift hint had a second defect: it said a bare `agents.py lift`, whose
-  default scope is `repo`, while `check-halt --scope repo` also reports
-  machine halts. It now names the halt by id.
 
 What is not done, deliberately for now: a lift tells nobody. The sessions
 that stopped stay stopped until the operator speaks to them, and a halt
@@ -4617,101 +4570,31 @@ one-time "halt N was lifted" notice to every identity in `halt_deliveries`,
 and dropping a queued prompt whose halt has gone, would close both.
 
 A halt an agent raises with the CLI from its own shell is recorded as the
-operator's, because the hub consumes `ORCH2_AGENT_NAME` (above) and the CLI
-has no identity: `raiser_running` cannot speak for such a halt, and only its
+operator's, because the hub consumes `ORCH2_AGENT_NAME` (above), gives its
+sessions no `AGENT_COMMS_NAME`, and so the CLI has no identity: `raiser_running` cannot speak for such a halt, and only its
 age shows that it has been forgotten. `RaiseHalt` records the agent.
 
-### Surfacing: how an agent finds any of this
+**The tools and the mirror.** Every session is given the halt tools:
+agent-comms' MCP server, `agent-halt`, a stdio process run by the hub's own
+interpreter (`sdk_bridge.halt_server_config`; `python`, not `pythonw`, whose
+stdio a server cannot use), merged into `mcp_servers` alongside any the user
+configured — except when the user's configuration is a path or inline JSON,
+which cannot be merged into, as before. It learns which agent it works for from
+the registration this bridge makes, by the session's id, on every call, since
+the identity is settled only after the session starts. The mirror
+(`agent_comms.mirror_peer_registries`) runs from the ticker, throttled, over
+every config directory plus this hub's own account, which may live outside
+`~/.claude*`.
 
-`specs/agent-comms-addendum-surfacing.md` answers a question the spec did not,
-and its two halves pull opposite ways.
+**Tell a copied session that it moved** (an item of
+`agent-comms-improvements-checklist.md`, the defect list from a day of real
+use; its other items are agent-comms'):
 
-**Messaging gets no new tool and no documentation.** The description already
-shipped to every agent says `ListAgents` lists "other local Claude sessions on
-this machine" — the capability was advertised, only the implementation was
-account-scoped. Inspection (not assumption) found the mechanism: the CLI
-advertises itself in `<CLAUDE_CONFIG_DIR>/sessions/<pid>.json` plus a
-`<pid>.<hash>.key`, then peers talk over a **machine-global named pipe**
-recorded in that file. The transport was never account-scoped; only the
-directory listing was. `mirror_peer_registries()` copies each *live* session's
-advertisement (and its key) into every other config directory, driven from the
-ticker.
-
-The sharpened reason this matters: **an empty `ListAgents` is
-indistinguishable from "this feature does not exist here."** The agent that hit
-this got one negative answer, never tried `SendMessage` at all, concluded the
-capability was absent and spent an hour building a file-based workaround. No
-quality of tool description compensates — by then the agent has its answer.
-
-Verified by observation, which the addendum insists on over reasoning about
-descriptions: `ListAgents` went from **1 peer to 4**, and a `SendMessage` from
-an account-c session was found in the **recipient's own transcript** under
-account-b — queued at `22:14:01.677Z`, processed at `22:14:07.372Z`, i.e. its
-next turn boundary.
-
-Two invariants keep the mirror safe. Only *live* sessions are copied
-(`_pid_is_a_live_claude` requires both that the pid exists **and** that it is a
-claude process, since pids are recycled), and the reaper removes only files
-recorded in its own manifest — after a source disappears a copy is
-indistinguishable from an original by inspection, and deleting a real
-advertisement would unregister somebody's working session, the one outcome
-worse than the bug.
-
-**Halt gets exactly one tool**, in `agent_tools.py`, exposed as an in-process
-MCP server (`agent-halt`) merged into `mcp_servers` alongside any the user
-configured. Checking deliberately stays a CLI: it must work from a bare shell
-with no client running, or every script wanting to be well-behaved would have
-to boot an agent to ask permission. The descriptions state the *occasion*
-("use this when you need every agent quiescent — a migration, a shared-file
-repair"), because one that only says "raises a halt" gets read and not acted on.
-
-Only one line about this belongs in an instruction file — the one a tool
-description cannot carry, about *when* — and it lives in the projects-level
-`CLAUDE.md`.
-
-### The five improvements from a day of real use
-
-`agent-comms-improvements-checklist.md` was written after four sessions used
-the registry for an afternoon. Each item is a defect that cost that day
-something, and the fixes are shaped by what it cost:
-
-1. **Attributes in the listing.** Name, kind and start time were all it gave,
-   so one agent was identifiable only because it messaged first and another
-   was found by elimination on a timestamp — the message sent to it framed
-   defensively ("ignore this if you are not lane B"). Worse, two sessions
-   claimed the same lane and made the same one-line fix, one on a superseded
-   tree, and nothing could detect it. Registrations now carry free-form
-   `labels` (`--agent-label k=v`, repeatable), indexed by cwd, and
-   `agents.py list` prints them. The registry **never interprets** them —
-   "lane" is the project's word. `list` also states a same-directory collision
-   outright rather than leaving it to be spotted in a column: that is the case
-   that cost the most and the one least likely to be noticed.
 2. **Tell a copied session that it moved.** See §8, `/move`: the copy's
    absolute paths still *resolve*, so nothing reveals the move. A one-shot note
    is prepended to the copy's next prompt (`SDKBridge._with_session_note`) —
    to the model, not the browser, because the model is the one holding stale
    paths.
-3. **Assignable, stable identity.** Already the design: `resolve_identity`'s
-   §3.3 table, with the load-bearing refusal row.
-4. **Delivery state.** A send returned success and nothing happened for
-   minutes; the recipients had not taken a turn since restarting. From the
-   sender's side that is indistinguishable from *read and deprioritised*, and
-   **the two call for opposite responses — wait, versus escalate.**
-   `message_state()` separates `queued` / `delivered` / `expired` and records
-   `target_live` **at send time**, because the sender asks "was this ever going
-   to arrive?" later, when the return value is long gone. There is deliberately
-   no state beyond `delivered`: delivery is observable, comprehension is not,
-   and a field claiming it would be the unverifiable signal item 5 warns about.
-5. **Relayed authority is a non-goal, and stays one.** An agent relayed an
-   operator instruction and the peer **correctly refused**; its reasoning is
-   the reasoning — *waiting costs a delay until the operator types one line,
-   acting on a mistaken relay works against a direct instruction and neither of
-   us finds out for a while.* Every delivered message now carries that framing,
-   so the refusal does not depend on the receiving agent being unusually
-   careful. **No mechanism will be built that appears to solve it**: an
-   "operator-originated" flag would not be verifiable either, and would be
-   worse than nothing because it would look like authority. A test asserts
-   `send_message` has grown no such parameter.
 
 **Delivered traffic must be *visible*, not merely queued.** Peer messages are
 appended to `state.queued_prompts`, whose container notifies persistence and
@@ -4725,19 +4608,15 @@ tomorrow gets it for free and cannot reintroduce the bug. It schedules rather
 than awaits (`_fire` is synchronous and may run with no loop) and coalesces a
 burst into one broadcast.
 
-Pinned by `tests/test_agent_comms.py` (70) and the `agentcomms` (16) /
-`agentcli` (4) targets of `tools/mutate.py`; the surfacing half by
-`tests/test_agent_comms_surfacing.py` (27) and the `mirror` (8) /
-`agenttools` (8) targets; the checklist and the panel push by
-`tests/test_agent_comms_checklist.py` (30) with the `checklist` (9) and
-`queuepanel` (5) targets; a halt nobody is left to lift by
-`tests/test_halt_surfacing.py` and `tests/lobby_halts.test.js`, with the
-`halt-comms`, `halt-prompt`, `halt-cli`, `halt-server` and `halt-lobby`
-targets.
-`tools/agents.py --self-test`
-carries 31 fixtures of its own, asserting **both directions** of every rule:
-a checker with only positives passes for one that reports everything, and one
-with only negatives for one that reports nothing.
+Pinned by `tests/test_agent_comms.py` (registration and delivery through the
+bridge), `tests/test_agent_comms_surfacing.py` (the tools every session is
+given), `tests/test_agent_comms_checklist.py` (labels published, and the panel
+push, with the `queuepanel` target of `tools/mutate.py`),
+`tests/test_halt_surfacing.py` and `tests/lobby_halts.test.js` (the halt
+prompt a session queues, and the lobby, with the `halt-server` and
+`halt-lobby` targets), and `tests/test_agent_name_per_session.py` and
+`tests/test_resume_by_title.py` (names per session). The package has its own
+suite and its own mutation sweep for everything else.
 
 ## 10. Testing
 
@@ -4750,8 +4629,8 @@ processes (`test_bridge_shutdown.py`), CLI-status surfacing and wakeup deferral
 (`test_compacting_status.py`), pending-prompt delivery (`test_queue_poke.py`,
 `test_queue_drain.py`, `test_idle_config_reconnect_queue.py`), worker-task
 ownership and restart-after-foreign-cancel (`test_worker_survival.py`),
-prompt-ack dispositions (`test_prompt_ack.py`), cross-account agent
-identity/registry/halt (`test_agent_comms.py`, section 9a), what a reconnect does to
+prompt-ack dispositions (`test_prompt_ack.py`), how a session registers with
+agent-comms and is delivered to (`test_agent_comms.py`, section 9a), what a reconnect does to
 running background tasks (`test_reconnect_bg_tasks.py`, section 6d), and whose
 queued prompts a starting session may adopt (`test_queue_persistence.py`,
 section 6), which sessions the lobby calls running

@@ -14,10 +14,7 @@ one of them would rot.
 from __future__ import annotations
 
 import asyncio
-import inspect
-import sqlite3
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -34,7 +31,7 @@ from state import init_state_from_config          # noqa: E402
 @pytest.fixture(autouse=True)
 def _isolated_store(tmp_path, monkeypatch):
     """A private registry per test -- never the machine-wide real one."""
-    monkeypatch.setenv("ORCH2_AGENT_DB", str(tmp_path / "agents.db"))
+    monkeypatch.setenv(ac.DB_ENV, str(tmp_path / "agents.db"))
     monkeypatch.delenv("ORCH2_AGENT_NAME", raising=False)
     yield
 
@@ -67,82 +64,6 @@ def _poll(br):
 # sessions claimed the same lane and made the same one-line fix, one of them on
 # a superseded tree, and *nothing in the system could detect it* -- including
 # the two agents.
-
-def test_labels_are_stored_and_returned(tmp_path):
-    ac.register("a", cwd=str(tmp_path), labels={"lane": "b", "role": "review"})
-    got = {x.identity: x.labels for x in ac.live_agents()}
-    assert got["a"] == {"lane": "b", "role": "review"}
-
-
-def test_labels_are_not_interpreted(tmp_path):
-    """"lane" is the project's word, not the registry's.  Whatever the caller
-    puts in comes back unchanged, including keys this code has never heard of;
-    a registry that understood them would have opinions about them."""
-    ac.register("a", cwd=str(tmp_path), labels={"lane": "b", "quokka": "42"})
-    got = {x.identity: x.labels for x in ac.live_agents()}["a"]
-    assert got == {"lane": "b", "quokka": "42"}
-
-
-def test_a_session_with_no_labels_is_fine(tmp_path):
-    ac.register("a", cwd=str(tmp_path))
-    assert {x.identity: x.labels for x in ac.live_agents()}["a"] == {}
-
-
-def test_labels_survive_a_heartbeat(tmp_path):
-    ac.register("a", cwd=str(tmp_path), labels={"lane": "b"})
-    ac.heartbeat("a")
-    assert {x.identity: x.labels for x in ac.live_agents()}["a"] == {"lane": "b"}
-
-
-def test_re_registering_updates_the_labels(tmp_path):
-    """Registration is an upsert, and a session that restarts with different
-    labels must publish the new ones -- otherwise the first launch's
-    annotation outlives every correction to it, which is worse than having
-    none, because it is wrong rather than absent."""
-    ac.register("a", cwd=str(tmp_path), labels={"lane": "b"})
-    ac.register("a", cwd=str(tmp_path), labels={"lane": "c", "role": "rev"})
-    got = {x.identity: x.labels for x in ac.live_agents()}["a"]
-    assert got == {"lane": "c", "role": "rev"}
-
-
-def test_register_returns_the_labels_it_stored(tmp_path):
-    """The caller holds the returned Agent and may act on it without
-    re-reading; a return value that disagreed with the store would be a
-    disagreement nothing else could detect."""
-    a = ac.register("a", cwd=str(tmp_path), labels={"lane": "b"})
-    assert a.labels == {"lane": "b"}
-    assert a.labels == {x.identity: x.labels for x in ac.live_agents()}["a"]
-
-
-def test_which_live_session_owns_this_directory(tmp_path):
-    """The question that previously had to be answered by messaging someone
-    and waiting.  It is a lookup, and the cwd index is there for it."""
-    other = tmp_path / "other"
-    other.mkdir()
-    ac.register("mine", cwd=str(tmp_path))
-    ac.register("theirs", cwd=str(other))
-    assert [a.identity for a in ac.live_agents(cwd=str(tmp_path))] == ["mine"]
-
-
-def test_two_live_sessions_in_one_directory_are_detectable(tmp_path):
-    """The done-when criterion, and the expensive one: this is the case that
-    produced the same fix twice on two trees."""
-    ac.register("first", cwd=str(tmp_path))
-    ac.register("second", cwd=str(tmp_path))
-    here = sorted(a.identity for a in ac.live_agents(cwd=str(tmp_path)))
-    assert here == ["first", "second"]
-
-
-def test_a_dead_registration_is_not_a_collision(tmp_path):
-    """Only *live* ones collide.  Counting a crashed predecessor would make
-    the warning fire on every ordinary restart, and a warning that always
-    fires is one nobody reads."""
-    now = time.time()
-    ac.register("old", cwd=str(tmp_path), now=now - ac.AGENT_TTL - 60)
-    ac.register("new", cwd=str(tmp_path), now=now)
-    live = [a.identity for a in ac.live_agents(cwd=str(tmp_path), now=now)]
-    assert live == ["new"]
-
 
 def test_the_bridge_publishes_operator_labels(tmp_path):
     br, _st, _ = _bridge(tmp_path, "x",
@@ -177,86 +98,6 @@ def test_registration_carries_the_labels_through(tmp_path):
 # receiver's next tool round.  From the sender's side that was indistinguishable
 # from having been read and deprioritised -- and **the two call for opposite
 # responses**: wait, versus escalate.
-
-def test_a_fresh_message_is_queued_not_delivered(tmp_path):
-    ac.register("them", cwd=str(tmp_path))
-    mid, _live = ac.send_message("hi", frm="me", to="them")
-    assert ac.message_state(mid)["state"] == "queued"
-
-
-def test_a_seen_message_says_delivered_and_by_whom(tmp_path):
-    ac.register("them", cwd=str(tmp_path))
-    mid, _ = ac.send_message("hi", frm="me", to="them")
-    ac.mark_delivered(mid, "them")
-    st = ac.message_state(mid)
-    assert st["state"] == "delivered"
-    assert [i for i, _at in st["delivered_to"]] == ["them"]
-
-
-def test_whether_the_target_was_live_is_recorded_not_just_returned(tmp_path):
-    """The sender asks "was this ever going to arrive?" *later* -- which is
-    exactly when the return value is no longer in hand."""
-    ac.register("them", cwd=str(tmp_path))
-    mid, live = ac.send_message("hi", frm="me", to="them")
-    assert live is True
-    assert ac.message_state(mid)["target_live_at_send"] is True
-
-
-def test_a_message_to_an_agent_that_was_not_up_records_that(tmp_path):
-    """Queued-for-a-restarting-agent and queued-for-an-agent-that-was-never-
-    there look identical without this, and only one is worth waiting for."""
-    mid, live = ac.send_message("hi", frm="me", to="ghost")
-    assert live is False
-    st = ac.message_state(mid)
-    assert st["state"] == "queued" and st["target_live_at_send"] is False
-
-
-def test_an_expired_message_is_not_reported_as_merely_queued(tmp_path):
-    """"Still waiting" and "never arrived and never will" are different
-    answers, and only one of them means re-send."""
-    now = time.time()
-    mid, _ = ac.send_message("hi", frm="me", to="them", ttl=1.0, now=now - 10)
-    assert ac.message_state(mid, now=now)["state"] == "expired"
-
-
-def test_delivery_beats_expiry_in_the_report(tmp_path):
-    """A message that was read and then expired was read.  Reporting it as
-    expired would send the sender chasing a delivery that happened."""
-    now = time.time()
-    mid, _ = ac.send_message("hi", frm="me", to="them", ttl=1.0, now=now - 10)
-    ac.mark_delivered(mid, "them", now=now - 9)
-    assert ac.message_state(mid, now=now)["state"] == "delivered"
-
-
-def test_an_unknown_message_id_says_so(tmp_path):
-    assert ac.message_state(999999)["state"] == "unknown"
-
-
-def test_the_report_names_the_addressee(tmp_path):
-    ac.register("them", cwd=str(tmp_path))
-    mid, _ = ac.send_message("hi", frm="me", to="them")
-    st = ac.message_state(mid)
-    assert st["to"] == "them" and st["from"] == "me"
-
-
-def test_a_store_written_before_target_live_existed_still_opens(tmp_path):
-    """The column is additive.  Refusing to open an older store would take the
-    whole feature down over one field of one report."""
-    p = tmp_path / "old.db"
-    old = sqlite3.connect(str(p))
-    old.executescript(
-        "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        " to_identity TEXT, scope_kind TEXT NOT NULL,"
-        " scope_value TEXT NOT NULL DEFAULT '', from_identity TEXT NOT NULL,"
-        " body TEXT NOT NULL, created_at REAL NOT NULL,"
-        " expires_at REAL NOT NULL);")
-    old.commit()
-    old.close()
-    conn = ac.connect(p)
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
-    conn.close()
-    assert "target_live" in cols, "the additive migration did not run"
-
 
 # ---------------------------------------------------------------------------
 # A delivered message must be *visible*, not merely queued
@@ -385,21 +226,3 @@ def test_the_message_body_still_arrives_intact(tmp_path):
     _poll(br)
     assert "the guard is inverted" in "\n".join(st.queued_prompts)
 
-
-def test_send_message_has_no_authority_parameter():
-    """A flag marking a message operator-originated would not be verifiable
-    either -- any agent could set it -- and would be *worse than nothing*,
-    because it would look like authority."""
-    sig = inspect.signature(ac.send_message)
-    for bad in ("operator", "authority", "priority", "from_operator",
-                "urgent", "trusted"):
-        assert bad not in sig.parameters, (
-            f"send_message grew a {bad!r} parameter; checklist item 5 says "
-            f"no mechanism may appear to solve relayed authority")
-
-
-def test_the_cli_states_the_non_goal():
-    """`agents.py` is what an agent reads before sending, so it is where the
-    statement has to be."""
-    src = (ROOT / "tools" / "agents.py").read_text(encoding="utf-8")
-    assert "never the operator's instruction" in src

@@ -445,7 +445,7 @@ class _CLI:
 def opened(monkeypatch, tmp_path):
     """Connect a bridge to SID, whose transcript is *records*; return what it
     said, its state and the env its CLI was given."""
-    monkeypatch.setenv("ORCH2_AGENT_DB", str(tmp_path / "agents.db"))
+    monkeypatch.setenv("AGENT_COMMS_DB", str(tmp_path / "agents.db"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
     monkeypatch.delenv("ORCH2_AGENT_NAME", raising=False)
     monkeypatch.setattr(sdk_bridge, "ClaudeSDKClient", _CLI)

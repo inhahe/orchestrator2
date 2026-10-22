@@ -46,18 +46,13 @@ Targets:
              (ScheduleWakeup stop=true) and by the operator (/loop off) --
              and a wakeup that keeps landing mid-turn gives up rather than
              re-arming itself forever
-  agentcomms agent_comms.py   x tests/test_agent_comms.py          (pytest)
-  agentcli   tools/agents.py x tests/test_agent_comms.py          (pytest)
-             cross-account agent identity, registry, messaging, halt --
-             including the two rules a plausible implementation gets wrong:
-             refusing an ambiguous identity rather than guessing, and a
-             notice not counting as a halt
-  halt-*     agent_comms.py, sdk_bridge.py, tools/agents.py, server.py
-             x tests/test_halt_surfacing.py (pytest), and static/lobby.js
-             x tests/lobby_halts.test.js (node)
-             a halt nobody is left to lift is recognisable as one: its age,
-             whether its raiser still runs here, commands that work from
-             any project, and the lobby's Lift
+  halt-*     server.py x tests/test_halt_surfacing.py (pytest), and
+             static/lobby.js x tests/lobby_halts.test.js (node)
+             a halt nobody is left to lift is recognisable as one in the
+             lobby, with its Lift
+             (The agent-comms package -- identity, registry, messaging, halt,
+             its command line and halt tools -- has its own sweep and its own
+             mutants: tools/mutate.py there.)
 
 The first two are design.md section 7, "Nothing that must keep working may be
 gated on an animation frame"; the third is section 6d, "A reconnect is not free
@@ -1415,339 +1410,9 @@ IDLE_MUTATIONS = [
      "    pass"),
 ]
 
-CHECKLIST_MUTATIONS = [
-    # -- item 1: attributes in the listing
-    ("labels are dropped at registration, so the listing is name-only again",
-     "             started, now, json.dumps(labels or {})),",
-     '             started, now, "{}"),'),
-
-    ("labels are reset on every heartbeat, so they last 30 seconds",
-     "            \"heartbeat_at=excluded.heartbeat_at, labels=excluded.labels\",",
-     "            \"heartbeat_at=excluded.heartbeat_at\",",),
-
-    ("the registry interprets labels instead of carrying them",
-     "                     heartbeat_at=now, labels=dict(labels or {}))",
-     "                     heartbeat_at=now, labels={})"),
-
-    ("the cwd filter is ignored, so 'who owns this directory' cannot be asked",
-     '            sql += " AND cwd = ?"\n            args.append(norm_path(cwd))',
-     "            pass"),
-
-    # -- item 4: delivery state
-    ("whether the target was live is not recorded, only returned",
-     "             frm, body, now, now + ttl, 1 if live else 0),",
-     "             frm, body, now, now + ttl, 0),"),
-
-    ("a queued message is reported as delivered",
-     '        if got:\n            state = "delivered"',
-     '        if True:\n            state = "delivered"'),
-
-    ("an expired message is reported as still queued",
-     '        elif row["expires_at"] <= now:\n            state = "expired"',
-     '        elif False:\n            state = "expired"'),
-
-    ("an unknown id is reported as an ordinary queued message",
-     '            return {"id": message_id, "state": "unknown", "delivered_to": []}',
-     '            return {"id": message_id, "state": "queued", "delivered_to": []}'),
-
-    ("a delivered-then-expired message is reported as expired, sending the "
-     "sender after a delivery that already happened",
-     '        if got:\n            state = "delivered"\n'
-     '        elif row["expires_at"] <= now:\n            state = "expired"',
-     '        if row["expires_at"] <= now:\n            state = "expired"\n'
-     '        elif got:\n            state = "delivered"'),
-]
-
-AGENTCOMMS_MUTATIONS = [
-    ("a fresh session guesses an identity instead of refusing (the load-bearing row)",
-     "        raise IdentityRefused(cwd, [r[\"identity\"] for r in rows])",
-     "        return rows[0][\"identity\"], \"adopted\""),
-
-    ("a LIVE identity is adopted, so two sessions share one name",
-     "            if now - rows[0][\"heartbeat_at\"] <= ttl:",
-     "            if False:"),
-
-    ("registrations never expire, so auto-adoption is unsafe",
-     "        sql = \"SELECT * FROM agents WHERE heartbeat_at >= ?\"\n"
-     "        args: list[Any] = [now - ttl]",
-     "        sql = \"SELECT * FROM agents WHERE heartbeat_at >= ?\"\n"
-     "        args: list[Any] = [0]"),
-
-    ("a resumed session does not inherit its identity",
-     "        if session_id:\n"
-     "            row = conn.execute(\n"
-     "                \"SELECT identity FROM agents WHERE session_id = ?\",",
-     "        if False:\n"
-     "            row = conn.execute(\n"
-     "                \"SELECT identity FROM agents WHERE session_id = ?\","),
-
-    ("a broadcast comes back to its own sender",
-     "            \"  AND m.from_identity != ? \"",
-     "            \"  AND m.from_identity != coalesce(NULL, '') \""),
-
-    ("delivery is not tracked, so a message repeats forever",
-     "            \"  AND NOT EXISTS (SELECT 1 FROM deliveries d \"\n"
-     "            \"                  WHERE d.message_id = m.id AND d.identity = ?) \"",
-     "            \"  AND (? IS NOT NULL) \""),
-
-    ("a repo broadcast leaks into every other repo",
-     "            \"              OR (m.scope_kind = 'repo' AND m.scope_value = ?) \"",
-     "            \"              OR (m.scope_kind = 'repo' AND ? IS NOT NULL) \""),
-
-    ("messages never expire",
-     "            \"WHERE m.expires_at > ? \"",
-     "            \"WHERE m.expires_at > -1 AND ? IS NOT NULL \""),
-
-    ("a halt expires on its own (spec forbids it explicitly)",
-     "            \"SELECT * FROM halts WHERE lifted_at IS NULL AND (\"",
-     "            \"SELECT * FROM halts WHERE lifted_at IS NULL \"\n"
-     "            \"AND raised_at > strftime('%s','now') - 3600 AND (\""),
-
-    ("a repo halt halts every repo",
-     "            \"  OR (scope_kind = 'repo' AND scope_value = ?)) \"\n"
-     "            \"ORDER BY raised_at LIMIT 1\",",
-     "            \"  OR (scope_kind = 'repo' AND ? IS NOT NULL)) \"\n"
-     "            \"ORDER BY raised_at LIMIT 1\","),
-
-    ("a machine halt stops covering other repos",
-     "            \"  scope_kind = 'machine' \"\n"
-     "            \"  OR (scope_kind = 'repo' AND scope_value = ?)) \"\n"
-     "            \"ORDER BY raised_at LIMIT 1\",",
-     "            \"  scope_kind = 'repo' AND scope_value = ?) \"\n"
-     "            \"ORDER BY raised_at LIMIT 1\","),
-
-    # NB: an earlier attempt here mutated halt_in_force to call
-    # pending_halt_for(''), which is *equivalent* -- nothing ever delivers to
-    # the empty identity, so it can never be consumed.  The realistic form of
-    # this bug is conflating "this agent has been told" with "the halt is
-    # over", which is what the mutation below actually does.
-    ("marking a halt delivered lifts it, so telling one agent un-halts everyone",
-     "        conn.execute(\n"
-     "            \"INSERT OR IGNORE INTO halt_deliveries (halt_id, identity, \"\n"
-     "            \"delivered_at) VALUES (?,?,?)\", (halt_id, identity, now))\n"
-     "        conn.commit()",
-     "        conn.execute(\n"
-     "            \"INSERT OR IGNORE INTO halt_deliveries (halt_id, identity, \"\n"
-     "            \"delivered_at) VALUES (?,?,?)\", (halt_id, identity, now))\n"
-     "        conn.execute(\"UPDATE halts SET lifted_at = ? WHERE id = ?\",\n"
-     "                     (now, halt_id))\n"
-     "        conn.commit()"),
-
-    ("a halt is announced to every agent again on every poll",
-     "            \"AND NOT EXISTS (SELECT 1 FROM halt_deliveries d \"\n"
-     "            \"                WHERE d.halt_id = h.id AND d.identity = ?) \"",
-     "            \"AND (? IS NOT NULL) \""),
-
-    ("the registry moves into a config dir, reproducing the original defect",
-     '    base = os.environ.get("LOCALAPPDATA")\n'
-     '    root = Path(base) if base else (Path.home() / ".local" / "share")',
-     '    base = os.environ.get("CLAUDE_CONFIG_DIR")\n'
-     '    root = Path(base) if base else (Path.home() / ".claude")'),
-
-    ("paths are not normalised, so one directory looks like several",
-     "        return os.path.normcase(str(Path(p).resolve()))",
-     "        return str(p)"),
-
-    ("an invalid identity is stored rather than refused",
-     "            if not _valid_identity(explicit):",
-     "            if False:"),
-]
-
-MIRROR_MUTATIONS = [
-    ("no mirroring, so every other account sees an EMPTY listing again",
-     "                manifest[str(dest)] = str(g)\n                added += 1",
-     "                pass"),
-
-    ("the auth key is left behind, so a peer can be listed but not messaged",
-     '        group = [src] + list((src_dir / "sessions").glob(f"{stem}.*.key"))',
-     "        group = [src]"),
-
-    ("dead sessions are advertised, so peers look reachable and hang",
-     "            if _pid_is_a_live_claude(pid):\n                live.append((d, f))",
-     "            live.append((d, f))"),
-
-    ("any process with that pid counts, so a recycled pid keeps a ghost listed",
-     '        return psutil.pid_exists(pid) and "claude" in (\n'
-     '            psutil.Process(pid).name() or "").lower()',
-     "        return psutil.pid_exists(pid)"),
-
-    ("mirrors are never reaped, so exited sessions stay advertised forever",
-     "        if not keep:\n            try:\n                os.unlink(dest)\n"
-     "                removed += 1",
-     "        if False:\n            try:\n                os.unlink(dest)\n"
-     "                removed += 1"),
-
-    ("the reaper deletes real advertisements, unregistering live sessions",
-     "    for dest, src in list(manifest.items()):",
-     "    for dest, src in [(str(p), '') for d in dirs "
-     "for p in (d / 'sessions').glob('*.json')]:"),
-
-    ("mirrors are re-mirrored as originals, so the manifest grows without bound",
-     "            if str(f) in manifest:\n                continue",
-     "            if False:\n                continue"),
-
-    ("turning it off removes the originals too",
-     "    for dest in list(manifest):",
-     "    for dest in [str(p) for d in _config_dirs() "
-     "for p in (d / 'sessions').glob('*')]:"),
-]
-
-AGENTTOOLS_MUTATIONS = [
-    ("a messaging tool is added, which the addendum forbids",
-     "    return [raise_halt_tool, lift_halt_tool]",
-     "    return [raise_halt_tool, lift_halt_tool, raise_halt_tool]"),
-
-    ("the halt tool disappears from the tool list, so no agent can find it",
-     "    return [raise_halt_tool, lift_halt_tool]",
-     "    return []"),
-
-    ("the description stops saying WHEN to use it",
-     '    "Use this when you need every agent quiescent before doing something that "',
-     '    "This raises a halt. "'),
-
-    ("a halt with no reason is accepted, so peers are stopped for nothing",
-     '        if not reason:',
-     "        if False:"),
-
-    ("the tool no longer says the halt must be lifted",
-     '    "It is deliberate and rare. It stays in force until you lift it explicitly "',
-     '    "It is deliberate and rare. "'),
-
-    ("raising does not actually raise anything",
-     "        hid = ac.raise_halt(reason, by=by, scope_kind=scope, scope_value=value)",
-     "        hid = 0"),
-
-    ("lifting does not actually lift anything",
-     "        n = ac.lift_halt(scope_kind=scope, scope_value=value)",
-     "        n = 0"),
-
-    ("an unknown scope is silently treated as repo",
-     '    if scope not in ("repo", "machine"):\n'
-     '        raise ValueError(f"scope must be \'repo\' or \'machine\', not {scope!r}")',
-     '    scope = "repo" if scope not in ("repo", "machine") else scope'),
-]
-
-AGENTCLI_MUTATIONS = [
-    ("check-halt exits zero even when halted (the whole contract)",
-     "    print(\"=== HALT IN FORCE -- do not start this operation ===\", file=sys.stderr)",
-     "    return 0\n    print(\"=== HALT IN FORCE ===\", file=sys.stderr)"),
-
-    ("check-halt exits non-zero when clear, so callers learn to ignore it",
-     "        if not args.quiet:\n"
-     "            print(f\"check-halt: clear ({args.scope})\")\n"
-     "        return 0",
-     "        if not args.quiet:\n"
-     "            print(f\"check-halt: clear ({args.scope})\")\n"
-     "        return 1"),
-
-    ("a repo check consults the machine scope, so it never sees its own halt",
-     '    repo = ac.repo_key(cwd) if args.scope == "repo" else ""',
-     '    repo = ""'),
-
-    ("the refusal says nothing about who or why",
-     '    print(f"reason    : {halt.reason}", file=sys.stderr)',
-     ""),
-]
-
 # A halt nobody is left to lift must be recognisable as one: its age, whether
 # its raiser still runs here, commands that work from any project, and a Lift
 # in the lobby (design.md section 9a, "A halt nobody is left to lift").
-HALTCOMMS_MUTATIONS = [
-    ("halts_in_force lists lifted halts too",
-     '"SELECT * FROM halts WHERE lifted_at IS NULL ORDER BY raised_at")]',
-     '"SELECT * FROM halts ORDER BY raised_at")]'),
-
-    ("halts_in_force lists the newest first",
-     '"SELECT * FROM halts WHERE lifted_at IS NULL ORDER BY raised_at")]',
-     '"SELECT * FROM halts WHERE lifted_at IS NULL ORDER BY raised_at DESC")]'),
-
-    ("a raiser whose heartbeat stopped still counts as running",
-     "    return agent is not None and agent.is_live(now)",
-     "    return agent is not None"),
-
-    ("a raiser that left the registry counts as running",
-     "    return agent is not None and agent.is_live(now)",
-     "    return agent is None or agent.is_live(now)"),
-
-    ("the operator is reported as a raiser that has gone",
-     "    if halt.raised_by in (OPERATOR, UNKNOWN_AGENT):\n        return None\n",
-     ""),
-
-    ("the command a session is told to run is relative again (the original bug)",
-     "    return \" \".join([f'python \"{AGENTS_CLI.as_posix()}\"', *args])",
-     "    return \" \".join(['python \"tools/agents.py\"', *args])"),
-
-    ("a halt four days old reads as 96.0h",
-     '    if d < 48 * 3600:\n        return f"{d / 3600:.1f}h ago"\n'
-     '    return f"{d / 86400:.0f} days ago"',
-     '    return f"{d / 3600:.1f}h ago"'),
-]
-
-HALTPROMPT_MUTATIONS = [
-    ("the prompt does not say how old the halt is",
-     '            f"{agent_comms.age_text(halt.raised_at, now)}, at {stamp}: "',
-     '            f"at {stamp}: "'),
-
-    ("a raiser that has gone is never mentioned",
-     "        if raiser_running is False:",
-     "        if False:"),
-
-    ("a raiser that is running, or is nobody, is called gone",
-     "        if raiser_running is False:",
-     "        if not raiser_running:"),
-
-    ("the check command is relative again, so it fails outside this project",
-     "            f\"  {agent_comms.cli_command('check-halt', '--scope', scope)}\\n\"",
-     "            f\"  python tools/agents.py check-halt --scope {scope}\\n\""),
-
-    ("the lift offered is by scope, so it takes a live halt with it",
-     "                f\"  {agent_comms.cli_command('lift', '--id', str(halt.id))}\"",
-     "                f\"  {agent_comms.cli_command('lift', '--scope', scope)}\""),
-
-    ("the poll never asks whether the raiser is running",
-     "                    running = agent_comms.raiser_running(halt, conn=conn)",
-     "                    running = None"),
-
-    ("a failed raiser lookup loses the halt",
-     "                except Exception:\n"
-     "                    running = None      # unknown: the halt is still told",
-     "                except ImportError:\n                    running = None"),
-
-    ("the halt is marked delivered before its text is built, so a failure "
-     "there loses it for good",
-     "                text = self._halt_prompt(halt, running)\n"
-     "                agent_comms.mark_halt_delivered(halt.id, ident, conn=conn)\n",
-     "                agent_comms.mark_halt_delivered(halt.id, ident, conn=conn)\n"
-     "                text = self._halt_prompt(halt, running)\n"),
-]
-
-HALTCLI_MUTATIONS = [
-    ("check-halt's lift hint is the bare default again, which misses a "
-     "machine halt (the original bug)",
-     '          + ac.cli_command("lift", "--id", str(halt.id)), file=sys.stderr)',
-     '          + ac.cli_command("lift"), file=sys.stderr)'),
-
-    ("the hint lifts by scope, taking another halt with it",
-     '          + ac.cli_command("lift", "--id", str(halt.id)), file=sys.stderr)',
-     '          + ac.cli_command("lift", "--scope", halt.scope_kind), file=sys.stderr)'),
-
-    ("lift --id lifts the whole machine scope instead",
-     "        n = ac.lift_halt(halt_id=args.id)",
-     '        n = ac.lift_halt(scope_kind="machine")'),
-
-    ("halt's own lift hint is relative again",
-     '    print("Lift it explicitly with:  " + ac.cli_command("lift", "--id", str(hid)))',
-     '    print("Lift it explicitly with:  agents.py lift --id " + str(hid))'),
-
-    ("check-halt does not say how old the halt is",
-     '    print(f"raised at : {_stamp(halt.raised_at)}  ({ac.age_text(halt.raised_at)})",',
-     '    print(f"raised at : {_stamp(halt.raised_at)}",'),
-
-    ("check-halt does not say the raiser has gone",
-     "    if ac.raiser_running(halt) is False:",
-     "    if False:"),
-]
-
 HALTSERVER_MUTATIONS = [
     ("the full session list drops the halts",
      '        "stale": stale,\n        "halts": halts,\n    }',
@@ -4445,18 +4110,6 @@ RESUMETITLE_BRIDGE_MUTATIONS = [
      ""),
 ]
 
-RESUMETITLE_COMMS_MUTATIONS = [
-    ("deregistering deletes the entry whoever holds it now",
-     "                \"DELETE FROM agents WHERE identity = ? AND session_id IN (?, '')\",\n"
-     "                (identity, session_id))",
-     "                \"DELETE FROM agents WHERE identity = ?\",\n"
-     "                (identity,))"),
-
-    ("an entry registered before its session had an id can never be removed",
-     "session_id IN (?, '')",
-     "session_id = ?"),
-]
-
 # --agent-name names one session, not the hub.  tests/test_agent_name_per_session.py.
 AGENTNAME_MUTATIONS = [
     ("the identity comes from the environment again, which every session in "
@@ -4762,36 +4415,6 @@ AGENTNAME_CFG_MUTATIONS = [
     ("a blank flag hides the variable",
      '    return (flag or "").strip() or (env or "").strip() or None\n',
      '    return (flag or env or "").strip() or None\n'),
-]
-
-AGENTNAME_COMMS_MUTATIONS = [
-    ("a second name for a session does not replace the first",
-     '"name=excluded.name, named_at=excluded.named_at, "',
-     '"named_at=excluded.named_at, "'),
-
-    ("a session given only labels is not remembered",
-     "    if not sid or not (nm or lab):\n",
-     "    if not sid or not nm:\n"),
-
-    ("a blank name and no labels are recorded anyway",
-     "    if not sid or not (nm or lab):\n",
-     "    if not sid:\n"),
-
-    ("a second set of labels does not replace the first",
-     '"labels=excluded.labels",',
-     '"named_at=excluded.named_at",'),
-
-    ("remembered labels are never read back",
-     '    return (row["name"] or None), {str(k): str(v) for k, v in labels.items()}\n',
-     '    return (row["name"] or None), {}\n'),
-
-    ("a labels-only record reads as a session named ''",
-     '    return (row["name"] or None), {str(k): str(v) for k, v in labels.items()}\n',
-     '    return row["name"], {str(k): str(v) for k, v in labels.items()}\n'),
-
-    ("a registry from before labels were remembered cannot record them",
-     '        if "labels" not in cols:\n',
-     "        if False:\n"),
 ]
 
 AGENTNAME_STATE_MUTATIONS = [
@@ -8104,8 +7727,6 @@ TARGETS = {
                            RESUMETITLE_SERVER_MUTATIONS, "pytest"),
     "resumetitle-bridge": ("sdk_bridge.py", "tests/test_resume_by_title.py",
                            RESUMETITLE_BRIDGE_MUTATIONS, "pytest"),
-    "resumetitle-comms": ("agent_comms.py", "tests/test_resume_by_title.py",
-                          RESUMETITLE_COMMS_MUTATIONS, "pytest"),
     "agentname": ("sdk_bridge.py", "tests/test_agent_name_per_session.py",
                   AGENTNAME_MUTATIONS, "pytest"),
     "agentname-server": ("server.py", "tests/test_agent_name_per_session.py",
@@ -8114,8 +7735,6 @@ TARGETS = {
                          LAUNCHLOG_SERVER_MUTATIONS, "pytest"),
     "agentname-cfg": ("config.py", "tests/test_agent_name_per_session.py",
                       AGENTNAME_CFG_MUTATIONS, "pytest"),
-    "agentname-comms": ("agent_comms.py", "tests/test_agent_name_per_session.py",
-                        AGENTNAME_COMMS_MUTATIONS, "pytest"),
     "agentname-state": ("state.py", "tests/test_agent_name_per_session.py",
                         AGENTNAME_STATE_MUTATIONS, "pytest"),
     "agentname-cmd": ("commands.py", "tests/test_agent_name_per_session.py",
@@ -8153,22 +7772,6 @@ TARGETS = {
                    QUEUEPANEL_MUTATIONS, "pytest"),
     "idle": ("server.py", "tests/test_idle_teardown.py",
              IDLE_MUTATIONS, "pytest"),
-    "checklist": ("agent_comms.py", "tests/test_agent_comms_checklist.py",
-                  CHECKLIST_MUTATIONS, "pytest"),
-    "agentcomms": ("agent_comms.py", "tests/test_agent_comms.py",
-                   AGENTCOMMS_MUTATIONS, "pytest"),
-    "mirror": ("agent_comms.py", "tests/test_agent_comms_surfacing.py",
-               MIRROR_MUTATIONS, "pytest"),
-    "agenttools": ("agent_tools.py", "tests/test_agent_comms_surfacing.py",
-                   AGENTTOOLS_MUTATIONS, "pytest"),
-    "agentcli": ("tools/agents.py", "tests/test_agent_comms.py",
-                 AGENTCLI_MUTATIONS, "pytest"),
-    "halt-comms": ("agent_comms.py", "tests/test_halt_surfacing.py",
-                   HALTCOMMS_MUTATIONS, "pytest"),
-    "halt-prompt": ("sdk_bridge.py", "tests/test_halt_surfacing.py",
-                    HALTPROMPT_MUTATIONS, "pytest"),
-    "halt-cli": ("tools/agents.py", "tests/test_halt_surfacing.py",
-                 HALTCLI_MUTATIONS, "pytest"),
     "halt-server": ("server.py", "tests/test_halt_surfacing.py",
                     HALTSERVER_MUTATIONS, "pytest"),
     "halt-lobby": ("static/lobby.js", "tests/lobby_halts.test.js",
