@@ -1,5 +1,58 @@
 # Known issues / tech debt — orchestrator2
 
+## The stall probe looks for a `D:` session's output under the UNC name — OPEN (2026-10-21)
+
+`bg_stall.task_output_path` resolves the session's cwd (`Path.resolve`) before
+turning it into the CLI's project directory name. On this machine `D:`
+resolves to the loopback share `\\DESKTOP-T84VAT6\D`, so a session started in
+`D:\visual studio projects\backup` is looked for under
+`claude/--DESKTOP-T84VAT6-D-visual-studio-projects-backup/`, while the CLI
+writes it under `claude/D--visual-studio-projects-backup/` (both exist side by
+side in `%TEMP%\claude`; the CLI keeps a cwd as given). So the probe that
+notices a stalled background task finds no output file for any `D:` session
+here. `tests/test_bg_stall.py::test_the_output_path_matches_the_cli_layout`
+fails on this machine for that reason, on `HEAD` as well. The likely fix is to
+stop resolving (`os.path.abspath` keeps the drive letter); first find out why
+it resolves at all: a junction such as `D:\bl` may be the reason.
+
+## Three tests fail on a slow or long run — OPEN (2026-10-21)
+
+All three fail on `HEAD` as well; found by a full run from the loopback share,
+which took 2 h 20 min.
+
+* `tests/test_resume_after_limit.py` (9 tests) computes `RESET = int(NOW) +
+  3600` once, at import. A run that reaches them more than an hour after
+  collection starts finds the reset in the past, and the bridge (correctly)
+  schedules from the clamp instead. They pass when run alone. Fix: compute the
+  reset inside each test, or in a fixture.
+* `tests/test_stale_sources.py::test_the_check_is_cached` calls
+  `stale_sources()` twice and expects one scan inside `_STALE_CACHE_TTL`
+  (10 s). When stat-ing every loaded module takes longer than that, as over
+  the share, the second call is outside the TTL. Fix: freeze the clock
+  (`server.time.monotonic`) in the test rather than relying on speed.
+* `tests/test_model_list.py::test_a_hanging_api_does_not_hang_the_command`
+  (blocked 53 s against a 2 s budget) and
+  `::test_a_second_show_moments_later_does_not_refetch` (fetched twice) fail
+  on this machine on a quiet run too, outside the full suite. Not yet
+  investigated: 53 s is far beyond any load, so this may be a real defect in
+  the budget rather than in the test.
+
+## A halt nobody was left to lift told every new session to stop — FIXED (2026-10-21)
+
+Lane-F raised a machine halt for a PC migration on 2026-10-17 and moved with
+SlateOS to the new PC; the halt was never lifted here, and for four days every
+new session opened to the same "HALT … stop taking new work" prompt (20
+deliveries). Lifted by hand on 2026-10-21. Three defects made it hard to see
+and to clear: the prompt never said how old the halt was or that its raiser
+was gone; nothing outside the CLI listed halts; and both commands the prompt
+and `check-halt` printed were wrong somewhere: `python tools/agents.py` is a
+relative path that exists only in this project, and `check-halt`'s bare
+`agents.py lift` takes the repo scope by default, so it lifts nothing when
+the halt is machine-wide. See design.md §9a, "A halt nobody is left to
+lift". Tests: `tests/test_halt_surfacing.py`, `tests/lobby_halts.test.js`;
+mutation targets `halt-comms`, `halt-prompt`, `halt-cli`, `halt-server`,
+`halt-lobby` (39 mutants, all caught).
+
 ## `--resume` refused a session in another directory when `--cwd` was given — FIXED (2026-10-21)
 
 > "this contradicts what you said earlier, that a resume can be done from any
