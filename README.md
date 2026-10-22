@@ -15,10 +15,10 @@ A web-based orchestrator for the Claude Agent SDK. Wraps Claude Code's agentic c
 pip install -r requirements.txt
 ```
 
-After pulling a newer orchestrator2, run it again with `--upgrade`
-(`pip install --upgrade -r requirements.txt`): the agent-comms package comes
-from a git tag, and pip keeps an installed one however old it is. orchestrator2
-says so, and does not start, when the one installed is too old.
+After pulling a newer orchestrator2, run it again. The agent-comms package
+comes from a git tag, and pip keeps an installed one however old it is: when
+the one installed is too old, orchestrator2 says so at start, with the command
+that upgrades it.
 
 **3. Sign in to your Claude account**
 

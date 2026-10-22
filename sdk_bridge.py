@@ -73,6 +73,10 @@ except Exception:  # pragma: no cover - defensive
         "agent-comms could not be imported: no session will be registered, told "
         "of a halt or given the halt tools", exc_info=True)
 
+#: The --mcp-config values already warned of as unreadable.
+_UNREADABLE_MCP_CONFIGS: set[str] = set()
+
+
 def mcp_servers_of(value: str, cwd: str) -> dict[str, Any] | None:
     """The MCP servers a ``--mcp-config`` *value* names, by name, or None when
     it is neither inline JSON nor a JSON file this can read.
@@ -1107,6 +1111,9 @@ class SDKBridge:
         # next (_take_session_id) by the next poll, before it tells anything.
         self._unnamed_conversation: str | None = None
         self._halt_carries: list[tuple[str, str]] = []
+        # Counts the conversations this bridge has run, so a poll can tell
+        # that the one it asked for ended while it asked (_new_conversation).
+        self._conversation_epoch = 0
 
         # Set while a queue_update push is already scheduled, so a burst of
         # appends (an agent-comms poll delivering three messages at once) costs
@@ -1170,6 +1177,8 @@ class SDKBridge:
         rather than starting another, as a new CLI's does.
         """
         old = self.state.session_id
+        if old and old != sid and not same_conversation:
+            self._new_conversation()
         if old != sid and agent_comms is not None:
             # The halts this conversation was told of go with it to its new
             # key: from the one it had before its first id, or across a trim.
@@ -1530,10 +1539,13 @@ class SDKBridge:
             theirs = mcp_servers_of(self.config.mcp_config, self.config.cwd)
             if theirs is None:
                 # Passed on as given, for the CLI to read or refuse; there is
-                # no adding ours to what this could not read.
-                log.warning("--mcp-config %r is neither a JSON file nor JSON: "
-                            "the halt tools are not added beside it",
-                            self.config.mcp_config)
+                # no adding ours to what this could not read.  Said once: the
+                # options are built at every connect.
+                if self.config.mcp_config not in _UNREADABLE_MCP_CONFIGS:
+                    _UNREADABLE_MCP_CONFIGS.add(self.config.mcp_config)
+                    log.warning("--mcp-config %r is neither a JSON file nor JSON: "
+                                "the halt tools are not added beside it",
+                                self.config.mcp_config)
                 kwargs["mcp_servers"] = self.config.mcp_config
             else:
                 servers.update(theirs)
@@ -7364,7 +7376,7 @@ class SDKBridge:
         if state.session_id:
             self._report_session_id(state.session_id)
         state.session_id = None
-        self._unnamed_conversation = None   # a new conversation, never told
+        self._new_conversation()
         state.session_title = None
         state.context_tokens = 0
         state.turns = 0
@@ -7711,22 +7723,43 @@ class SDKBridge:
                 log.warning("agent registration %r had vanished; restoring it",
                             self.agent_identity)
                 await self._republish_agent()
-        if now - self._agent_poll_at < AGENT_POLL_INTERVAL:
+        # A carry waits for no interval: until it is made, a restart would
+        # leave the conversation untold under its new key.
+        if now - self._agent_poll_at < AGENT_POLL_INTERVAL and not self._halt_carries:
             return
         self._agent_poll_at = now
         # On this thread, where the session id changes: the key and the
         # carries a poll works with are one moment's.
         key = self._halt_key()
         carries, self._halt_carries = self._halt_carries, []
+        epoch = self._conversation_epoch
         try:
             parts = await asyncio.to_thread(self._collect_agent_comms, key, carries)
         except Exception:
             self._halt_carries[:0] = carries    # carrying twice changes nothing
             log.debug("agent comms poll failed", exc_info=True)
             return
+        if self._conversation_epoch != epoch:
+            # Asked for a conversation that has ended: its halt is not the
+            # new one's, which is told under its own key.
+            parts = [p for p in parts if not p.startswith(agent_comms.HALT_PROMPT_PREFIX)]
         for text in parts:
             if text not in self.state.queued_prompts:
                 self.state.queued_prompts.append(text)
+
+    def _new_conversation(self) -> None:
+        """The conversation this bridge runs is another from here on (a
+        /clear; a CLI that started another session).  It is told of halts
+        under a key of its own, so a halt prompt still queued for the last one
+        goes -- delivered, it would be told twice -- as does one a poll in
+        flight brings back for it (``_conversation_epoch``)."""
+        self._unnamed_conversation = None
+        self._conversation_epoch += 1
+        if agent_comms is None:
+            return
+        for text in [p for p in self.state.queued_prompts
+                     if isinstance(p, str) and p.startswith(agent_comms.HALT_PROMPT_PREFIX)]:
+            self.state.queued_prompts.remove(text)
 
     def _halt_key(self) -> str:
         """The key this conversation is told of halts under: its session's,

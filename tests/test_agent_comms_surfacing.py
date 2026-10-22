@@ -117,6 +117,16 @@ def test_an_mcp_config_this_cannot_read_is_passed_on_as_given(tmp_path):
     assert _servers(tmp_path, "--mcp-config", "no-such-file.json") == "no-such-file.json"
 
 
+def test_an_unreadable_mcp_config_is_warned_of_once(tmp_path, monkeypatch, caplog):
+    """The options are built at every connect: a warning each time would bury
+    the one that mattered."""
+    import sdk_bridge
+    monkeypatch.setattr(sdk_bridge, "_UNREADABLE_MCP_CONFIGS", set())
+    for _ in range(3):
+        _servers(tmp_path, "--mcp-config", "no-such-file.json")
+    assert sum("neither a JSON file nor JSON" in r.getMessage() for r in caplog.records) == 1
+
+
 def test_a_server_of_theirs_by_the_halt_tools_name_wins(tmp_path):
     servers = _servers(tmp_path, "--mcp-config", json.dumps({"agent-halt": MINE}))
     assert servers["agent-halt"] == MINE

@@ -1508,8 +1508,26 @@ HALTBRIDGE_MUTATIONS = [
      "        carries, self._halt_carries = [], []"),
 
     ("a conversation cleared before its first id keeps its key",
-     "        self._unnamed_conversation = None   # a new conversation, never told\n",
-     ""),
+     "        self._unnamed_conversation = None\n        self._conversation_epoch += 1\n",
+     "        self._conversation_epoch += 1\n"),
+
+    ("a halt queued for a conversation that ended is told to the next as well",
+     "        for text in [p for p in self.state.queued_prompts\n"
+     "                     if isinstance(p, str) and p.startswith(agent_comms.HALT_PROMPT_PREFIX)]:\n"
+     "            self.state.queued_prompts.remove(text)",
+     "        pass"),
+
+    ("a CLI that started another session keeps the last one's queued halt",
+     "        if old and old != sid and not same_conversation:\n            self._new_conversation()",
+     "        if False:\n            self._new_conversation()"),
+
+    ("a poll answered after a /clear queues the ended conversation's halt",
+     "        if self._conversation_epoch != epoch:",
+     "        if False:"),
+
+    ("a carry waits out the poll interval, which a restart can fall in",
+     "        if now - self._agent_poll_at < AGENT_POLL_INTERVAL and not self._halt_carries:",
+     "        if now - self._agent_poll_at < AGENT_POLL_INTERVAL:"),
 
     ("the agent is told of the halt it raised",
      "                key, agent=ident, repo=self._agent_repo, conn=conn)",
@@ -1542,6 +1560,10 @@ MCPCONFIG_MUTATIONS = [
      '                kwargs["mcp_servers"] = self.config.mcp_config',
      "                pass"),
 
+    ("an unreadable --mcp-config is warned of at every connect",
+     "                if self.config.mcp_config not in _UNREADABLE_MCP_CONFIGS:",
+     "                if True:"),
+
     ("the halt server runs without -P, so a checkout's own agent_comms wins",
      "    command = agent_comms.server_command()",
      '    command = [sys.executable, "-m", "agent_comms.server"]'),
@@ -1554,12 +1576,24 @@ PREFLIGHT_MUTATIONS = [
      ""),
 
     ("an agent-comms too old for this code is let through",
-     "        if _release(have) < floor:",
+     "        if _older_than(have, floor):",
      "        if False:"),
 
+    ("1.1 reads as older than 1.1.0",
+     "    return have + (0,) * (width - len(have)) < floor + (0,) * (width - len(floor))",
+     "    return have < floor"),
+
+    ("a stale package is upgraded along with every other",
+     "f'\"{_requirement_line(requirements, dist)}\"')",
+     "f'-r {requirements}')"),
+
     ("the hub's sessions get the hook as well as the bridge",
-     '    os.environ[agent_comms.TOLD_BY_ENV] = "orchestrator2"',
+     '    os.environ[agent_comms.TOLD_BY_ENV] = f"orchestrator2:{os.getpid()}"',
      "    pass"),
+
+    ("the teller names no process, so a claude started in a session is never told",
+     '    os.environ[agent_comms.TOLD_BY_ENV] = f"orchestrator2:{os.getpid()}"',
+     '    os.environ[agent_comms.TOLD_BY_ENV] = "orchestrator2"'),
 
     ("one caller's name is lent to every session",
      "    os.environ.pop(NAME_ENV, None)\n",

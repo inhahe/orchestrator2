@@ -154,11 +154,14 @@ a Windows Python and a WSL `python3` can both run this file.
 `_require_dependencies()` closes that: it `find_spec`s every required
 distribution (locating without importing, so the lazy imports stay lazy) and
 prints all the missing ones at once, `sys.executable`, and the exact
-`pip install --upgrade -r requirements.txt` line to run. A package older than
-`_MIN_VERSIONS` allows is refused the same way: agent-comms comes from a git
-URL, which pip counts as satisfied by any installed release, so a hub updated
-by `git pull` alone would otherwise run against an older one and lose its halts
-to errors logged at DEBUG. It is called **after every path
+`pip install -r requirements.txt` line to run. A package older than
+`_MIN_VERSIONS` allows is refused the same way, with the upgrade of that one
+package (`pip install --upgrade "<its requirements line>"`; `--upgrade -r`
+would move every package to its newest release too): agent-comms comes from a
+git tag, which pip counts as satisfied by any installed release, so a hub
+updated by `git pull` alone would otherwise run against an older one and lose
+its halts to errors logged at DEBUG. Releases compare with missing numbers read
+as 0 (`_older_than`: `1.1` is `1.1.0`). It is called **after every path
 that exits without serving and before the splash pre-server starts** — earlier
 would reject hub joins that need none of those packages, later would leave a
 splash listening on a bound socket with a traceback behind it.
@@ -4559,12 +4562,19 @@ conversation one: before its first session id it is told under a key of its
 own (`agent_comms.conversation_key`), and when the id arrives, or a context
 trim starts a new transcript (`_take_session_id(…, same_conversation=True)`),
 the next poll carries what it was told to the new key (`carry_told`) before it
-tells anything. A halt the session's agent raised is never told to it. The hub
-sets `AGENT_COMMS_TOLD_BY=orchestrator2` in its environment at start
+tells anything, at the next tick rather than the next poll. When the
+conversation ends (`_new_conversation`: a /clear, a CLI that started another
+session), a halt prompt still queued for it is dropped, and one a poll in
+flight brings back for it is not queued (`_conversation_epoch`): the next
+conversation is told under its own key, and would otherwise hear it twice. A
+halt the session's agent raised is never told to it. The hub sets
+`AGENT_COMMS_TOLD_BY=orchestrator2:<its pid>` in its environment at start
 (`server._prepare_agent_comms_env`), which every CLI it runs inherits, so the
 package's hook, if the account has it, leaves these sessions to the bridge: it
 would otherwise tell a new conversation a second time in its first turn, before
-the bridge had heard of its session id. The same start removes
+the bridge had heard of its session id. The pid lets the hook tell them from a
+`claude` an agent starts from its Bash tool, a `claude -p` review say, which
+inherits the variable but which no bridge tells. The same start removes
 `AGENT_COMMS_NAME`, which names one caller and would sign every session's CLI
 halts and messages. A new session id also makes the next tick heartbeat, so the
 registration, by which the halt server finds whose halt it raises, carries the

@@ -17,6 +17,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -131,13 +133,77 @@ def test_a_conversation_told_before_its_first_session_id_keeps_it(tmp_path):
     assert ac.pending_halt_for(ac.session_key("sb-first")) is None
 
 
-def test_a_trimmed_conversation_is_not_told_again(tmp_path):
-    """A context trim starts a new transcript for the same conversation."""
+@pytest.mark.parametrize("ends", ["clear", "another CLI session"])
+def test_a_halt_queued_for_a_conversation_that_ended_is_not_told_twice(tmp_path, ends):
+    """Queued, not yet delivered, when the conversation ended: delivered to
+    the next one, which is then told under its own key, it would be twice."""
     st, poll = _bridge_and_poll(tmp_path)
+    ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
+    st.queued_prompts.append("carry on with the build")
+    poll()
+    assert len(st.queued_prompts) == 2
+    if ends == "clear":
+        _clear(poll.bridge)
+    else:
+        poll.bridge._take_session_id("sb-other")
+    poll()
+    halts = [p for p in st.queued_prompts if p.startswith(ac.HALT_PROMPT_PREFIX)]
+    assert len(halts) == 1, st.queued_prompts
+    assert "carry on with the build" in st.queued_prompts, "a prompt the operator queued went too"
+
+
+def test_a_poll_that_comes_back_after_the_conversation_ended_queues_no_halt(tmp_path):
+    """Asked for one conversation, answered after a /clear: its halt is not
+    the next one's."""
+    st, poll = _bridge_and_poll(tmp_path)
+    br = poll.bridge
+    ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
+    real = br._collect_agent_comms
+
+    def cleared_meanwhile(key, carries):
+        out = real(key, carries)
+        br._conversation_epoch += 1         # what a /clear does while it is out
+        return out
+    br._collect_agent_comms = cleared_meanwhile
+    poll()
+    assert list(st.queued_prompts) == []
+
+
+def test_a_carry_is_made_at_the_next_tick_not_the_next_poll(tmp_path):
+    """Waiting out the poll interval, a restart in it would lose the carry."""
+    st, poll = _bridge_and_poll(tmp_path)
+    br = poll.bridge
+    st.session_id = None
+    ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
+    poll()
+    br._take_session_id("sb-first")
+    br._agent_poll_at = time.monotonic()                # it has just polled
+    asyncio.run(br.poll_agent_comms())
+    assert ac.pending_halt_for(ac.session_key("sb-first")) is None
+
+
+def test_a_trimmed_conversation_is_not_told_again(tmp_path, monkeypatch):
+    """A context trim starts a new transcript for the same conversation: run
+    as the bridge runs it, between turns."""
+    import dataclasses
+
+    import sdk_bridge
+    st, poll = _bridge_and_poll(tmp_path)
+    br = poll.bridge
     ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
     poll()
     st.queued_prompts.clear()
-    poll.bridge._take_session_id("sb-trimmed", same_conversation=True)
+
+    async def nothing(*_a, **_k):
+        return None
+    monkeypatch.setattr(sdk_bridge, "trim_session", lambda sid, proj, max_ctx: "sb-trimmed")
+    br.config = dataclasses.replace(br.config, max_context_tokens=100)
+    st.context_tokens = 500
+    br.reconnect = nothing
+    br._maybe_recycle_cli = nothing
+    br._await_next_prompt = nothing
+    asyncio.run(br._between_turns("done", False))
+    assert st.session_id == "sb-trimmed", "no trim ran"
     poll()
     assert list(st.queued_prompts) == []
 

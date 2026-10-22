@@ -201,7 +201,10 @@ def _prepare_agent_comms_env() -> None:
     from agent_comms.cli import NAME_ENV
 
     os.environ.pop(NAME_ENV, None)
-    os.environ[agent_comms.TOLD_BY_ENV] = "orchestrator2"
+    # With this process's pid: the hook leaves a session to orchestrator2
+    # only when this process started its CLI, not every `claude` that
+    # inherits the variable from one of them.
+    os.environ[agent_comms.TOLD_BY_ENV] = f"orchestrator2:{os.getpid()}"
 
 
 def _detach_child_env(cfg: Config) -> dict[str, str]:
@@ -1624,9 +1627,11 @@ async def _tick_runtime(rt: SessionRuntime) -> bool:
         _mirror_at = _now
         try:
             import agent_comms as _ac
-            # This hub's own account may live outside ~/.claude*.
-            dirs = _ac.config_dirs([hub_account()])
-            added, removed = await asyncio.to_thread(_ac.mirror_peer_registries, dirs)
+            # This hub's own account may live outside ~/.claude*.  Found in the
+            # thread too: it stats every ~/.claude* entry.
+            account = hub_account()
+            added, removed = await asyncio.to_thread(
+                lambda: _ac.mirror_peer_registries(_ac.config_dirs([account])))
             if added or removed:
                 log.info("peer registry mirror: +%d -%d", added, removed)
         except Exception:
@@ -6538,6 +6543,28 @@ def _release(version: str) -> tuple[int, ...]:
     return tuple(out)
 
 
+def _older_than(version: str, floor: tuple[int, ...]) -> bool:
+    """Whether *version* is a release before *floor*, missing numbers read as
+    0: ``1.1`` is ``1.1.0``, where tuples alone would put ``(1, 1)`` first."""
+    have = _release(version)
+    width = max(len(have), len(floor))
+    return have + (0,) * (width - len(have)) < floor + (0,) * (width - len(floor))
+
+
+def _requirement_line(requirements: Path, dist: str) -> str:
+    """*dist*'s line in the requirements file *requirements*, which says where
+    it comes from (a git tag, for agent-comms); the bare name without one."""
+    try:
+        lines = requirements.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return dist
+    for line in lines:
+        line = line.strip()
+        if re.match(rf"{re.escape(dist)}(?![\w.-])", line, re.IGNORECASE):
+            return line
+    return dist
+
+
 def _require_dependencies() -> None:
     """Fail with an actionable message, not a traceback, if deps are missing.
 
@@ -6569,25 +6596,31 @@ def _require_dependencies() -> None:
             found = False
         if not found:
             missing.append(dist)
-    stale: list[str] = []
+    stale: dict[str, str] = {}      # distribution -> what to say of it
     for dist, floor in _MIN_VERSIONS.items():
         try:
             have = importlib.metadata.version(dist)
         except importlib.metadata.PackageNotFoundError:
             continue    # missing above, or on the path without metadata
-        if _release(have) < floor:
-            stale.append(f"{dist} {have} (needs {'.'.join(map(str, floor))} or newer)")
+        if _older_than(have, floor):
+            stale[dist] = f"{dist} {have} (needs {'.'.join(map(str, floor))} or newer)"
     if not missing and not stale:
         return
 
+    requirements = Path(__file__).resolve().parent / "requirements.txt"
     if missing:
         print(f"orchestrator2 can't start: missing {len(missing)} required "
               f"package(s): {', '.join(missing)}")
     if stale:
-        print(f"orchestrator2 can't start: too old: {', '.join(stale)}")
+        print(f"orchestrator2 can't start: too old: {', '.join(stale.values())}")
     print(f"  Interpreter: {sys.executable}")
-    print(f"  Install with: {sys.executable} -m pip install --upgrade -r "
-          f"{Path(__file__).resolve().parent / 'requirements.txt'}")
+    if missing:
+        print(f"  Install with: {sys.executable} -m pip install -r {requirements}")
+    for dist in stale:
+        # That one alone: --upgrade -r would move every package listed to its
+        # newest release as well.
+        print(f'  Upgrade with: {sys.executable} -m pip install --upgrade '
+              f'"{_requirement_line(requirements, dist)}"')
     if sys.platform != "win32":
         print("  (This is not the Windows Python. If you meant to use the "
               "Windows install, run it from Windows — a server started here "

@@ -109,7 +109,7 @@ def test_the_message_gives_a_runnable_install_command(monkeypatch, capsys):
         server._require_dependencies()
 
     out = capsys.readouterr().out
-    assert "-m pip install --upgrade -r" in out
+    assert "-m pip install -r" in out
     assert str(REQ_TXT) in out
 
 
@@ -133,7 +133,10 @@ def test_an_agent_comms_older_than_this_code_needs_stops_the_launch(monkeypatch,
         server._require_dependencies()
     out = capsys.readouterr().out
     assert "too old: agent-comms 0.9.2 (needs 1.0.0 or newer)" in out
-    assert "--upgrade" in out, "plain pip install keeps the old one"
+    line = next(ln.strip() for ln in REQ_TXT.read_text(encoding="utf-8").splitlines()
+                if ln.startswith("agent-comms"))
+    assert f'-m pip install --upgrade "{line}"' in out, "plain pip install keeps the old one"
+    assert "--upgrade -r" not in out, "would move every package to its newest release"
 
 
 def test_an_agent_comms_new_enough_passes(monkeypatch, capsys):
@@ -145,7 +148,9 @@ def test_an_agent_comms_new_enough_passes(monkeypatch, capsys):
 
 def test_a_release_is_read_from_its_leading_numbers():
     assert server._release("1.2.0.dev3") == (1, 2, 0)
-    assert server._release("1.10") > server._release("1.9.9")
+    assert server._older_than("1.9.9", (1, 10))
+    assert not server._older_than("1.1", (1, 1, 0)), "1.1 is 1.1.0"
+    assert server._older_than("1.0.9", (1, 1, 0))
 
 
 def test_the_distribution_name_is_reported_not_the_module_name(monkeypatch, capsys):
@@ -221,6 +226,13 @@ def test_checking_does_not_import_the_dependencies(monkeypatch):
 
 
 # --- what is (and is not) required -----------------------------------------
+
+def test_agent_comms_is_required():
+    """The registry, the halts and the halt tools: a hub without it would run
+    with none of them, and say so nowhere."""
+    assert server._REQUIRED_MODULES.get("agent_comms") == "agent-comms"
+    assert "agent-comms" in server._MIN_VERSIONS
+
 
 def test_graphifyy_is_not_required():
     """It is named in a prompt for the agent to run, never imported by us."""
@@ -353,4 +365,5 @@ def test_the_hub_tells_its_sessions_itself_and_lends_them_no_name(monkeypatch):
     monkeypatch.delenv(agent_comms.TOLD_BY_ENV, raising=False)
     server._prepare_agent_comms_env()
     assert NAME_ENV not in os.environ
-    assert os.environ[agent_comms.TOLD_BY_ENV] == "orchestrator2"
+    assert os.environ[agent_comms.TOLD_BY_ENV] == f"orchestrator2:{os.getpid()}", \
+        "the hook could not tell this hub's sessions from a claude started in one"
