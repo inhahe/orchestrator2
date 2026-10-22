@@ -231,11 +231,16 @@ def cmd_halt(args) -> int:
           + (f" {value}" if value else "") + f") by {by}: {args.reason}")
     print("Every agent in scope is asked to stop at its next clean point, and")
     print("any operation that calls check-halt will refuse to start.")
-    print("Lift it explicitly with:  agents.py lift --scope " + args.scope)
+    print("Lift it explicitly with:  " + ac.cli_command("lift", "--id", str(hid)))
     return 0
 
 
 def cmd_lift(args) -> int:
+    if args.id is not None:
+        n = ac.lift_halt(halt_id=args.id)
+        print(f"halt {args.id} lifted" if n else
+              f"halt {args.id} was not in force")
+        return 0
     cwd = args.cwd or os.getcwd()
     value = ac.repo_key(cwd) if args.scope == "repo" else ""
     n = ac.lift_halt(scope_kind=args.scope, scope_value=value)
@@ -255,7 +260,8 @@ def cmd_check_halt(args) -> int:
     print("=== HALT IN FORCE -- do not start this operation ===", file=sys.stderr)
     by = halt.raised_by
     if ac.raiser_running(halt) is False:
-        by += "  (no live session on this machine now)"
+        by += "  (not registered as running on this machine)"
+    print(f"halt      : {halt.id}", file=sys.stderr)
     print(f"raised by : {by}", file=sys.stderr)
     print(f"raised at : {_stamp(halt.raised_at)}  ({ac.age_text(halt.raised_at)})",
           file=sys.stderr)
@@ -265,10 +271,12 @@ def cmd_check_halt(args) -> int:
     print("", file=sys.stderr)
     print("This is not a failure of your operation -- it is a deliberate stop.",
           file=sys.stderr)
-    # The halt's own scope, not this check's: `check-halt --scope repo` also
-    # reports a machine halt, which `lift`'s default (repo) would not touch.
+    # By id, not by scope: a scope lift takes every halt in the scope with it
+    # (one still protecting live work, too), a repo one resolves the
+    # repository from wherever it is pasted, and `check-halt --scope repo`
+    # also reports machine halts, which `lift`'s default scope would miss.
     print("It is lifted explicitly, never on a timer:  "
-          + ac.cli_command("lift", "--scope", halt.scope_kind), file=sys.stderr)
+          + ac.cli_command("lift", "--id", str(halt.id)), file=sys.stderr)
     return 1
 
 
@@ -453,7 +461,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(fn=cmd_halt)
 
     p = sub.add_parser("lift", help="lift a halt (explicit, never a timer)")
-    p.add_argument("--scope", choices=("repo", "machine"), default="repo")
+    p.add_argument("--scope", choices=("repo", "machine"), default="repo",
+                   help="lift every halt in this scope")
+    p.add_argument("--id", type=int,
+                   help="lift this one halt instead (halt and check-halt "
+                        "print its id)")
     p.set_defaults(fn=cmd_lift)
 
     p = sub.add_parser("check-halt",

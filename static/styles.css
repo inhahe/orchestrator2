@@ -1885,7 +1885,9 @@ html, body {
    and next to the Restart button, which is the entire remedy.  Warning-
    coloured rather than error-coloured: nothing is broken, but what you are
    looking at may not be what is on disk. */
-.lobby-stale {
+/* The warning bands above the session lists: stale code, and each halt. */
+.lobby-stale,
+.lobby-halt {
   margin: 0 0 14px;
   padding: 10px 14px;
   border: 1px solid var(--system-warning, #e0af68);
@@ -1896,7 +1898,8 @@ html, body {
   font-size: 12.5px;
   line-height: 1.5;
 }
-.lobby-stale b { color: var(--system-warning, #e0af68); }
+.lobby-stale b,
+.lobby-halt b { color: var(--system-warning, #e0af68); }
 .lobby-stale-files {
   display: block;
   margin-top: 4px;
@@ -1911,17 +1914,7 @@ html, body {
   display: flex;
   align-items: flex-start;
   gap: 12px;
-  margin: 0 0 14px;
-  padding: 10px 14px;
-  border: 1px solid var(--system-warning, #e0af68);
-  border-left-width: 3px;
-  border-radius: var(--radius);
-  background: rgba(224, 175, 104, 0.08);
-  color: var(--text);
-  font-size: 12.5px;
-  line-height: 1.5;
 }
-.lobby-halt b { color: var(--system-warning, #e0af68); }
 .lobby-halt-text { flex: 1 1 auto; min-width: 0; }
 .lobby-halt-reason {
   display: block;
@@ -1943,9 +1936,10 @@ html, body {
   white-space: nowrap;
   transition: background 0.12s, color 0.12s;
 }
+/* Dark on the amber: white on it is about 1.9:1. */
 .lobby-halt-lift:hover:not(:disabled) {
   background: var(--system-warning, #e0af68);
-  color: #fff;
+  color: var(--bg, #1a1a2e);
 }
 .lobby-halt-lift:disabled { opacity: 0.6; cursor: default; }
 

@@ -1689,8 +1689,8 @@ HALTPROMPT_MUTATIONS = [
      '            f"at {stamp}: "'),
 
     ("a raiser that has gone is never mentioned",
-     "        if raiser_running is False:\n            text += (",
-     "        if False:\n            text += ("),
+     "        if raiser_running is False:",
+     "        if False:"),
 
     ("a raiser that is running, or is nobody, is called gone",
      "        if raiser_running is False:",
@@ -1700,24 +1700,44 @@ HALTPROMPT_MUTATIONS = [
      "            f\"  {agent_comms.cli_command('check-halt', '--scope', scope)}\\n\"",
      "            f\"  python tools/agents.py check-halt --scope {scope}\\n\""),
 
-    ("the lift offered takes the default scope, not the halt's",
-     "                f\"  {agent_comms.cli_command('lift', '--scope', scope)}\"",
-     "                f\"  {agent_comms.cli_command('lift')}\""),
+    ("the lift offered is by scope, so it takes a live halt with it",
+     "                f\"  {agent_comms.cli_command('lift', '--id', str(halt.id))}\"",
+     "                f\"  {agent_comms.cli_command('lift', '--scope', scope)}\""),
 
     ("the poll never asks whether the raiser is running",
-     "                    halt, agent_comms.raiser_running(halt, conn=conn)))",
-     "                    halt, None))"),
+     "                    running = agent_comms.raiser_running(halt, conn=conn)",
+     "                    running = None"),
+
+    ("a failed raiser lookup loses the halt",
+     "                except Exception:\n"
+     "                    running = None      # unknown: the halt is still told",
+     "                except ImportError:\n                    running = None"),
+
+    ("the halt is marked delivered before its text is built, so a failure "
+     "there loses it for good",
+     "                text = self._halt_prompt(halt, running)\n"
+     "                agent_comms.mark_halt_delivered(halt.id, ident, conn=conn)\n",
+     "                agent_comms.mark_halt_delivered(halt.id, ident, conn=conn)\n"
+     "                text = self._halt_prompt(halt, running)\n"),
 ]
 
 HALTCLI_MUTATIONS = [
     ("check-halt's lift hint is the bare default again, which misses a "
      "machine halt (the original bug)",
-     '          + ac.cli_command("lift", "--scope", halt.scope_kind), file=sys.stderr)',
+     '          + ac.cli_command("lift", "--id", str(halt.id)), file=sys.stderr)',
      '          + ac.cli_command("lift"), file=sys.stderr)'),
 
-    ("the hint names the check's scope rather than the halt's",
-     '          + ac.cli_command("lift", "--scope", halt.scope_kind), file=sys.stderr)',
-     '          + ac.cli_command("lift", "--scope", args.scope), file=sys.stderr)'),
+    ("the hint lifts by scope, taking another halt with it",
+     '          + ac.cli_command("lift", "--id", str(halt.id)), file=sys.stderr)',
+     '          + ac.cli_command("lift", "--scope", halt.scope_kind), file=sys.stderr)'),
+
+    ("lift --id lifts the whole machine scope instead",
+     "        n = ac.lift_halt(halt_id=args.id)",
+     '        n = ac.lift_halt(scope_kind="machine")'),
+
+    ("halt's own lift hint is relative again",
+     '    print("Lift it explicitly with:  " + ac.cli_command("lift", "--id", str(hid)))',
+     '    print("Lift it explicitly with:  agents.py lift --id " + str(hid))'),
 
     ("check-halt does not say how old the halt is",
      '    print(f"raised at : {_stamp(halt.raised_at)}  ({ac.age_text(halt.raised_at)})",',
@@ -1740,6 +1760,10 @@ HALTSERVER_MUTATIONS = [
     ("the lobby is not told whether a raiser is running",
      '                "raiser_running": _ac.raiser_running(h, conn=conn, now=now),',
      '                "raiser_running": None,'),
+
+    ("the lobby is not given the age, so it words one by its own clock",
+     '                "age": _ac.age_text(h.raised_at, now),\n',
+     ""),
 
     ("an unreadable registry takes the session list down with it",
      '    except Exception:\n'
@@ -1764,12 +1788,20 @@ HALTSERVER_MUTATIONS = [
      ""),
 
     ("the other lobbies are not shown the lift",
-     "    await _push_session_list()\n    if ws not in _lobby_targets():",
+     "    await lobby_broadcast(payload)\n    if ws not in _lobby_targets():",
      "    if ws not in _lobby_targets():"),
 
     ("the tab that clicked is not shown the lift",
-     "    if ws not in _lobby_targets():\n        await _push_session_list(ws)",
+     "    if ws not in _lobby_targets():\n        await send_to(ws, payload)",
      ""),
+
+    ("the session list is built twice, scanning the disk twice",
+     "    await lobby_broadcast(payload)\n"
+     "    if ws not in _lobby_targets():\n"
+     "        await send_to(ws, payload)",
+     "    await lobby_broadcast(payload)\n"
+     "    if ws not in _lobby_targets():\n"
+     "        await send_to(ws, await _session_list_payload())"),
 ]
 
 HALTLOBBY_MUTATIONS = [
@@ -1802,15 +1834,23 @@ HALTLOBBY_MUTATIONS = [
      "    if (!h.raiser_running) {"),
 
     ("the age is left out",
-     "      + (h.raised_at ? ' ' + _fmtAgo(h.raised_at) : '') + '.';",
+     "      + (h.age ? ' ' + h.age : '') + '.';",
      "      + '.';"),
+
+    ("the age is worded by the browser's clock, not the server's",
+     "      + (h.age ? ' ' + h.age : '') + '.';",
+     "      + (h.raised_at ? ' ' + _fmtAgo(h.raised_at) : '') + '.';"),
+
+    ("every refresh rewrites the text, ending a selection in it",
+     "    if (el.textContent !== text) el.textContent = text;",
+     "    el.textContent = text;"),
 
     ("a repository is named by its .git directory",
      r"    const repo = String(h.scope_value || '').replace(/[\\/]\.git$/i, '');",
      "    const repo = String(h.scope_value || '');"),
 
     ("the reason is parsed as HTML",
-     "    row.querySelector('.lobby-halt-reason').textContent = h.reason || '';",
+     "    _setText(row.querySelector('.lobby-halt-reason'), h.reason || '');",
      "    row.querySelector('.lobby-halt-reason').innerHTML = h.reason || '';"),
 
     ("Lift does not ask first",

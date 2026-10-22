@@ -622,17 +622,7 @@ const Lobby = (() => {
       if (el) el.remove();
       return;
     }
-    if (!el) {
-      el = document.createElement('div');
-      el.id = 'lobby-stale';
-      el.className = 'lobby-stale';
-      const notice = document.getElementById('lobby-notice');
-      if (notice && notice.parentNode) {
-        notice.parentNode.insertBefore(el, notice);
-      } else if (elLobby) {
-        elLobby.appendChild(el);
-      }
-    }
+    el = _bannerBox('lobby-stale', 'lobby-stale');
     const files = (stale.files || []).join(', ');
     const age = stale.started_at ? _fmtAgo(stale.started_at) : '';
     el.innerHTML =
@@ -644,6 +634,30 @@ const Lobby = (() => {
     el.title = 'Python is loaded once at import, so a running server keeps '
       + 'executing the version it started with. Static files (JS/CSS) are '
       + 're-read per request — those only need a browser refresh.';
+  }
+
+  // The element *id* of a banner above the session lists, created with
+  // *className* on first use.  It goes before the lobby notice bar, so it sits
+  // outside the card lists.
+  function _bannerBox(id, className) {
+    let el = document.getElementById(id);
+    if (el) return el;
+    el = document.createElement('div');
+    el.id = id;
+    if (className) el.className = className;
+    const notice = document.getElementById('lobby-notice');
+    if (notice && notice.parentNode) {
+      notice.parentNode.insertBefore(el, notice);
+    } else if (elLobby) {
+      elLobby.appendChild(el);
+    }
+    return el;
+  }
+
+  // Sets *el*'s text only when it differs, so a refresh that changes nothing
+  // leaves alone a selection the operator is making in it.
+  function _setText(el, text) {
+    if (el.textContent !== text) el.textContent = text;
   }
 
   // "A halt is in force": one row per halt, each with the button that lifts it.
@@ -664,16 +678,7 @@ const Lobby = (() => {
       if (box) box.remove();
       return;
     }
-    if (!box) {
-      box = document.createElement('div');
-      box.id = 'lobby-halts';
-      const notice = document.getElementById('lobby-notice');
-      if (notice && notice.parentNode) {
-        notice.parentNode.insertBefore(box, notice);
-      } else if (elLobby) {
-        elLobby.appendChild(box);
-      }
-    }
+    box = _bannerBox('lobby-halts');
     const shown = new Set();
     list.forEach((h) => {
       const id = String(h.id);
@@ -720,31 +725,33 @@ const Lobby = (() => {
     return 'every session in ' + (repo || 'one repository');
   }
 
+  // The age is the server's wording (`age`), by the server's clock: a phone
+  // whose clock is off would otherwise contradict the halt prompt.
   function _fillHaltRow(row, h) {
     row._halt = h;
     let meta = ` for ${_haltWhere(h)}, raised by ${h.raised_by}`
-      + (h.raised_at ? ' ' + _fmtAgo(h.raised_at) : '') + '.';
+      + (h.age ? ' ' + h.age : '') + '.';
     if (h.raiser_running === false) {
-      meta += ` ${h.raised_by} has no live session on this machine, so `
-        + 'nobody may be left to lift it.';
+      meta += ` ${h.raised_by} is not registered as running on this `
+        + 'machine, so nobody may be left to lift it.';
     }
-    row.querySelector('.lobby-halt-meta').textContent = meta;
-    row.querySelector('.lobby-halt-reason').textContent = h.reason || '';
+    _setText(row.querySelector('.lobby-halt-meta'), meta);
+    _setText(row.querySelector('.lobby-halt-reason'), h.reason || '');
     // A lift the server did not carry out leaves the row in place; offer the
     // button again rather than leave it stuck at "Lifting…".
     const btn = row.querySelector('.lobby-halt-lift');
     if (!row._liftSentAt || Date.now() - row._liftSentAt > 5000) {
       row._liftSentAt = 0;
       btn.disabled = false;
-      btn.textContent = 'Lift';
+      _setText(btn, 'Lift');
     }
   }
 
   function _liftHalt(row) {
     const h = row._halt;
     if (!h) return;
-    const msg = `Lift this halt?\n\n${h.raised_by} raised it `
-      + `${_fmtAgo(h.raised_at)}: ${h.reason}\n\n`
+    const msg = `Lift this halt?\n\n${h.raised_by} raised it`
+      + `${h.age ? ' ' + h.age : ''}: ${h.reason}\n\n`
       + `Lifting it lets ${_haltWhere(h)} take on work again, and long jobs `
       + 'that check for a halt start again.';
     if (!window.confirm(msg)) return;

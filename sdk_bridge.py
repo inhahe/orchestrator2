@@ -7683,9 +7683,17 @@ class SDKBridge:
             halt = agent_comms.pending_halt_for(ident, repo=self._agent_repo,
                                                 conn=conn)
             if halt is not None:
+                # The text first: marking it delivered is what stops it being
+                # offered again, so anything that fails after that loses it.
+                try:
+                    running = agent_comms.raiser_running(halt, conn=conn)
+                except Exception:
+                    running = None      # unknown: the halt is still told
+                    log.debug("could not ask after halt %s's raiser",
+                              halt.id, exc_info=True)
+                text = self._halt_prompt(halt, running)
                 agent_comms.mark_halt_delivered(halt.id, ident, conn=conn)
-                out.append(self._halt_prompt(
-                    halt, agent_comms.raiser_running(halt, conn=conn)))
+                out.append(text)
             msgs = agent_comms.pending_messages(
                 ident, repo=self._agent_repo, cwd=cwd, conn=conn)
             for m in msgs:
@@ -7734,13 +7742,15 @@ class SDKBridge:
             f"Reply to the operator confirming you have stopped."
         )
         if raiser_running is False:
+            # By id: LiftHalt and `lift --scope` take every halt in the scope,
+            # including any another agent raised for work still running.
             text += (
-                f"\n\n{halt.raised_by}, which raised it, has no live session "
-                f"on this machine now, so nobody may be left to lift it. Tell "
-                f"the operator that, and how old the halt is. If the operator "
-                f"says its reason has passed, lift it with the LiftHalt tool "
-                f"(scope \"{scope}\"), or with:\n"
-                f"  {agent_comms.cli_command('lift', '--scope', scope)}"
+                f"\n\n{halt.raised_by}, which raised it, is not registered as "
+                f"running on this machine, so nobody may be left to lift it. "
+                f"Tell the operator that, and how old the halt is. If the "
+                f"operator says its reason has passed, lift this one halt "
+                f"with:\n"
+                f"  {agent_comms.cli_command('lift', '--id', str(halt.id))}"
             )
         return text
 

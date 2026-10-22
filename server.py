@@ -999,7 +999,9 @@ def _halts_payload() -> list[dict[str, Any]] | None:
     read, which the lobby shows as nothing: the session list must not fail
     for want of it.  ``raiser_running`` is
     :func:`agent_comms.raiser_running`'s answer, so the banner can say when
-    nobody is left to lift a halt.
+    nobody is left to lift a halt.  ``age`` is worded here, by the clock
+    that wrote ``raised_at``, rather than by a phone's in the browser, and
+    reads as the halt prompt does.
     """
     try:
         import agent_comms as _ac
@@ -1012,6 +1014,7 @@ def _halts_payload() -> list[dict[str, Any]] | None:
                 "scope_value": h.scope_value,
                 "raised_by": h.raised_by,
                 "raised_at": h.raised_at,
+                "age": _ac.age_text(h.raised_at, now),
                 "reason": h.reason,
                 "raiser_running": _ac.raiser_running(h, conn=conn, now=now),
             } for h in _ac.halts_in_force(conn=conn)]
@@ -1037,9 +1040,12 @@ async def _lift_halt_from_lobby(ws: WebSocket, raw_id: Any) -> None:
     except Exception as exc:
         log.exception("could not lift halt %s", hid)
         await _lobby_error(ws, f"Couldn't lift halt {hid}: {exc}")
-    await _push_session_list()
+    # One payload for every lobby and for the tab that clicked, which need
+    # not be one of them: building it scans the disk.
+    payload = await _session_list_payload()
+    await lobby_broadcast(payload)
     if ws not in _lobby_targets():
-        await _push_session_list(ws)
+        await send_to(ws, payload)
 
 
 async def lobby_broadcast(msg: dict[str, Any]) -> None:

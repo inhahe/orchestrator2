@@ -97,7 +97,10 @@ OPERATOR = "operator"
 UNKNOWN_AGENT = "unknown-agent"
 
 #: The command-line half of this module (``check-halt`` and the rest).
-AGENTS_CLI = Path(__file__).resolve().parent / "tools" / "agents.py"
+#: ``abspath``, not ``resolve``: on a machine whose drive is a share,
+#: resolving turns ``D:/...`` into ``//HOST/D/...``, a path through the
+#: network that nobody types and that fails when the share is down.
+AGENTS_CLI = Path(os.path.abspath(__file__)).parent / "tools" / "agents.py"
 
 _IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 

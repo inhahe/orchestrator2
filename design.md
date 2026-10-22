@@ -4577,8 +4577,19 @@ none of which lifts anything by itself:
   clean exit deletes the row), and `None` for a halt no agent raised
   (`OPERATOR`, `UNKNOWN_AGENT`). On `False`, `SDKBridge._halt_prompt` says
   so, asks the agent to tell the operator, and gives the lift to use if the
-  operator says the reason has passed. `False` is a fact, not a verdict: a
-  raiser may stop along with everyone else while the maintenance runs.
+  operator says the reason has passed. `False` is a fact about this
+  registry, not a verdict, and is worded as one ("is not registered as
+  running on this machine"): a raiser may stop along with everyone else while
+  the maintenance runs, and a session outside orchestrator2 that raised one
+  under a name with the CLI was never registered at all. The prompt's text is
+  built **before** the halt is marked delivered, since marking it is what
+  stops it being offered again; a raiser lookup that fails leaves the note
+  out rather than the halt.
+* **Every lift a prompt or the CLI offers is one halt, by id**
+  (`agents.py lift --id N`; `halt` and `check-halt` print the id). A scope
+  lift, which `LiftHalt` and `lift --scope` are, takes every halt in the
+  scope with it, including one another agent raised for work still running,
+  and a repo-scope one resolves the repository from wherever it is pasted.
 * **The lobby lists every halt in force, each with a Lift button.**
   `session_list` carries `halts` (`server._halts_payload`, from
   `agent_comms.halts_in_force()`), the fast landing payload included, for the
@@ -4586,15 +4597,29 @@ none of which lifts anything by itself:
   `lift_halt {id}` lifts that one halt by id and pushes the list to every
   lobby. The rows are updated in place, never rebuilt, because the list is
   re-sent every two seconds and a button replaced between mousedown and
-  mouseup loses the click.
+  mouseup loses the click; their text is written only when it changes, so a
+  refresh does not end a selection. Each halt's `age` is worded by the hub,
+  so a browser whose clock is off cannot contradict the prompt.
 * **Every command a session is told to run works from its own directory.**
   The prompt used to say `python tools/agents.py check-halt`, a relative path
   that exists only in this project, while the sessions told to run it work in
   every project on the machine. `agent_comms.cli_command()` builds it from
-  `AGENTS_CLI`, absolute and in forward slashes. `check-halt`'s own lift hint
-  had a second defect: it said a bare `agents.py lift`, whose default scope is
-  `repo`, while `check-halt --scope repo` also reports machine halts. It now
-  names the halt's own scope.
+  `AGENTS_CLI`, absolute (by `abspath`, not `resolve`, which turns a drive
+  that is a share into its UNC path) and in forward slashes. `check-halt`'s
+  own lift hint had a second defect: it said a bare `agents.py lift`, whose
+  default scope is `repo`, while `check-halt --scope repo` also reports
+  machine halts. It now names the halt by id.
+
+What is not done, deliberately for now: a lift tells nobody. The sessions
+that stopped stay stopped until the operator speaks to them, and a halt
+prompt still queued in a busy session is delivered after the lift. A
+one-time "halt N was lifted" notice to every identity in `halt_deliveries`,
+and dropping a queued prompt whose halt has gone, would close both.
+
+A halt an agent raises with the CLI from its own shell is recorded as the
+operator's, because the hub consumes `ORCH2_AGENT_NAME` (above) and the CLI
+has no identity: `raiser_running` cannot speak for such a halt, and only its
+age shows that it has been forgotten. `RaiseHalt` records the agent.
 
 ### Surfacing: how an agent finds any of this
 

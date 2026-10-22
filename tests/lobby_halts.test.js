@@ -70,16 +70,18 @@ function makePage() {
 
 const NOW = Math.floor(Date.now() / 1000);
 
+const GONE = 'is not registered as running on this machine';
+
 const MIGRATION = {
   id: 1, scope_kind: 'machine', scope_value: '', raised_by: 'Lane-F',
-  raised_at: NOW - 4 * 86400, reason: 'PC migration: commit, push and stop.',
-  raiser_running: false,
+  raised_at: NOW - 4 * 86400, age: '4 days ago',
+  reason: 'PC migration: commit, push and stop.', raiser_running: false,
 };
 
 const REPAIR = {
   id: 2, scope_kind: 'repo', scope_value: 'd:\\visual studio projects\\os\\.git',
-  raised_by: 'Lane-A', raised_at: NOW - 600, reason: 'repairing the index',
-  raiser_running: true,
+  raised_by: 'Lane-A', raised_at: NOW - 600, age: '10m ago',
+  reason: 'repairing the index', raiser_running: true,
 };
 
 function textOf(el) { return (el.textContent || '').replace(/\s+/g, ' ').trim(); }
@@ -100,21 +102,28 @@ test('a payload without the field shows nothing', () => {
 test('a halt shows who raised it, how long ago, and why', () => {
   const t = textOf(makePage().render([MIGRATION]).rows()[0]);
   assert(t.includes('Lane-F'), t);
-  assert(/4d ago/.test(t), t);
+  assert(t.includes('4 days ago'), t);
   assert(t.includes('PC migration'), t);
   assert(t.includes('every session on this machine'), t);
 });
 
+test("the age is the server's, not the browser clock's", () => {
+  // A phone whose clock is off would contradict the halt prompt.
+  const skewed = Object.assign({}, MIGRATION, { raised_at: NOW });
+  const t = textOf(makePage().render([skewed]).rows()[0]);
+  assert(t.includes('4 days ago'), t);
+});
+
 test('a raiser that has gone is said out loud', () => {
   const t = textOf(makePage().render([MIGRATION]).rows()[0]);
-  assert(/Lane-F has no live session on this machine/.test(t), t);
+  assert(t.includes('Lane-F ' + GONE), t);
 });
 
 test('a raiser that is running, or is nobody, is not called gone', () => {
   const p = makePage().render([REPAIR,
     Object.assign({}, MIGRATION, { id: 3, raised_by: 'operator',
                                    raiser_running: null })]);
-  p.rows().forEach((r) => assert(!/no live session/.test(textOf(r)), textOf(r)));
+  p.rows().forEach((r) => assert(!textOf(r).includes(GONE), textOf(r)));
 });
 
 test('a repository halt names the repository, not its .git directory', () => {
@@ -151,6 +160,7 @@ test('Lift asks first, and a "no" sends nothing', () => {
   p.rows()[0].querySelector('button').click();
   assert(/Lift this halt/.test(asked), asked);
   assert(asked.includes('PC migration'), 'the question omits what is lifted');
+  assert(asked.includes('4 days ago'), 'the question omits how old it is');
   assert(p.lifts().length === 0, 'lifted after the operator said no');
 });
 
@@ -171,6 +181,25 @@ test('the two-second refresh keeps the button it already has', () => {
   p.render([MIGRATION]);
   assert(p.rows()[0].querySelector('button') === before,
          'the row was rebuilt on a refresh');
+});
+
+test('a refresh that changes nothing leaves the text alone', () => {
+  // Rewriting it, even with the same words, ends a selection the operator is
+  // making to copy the reason or the raiser's name.
+  const p = makePage().render([MIGRATION]);
+  const reason = p.rows()[0].querySelector('.lobby-halt-reason').firstChild;
+  const meta = p.rows()[0].querySelector('.lobby-halt-meta').firstChild;
+  p.render([MIGRATION]);
+  assert(p.rows()[0].querySelector('.lobby-halt-reason').firstChild === reason,
+         'the reason was rewritten');
+  assert(p.rows()[0].querySelector('.lobby-halt-meta').firstChild === meta,
+         'the raiser line was rewritten');
+});
+
+test('a refresh that does change a halt shows it', () => {
+  const p = makePage().render([MIGRATION]);
+  p.render([Object.assign({}, MIGRATION, { age: '5 days ago' })]);
+  assert(textOf(p.rows()[0]).includes('5 days ago'), textOf(p.rows()[0]));
 });
 
 test('a lifted halt leaves the banner', () => {

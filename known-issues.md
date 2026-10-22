@@ -48,10 +48,11 @@ was gone; nothing outside the CLI listed halts; and both commands the prompt
 and `check-halt` printed were wrong somewhere: `python tools/agents.py` is a
 relative path that exists only in this project, and `check-halt`'s bare
 `agents.py lift` takes the repo scope by default, so it lifts nothing when
-the halt is machine-wide. See design.md §9a, "A halt nobody is left to
+the halt is machine-wide. Every lift offered is now one halt, by id
+(`agents.py lift --id N`). See design.md §9a, "A halt nobody is left to
 lift". Tests: `tests/test_halt_surfacing.py`, `tests/lobby_halts.test.js`;
 mutation targets `halt-comms`, `halt-prompt`, `halt-cli`, `halt-server`,
-`halt-lobby` (39 mutants, all caught).
+`halt-lobby`.
 
 ## `--resume` refused a session in another directory when `--cwd` was given — FIXED (2026-10-21)
 
