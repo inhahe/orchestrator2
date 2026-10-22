@@ -4543,8 +4543,10 @@ undelivered until the agent happened to do something.
 The halt's text, and its once-only record, are agent-comms'
 (`take_pending_halt`): the text is built before the halt is marked told, so a
 failure in between loses nothing, and the same words reach a session whether
-this bridge tells it or the package's hook does. The hook skips a session
-registered here, so nothing is told twice.
+this bridge tells it or the package's hook does. The bridge records and checks
+a halt under the session's agent identity and its session key
+(`session_key(session_id)`), the name the hook knows it by, so a session both
+reach hears the halt from whichever comes first, and once.
 
 **A halt nobody is left to lift** is recognisable as one: the prompt says how
 old the halt is and whether its raiser is still registered here, and offers

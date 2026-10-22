@@ -7687,10 +7687,12 @@ class SDKBridge:
         conn = agent_comms.connect()
         try:
             # The same words, and the same order -- the text built before the
-            # halt is marked delivered -- as the hook that tells a session no
-            # program like this one runs.
-            text = agent_comms.take_pending_halt(ident, repo=self._agent_repo,
-                                                 conn=conn)
+            # halt is marked delivered -- as agent-comms' hook, which tells a
+            # session by its id.  Recorded and checked under both names, so a
+            # session the hook also reaches hears the halt only once.
+            text = agent_comms.take_pending_halt(
+                ident, repo=self._agent_repo, conn=conn,
+                also=[agent_comms.session_key(self.state.session_id)])
             if text is not None:
                 out.append(text)
             msgs = agent_comms.pending_messages(

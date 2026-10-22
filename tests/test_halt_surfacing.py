@@ -63,6 +63,24 @@ def test_a_delivered_halt_prompt_carries_the_raisers_absence(tmp_path):
     assert GONE in text, text
 
 
+def test_a_halt_the_hook_already_told_is_not_told_again(tmp_path):
+    """agent-comms' hook tells a session by its id; the bridge checks that
+    name too, so the session hears the halt once."""
+    st, poll = _bridge_and_poll(tmp_path)
+    hid = ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
+    ac.mark_halt_delivered(hid, ac.session_key("sb"))      # as the hook records it
+    poll()
+    assert list(st.queued_prompts) == []
+
+
+def test_a_halt_the_bridge_told_is_recorded_for_the_hook_too(tmp_path):
+    st, poll = _bridge_and_poll(tmp_path)
+    ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
+    poll()
+    assert len(st.queued_prompts) == 1
+    assert ac.pending_halt_for(ac.session_key("sb")) is None, "the hook would tell it again"
+
+
 def test_a_failed_raiser_lookup_still_tells_the_halt(tmp_path, monkeypatch):
     st, poll = _bridge_and_poll(tmp_path)
     ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
