@@ -591,13 +591,18 @@ python -m agent_comms list                        # live sessions, all accounts
 python -m agent_comms send "stop soon" --to lane-b
 python -m agent_comms broadcast "tree is moving"  # everyone in this repo
 python -m agent_comms halt "migrating to E:"      # ask everyone to stop
-python -m agent_comms lift                        # explicit, never a timer
+python -m agent_comms lift --id 7                 # lift halt 7: explicit, never a timer
 python -m agent_comms lift --scope machine        # ... every machine-wide one
-python -m agent_comms lift --id 7                 # ... just halt 7
+python -m agent_comms lift                        # ... nothing: lists the halts in force
 python -m agent_comms check-halt --scope repo     # 0 = clear, non-zero = halted
 ```
 
 (`python tools/agents.py …`, the old path, still runs the same command line.)
+
+The store stays where orchestrator2 created it,
+`%LOCALAPPDATA%\orchestrator2\agents.db`, until you move it to agent-comms' own
+place with `python -m agent_comms migrate-store`, once no hub running the older
+code is up. Nothing needs it moved; every command warns should both exist.
 
 Agents themselves need none of that: their existing `ListAgents` and
 `SendMessage` tools now simply work across accounts. The registry the CLI uses
