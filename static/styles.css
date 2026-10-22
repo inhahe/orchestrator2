@@ -1906,6 +1906,49 @@ html, body {
   word-break: break-word;
 }
 
+/* A halt in force, with its Lift button (lobby.js, _renderHalts). */
+.lobby-halt {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--system-warning, #e0af68);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  background: rgba(224, 175, 104, 0.08);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.lobby-halt b { color: var(--system-warning, #e0af68); }
+.lobby-halt-text { flex: 1 1 auto; min-width: 0; }
+.lobby-halt-reason {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+.lobby-halt-lift {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1;
+  color: var(--system-warning, #e0af68);
+  background: none;
+  border: 1px solid var(--system-warning, #e0af68);
+  border-radius: 5px;
+  cursor: pointer;
+  padding: 7px 12px;
+  white-space: nowrap;
+  transition: background 0.12s, color 0.12s;
+}
+.lobby-halt-lift:hover:not(:disabled) {
+  background: var(--system-warning, #e0af68);
+  color: #fff;
+}
+.lobby-halt-lift:disabled { opacity: 0.6; cursor: default; }
+
 /* Row for status pills between the cwd and the meta line.  A pill is not a
    field in the meta row's `a . b . c` run: mixing one in pushed the run past
    the card width and wrapped it, stranding a separator at the end of a line

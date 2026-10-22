@@ -71,8 +71,10 @@ __all__ = [
     "message_state",
     "send_message", "pending_messages", "mark_delivered", "message_status",
     "raise_halt", "lift_halt", "active_halt", "halt_in_force",
+    "halts_in_force", "raiser_running",
     "pending_halt_for", "mark_halt_delivered",
     "AGENT_TTL", "HEARTBEAT_INTERVAL", "MESSAGE_TTL",
+    "OPERATOR", "UNKNOWN_AGENT", "AGENTS_CLI", "cli_command", "age_text",
     "mirror_peer_registries", "unmirror_all",
 ]
 
@@ -87,6 +89,15 @@ HEARTBEAT_INTERVAL = 30.0
 #: Long enough to outlive a restart, short enough that a week-old "stop now" is
 #: not delivered to a session that has no idea what it refers to.
 MESSAGE_TTL = 24 * 3600.0
+
+#: ``raised_by`` of a halt no agent raised: one raised by hand with the CLI,
+#: and one raised by the tool in a session that has no identity.  Neither
+#: names a registration, so neither can be asked whether it is still running.
+OPERATOR = "operator"
+UNKNOWN_AGENT = "unknown-agent"
+
+#: The command-line half of this module (``check-halt`` and the rest).
+AGENTS_CLI = Path(__file__).resolve().parent / "tools" / "agents.py"
 
 _IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -312,6 +323,37 @@ def _branch(cwd: str | os.PathLike[str] | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Wording shared by the CLI and the bridge
+# ---------------------------------------------------------------------------
+
+def cli_command(*args: str) -> str:
+    """A ``tools/agents.py`` command line that runs from any directory.
+
+    *args* are the subcommand and its options.  The path is absolute because
+    the sessions told to run it work in every project on the machine, and a
+    relative ``tools/agents.py`` exists only in this one.  Forward slashes,
+    quoted, so it pastes into bash, PowerShell and cmd alike.
+    """
+    return " ".join([f'python "{AGENTS_CLI.as_posix()}"', *args])
+
+
+def age_text(t: float, now: float | None = None) -> str:
+    """How long before *now* the epoch time *t* was, as ``"4 days ago"``.
+
+    Days past two of them: a halt forgotten since last week read as
+    ``"96.4h ago"`` hides the one thing its age is there to show.
+    """
+    d = max(0.0, (now if now is not None else time.time()) - t)
+    if d < 90:
+        return f"{d:.0f}s ago"
+    if d < 5400:
+        return f"{d / 60:.0f}m ago"
+    if d < 48 * 3600:
+        return f"{d / 3600:.1f}h ago"
+    return f"{d / 86400:.0f} days ago"
+
+
+# ---------------------------------------------------------------------------
 # Records
 # ---------------------------------------------------------------------------
 
@@ -367,6 +409,12 @@ def _agent_from_row(r: sqlite3.Row) -> Agent:
         heartbeat_at=r["heartbeat_at"],
         labels=labels if isinstance(labels, dict) else {},
     )
+
+
+def _halt_from_row(r: sqlite3.Row) -> Halt:
+    return Halt(id=r["id"], scope_kind=r["scope_kind"],
+                scope_value=r["scope_value"], raised_by=r["raised_by"],
+                raised_at=r["raised_at"], reason=r["reason"])
 
 
 # ---------------------------------------------------------------------------
@@ -960,11 +1008,7 @@ def active_halt(*, repo: str = "", conn: sqlite3.Connection | None = None
             "  OR (scope_kind = 'repo' AND scope_value = ?)) "
             "ORDER BY raised_at LIMIT 1",
             (norm_path(repo) if repo else "",)).fetchone()
-        if not row:
-            return None
-        return Halt(id=row["id"], scope_kind=row["scope_kind"],
-                    scope_value=row["scope_value"], raised_by=row["raised_by"],
-                    raised_at=row["raised_at"], reason=row["reason"])
+        return _halt_from_row(row) if row else None
     finally:
         if own:
             conn.close()
@@ -974,6 +1018,40 @@ def halt_in_force(*, repo: str = "", conn: sqlite3.Connection | None = None
                   ) -> bool:
     """The hard check an expensive operation calls before starting (§6.2)."""
     return active_halt(repo=repo, conn=conn) is not None
+
+
+def halts_in_force(*, conn: sqlite3.Connection | None = None) -> list[Halt]:
+    """Every halt not yet lifted, of any scope and repository, oldest first.
+
+    What the operator is shown, as opposed to :func:`active_halt`, which is
+    what binds one repository.
+    """
+    own = conn is None
+    conn = conn or connect()
+    try:
+        return [_halt_from_row(r) for r in conn.execute(
+            "SELECT * FROM halts WHERE lifted_at IS NULL ORDER BY raised_at")]
+    finally:
+        if own:
+            conn.close()
+
+
+def raiser_running(halt: Halt, *, conn: sqlite3.Connection | None = None,
+                   now: float | None = None) -> bool | None:
+    """Whether the agent that raised *halt* has a live session on this machine.
+
+    ``None`` when no agent raised it (:data:`OPERATOR`, :data:`UNKNOWN_AGENT`).
+    ``False`` is the answer worth passing on: nothing lifts a halt but an
+    explicit act, so one whose raiser has gone -- finished, or moved to
+    another machine along with the project it protected -- stays up, and every
+    new session is told to stop, until somebody notices.  It is a fact for the
+    operator to weigh, not proof the halt is stale: a raiser may stop along
+    with everyone else while the maintenance runs.
+    """
+    if halt.raised_by in (OPERATOR, UNKNOWN_AGENT):
+        return None
+    agent = find_agent(halt.raised_by, conn=conn)
+    return agent is not None and agent.is_live(now)
 
 
 def pending_halt_for(identity: str, *, repo: str = "",
@@ -996,11 +1074,7 @@ def pending_halt_for(identity: str, *, repo: str = "",
             "                WHERE d.halt_id = h.id AND d.identity = ?) "
             "ORDER BY h.raised_at LIMIT 1",
             (norm_path(repo) if repo else "", identity)).fetchone()
-        if not row:
-            return None
-        return Halt(id=row["id"], scope_kind=row["scope_kind"],
-                    scope_value=row["scope_value"], raised_by=row["raised_by"],
-                    raised_at=row["raised_at"], reason=row["reason"])
+        return _halt_from_row(row) if row else None
     finally:
         if own:
             conn.close()

@@ -589,6 +589,7 @@ python tools/agents.py send "stop soon" --to lane-b
 python tools/agents.py broadcast "tree is moving"  # everyone in this repo
 python tools/agents.py halt "migrating to E:"      # ask everyone to stop
 python tools/agents.py lift                        # explicit, never a timer
+python tools/agents.py lift --scope machine        # ... a machine-wide one
 python tools/agents.py check-halt --scope repo     # 0 = clear, non-zero = halted
 ```
 
@@ -613,6 +614,15 @@ refuses if a halt is in force. Nothing tries to guess which jobs are expensive
 — the job about to spend three hours is the one that knows, and it alone knows
 where its safe abort points are. It is cooperative by design: a job that does
 not check cannot be stopped.
+
+Nothing lifts a halt on a timer, so a halt whose raiser has finished, or has
+moved to another machine with its project, stays up until somebody lifts it,
+and every new session is told to stop meanwhile. To make such a halt easy to
+spot, the lobby shows a band for each halt in force, above the session lists:
+who raised it, how long ago and why, and, when the raiser has no live session
+on this machine any more, that nobody may be left to lift it. **Lift** beside
+it lifts that one halt. The prompt each session receives about a halt gives
+the same facts, and its commands work from whatever project the session is in.
 
 A session's identity is a **name**, not something derived from its account or
 directory: set it with `--agent-name` (or `ORCH2_AGENT_NAME`). The name belongs

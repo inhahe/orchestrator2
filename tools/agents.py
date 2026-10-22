@@ -67,15 +67,6 @@ def _stamp(t: float) -> str:
     return _dt.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _age(t: float) -> str:
-    d = max(0.0, _dt.datetime.now().timestamp() - t)
-    if d < 90:
-        return f"{d:.0f}s ago"
-    if d < 5400:
-        return f"{d / 60:.0f}m ago"
-    return f"{d / 3600:.1f}h ago"
-
-
 def _identity(args) -> str:
     """This caller's identity: explicit, else the environment's, else unknown.
 
@@ -107,7 +98,7 @@ def cmd_list(args) -> int:
     for a in agents:
         acct = Path(a.account).name if a.account else "-"
         print(f"{a.identity:<20} {acct:<22} {(a.branch or '-'):<16} "
-              f"{_age(a.heartbeat_at):<10} {a.cwd}")
+              f"{ac.age_text(a.heartbeat_at):<10} {a.cwd}")
         # Caller-supplied labels (--agent-label k=v).  The service never
         # interprets them: "lane" is the project's word, not this tool's.
         if a.labels:
@@ -143,7 +134,7 @@ def cmd_whoami(args) -> int:
 
 
 def cmd_send(args) -> int:
-    frm = _identity(args) or "operator"
+    frm = _identity(args) or ac.OPERATOR
     mid, live = ac.send_message(args.text, frm=frm, to=args.to)
     where = "delivered at their next turn boundary" if live else (
         "queued -- that agent is not live right now")
@@ -156,7 +147,7 @@ def cmd_send(args) -> int:
 
 
 def cmd_broadcast(args) -> int:
-    frm = _identity(args) or "operator"
+    frm = _identity(args) or ac.OPERATOR
     cwd = args.cwd or os.getcwd()
     value = ""
     if args.scope == "repo":
@@ -231,7 +222,7 @@ def cmd_status(args) -> int:
 
 
 def cmd_halt(args) -> int:
-    by = _identity(args) or "operator"
+    by = _identity(args) or ac.OPERATOR
     cwd = args.cwd or os.getcwd()
     value = ac.repo_key(cwd) if args.scope == "repo" else ""
     hid = ac.raise_halt(args.reason, by=by, scope_kind=args.scope,
@@ -262,16 +253,22 @@ def cmd_check_halt(args) -> int:
             print(f"check-halt: clear ({args.scope})")
         return 0
     print("=== HALT IN FORCE -- do not start this operation ===", file=sys.stderr)
-    print(f"raised by : {halt.raised_by}", file=sys.stderr)
-    print(f"raised at : {_stamp(halt.raised_at)}", file=sys.stderr)
+    by = halt.raised_by
+    if ac.raiser_running(halt) is False:
+        by += "  (no live session on this machine now)"
+    print(f"raised by : {by}", file=sys.stderr)
+    print(f"raised at : {_stamp(halt.raised_at)}  ({ac.age_text(halt.raised_at)})",
+          file=sys.stderr)
     print(f"scope     : {halt.scope_kind}"
           + (f" {halt.scope_value}" if halt.scope_value else ""), file=sys.stderr)
     print(f"reason    : {halt.reason}", file=sys.stderr)
     print("", file=sys.stderr)
     print("This is not a failure of your operation -- it is a deliberate stop.",
           file=sys.stderr)
-    print("It is lifted explicitly, never on a timer:  agents.py lift",
-          file=sys.stderr)
+    # The halt's own scope, not this check's: `check-halt --scope repo` also
+    # reports a machine halt, which `lift`'s default (repo) would not touch.
+    print("It is lifted explicitly, never on a timer:  "
+          + ac.cli_command("lift", "--scope", halt.scope_kind), file=sys.stderr)
     return 1
 
 

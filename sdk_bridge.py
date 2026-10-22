@@ -7684,17 +7684,8 @@ class SDKBridge:
                                                 conn=conn)
             if halt is not None:
                 agent_comms.mark_halt_delivered(halt.id, ident, conn=conn)
-                out.append(
-                    f"[agent-comms] HALT raised by {halt.raised_by} "
-                    f"({halt.scope_kind} scope): {halt.reason}\n\n"
-                    f"Stop taking new work. Finish or safely abandon what you "
-                    f"are holding, commit and push it, and do not start "
-                    f"another long task. The halt stays in force until it is "
-                    f"lifted explicitly — check with:\n"
-                    f"  python tools/agents.py check-halt --scope "
-                    f"{halt.scope_kind}\n"
-                    f"Reply to the operator confirming you have stopped."
-                )
+                out.append(self._halt_prompt(
+                    halt, agent_comms.raiser_running(halt, conn=conn)))
             msgs = agent_comms.pending_messages(
                 ident, repo=self._agent_repo, cwd=cwd, conn=conn)
             for m in msgs:
@@ -7718,6 +7709,40 @@ class SDKBridge:
         finally:
             conn.close()
         return out
+
+    @staticmethod
+    def _halt_prompt(halt, raiser_running: bool | None,
+                     now: float | None = None) -> str:
+        """The prompt that tells this session's agent about *halt*.
+
+        *raiser_running* is :func:`agent_comms.raiser_running`'s answer for
+        it.  The age is always given, and a raiser that has gone is said out
+        loud, so the agent passes on to the operator what makes a forgotten
+        halt recognisable as one.
+        """
+        scope = halt.scope_kind
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(halt.raised_at))
+        text = (
+            f"[agent-comms] HALT raised by {halt.raised_by} ({scope} scope) "
+            f"{agent_comms.age_text(halt.raised_at, now)}, at {stamp}: "
+            f"{halt.reason}\n\n"
+            f"Stop taking new work. Finish or safely abandon what you are "
+            f"holding, commit and push it, and do not start another long "
+            f"task. The halt stays in force until it is lifted explicitly — "
+            f"check with:\n"
+            f"  {agent_comms.cli_command('check-halt', '--scope', scope)}\n"
+            f"Reply to the operator confirming you have stopped."
+        )
+        if raiser_running is False:
+            text += (
+                f"\n\n{halt.raised_by}, which raised it, has no live session "
+                f"on this machine now, so nobody may be left to lift it. Tell "
+                f"the operator that, and how old the halt is. If the operator "
+                f"says its reason has passed, lift it with the LiftHalt tool "
+                f"(scope \"{scope}\"), or with:\n"
+                f"  {agent_comms.cli_command('lift', '--scope', scope)}"
+            )
+        return text
 
     async def _warn_if_name_in_use(self, ident: str) -> None:
         """Say so when another live session already answers to *ident*.

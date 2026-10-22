@@ -3553,8 +3553,10 @@ started under a different `CLAUDE_CONFIG_DIR` still reopens correctly.
 
 **Wire protocol** — client → server: `list`, `lobby_watch {on}`, `detach`,
 `attach {rid}`, `open {session_id, cwd, account}`, `new {cwd}`, `close {rid}`,
-`move_list`, `move_do {config_dir, new_name, cwd}`. Server → client:
-`session_list {running, recent, recent_pending}`, `attached {session}`,
+`move_list`, `move_do {config_dir, new_name, cwd}`, `lift_halt {id}` (§9a).
+Server → client:
+`session_list {running, recent, recent_pending, stale, halts}`,
+`attached {session}`,
 `session_closed {rid, message}`, `lobby_notice {message}`,
 `session_elsewhere {session_id, holder_pid, started, port, cwd, account}`.
 
@@ -4559,6 +4561,41 @@ explicitly.
 worktrees of one repository share a halt — which is the motivating case, three
 lanes in three worktrees.
 
+### A halt nobody is left to lift
+
+The other side of "never on a timer": a halt whose raiser has gone stays up.
+On 2026-10-17 Lane-F raised a machine halt for a PC migration and then moved,
+with SlateOS, to the new PC. Nothing here lifted it, and over four days every
+new session on this machine (20 of them) opened to "HALT … stop taking new
+work". What made it hard to see was that the halt prompt was identical on day
+four and on day one. Three things now make such a halt recognisable as one,
+none of which lifts anything by itself:
+
+* **The prompt says how old the halt is, and whether its raiser is still
+  here.** `agent_comms.raiser_running()` answers from the registry: `True` for
+  a live registration, `False` for a stale heartbeat or no registration (a
+  clean exit deletes the row), and `None` for a halt no agent raised
+  (`OPERATOR`, `UNKNOWN_AGENT`). On `False`, `SDKBridge._halt_prompt` says
+  so, asks the agent to tell the operator, and gives the lift to use if the
+  operator says the reason has passed. `False` is a fact, not a verdict: a
+  raiser may stop along with everyone else while the maintenance runs.
+* **The lobby lists every halt in force, each with a Lift button.**
+  `session_list` carries `halts` (`server._halts_payload`, from
+  `agent_comms.halts_in_force()`), the fast landing payload included, for the
+  reason `stale` rides it: a halt is why the sessions listed are idle.
+  `lift_halt {id}` lifts that one halt by id and pushes the list to every
+  lobby. The rows are updated in place, never rebuilt, because the list is
+  re-sent every two seconds and a button replaced between mousedown and
+  mouseup loses the click.
+* **Every command a session is told to run works from its own directory.**
+  The prompt used to say `python tools/agents.py check-halt`, a relative path
+  that exists only in this project, while the sessions told to run it work in
+  every project on the machine. `agent_comms.cli_command()` builds it from
+  `AGENTS_CLI`, absolute and in forward slashes. `check-halt`'s own lift hint
+  had a second defect: it said a bare `agents.py lift`, whose default scope is
+  `repo`, while `check-halt --scope repo` also reports machine halts. It now
+  names the halt's own scope.
+
 ### Surfacing: how an agent finds any of this
 
 `specs/agent-comms-addendum-surfacing.md` answers a question the spec did not,
@@ -4668,7 +4705,10 @@ Pinned by `tests/test_agent_comms.py` (70) and the `agentcomms` (16) /
 `tests/test_agent_comms_surfacing.py` (27) and the `mirror` (8) /
 `agenttools` (8) targets; the checklist and the panel push by
 `tests/test_agent_comms_checklist.py` (30) with the `checklist` (9) and
-`queuepanel` (5) targets.
+`queuepanel` (5) targets; a halt nobody is left to lift by
+`tests/test_halt_surfacing.py` and `tests/lobby_halts.test.js`, with the
+`halt-comms`, `halt-prompt`, `halt-cli`, `halt-server` and `halt-lobby`
+targets.
 `tools/agents.py --self-test`
 carries 31 fixtures of its own, asserting **both directions** of every rule:
 a checker with only positives passes for one that reports everything, and one

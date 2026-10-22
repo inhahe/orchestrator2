@@ -52,6 +52,12 @@ Targets:
              including the two rules a plausible implementation gets wrong:
              refusing an ambiguous identity rather than guessing, and a
              notice not counting as a halt
+  halt-*     agent_comms.py, sdk_bridge.py, tools/agents.py, server.py
+             x tests/test_halt_surfacing.py (pytest), and static/lobby.js
+             x tests/lobby_halts.test.js (node)
+             a halt nobody is left to lift is recognisable as one: its age,
+             whether its raiser still runs here, commands that work from
+             any project, and the lobby's Lift
 
 The first two are design.md section 7, "Nothing that must keep working may be
 gated on an animation frame"; the third is section 6d, "A reconnect is not free
@@ -1641,6 +1647,187 @@ AGENTCLI_MUTATIONS = [
     ("the refusal says nothing about who or why",
      '    print(f"reason    : {halt.reason}", file=sys.stderr)',
      ""),
+]
+
+# A halt nobody is left to lift must be recognisable as one: its age, whether
+# its raiser still runs here, commands that work from any project, and a Lift
+# in the lobby (design.md section 9a, "A halt nobody is left to lift").
+HALTCOMMS_MUTATIONS = [
+    ("halts_in_force lists lifted halts too",
+     '"SELECT * FROM halts WHERE lifted_at IS NULL ORDER BY raised_at")]',
+     '"SELECT * FROM halts ORDER BY raised_at")]'),
+
+    ("halts_in_force lists the newest first",
+     '"SELECT * FROM halts WHERE lifted_at IS NULL ORDER BY raised_at")]',
+     '"SELECT * FROM halts WHERE lifted_at IS NULL ORDER BY raised_at DESC")]'),
+
+    ("a raiser whose heartbeat stopped still counts as running",
+     "    return agent is not None and agent.is_live(now)",
+     "    return agent is not None"),
+
+    ("a raiser that left the registry counts as running",
+     "    return agent is not None and agent.is_live(now)",
+     "    return agent is None or agent.is_live(now)"),
+
+    ("the operator is reported as a raiser that has gone",
+     "    if halt.raised_by in (OPERATOR, UNKNOWN_AGENT):\n        return None\n",
+     ""),
+
+    ("the command a session is told to run is relative again (the original bug)",
+     "    return \" \".join([f'python \"{AGENTS_CLI.as_posix()}\"', *args])",
+     "    return \" \".join(['python \"tools/agents.py\"', *args])"),
+
+    ("a halt four days old reads as 96.0h",
+     '    if d < 48 * 3600:\n        return f"{d / 3600:.1f}h ago"\n'
+     '    return f"{d / 86400:.0f} days ago"',
+     '    return f"{d / 3600:.1f}h ago"'),
+]
+
+HALTPROMPT_MUTATIONS = [
+    ("the prompt does not say how old the halt is",
+     '            f"{agent_comms.age_text(halt.raised_at, now)}, at {stamp}: "',
+     '            f"at {stamp}: "'),
+
+    ("a raiser that has gone is never mentioned",
+     "        if raiser_running is False:\n            text += (",
+     "        if False:\n            text += ("),
+
+    ("a raiser that is running, or is nobody, is called gone",
+     "        if raiser_running is False:",
+     "        if not raiser_running:"),
+
+    ("the check command is relative again, so it fails outside this project",
+     "            f\"  {agent_comms.cli_command('check-halt', '--scope', scope)}\\n\"",
+     "            f\"  python tools/agents.py check-halt --scope {scope}\\n\""),
+
+    ("the lift offered takes the default scope, not the halt's",
+     "                f\"  {agent_comms.cli_command('lift', '--scope', scope)}\"",
+     "                f\"  {agent_comms.cli_command('lift')}\""),
+
+    ("the poll never asks whether the raiser is running",
+     "                    halt, agent_comms.raiser_running(halt, conn=conn)))",
+     "                    halt, None))"),
+]
+
+HALTCLI_MUTATIONS = [
+    ("check-halt's lift hint is the bare default again, which misses a "
+     "machine halt (the original bug)",
+     '          + ac.cli_command("lift", "--scope", halt.scope_kind), file=sys.stderr)',
+     '          + ac.cli_command("lift"), file=sys.stderr)'),
+
+    ("the hint names the check's scope rather than the halt's",
+     '          + ac.cli_command("lift", "--scope", halt.scope_kind), file=sys.stderr)',
+     '          + ac.cli_command("lift", "--scope", args.scope), file=sys.stderr)'),
+
+    ("check-halt does not say how old the halt is",
+     '    print(f"raised at : {_stamp(halt.raised_at)}  ({ac.age_text(halt.raised_at)})",',
+     '    print(f"raised at : {_stamp(halt.raised_at)}",'),
+
+    ("check-halt does not say the raiser has gone",
+     "    if ac.raiser_running(halt) is False:",
+     "    if False:"),
+]
+
+HALTSERVER_MUTATIONS = [
+    ("the full session list drops the halts",
+     '        "stale": stale,\n        "halts": halts,\n    }',
+     '        "stale": stale,\n    }'),
+
+    ("the fast landing payload drops the halts",
+     '            "stale": stale,\n            "halts": halts,',
+     '            "stale": stale,'),
+
+    ("the lobby is not told whether a raiser is running",
+     '                "raiser_running": _ac.raiser_running(h, conn=conn, now=now),',
+     '                "raiser_running": None,'),
+
+    ("an unreadable registry takes the session list down with it",
+     '    except Exception:\n'
+     '        log.debug("could not read the halts for the lobby", exc_info=True)\n'
+     '        return None',
+     '    except ImportError:\n        return None'),
+
+    ("Lift lifts every halt, not the one beside it",
+     "        n = await asyncio.to_thread(_ac.lift_halt, halt_id=hid)",
+     "        n = await asyncio.to_thread(_ac.lift_halt)"),
+
+    ("a bad id lifts every halt",
+     '    except (TypeError, ValueError):\n'
+     '        await _lobby_error(ws, f"Not a halt id: {raw_id!r}")\n'
+     '        return',
+     '    except (TypeError, ValueError):\n        hid = None'),
+
+    ("the lobby's lift_halt is not handled, so it reaches the chat",
+     '    if msg_type == "lift_halt":\n'
+     '        await _lift_halt_from_lobby(ws, msg.get("id"))\n'
+     '        return True\n',
+     ""),
+
+    ("the other lobbies are not shown the lift",
+     "    await _push_session_list()\n    if ws not in _lobby_targets():",
+     "    if ws not in _lobby_targets():"),
+
+    ("the tab that clicked is not shown the lift",
+     "    if ws not in _lobby_targets():\n        await _push_session_list(ws)",
+     ""),
+]
+
+HALTLOBBY_MUTATIONS = [
+    ("the lobby never draws the halts",
+     "    _renderHalts(msg.halts);\n",
+     ""),
+
+    ("every refresh rebuilds the rows, so a click mid-refresh is lost",
+     "      let row = Array.from(box.children).find((r) => r.dataset.haltId === id);",
+     "      Array.from(box.children).filter((r) => r.dataset.haltId === id)\n"
+     "        .forEach((r) => r.remove());\n"
+     "      let row = null;"),
+
+    ("a lifted halt stays in the banner",
+     "    Array.from(box.children).forEach((row) => {\n"
+     "      if (!shown.has(row.dataset.haltId)) row.remove();\n"
+     "    });",
+     ""),
+
+    ("the banner outlives the last halt",
+     "    if (!list.length) {\n      if (box) box.remove();\n      return;\n    }",
+     "    if (!list.length) return;"),
+
+    ("a raiser that has gone is never mentioned",
+     "    if (h.raiser_running === false) {",
+     "    if (false) {"),
+
+    ("a raiser that is nobody (the operator) is called gone",
+     "    if (h.raiser_running === false) {",
+     "    if (!h.raiser_running) {"),
+
+    ("the age is left out",
+     "      + (h.raised_at ? ' ' + _fmtAgo(h.raised_at) : '') + '.';",
+     "      + '.';"),
+
+    ("a repository is named by its .git directory",
+     r"    const repo = String(h.scope_value || '').replace(/[\\/]\.git$/i, '');",
+     "    const repo = String(h.scope_value || '');"),
+
+    ("the reason is parsed as HTML",
+     "    row.querySelector('.lobby-halt-reason').textContent = h.reason || '';",
+     "    row.querySelector('.lobby-halt-reason').innerHTML = h.reason || '';"),
+
+    ("Lift does not ask first",
+     "    if (!window.confirm(msg)) return;\n    row._liftSentAt = Date.now();",
+     "    row._liftSentAt = Date.now();"),
+
+    ("a second click while the first is in flight sends another lift",
+     "    btn.disabled = true;\n    btn.textContent = 'Lifting…';",
+     "    btn.textContent = 'Lifting…';"),
+
+    ("every refresh re-arms the button at once",
+     "    if (!row._liftSentAt || Date.now() - row._liftSentAt > 5000) {",
+     "    if (true) {"),
+
+    ("Lift sends another halt's id",
+     "    App.send({ type: 'lift_halt', id: h.id });",
+     "    App.send({ type: 'lift_halt', id: 1 });"),
 ]
 
 TODOSEED_MUTATIONS = [
@@ -7936,6 +8123,16 @@ TARGETS = {
                    AGENTTOOLS_MUTATIONS, "pytest"),
     "agentcli": ("tools/agents.py", "tests/test_agent_comms.py",
                  AGENTCLI_MUTATIONS, "pytest"),
+    "halt-comms": ("agent_comms.py", "tests/test_halt_surfacing.py",
+                   HALTCOMMS_MUTATIONS, "pytest"),
+    "halt-prompt": ("sdk_bridge.py", "tests/test_halt_surfacing.py",
+                    HALTPROMPT_MUTATIONS, "pytest"),
+    "halt-cli": ("tools/agents.py", "tests/test_halt_surfacing.py",
+                 HALTCLI_MUTATIONS, "pytest"),
+    "halt-server": ("server.py", "tests/test_halt_surfacing.py",
+                    HALTSERVER_MUTATIONS, "pytest"),
+    "halt-lobby": ("static/lobby.js", "tests/lobby_halts.test.js",
+                   HALTLOBBY_MUTATIONS, "node"),
     "todoseed": ("session.py", "tests/test_todo_seeding.py",
                  TODOSEED_MUTATIONS, "pytest"),
     "tabecho": ("server.py", "tests/test_multi_tab_echo.py",

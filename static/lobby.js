@@ -10,9 +10,9 @@
  *
  * Wire protocol
  *   send:    list, attach {rid}, open {session_id, cwd}, new {cwd},
- *            close {rid}
- *   receive: session_list {running:[meta], recent:[disk]}, attached {session},
- *            session_closed {rid, message}
+ *            close {rid}, lift_halt {id}
+ *   receive: session_list {running:[meta], recent:[disk], stale, halts},
+ *            attached {session}, session_closed {rid, message}
  */
 
 const Lobby = (() => {
@@ -570,6 +570,7 @@ const Lobby = (() => {
     // "loading sessions…" spinner up instead of flashing an empty "recent"
     // placeholder.
     _renderStale(msg.stale);
+    _renderHalts(msg.halts);
     _renderMobileHint();
     _renderRunning(msg.running || []);
     if (msg.recent_pending) {
@@ -643,6 +644,115 @@ const Lobby = (() => {
     el.title = 'Python is loaded once at import, so a running server keeps '
       + 'executing the version it started with. Static files (JS/CSS) are '
       + 're-read per request — those only need a browser refresh.';
+  }
+
+  // "A halt is in force": one row per halt, each with the button that lifts it.
+  //
+  // Nothing lifts a halt but an explicit act, and a raiser that has finished,
+  // or moved to another machine with its project, never comes back to do it.
+  // The halt then tells every new session to stop, indefinitely.  So the
+  // banner puts each halt, its age and whether its raiser is still running in
+  // front of the operator, beside the sessions it is keeping idle.
+  //
+  // Rows are updated in place, never rebuilt: the list is re-sent every two
+  // seconds, and a button replaced between mousedown and mouseup loses the
+  // click.
+  function _renderHalts(halts) {
+    let box = document.getElementById('lobby-halts');
+    const list = Array.isArray(halts) ? halts : [];
+    if (!list.length) {
+      if (box) box.remove();
+      return;
+    }
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'lobby-halts';
+      const notice = document.getElementById('lobby-notice');
+      if (notice && notice.parentNode) {
+        notice.parentNode.insertBefore(box, notice);
+      } else if (elLobby) {
+        elLobby.appendChild(box);
+      }
+    }
+    const shown = new Set();
+    list.forEach((h) => {
+      const id = String(h.id);
+      shown.add(id);
+      let row = Array.from(box.children).find((r) => r.dataset.haltId === id);
+      if (!row) {
+        row = _haltRow(id);
+        box.appendChild(row);
+      }
+      _fillHaltRow(row, h);
+    });
+    Array.from(box.children).forEach((row) => {
+      if (!shown.has(row.dataset.haltId)) row.remove();
+    });
+  }
+
+  function _haltRow(id) {
+    const row = document.createElement('div');
+    row.className = 'lobby-halt';
+    row.dataset.haltId = id;
+    const text = document.createElement('div');
+    text.className = 'lobby-halt-text';
+    const head = document.createElement('b');
+    head.textContent = 'A halt is in force';
+    const meta = document.createElement('span');
+    meta.className = 'lobby-halt-meta';
+    const reason = document.createElement('span');
+    reason.className = 'lobby-halt-reason';
+    text.append(head, meta, reason);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'lobby-halt-lift';
+    btn.addEventListener('click', () => _liftHalt(row));
+    row.append(text, btn);
+    return row;
+  }
+
+  // Who a halt stops, in words: "every session on this machine", or every
+  // session in one repository, named by its directory rather than by the
+  // `.git` directory the registry keys it on.
+  function _haltWhere(h) {
+    if (h.scope_kind === 'machine') return 'every session on this machine';
+    const repo = String(h.scope_value || '').replace(/[\\/]\.git$/i, '');
+    return 'every session in ' + (repo || 'one repository');
+  }
+
+  function _fillHaltRow(row, h) {
+    row._halt = h;
+    let meta = ` for ${_haltWhere(h)}, raised by ${h.raised_by}`
+      + (h.raised_at ? ' ' + _fmtAgo(h.raised_at) : '') + '.';
+    if (h.raiser_running === false) {
+      meta += ` ${h.raised_by} has no live session on this machine, so `
+        + 'nobody may be left to lift it.';
+    }
+    row.querySelector('.lobby-halt-meta').textContent = meta;
+    row.querySelector('.lobby-halt-reason').textContent = h.reason || '';
+    // A lift the server did not carry out leaves the row in place; offer the
+    // button again rather than leave it stuck at "Lifting…".
+    const btn = row.querySelector('.lobby-halt-lift');
+    if (!row._liftSentAt || Date.now() - row._liftSentAt > 5000) {
+      row._liftSentAt = 0;
+      btn.disabled = false;
+      btn.textContent = 'Lift';
+    }
+  }
+
+  function _liftHalt(row) {
+    const h = row._halt;
+    if (!h) return;
+    const msg = `Lift this halt?\n\n${h.raised_by} raised it `
+      + `${_fmtAgo(h.raised_at)}: ${h.reason}\n\n`
+      + `Lifting it lets ${_haltWhere(h)} take on work again, and long jobs `
+      + 'that check for a halt start again.';
+    if (!window.confirm(msg)) return;
+    row._liftSentAt = Date.now();
+    const btn = row.querySelector('.lobby-halt-lift');
+    btn.disabled = true;
+    btn.textContent = 'Lifting…';
+    App.send({ type: 'lift_halt', id: h.id });
   }
 
   // Shared landing/visibility logic for both the pending and full renders.

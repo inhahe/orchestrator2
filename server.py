@@ -939,6 +939,8 @@ async def _session_list_payload(include_recent: bool = True) -> dict[str, Any]:
     # a hub running stale code is exactly the thing you want to learn about
     # *before* you start reading its session list for clues.
     stale = stale_sources()
+    # The same goes for a halt: it is why the sessions listed are idle.
+    halts = await asyncio.to_thread(_halts_payload)
     if not include_recent:
         return {
             "type": "session_list",
@@ -946,6 +948,7 @@ async def _session_list_payload(include_recent: bool = True) -> dict[str, Any]:
             "recent": [],
             "recent_pending": True,
             "stale": stale,
+            "halts": halts,
         }
     loop = asyncio.get_running_loop()
     recent = await loop.run_in_executor(None, _recent_disk_sessions)
@@ -985,7 +988,58 @@ async def _session_list_payload(include_recent: bool = True) -> dict[str, Any]:
         "running": running,
         "recent": recent,
         "stale": stale,
+        "halts": halts,
     }
+
+
+def _halts_payload() -> list[dict[str, Any]] | None:
+    """Every halt in force on the machine, for the lobby's banner.
+
+    **Blocking** (one SQLite read).  ``None`` when the registry cannot be
+    read, which the lobby shows as nothing: the session list must not fail
+    for want of it.  ``raiser_running`` is
+    :func:`agent_comms.raiser_running`'s answer, so the banner can say when
+    nobody is left to lift a halt.
+    """
+    try:
+        import agent_comms as _ac
+        conn = _ac.connect()
+        try:
+            now = time.time()
+            return [{
+                "id": h.id,
+                "scope_kind": h.scope_kind,
+                "scope_value": h.scope_value,
+                "raised_by": h.raised_by,
+                "raised_at": h.raised_at,
+                "reason": h.reason,
+                "raiser_running": _ac.raiser_running(h, conn=conn, now=now),
+            } for h in _ac.halts_in_force(conn=conn)]
+        finally:
+            conn.close()
+    except Exception:
+        log.debug("could not read the halts for the lobby", exc_info=True)
+        return None
+
+
+async def _lift_halt_from_lobby(ws: WebSocket, raw_id: Any) -> None:
+    """The lobby banner's Lift: lift halt *raw_id*, then show every lobby."""
+    try:
+        hid = int(raw_id)
+    except (TypeError, ValueError):
+        await _lobby_error(ws, f"Not a halt id: {raw_id!r}")
+        return
+    try:
+        import agent_comms as _ac
+        n = await asyncio.to_thread(_ac.lift_halt, halt_id=hid)
+        log.info("halt %s lifted from the lobby%s", hid,
+                 "" if n else " (it was already lifted)")
+    except Exception as exc:
+        log.exception("could not lift halt %s", hid)
+        await _lobby_error(ws, f"Couldn't lift halt {hid}: {exc}")
+    await _push_session_list()
+    if ws not in _lobby_targets():
+        await _push_session_list(ws)
 
 
 async def lobby_broadcast(msg: dict[str, Any]) -> None:
@@ -5642,6 +5696,10 @@ async def _handle_lobby_message(ws: WebSocket, msg: dict[str, Any]) -> bool:
 
     if msg_type == "move_do":
         await _do_move(ws, msg)
+        return True
+
+    if msg_type == "lift_halt":
+        await _lift_halt_from_lobby(ws, msg.get("id"))
         return True
 
     if msg_type == "attach":

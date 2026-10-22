@@ -95,7 +95,7 @@ def build_halt_tools(*, identity_getter, cwd_getter):
         except ValueError as e:
             return {"content": [{"type": "text", "text": f"Refused: {e}"}],
                     "isError": True}
-        by = identity_getter() or "unknown-agent"
+        by = identity_getter() or ac.UNKNOWN_AGENT
         hid = ac.raise_halt(reason, by=by, scope_kind=scope, scope_value=value)
         others = [a.identity for a in ac.live_agents(
             **({"repo": value} if scope == "repo" else {}))
