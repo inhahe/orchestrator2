@@ -139,8 +139,18 @@ def _write(path: Path, records) -> Path:
     return path
 
 
-NOW = time.time()
-RESET = int(NOW) + 3600
+#: Now, and a limit's reset an hour after it: set as each test starts
+#: (_fresh_clock).  Taken once, at import, the reset has passed by the time a
+#: long suite reaches the tests that need it ahead.
+NOW = 0.0
+RESET = 0
+
+
+@pytest.fixture(autouse=True)
+def _fresh_clock():
+    global NOW, RESET
+    NOW = time.time()
+    RESET = int(NOW) + 3600
 
 
 # ---------------------------------------------------------------------------
@@ -951,9 +961,9 @@ def test_on_after_a_live_limit_was_announced(tmp_path, monkeypatch):
     asyncio.run(go())
 
 
-def _stopped_transcript(tmp_path, reset=RESET):
+def _stopped_transcript(tmp_path, reset=None):
     return _write(tmp_path / f"{SID}.jsonl", [_prompt("go", NOW - 900),
-                                              _limit(NOW - 800, reset)])
+                                              _limit(NOW - 800, RESET if reset is None else reset)])
 
 
 def test_on_after_opening_a_session_a_limit_had_stopped(tmp_path, monkeypatch):
@@ -1254,11 +1264,11 @@ def test_a_session_waiting_hours_on_a_limit_is_closed_and_scheduled(tmp_path, mo
     assert [r["session_id"] for r in scheduled] == [SID]
 
 
-@pytest.mark.parametrize("st", [_St(limit_resume_at=time.time() + 30),
-                                _St(limit_resume_at=time.time() - 1),
-                                _St(connecting=True)])
-def test_a_session_about_to_resume_is_not_closed(tmp_path, monkeypatch, st):
+@pytest.mark.parametrize("due_in, connecting", [(30, False), (-1, False), (None, True)])
+def test_a_session_about_to_resume_is_not_closed(tmp_path, monkeypatch, due_in, connecting):
     """Closing it would only mean reopening it a moment later."""
+    st = (_St(connecting=True) if connecting
+          else _St(limit_resume_at=time.time() + due_in))
     torn, _ = _idle(monkeypatch, _RT(str(tmp_path), st))
     assert torn == []
 
