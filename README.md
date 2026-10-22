@@ -15,6 +15,11 @@ A web-based orchestrator for the Claude Agent SDK. Wraps Claude Code's agentic c
 pip install -r requirements.txt
 ```
 
+After pulling a newer orchestrator2, run it again with `--upgrade`
+(`pip install --upgrade -r requirements.txt`): the agent-comms package comes
+from a git tag, and pip keeps an installed one however old it is. orchestrator2
+says so, and does not start, when the one installed is too old.
+
 **3. Sign in to your Claude account**
 
 You need to be logged in to Claude. orchestrator2 checks this automatically on startup and, if you're not signed in, opens the normal Claude login window for you. You can also do it yourself any time:
@@ -432,7 +437,7 @@ You can see which a session uses. The status bar's plan field reads **`API $1.23
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--append-system-prompt TEXT` | -- | Extra instructions appended to the system prompt |
-| `--mcp-config PATH_OR_JSON` | -- | MCP servers config — a JSON file path or inline JSON string. Lets the orchestrator act as an MCP client. Use the `/mcp` command at runtime to inspect and manage the configured servers |
+| `--mcp-config PATH_OR_JSON` | -- | MCP servers config — a JSON file path or inline JSON string. Lets the orchestrator act as an MCP client. Every session also gets the halt tools (`agent-halt`) beside these. Use the `/mcp` command at runtime to inspect and manage the configured servers |
 
 ### Display
 
@@ -599,10 +604,12 @@ python -m agent_comms check-halt --scope repo     # 0 = clear, non-zero = halted
 
 (`python tools/agents.py …`, the old path, still runs the same command line.)
 
-The store stays where orchestrator2 created it,
-`%LOCALAPPDATA%\orchestrator2\agents.db`, until you move it to agent-comms' own
-place with `python -m agent_comms migrate-store`, once no hub running the older
-code is up. Nothing needs it moved; every command warns should both exist.
+**If you used orchestrator2 before agent-comms became a package of its own,**
+you may need to run `python -m agent_comms migrate-store` once. The store stays
+where orchestrator2 created it, `%LOCALAPPDATA%\orchestrator2\agents.db`, and
+goes on working there. But should a command warn that two stores exist, a halt
+raised in one is not seen in the other: stop any hub still running the older
+code, then run it.
 
 Agents themselves need none of that: their existing `ListAgents` and
 `SendMessage` tools now simply work across accounts. The registry the CLI uses
@@ -619,7 +626,10 @@ every session it runs.
 
 The commands above are the operator/script surface. Messages arrive at the
 addressee's **next turn boundary**, as a queued prompt — never mid-turn, so
-they cannot interrupt a half-finished edit.
+they cannot interrupt a half-finished edit. A halt is told the same way, once
+to each conversation: a session `/clear`ed while a halt is up is told again.
+If your accounts have agent-comms' hook installed, it leaves the sessions
+orchestrator2 runs to orchestrator2.
 
 `check-halt` is the enforcement half: a long job calls it before starting and
 refuses if a halt is in force. Nothing tries to guess which jobs are expensive

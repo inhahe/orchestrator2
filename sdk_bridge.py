@@ -61,23 +61,44 @@ except ImportError:
     ThinkingBlock = None  # type: ignore[assignment]
 
 # The cross-account agent registry: the agent-comms package (its docs/spec.md).
-# Optional on purpose: a coordination convenience must never be the reason a
-# session refuses to run, so every call site degrades to a no-op when it is
-# absent.
+# Required (server.py will not start a hub without it), but every call site
+# still degrades to a no-op when it is unusable: a coordination convenience
+# must never be the reason a session refuses to run.  A package that fails to
+# import is said loudly, since nothing else would say it.
 try:
     import agent_comms
 except Exception:  # pragma: no cover - defensive
     agent_comms = None  # type: ignore[assignment]
+    logging.getLogger(__name__).error(
+        "agent-comms could not be imported: no session will be registered, told "
+        "of a halt or given the halt tools", exc_info=True)
+
+def mcp_servers_of(value: str, cwd: str) -> dict[str, Any] | None:
+    """The MCP servers a ``--mcp-config`` *value* names, by name, or None when
+    it is neither inline JSON nor a JSON file this can read.
+
+    The forms the CLI reads: ``{"mcpServers": {...}}``, inline or in a file (a
+    relative path is the CLI's, from the session's *cwd*), or the bare map.
+    """
+    text = value.strip()
+    try:
+        if not text.startswith("{"):
+            path = Path(text).expanduser()
+            text = (path if path.is_absolute() else Path(cwd) / path).read_text(encoding="utf-8")
+        data = json.loads(text)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    inner = data.get("mcpServers", data)
+    return dict(inner) if isinstance(inner, dict) else None
+
 
 def halt_server_config() -> dict[str, Any]:
     """The ``mcp_servers`` entry for agent-comms' halt tools: its stdio server,
-    run by this interpreter, which has the package."""
-    exe = sys.executable
-    if os.path.basename(exe).lower().startswith("pythonw"):
-        console = os.path.join(os.path.dirname(exe), "python" + os.path.splitext(exe)[1])
-        if os.path.exists(console):
-            exe = console   # a server needs its stdio, which pythonw's may not be
-    return {"type": "stdio", "command": exe, "args": ["-m", "agent_comms.server"]}
+    as agent-comms runs it (this interpreter, which has the package)."""
+    command = agent_comms.server_command()
+    return {"type": "stdio", "command": command[0], "args": command[1:]}
 
 
 #: How often to look for pending agent traffic.  Not every tick: the ticker
@@ -1070,7 +1091,7 @@ class SDKBridge:
         # from current state and therefore satisfies whatever was waiting.
         self._deferred_reconnect: str | None = None
 
-        # Cross-account agent identity (specs/agent-comms-spec.md).  Resolved
+        # Cross-account agent identity (agent-comms' docs/spec.md).  Resolved
         # once, on the first connect, and then stable for the life of the
         # session; None means the registry is unavailable and every comms
         # operation degrades to a no-op rather than blocking the session.
@@ -1080,6 +1101,12 @@ class SDKBridge:
         self._agent_repo: str = ""
         self._agent_hb_at: float = 0.0
         self._agent_poll_at: float = 0.0
+        # A halt is told once per conversation, under its session key
+        # (_halt_key).  Before its first session id the conversation has a key
+        # of its own, and what it was told under one key is carried to the
+        # next (_take_session_id) by the next poll, before it tells anything.
+        self._unnamed_conversation: str | None = None
+        self._halt_carries: list[tuple[str, str]] = []
 
         # Set while a queue_update push is already scheduled, so a burst of
         # appends (an agent-comms poll delivering three messages at once) costs
@@ -1133,14 +1160,28 @@ class SDKBridge:
             if unknown is not None:
                 self._effort_refused(unknown.group(1), line)
 
-    def _take_session_id(self, sid: str) -> None:
+    def _take_session_id(self, sid: str, *, same_conversation: bool = False) -> None:
         """Make *sid* the session this bridge runs.
 
         Every id the CLI gives (an init, a result, a trim's new transcript)
         comes through here.  ``on_session_id`` hears of it, and of the id it
-        replaces (see ``_report_session_id``).
+        replaces (see ``_report_session_id``).  *same_conversation*: *sid*
+        continues the conversation the old id ran, as a trim's transcript does,
+        rather than starting another, as a new CLI's does.
         """
         old = self.state.session_id
+        if old != sid and agent_comms is not None:
+            # The halts this conversation was told of go with it to its new
+            # key: from the one it had before its first id, or across a trim.
+            carry_from = (self._unnamed_conversation if not old
+                          else agent_comms.session_key(old) if same_conversation else None)
+            if carry_from:
+                self._halt_carries.append((carry_from, agent_comms.session_key(sid)))
+            self._unnamed_conversation = None
+            # The registration carries the session id, by which agent-comms'
+            # halt server finds whose halt it raises: at the next tick, not
+            # at the next heartbeat.
+            self._agent_hb_at = float("-inf")
         if old and old != sid:
             self._report_session_id(old)
             # The same conversation under a new id -- the rolling context trim
@@ -1482,18 +1523,20 @@ class SDKBridge:
             kwargs["disallowed_tools"] = list(self.config.disallowed_tools)
 
         # MCP config — lets the orchestrator act as an MCP client.  The SDK
-        # option is named ``mcp_servers`` and accepts a dict of server configs,
-        # a path to a JSON file, or an inline JSON string; all forms are passed
-        # through to the CLI's ``--mcp-config``.
+        # option is named ``mcp_servers``; the user's --mcp-config (a JSON file
+        # or inline JSON) is read into it, so that ours can go beside theirs.
         servers: dict[str, Any] = {}
         if self.config.mcp_config:
-            if isinstance(self.config.mcp_config, dict):
-                servers.update(self.config.mcp_config)
-            else:
-                # A path or inline JSON: pass it through untouched, and give up
-                # on adding ours rather than trying to merge into a string.
+            theirs = mcp_servers_of(self.config.mcp_config, self.config.cwd)
+            if theirs is None:
+                # Passed on as given, for the CLI to read or refuse; there is
+                # no adding ours to what this could not read.
+                log.warning("--mcp-config %r is neither a JSON file nor JSON: "
+                            "the halt tools are not added beside it",
+                            self.config.mcp_config)
                 kwargs["mcp_servers"] = self.config.mcp_config
-                servers = {}
+            else:
+                servers.update(theirs)
 
         # The one agent-facing tool the comms addendum asks for (§2): raising
         # and lifting a halt must be *discoverable in the tool list*, because
@@ -1504,7 +1547,7 @@ class SDKBridge:
         # have; it learns which agent it works for from the registration this
         # bridge makes, by the session's id.
         if agent_comms is not None and "mcp_servers" not in kwargs:
-            servers["agent-halt"] = halt_server_config()
+            servers.setdefault("agent-halt", halt_server_config())  # one of theirs by the name wins
         if servers:
             kwargs["mcp_servers"] = servers
 
@@ -7028,7 +7071,7 @@ class SDKBridge:
                 # the new one is read from its start.  What was spent stays.
                 state.cost_mark_size = None
                 state.cost_mark_saved = None
-                self._take_session_id(new_sid)
+                self._take_session_id(new_sid, same_conversation=True)
                 await self.reconnect()
                 await self.broadcast({
                     "type": "system_msg", "subtype": "info",
@@ -7321,6 +7364,7 @@ class SDKBridge:
         if state.session_id:
             self._report_session_id(state.session_id)
         state.session_id = None
+        self._unnamed_conversation = None   # a new conversation, never told
         state.session_title = None
         state.context_tokens = 0
         state.turns = 0
@@ -7517,7 +7561,7 @@ class SDKBridge:
         )
 
     # ------------------------------------------------------------------
-    # Cross-account agent comms (specs/agent-comms-spec.md)
+    # Cross-account agent comms (agent-comms' docs/spec.md)
     # ------------------------------------------------------------------
 
     def _agent_enabled(self) -> bool:
@@ -7670,31 +7714,66 @@ class SDKBridge:
         if now - self._agent_poll_at < AGENT_POLL_INTERVAL:
             return
         self._agent_poll_at = now
+        # On this thread, where the session id changes: the key and the
+        # carries a poll works with are one moment's.
+        key = self._halt_key()
+        carries, self._halt_carries = self._halt_carries, []
         try:
-            parts = await asyncio.to_thread(self._collect_agent_comms)
+            parts = await asyncio.to_thread(self._collect_agent_comms, key, carries)
         except Exception:
+            self._halt_carries[:0] = carries    # carrying twice changes nothing
             log.debug("agent comms poll failed", exc_info=True)
             return
         for text in parts:
             if text not in self.state.queued_prompts:
                 self.state.queued_prompts.append(text)
 
-    def _collect_agent_comms(self) -> list[str]:
-        """**Blocking** -- runs in a thread.  Returns prompts to queue."""
+    def _halt_key(self) -> str:
+        """The key this conversation is told of halts under: its session's,
+        once it has an id; before then, one minted for it."""
+        key = agent_comms.session_key(self.state.session_id)
+        if key:
+            return key
+        if self._unnamed_conversation is None:
+            self._unnamed_conversation = agent_comms.conversation_key()
+        return self._unnamed_conversation
+
+    def _collect_agent_comms(self, key: str,
+                             carries: list[tuple[str, str]]) -> list[str]:
+        """**Blocking** -- runs in a thread.  Returns prompts to queue: a halt
+        the conversation *key* has not been told of, after *carries* (from key,
+        to key) have moved what it was told under its earlier keys, then the
+        messages waiting for its agent.
+
+        Whatever has been recorded as told is returned, even when a later step
+        fails: the record is what stops it being offered again, so text taken
+        and then dropped would never reach the session at all.
+        """
         ident = self.agent_identity
         cwd = getattr(self.config, "cwd", "") or ""
         out: list[str] = []
         conn = agent_comms.connect()
         try:
+            for old, new in carries:
+                agent_comms.carry_told(old, new, conn=conn)
             # The same words, and the same order -- the text built before the
-            # halt is marked delivered -- as agent-comms' hook, which tells a
-            # session by its id.  Recorded and checked under both names, so a
-            # session the hook also reaches hears the halt only once.
+            # halt is recorded as told -- as agent-comms' hook, which tells the
+            # sessions nothing like this bridge runs.
             text = agent_comms.take_pending_halt(
-                ident, repo=self._agent_repo, conn=conn,
-                also=[agent_comms.session_key(self.state.session_id)])
+                key, agent=ident, repo=self._agent_repo, conn=conn)
             if text is not None:
                 out.append(text)
+            self._collect_agent_messages(ident, cwd, conn, out)
+        finally:
+            conn.close()
+        return out
+
+    def _collect_agent_messages(self, ident: str, cwd: str, conn: Any,
+                                out: list[str]) -> None:
+        """Append the messages waiting for *ident* to *out*, each as it is
+        marked delivered.  A failure part-way is logged, not raised: *out*
+        already holds a halt, or messages, recorded as told."""
+        try:
             msgs = agent_comms.pending_messages(
                 ident, repo=self._agent_repo, cwd=cwd, conn=conn)
             for m in msgs:
@@ -7715,9 +7794,9 @@ class SDKBridge:
                     f"against a direct instruction and neither of you finds "
                     f"out for a while."
                 )
-        finally:
-            conn.close()
-        return out
+        except Exception:
+            log.warning("agent messages for %r could not all be taken", ident,
+                        exc_info=True)
 
     async def _warn_if_name_in_use(self, ident: str) -> None:
         """Say so when another live session already answers to *ident*.

@@ -31,7 +31,9 @@
 > being contradicted on is the property most easily lost to well-meant
 > wrapping) each have a test.
 
-Companion to `agent-comms-spec.md`. That document is the design; this is the
+Companion to the specification, now the agent-comms package's
+[`docs/spec.md`](https://github.com/inhahe/agent-comms/blob/main/docs/spec.md).
+That document is the design; this is the
 short list to verify an implementation against. Each item states what was
 **observed** on 2026-09-06 (the day the cross-account registry landed and four
 sessions used it for an afternoon), what to change, and how to tell it is done.

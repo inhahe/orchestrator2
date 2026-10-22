@@ -186,6 +186,24 @@ def _take_launch_api_key() -> str | None:
     return (os.environ.pop("ANTHROPIC_API_KEY", None) or "").strip() or None
 
 
+def _prepare_agent_comms_env() -> None:
+    """Make this process's environment, which every CLI it starts inherits,
+    say what agent-comms must read there.
+
+    ``AGENT_COMMS_TOLD_BY`` set: the bridge tells its sessions of halts itself,
+    at their turn boundaries, so agent-comms' hook leaves them to it -- one
+    teller per conversation.  ``AGENT_COMMS_NAME`` removed: it names one
+    caller, and inherited it would sign every session's ``python -m
+    agent_comms`` halts and messages, as ``ORCH2_AGENT_NAME`` would have named
+    every session had parse_args not consumed it.
+    """
+    import agent_comms
+    from agent_comms.cli import NAME_ENV
+
+    os.environ.pop(NAME_ENV, None)
+    os.environ[agent_comms.TOLD_BY_ENV] = "orchestrator2"
+
+
 def _detach_child_env(cfg: Config) -> dict[str, str]:
     """The environment for the headless child a ``--detach`` launch hands off to.
 
@@ -1008,6 +1026,15 @@ def _halts_payload() -> list[dict[str, Any]] | None:
         conn = _ac.connect()
         try:
             now = time.time()
+
+            def running(h: Any) -> bool | None:
+                # Unknown, not the banner gone: it exists to show the halts.
+                try:
+                    return _ac.raiser_running(h, conn=conn, now=now)
+                except Exception:
+                    log.debug("could not ask after halt %s's raiser", h.id, exc_info=True)
+                    return None
+
             return [{
                 "id": h.id,
                 "scope_kind": h.scope_kind,
@@ -1016,7 +1043,7 @@ def _halts_payload() -> list[dict[str, Any]] | None:
                 "raised_at": h.raised_at,
                 "age": _ac.age_text(h.raised_at, now),
                 "reason": h.reason,
-                "raiser_running": _ac.raiser_running(h, conn=conn, now=now),
+                "raiser_running": running(h),
             } for h in _ac.halts_in_force(conn=conn)]
         finally:
             conn.close()
@@ -1606,7 +1633,7 @@ async def _tick_runtime(rt: SessionRuntime) -> bool:
             log.debug("peer registry mirror failed", exc_info=True)
 
     # Cross-account agent comms: heartbeat, and queue anything a sibling
-    # session has sent us (specs/agent-comms-spec.md).  Driven from the ticker
+    # session has sent us (agent-comms' docs/spec.md).  Driven from the ticker
     # because an *idle* agent is at a turn boundary too -- delivering only in
     # _between_turns would leave a halt undelivered until the agent happened to
     # do something, which is the opposite of what a halt is for.  The bridge
@@ -6487,7 +6514,28 @@ _REQUIRED_MODULES = {
     "websockets": "websockets",
     "psutil": "psutil",
     "claude_agent_sdk": "claude-agent-sdk",
+    "agent_comms": "agent-comms",
 }
+
+#: The oldest release of a dependency whose interface this code uses, by
+#: distribution.  agent-comms is installed from a git URL, which pip counts as
+#: satisfied by whatever release is already installed: without a floor, a hub
+#: updated by ``git pull`` would run against an older package and lose its
+#: halts to errors logged at DEBUG.
+_MIN_VERSIONS = {
+    "agent-comms": (1, 0, 0),
+}
+
+
+def _release(version: str) -> tuple[int, ...]:
+    """The release numbers of *version* (``"1.2.0.dev3"`` -> ``(1, 2, 0)``)."""
+    out = []
+    for part in version.split("."):
+        digits = re.match(r"\d+", part)
+        if not digits:
+            break
+        out.append(int(digits.group()))
+    return tuple(out)
 
 
 def _require_dependencies() -> None:
@@ -6507,8 +6555,10 @@ def _require_dependencies() -> None:
     Checked with ``find_spec``, which locates without importing, so this costs
     nothing measurable and does not undo the lazy-import optimisation. All
     missing packages are reported at once — fixing them one traceback at a time
-    is several minutes of nothing.
+    is several minutes of nothing.  So is a package older than
+    :data:`_MIN_VERSIONS` allows, by its installed metadata.
     """
+    import importlib.metadata
     import importlib.util
 
     missing: list[str] = []
@@ -6519,13 +6569,24 @@ def _require_dependencies() -> None:
             found = False
         if not found:
             missing.append(dist)
-    if not missing:
+    stale: list[str] = []
+    for dist, floor in _MIN_VERSIONS.items():
+        try:
+            have = importlib.metadata.version(dist)
+        except importlib.metadata.PackageNotFoundError:
+            continue    # missing above, or on the path without metadata
+        if _release(have) < floor:
+            stale.append(f"{dist} {have} (needs {'.'.join(map(str, floor))} or newer)")
+    if not missing and not stale:
         return
 
-    print(f"orchestrator2 can't start: missing {len(missing)} required "
-          f"package(s): {', '.join(missing)}")
+    if missing:
+        print(f"orchestrator2 can't start: missing {len(missing)} required "
+              f"package(s): {', '.join(missing)}")
+    if stale:
+        print(f"orchestrator2 can't start: too old: {', '.join(stale)}")
     print(f"  Interpreter: {sys.executable}")
-    print(f"  Install with: {sys.executable} -m pip install -r "
+    print(f"  Install with: {sys.executable} -m pip install --upgrade -r "
           f"{Path(__file__).resolve().parent / 'requirements.txt'}")
     if sys.platform != "win32":
         print("  (This is not the Windows Python. If you meant to use the "
@@ -7818,6 +7879,7 @@ def main() -> None:
     # checking later would leave a splash page listening on a bound socket
     # while the real import dies with a traceback behind it.
     _require_dependencies()
+    _prepare_agent_comms_env()
 
     url = f"http://localhost:{actual_port}"
     msg = f"orchestrator2 starting on {url}"

@@ -154,7 +154,11 @@ a Windows Python and a WSL `python3` can both run this file.
 `_require_dependencies()` closes that: it `find_spec`s every required
 distribution (locating without importing, so the lazy imports stay lazy) and
 prints all the missing ones at once, `sys.executable`, and the exact
-`pip install -r requirements.txt` line to run. It is called **after every path
+`pip install --upgrade -r requirements.txt` line to run. A package older than
+`_MIN_VERSIONS` allows is refused the same way: agent-comms comes from a git
+URL, which pip counts as satisfied by any installed release, so a hub updated
+by `git pull` alone would otherwise run against an older one and lose its halts
+to errors logged at DEBUG. It is called **after every path
 that exits without serving and before the splash pre-server starts** — earlier
 would reject hub joins that need none of those packages, later would leave a
 splash listening on a bound socket with a traceback behind it.
@@ -4543,10 +4547,28 @@ undelivered until the agent happened to do something.
 The halt's text, and its once-only record, are agent-comms'
 (`take_pending_halt`): the text is built before the halt is marked told, so a
 failure in between loses nothing, and the same words reach a session whether
-this bridge tells it or the package's hook does. The bridge records and checks
-a halt under the session's agent identity and its session key
-(`session_key(session_id)`), the name the hook knows it by, so a session both
-reach hears the halt from whichever comes first, and once.
+this bridge tells it or the package's hook does. A halt taken is returned even
+when the messages after it fail (`_collect_agent_messages` logs and goes on):
+dropped with the poll, it would never be offered again.
+
+**Once per conversation, by this bridge alone.** A halt is told once to each
+conversation, recorded under its session key (`_halt_key`), not under the
+agent: a `/clear`, or a CLI that started another session than the one the
+bridge ran, is a context that has never seen it. Two moves keep one
+conversation one: before its first session id it is told under a key of its
+own (`agent_comms.conversation_key`), and when the id arrives, or a context
+trim starts a new transcript (`_take_session_id(…, same_conversation=True)`),
+the next poll carries what it was told to the new key (`carry_told`) before it
+tells anything. A halt the session's agent raised is never told to it. The hub
+sets `AGENT_COMMS_TOLD_BY=orchestrator2` in its environment at start
+(`server._prepare_agent_comms_env`), which every CLI it runs inherits, so the
+package's hook, if the account has it, leaves these sessions to the bridge: it
+would otherwise tell a new conversation a second time in its first turn, before
+the bridge had heard of its session id. The same start removes
+`AGENT_COMMS_NAME`, which names one caller and would sign every session's CLI
+halts and messages. A new session id also makes the next tick heartbeat, so the
+registration, by which the halt server finds whose halt it raises, carries the
+new id within two seconds rather than thirty.
 
 **A halt nobody is left to lift** is recognisable as one: the prompt says how
 old the halt is and whether its raiser is still registered here, and offers
@@ -4577,11 +4599,16 @@ sessions no `AGENT_COMMS_NAME`, and so the CLI has no identity: `raiser_running`
 age shows that it has been forgotten. `RaiseHalt` records the agent.
 
 **The tools and the mirror.** Every session is given the halt tools:
-agent-comms' MCP server, `agent-halt`, a stdio process run by the hub's own
-interpreter (`sdk_bridge.halt_server_config`; `python`, not `pythonw`, whose
-stdio a server cannot use), merged into `mcp_servers` alongside any the user
-configured — except when the user's configuration is a path or inline JSON,
-which cannot be merged into, as before. It learns which agent it works for from
+agent-comms' MCP server, `agent-halt`, a stdio process run as agent-comms says
+(`sdk_bridge.halt_server_config`, from `agent_comms.server_command()`: the
+hub's interpreter as `python`, not `pythonw`, whose stdio a server cannot use,
+with `-P`, so an older checkout of this tree, holding its own `agent_comms.py`,
+cannot shadow the package in a session working there). A `--mcp-config`, a
+JSON file or inline JSON, is read (`mcp_servers_of`; the CLI's
+`{"mcpServers": …}` or a bare map, a relative file from the session's
+directory), and the halt tools go beside the servers it names; one of theirs
+called `agent-halt` wins. Only a value this cannot read is passed on as given,
+without the tools, and a warning says so. The server learns which agent it works for from
 the registration this bridge makes, by the session's id, on every call, since
 the identity is settled only after the session starts. The mirror
 (`agent_comms.mirror_peer_registries`) runs from the ticker, throttled, over

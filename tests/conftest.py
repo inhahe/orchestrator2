@@ -10,10 +10,13 @@ what made every session opened in this directory refuse an identity.  Tests
 that want a registry get their own via ``AGENT_COMMS_DB``; this makes that the
 default rather than something each file has to remember.
 
-**No test inherits a name or a compaction from the developer's shell**
-(``ORCH2_AGENT_NAME``, ``CLAUDE_CODE_SESSION_NAME``,
-``config.CLI_COMPACTION_VARS``): ``parse_args`` consumes the first, and a
-session running this suite from its Bash tool carries the others.
+**No test inherits a name, a teller or a compaction from the developer's
+shell** (``ORCH2_AGENT_NAME``, ``AGENT_COMMS_NAME``, ``AGENT_COMMS_TOLD_BY``,
+``CLAUDE_CODE_SESSION_NAME``, ``config.CLI_COMPACTION_VARS``): ``parse_args``
+consumes the first, a hub's start sets the third and removes the second, and a
+session running this suite from its Bash tool carries the rest.  Each is
+registered with ``monkeypatch``, so whatever a test's ``main()`` does to it is
+undone.
 
 **No test inherits another's account.**  ``account.adopt_from_environment``
 makes the process's account module state and takes ``CLAUDE_CONFIG_DIR`` out
@@ -39,6 +42,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import agent_comms  # noqa: E402
+from agent_comms.cli import NAME_ENV as AGENT_NAME_ENV  # noqa: E402
 import account  # noqa: E402
 import session  # noqa: E402
 from config import CLI_COMPACTION_VARS  # noqa: E402
@@ -49,9 +54,11 @@ import wakeup_store  # noqa: E402
 @pytest.fixture(autouse=True)
 def _private_agent_registry(monkeypatch, tmp_path_factory):
     monkeypatch.setenv(
-        "AGENT_COMMS_DB",
+        agent_comms.DB_ENV,
         str(tmp_path_factory.mktemp("agent-registry") / "agents.db"))
     monkeypatch.delenv("ORCH2_AGENT_NAME", raising=False)
+    monkeypatch.delenv(AGENT_NAME_ENV, raising=False)
+    monkeypatch.delenv(agent_comms.TOLD_BY_ENV, raising=False)
     monkeypatch.delenv("CLAUDE_CODE_SESSION_NAME", raising=False)
     for var in CLI_COMPACTION_VARS:
         monkeypatch.delenv(var, raising=False)

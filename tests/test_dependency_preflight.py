@@ -24,6 +24,7 @@ experience from here on.  These tests pin the pre-flight that replaces it.
 
 import builtins
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -108,8 +109,43 @@ def test_the_message_gives_a_runnable_install_command(monkeypatch, capsys):
         server._require_dependencies()
 
     out = capsys.readouterr().out
-    assert "-m pip install -r" in out
+    assert "-m pip install --upgrade -r" in out
     assert str(REQ_TXT) in out
+
+
+def _installed(monkeypatch, versions):
+    """Make the installed metadata report *versions* (distribution -> version)."""
+    import importlib.metadata
+    real = importlib.metadata.version
+
+    def fake(dist):
+        return versions[dist] if dist in versions else real(dist)
+    monkeypatch.setattr(importlib.metadata, "version", fake)
+
+
+def test_an_agent_comms_older_than_this_code_needs_stops_the_launch(monkeypatch, capsys):
+    """Installed from a git URL, which pip counts as satisfied by any release:
+    a hub updated by ``git pull`` alone would run against the old one, and lose
+    every halt to an error logged at DEBUG."""
+    _spec_for(monkeypatch, set(server._REQUIRED_MODULES))
+    _installed(monkeypatch, {"agent-comms": "0.9.2"})
+    with pytest.raises(SystemExit):
+        server._require_dependencies()
+    out = capsys.readouterr().out
+    assert "too old: agent-comms 0.9.2 (needs 1.0.0 or newer)" in out
+    assert "--upgrade" in out, "plain pip install keeps the old one"
+
+
+def test_an_agent_comms_new_enough_passes(monkeypatch, capsys):
+    _spec_for(monkeypatch, set(server._REQUIRED_MODULES))
+    _installed(monkeypatch, {"agent-comms": "1.0.0"})
+    server._require_dependencies()
+    assert capsys.readouterr().out == ""
+
+
+def test_a_release_is_read_from_its_leading_numbers():
+    assert server._release("1.2.0.dev3") == (1, 2, 0)
+    assert server._release("1.10") > server._release("1.9.9")
 
 
 def test_the_distribution_name_is_reported_not_the_module_name(monkeypatch, capsys):
@@ -288,3 +324,33 @@ def test_the_check_runs_before_anything_starts_listening(monkeypatch):
         server.main()
 
     assert started == [], "splash pre-server started before the pre-flight"
+
+
+def test_the_serving_path_prepares_the_environment_its_clis_inherit(monkeypatch):
+    monkeypatch.setattr(
+        sys, "argv",
+        ["server.py", "--standalone", "--skip-auto-login", "--port", "8299"],
+    )
+    _no_hub(monkeypatch)
+    monkeypatch.setattr(server, "_bind_port", lambda *a, **kw: (_FakeSock(), 8299))
+    monkeypatch.setattr(server, "_require_dependencies", lambda: None)
+
+    def boom():
+        raise _Boom()
+
+    monkeypatch.setattr(server, "_prepare_agent_comms_env", boom)
+    with pytest.raises(_Boom):
+        server.main()
+
+
+def test_the_hub_tells_its_sessions_itself_and_lends_them_no_name(monkeypatch):
+    """agent-comms' hook leaves a session with AGENT_COMMS_TOLD_BY to the
+    program that set it; AGENT_COMMS_NAME names one caller, not every session."""
+    import agent_comms
+    from agent_comms.cli import NAME_ENV
+
+    monkeypatch.setenv(NAME_ENV, "Lane-X")
+    monkeypatch.delenv(agent_comms.TOLD_BY_ENV, raising=False)
+    server._prepare_agent_comms_env()
+    assert NAME_ENV not in os.environ
+    assert os.environ[agent_comms.TOLD_BY_ENV] == "orchestrator2"

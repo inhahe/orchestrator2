@@ -1,8 +1,9 @@
 """How agents *discover* the comms features.
 
-Implements ``specs/agent-comms-addendum-surfacing.md``, which is a separate
-document from the main spec and gets a separate suite for the same reason: it
-changes no data model and no semantics, only what an agent can find.
+Implements the surfacing addendum to the agent-comms spec (its § numbers below;
+the addendum itself was never kept in a tree, and agent-comms' design.md,
+"Surfacing", sums it up).  It gets a suite of its own because it changes no
+data model and no semantics, only what an agent can find.
 
 Its two rules pull in opposite directions, and both matter:
 
@@ -51,6 +52,7 @@ session's transcript, not by checking that the call returns success":
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -89,14 +91,35 @@ def test_the_bridge_exposes_the_halt_tools_to_the_model(tmp_path):
     this interpreter, which has the package."""
     srv = _servers(tmp_path).get("agent-halt")
     assert srv == halt_server_config(), srv
-    assert srv["type"] == "stdio" and srv["args"] == ["-m", "agent_comms.server"]
+    assert srv["type"] == "stdio" and [srv["command"], *srv["args"]] == ac.server_command()
     assert Path(srv["command"]).is_file() and "pythonw" not in Path(srv["command"]).name.lower()
 
 
-def test_a_user_supplied_mcp_config_is_not_displaced(tmp_path):
-    """Adding ours must not silently drop theirs."""
-    servers = _servers(tmp_path, "--mcp-config", '{"mine": {"type": "stdio", "command": "x"}}')
-    assert "mine" in servers, "the user's MCP server was dropped"
+MINE = {"type": "stdio", "command": "x"}
+
+
+@pytest.mark.parametrize("given", [
+    json.dumps({"mcpServers": {"mine": MINE}}),          # the CLI's own shape
+    json.dumps({"mine": MINE}),                          # the bare map
+    "servers.json",                                      # a file, from the session's directory
+])
+def test_a_user_supplied_mcp_config_gets_the_halt_tools_beside_it(tmp_path, given):
+    """Adding ours must not drop theirs, nor theirs ours."""
+    (tmp_path / "servers.json").write_text(json.dumps({"mcpServers": {"mine": MINE}}),
+                                           encoding="utf-8")
+    servers = _servers(tmp_path, "--mcp-config", given)
+    assert servers.get("mine") == MINE, "the user's MCP server was dropped"
+    assert servers.get("agent-halt") == halt_server_config(), "the halt tools were dropped"
+
+
+def test_an_mcp_config_this_cannot_read_is_passed_on_as_given(tmp_path):
+    """For the CLI to read or refuse: there is nothing to add ours to."""
+    assert _servers(tmp_path, "--mcp-config", "no-such-file.json") == "no-such-file.json"
+
+
+def test_a_server_of_theirs_by_the_halt_tools_name_wins(tmp_path):
+    servers = _servers(tmp_path, "--mcp-config", json.dumps({"agent-halt": MINE}))
+    assert servers["agent-halt"] == MINE
 
 
 # ---------------------------------------------------------------------------

@@ -47,6 +47,7 @@ def _bridge_and_poll(tmp_path):
     def poll():
         br._agent_poll_at = 0.0
         asyncio.run(br.poll_agent_comms())
+    poll.bridge = br
     return st, poll
 
 
@@ -63,9 +64,9 @@ def test_a_delivered_halt_prompt_carries_the_raisers_absence(tmp_path):
     assert GONE in text, text
 
 
-def test_a_halt_the_hook_already_told_is_not_told_again(tmp_path):
-    """agent-comms' hook tells a session by its id; the bridge checks that
-    name too, so the session hears the halt once."""
+def test_a_conversation_told_elsewhere_is_not_told_again(tmp_path):
+    """agent-comms' hook told the session, in a terminal, before orchestrator2
+    resumed it: one conversation, one telling."""
     st, poll = _bridge_and_poll(tmp_path)
     hid = ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
     ac.mark_halt_delivered(hid, ac.session_key("sb"))      # as the hook records it
@@ -73,12 +74,128 @@ def test_a_halt_the_hook_already_told_is_not_told_again(tmp_path):
     assert list(st.queued_prompts) == []
 
 
-def test_a_halt_the_bridge_told_is_recorded_for_the_hook_too(tmp_path):
+def test_a_halt_the_bridge_told_is_recorded_under_the_conversation(tmp_path):
+    """So the session, resumed in a terminal, is not told again by the hook."""
     st, poll = _bridge_and_poll(tmp_path)
     ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
     poll()
     assert len(st.queued_prompts) == 1
     assert ac.pending_halt_for(ac.session_key("sb")) is None, "the hook would tell it again"
+
+
+def _clear(br):
+    """/clear, with no CLI to stop or start."""
+    async def nothing(*_a, **_k):
+        pass
+    br.disconnect = nothing
+    br.connect = nothing
+    asyncio.run(br._clear_context())
+
+
+def test_a_cleared_conversation_is_told_again(tmp_path):
+    """A /clear leaves a context that has never seen the halt."""
+    st, poll = _bridge_and_poll(tmp_path)
+    ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
+    poll()
+    st.queued_prompts.clear()
+    _clear(poll.bridge)
+    poll()
+    assert len(st.queued_prompts) == 1, "the new context was never told"
+
+
+def test_a_conversation_cleared_before_its_first_id_is_told_again(tmp_path):
+    """Told while new, under a key of its own, then cleared before any turn:
+    the conversation after it must not inherit that key."""
+    st, poll = _bridge_and_poll(tmp_path)
+    st.session_id = None
+    ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
+    poll()
+    st.queued_prompts.clear()
+    _clear(poll.bridge)
+    poll()
+    assert len(st.queued_prompts) == 1, "the new conversation took the old one's key"
+
+
+def test_a_conversation_told_before_its_first_session_id_keeps_it(tmp_path):
+    """Told while new and idle, under a key of its own; its first turn gives it
+    a session id, under which it must count as told."""
+    st, poll = _bridge_and_poll(tmp_path)
+    st.session_id = None
+    ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
+    poll()
+    assert len(st.queued_prompts) == 1
+    st.queued_prompts.clear()
+    poll.bridge._take_session_id("sb-first")
+    poll()
+    assert list(st.queued_prompts) == [], "told again once it had an id"
+    assert ac.pending_halt_for(ac.session_key("sb-first")) is None
+
+
+def test_a_trimmed_conversation_is_not_told_again(tmp_path):
+    """A context trim starts a new transcript for the same conversation."""
+    st, poll = _bridge_and_poll(tmp_path)
+    ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
+    poll()
+    st.queued_prompts.clear()
+    poll.bridge._take_session_id("sb-trimmed", same_conversation=True)
+    poll()
+    assert list(st.queued_prompts) == []
+
+
+def test_a_new_cli_session_is_told_again(tmp_path):
+    """The CLI started another session than the one the bridge ran: a new
+    context, which has not been told."""
+    st, poll = _bridge_and_poll(tmp_path)
+    ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
+    poll()
+    st.queued_prompts.clear()
+    poll.bridge._take_session_id("sb-other")
+    poll()
+    assert len(st.queued_prompts) == 1
+
+
+def test_a_failed_raiser_lookup_leaves_the_halt_in_the_banner(monkeypatch):
+    """The banner exists to show the halts: an unknown raiser is said as
+    unknown, not taken as a reason to show none."""
+    ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
+
+    def boom(*_a, **_k):
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(ac, "raiser_running", boom)
+    halts = server._halts_payload()
+    assert [h["reason"] for h in halts] == ["PC migration"]
+    assert halts[0]["raiser_running"] is None
+
+
+def test_a_halt_this_agent_raised_is_not_told_to_it(tmp_path):
+    st, poll = _bridge_and_poll(tmp_path)
+    ac.raise_halt("moving the tree", by="lane-b", scope_kind="machine")
+    poll()
+    assert list(st.queued_prompts) == []
+
+
+def test_a_message_that_fails_does_not_lose_the_halt_told_before_it(tmp_path, monkeypatch):
+    """The halt is recorded as told when it is taken: dropped with the poll,
+    it would never reach the session."""
+    st, poll = _bridge_and_poll(tmp_path)
+    ac.raise_halt("PC migration", by="Lane-F", scope_kind="machine")
+
+    def locked(*_a, **_k):
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(ac, "pending_messages", locked)
+    poll()
+    assert len(st.queued_prompts) == 1 and "PC migration" in st.queued_prompts[0]
+
+
+def test_the_halt_server_finds_the_agent_at_the_next_tick_after_a_new_id(tmp_path):
+    """The registration carries the session id, by which agent-comms' server
+    finds whose halt it raises: waiting for the next heartbeat would sign one
+    raised meanwhile unknown-agent."""
+    st, poll = _bridge_and_poll(tmp_path)
+    poll()                                                 # a heartbeat, now
+    poll.bridge._take_session_id("sb-after-clear")
+    poll()
+    assert ac.identity_for_session("sb-after-clear") == "lane-b"
 
 
 def test_a_failed_raiser_lookup_still_tells_the_halt(tmp_path, monkeypatch):
@@ -106,7 +223,7 @@ def test_a_prompt_that_fails_to_build_leaves_the_halt_to_tell(tmp_path,
     monkeypatch.setattr(ac, "halt_prompt", boom)
     poll()
     assert list(st.queued_prompts) == []
-    assert ac.pending_halt_for("lane-b") is not None, \
+    assert ac.pending_halt_for(ac.session_key("sb")) is not None, \
         "marked delivered without being told: it is lost for good"
 
 

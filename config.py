@@ -1178,7 +1178,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         metavar="NAME",
         help=(
             "The name of the session this launch opens: its identity in the "
-            "cross-account agent registry (see specs/agent-comms-spec.md) and "
+            "cross-account agent registry (see agent-comms' docs/spec.md) and "
             "the name other Claude sessions see in ListAgents / SendMessage.  "
             "Per session -- it names only the session this launch opens, "
             "including one opened in a hub that is already running, never the "

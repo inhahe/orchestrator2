@@ -1,8 +1,11 @@
 claude-agent-sdk>=0.2.151
 # Cross-account agent comms: the registry, messages and halts, and the halt
-# tools every session is given (design.md section 9a).  Working on both?
+# tools every session is given (design.md section 9a).  A release tag: pip
+# counts any installed release as satisfying a git URL, so after raising it
+# run `pip install --upgrade -r requirements.txt` (server.py refuses to start
+# on one older than _MIN_VERSIONS).  Working on both?
 #   pip install -e ../agent-comms
-agent-comms @ git+https://github.com/inhahe/agent-comms
+agent-comms @ git+https://github.com/inhahe/agent-comms@v1.0.0
 fastapi>=0.115
 graphifyy>=0.9.13
 psutil>=5.9

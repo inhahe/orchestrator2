@@ -49,7 +49,14 @@ Targets:
   halt-*     server.py x tests/test_halt_surfacing.py (pytest), and
              static/lobby.js x tests/lobby_halts.test.js (node)
              a halt nobody is left to lift is recognisable as one in the
-             lobby, with its Lift
+             lobby, with its Lift; and sdk_bridge.py x the same tests:
+             each conversation is told once, nothing lost on the way
+  preflight  server.py x tests/test_dependency_preflight.py (pytest)
+             a hub refuses to start without the packages it needs, or
+             with an agent-comms too old, and leaves its CLIs the
+             environment agent-comms reads
+  mcpconfig  sdk_bridge.py x tests/test_agent_comms_surfacing.py (pytest)
+             the halt tools go beside the servers a --mcp-config gives
              (The agent-comms package -- identity, registry, messaging, halt,
              its command line and halt tools -- has its own sweep and its own
              mutants: tools/mutate.py there.)
@@ -1423,8 +1430,14 @@ HALTSERVER_MUTATIONS = [
      '            "stale": stale,'),
 
     ("the lobby is not told whether a raiser is running",
-     '                "raiser_running": _ac.raiser_running(h, conn=conn, now=now),',
+     '                "raiser_running": running(h),',
      '                "raiser_running": None,'),
+
+    ("a failed raiser lookup takes the whole banner down",
+     "                except Exception:\n"
+     "                    log.debug(\"could not ask after halt %s's raiser\", h.id, exc_info=True)\n"
+     "                    return None",
+     "                except ImportError:\n                    return None"),
 
     ("the lobby is not given the age, so it words one by its own clock",
      '                "age": _ac.age_text(h.raised_at, now),\n',
@@ -1467,6 +1480,94 @@ HALTSERVER_MUTATIONS = [
      "    await lobby_broadcast(payload)\n"
      "    if ws not in _lobby_targets():\n"
      "        await send_to(ws, await _session_list_payload())"),
+]
+
+# The bridge tells each conversation once: a key per conversation, carried
+# where the conversation goes on under a new one, and nothing lost on the way.
+HALTBRIDGE_MUTATIONS = [
+    ("a message that fails takes the halt told before it down with it",
+     "        except Exception:\n"
+     '            log.warning("agent messages for %r could not all be taken", ident,\n'
+     "                        exc_info=True)",
+     "        except ImportError:\n            pass"),
+
+    ("a conversation told before its first id is told again once it has one",
+     "            carry_from = (self._unnamed_conversation if not old",
+     "            carry_from = (None if not old"),
+
+    ("a trimmed conversation is told again",
+     "                self._take_session_id(new_sid, same_conversation=True)",
+     "                self._take_session_id(new_sid)"),
+
+    ("a new CLI's session counts as the old conversation, so it is never told",
+     "                          else agent_comms.session_key(old) if same_conversation else None)",
+     "                          else agent_comms.session_key(old))"),
+
+    ("the carries are dropped, so every new key is told again",
+     "        carries, self._halt_carries = self._halt_carries, []",
+     "        carries, self._halt_carries = [], []"),
+
+    ("a conversation cleared before its first id keeps its key",
+     "        self._unnamed_conversation = None   # a new conversation, never told\n",
+     ""),
+
+    ("the agent is told of the halt it raised",
+     "                key, agent=ident, repo=self._agent_repo, conn=conn)",
+     "                key, agent=None, repo=self._agent_repo, conn=conn)"),
+
+    ("the halt server signs a halt raised after a new id unknown-agent until the heartbeat",
+     '            self._agent_hb_at = float("-inf")',
+     "            pass"),
+]
+
+# The halt tools beside the servers a --mcp-config gives.
+MCPCONFIG_MUTATIONS = [
+    ("a --mcp-config takes the halt tools away",
+     "                servers.update(theirs)",
+     "                kwargs[\"mcp_servers\"] = self.config.mcp_config"),
+
+    ("the CLI's own shape, {\"mcpServers\": ...}, is read as a server named mcpServers",
+     '    inner = data.get("mcpServers", data)',
+     "    inner = data"),
+
+    ("a relative file is looked for where the hub runs, not the session",
+     "(path if path.is_absolute() else Path(cwd) / path)",
+     "path"),
+
+    ("a server of theirs named agent-halt is replaced by ours",
+     '            servers.setdefault("agent-halt", halt_server_config())',
+     '            servers["agent-halt"] = halt_server_config()'),
+
+    ("a --mcp-config this cannot read is dropped",
+     '                kwargs["mcp_servers"] = self.config.mcp_config',
+     "                pass"),
+
+    ("the halt server runs without -P, so a checkout's own agent_comms wins",
+     "    command = agent_comms.server_command()",
+     '    command = [sys.executable, "-m", "agent_comms.server"]'),
+]
+
+# What the hub's start leaves for the CLIs it runs, and what it refuses.
+PREFLIGHT_MUTATIONS = [
+    ("agent-comms is not checked for at the start",
+     '    "agent_comms": "agent-comms",\n',
+     ""),
+
+    ("an agent-comms too old for this code is let through",
+     "        if _release(have) < floor:",
+     "        if False:"),
+
+    ("the hub's sessions get the hook as well as the bridge",
+     '    os.environ[agent_comms.TOLD_BY_ENV] = "orchestrator2"',
+     "    pass"),
+
+    ("one caller's name is lent to every session",
+     "    os.environ.pop(NAME_ENV, None)\n",
+     ""),
+
+    ("the serving path leaves the environment as it found it",
+     "    _require_dependencies()\n    _prepare_agent_comms_env()\n",
+     "    _require_dependencies()\n"),
 ]
 
 HALTLOBBY_MUTATIONS = [
@@ -7774,6 +7875,12 @@ TARGETS = {
              IDLE_MUTATIONS, "pytest"),
     "halt-server": ("server.py", "tests/test_halt_surfacing.py",
                     HALTSERVER_MUTATIONS, "pytest"),
+    "halt-bridge": ("sdk_bridge.py", "tests/test_halt_surfacing.py",
+                    HALTBRIDGE_MUTATIONS, "pytest"),
+    "preflight": ("server.py", "tests/test_dependency_preflight.py",
+                  PREFLIGHT_MUTATIONS, "pytest"),
+    "mcpconfig": ("sdk_bridge.py", "tests/test_agent_comms_surfacing.py",
+                  MCPCONFIG_MUTATIONS, "pytest"),
     "halt-lobby": ("static/lobby.js", "tests/lobby_halts.test.js",
                    HALTLOBBY_MUTATIONS, "node"),
     "todoseed": ("session.py", "tests/test_todo_seeding.py",
