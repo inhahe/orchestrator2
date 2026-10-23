@@ -1098,6 +1098,8 @@ async def lobby_broadcast(msg: dict[str, Any]) -> None:
 
 async def _push_session_list(target: WebSocket | None = None) -> None:
     """Push the current session list to one tab, or to all lobby tabs."""
+    if target is None and not _lobby_targets():
+        return   # building it scans every account's disk and every process
     payload = await _session_list_payload()
     if target is not None:
         await send_to(target, payload)
