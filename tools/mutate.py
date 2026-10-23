@@ -2045,18 +2045,20 @@ LOSTBG_SESSION_MUTATIONS = [
 GHOSTQUEUE_MUTATIONS = [
     ("a prompt is popped while a ghost turn streams -- the reported bug: "
      "echoed as You:, then the turn dies on the ghost turn's result",
-     "                if self.state.busy:\n"
-     '                    log.info("queue poke during a ghost turn — deferred to "\n'
-     '                             "its end (%d queued)", len(self.state.queued_prompts))\n'
-     "                    continue\n",
-     ""),
+     "        if not (self.state.busy or self.turn_active.is_set()):\n"
+     "            return False\n",
+     "        return False\n"),
 
     ("the guard asks turn_active, which a ghost turn never sets -- the exact "
      "confusion that caused the bug",
-     "                if self.state.busy:\n"
-     '                    log.info("queue poke during a ghost turn — deferred to "',
-     "                if self.turn_active.is_set():\n"
-     '                    log.info("queue poke during a ghost turn — deferred to "'),
+     "        if not (self.state.busy or self.turn_active.is_set()):\n",
+     "        if not self.turn_active.is_set():\n"),
+
+    ("a poke during a ghost turn holds the worker for the settle, away from "
+     "a quit or a /model",
+     "        if self._held_by_a_turn():\n            return None\n"
+     "        # Nor in the instant",
+     "        # Nor in the instant"),
 
     ('the poke that makes declining safe is removed, so a prompt deferred past a ghost turn sits in the queue forever -- worse than sending it early',
      '                self.event_queue.put_nowait(("wakeup", "queue-edit-done"))',
@@ -3628,10 +3630,9 @@ CLIQUEUE_BRIDGE_MUTATIONS = [
      "            since = max((t for t in (self._turn_ended_at, self._task_ended_at)"),
 
     ("it waits, but goes into the turn the CLI started anyway",
-     "        if state.busy or self.turn_active.is_set():\n"
-     "            log.info(\"queued prompt held:",
-     "        if False:\n"
-     "            log.info(\"queued prompt held:"),
+     "        if self._held_by_a_turn():\n            return None\n"
+     "        prompt = state.queued_prompts.popleft()",
+     "        prompt = state.queued_prompts.popleft()"),
 
     ("a ghost turn's end does not start the settle",
      "        self._ghost_settled.set()\n        self._turn_ended_at = time.monotonic()\n"
@@ -3649,8 +3650,10 @@ CLIQUEUE_BRIDGE_MUTATIONS = [
 
     ("a head put under edit during the settle is sent half-typed",
      "        if not state.queued_prompts or state.queue_editing_index == 0:\n"
-     "            return None\n        if state.busy or self.turn_active.is_set():",
-     "        if state.busy or self.turn_active.is_set():"),
+     "            return None\n        if self._held_by_a_turn():\n            return None\n"
+     "        prompt = state.queued_prompts.popleft()",
+     "        if self._held_by_a_turn():\n            return None\n"
+     "        prompt = state.queued_prompts.popleft()"),
 
     ("a peer's message is not recognised as one",
      "        if isinstance(origin, dict) and origin.get(\"kind\") == \"peer\":\n"

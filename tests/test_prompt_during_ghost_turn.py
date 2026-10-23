@@ -43,6 +43,7 @@ import asyncio
 import inspect
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -52,6 +53,7 @@ from claude_agent_sdk import (  # noqa: E402
     TextBlock,
 )
 
+import sdk_bridge                                     # noqa: E402
 from config import parse_args                        # noqa: E402
 from sdk_bridge import SDKBridge                      # noqa: E402
 from state import init_state_from_config              # noqa: E402
@@ -159,7 +161,6 @@ def test_the_prompt_goes_out_when_the_ghost_turn_ends():
 
     It goes out ``TURN_END_SETTLE_S`` after the end rather than at it, in case
     the CLI starts a turn of its own there (test_cli_queue_race.py)."""
-    import sdk_bridge
     br, state, _sent = _bridge()
 
     async def go():
@@ -184,6 +185,31 @@ def test_an_idle_worker_still_pops_immediately():
         return await asyncio.wait_for(br._await_next_prompt(), 1.0)
 
     assert asyncio.run(go()) == "my prompt"
+
+
+def test_a_poke_during_a_ghost_turn_does_not_hold_up_the_worker(monkeypatch):
+    """Declined at once, not after waiting out the settle: the worker is the
+    only one to act on a quit, a /model, a /btw meanwhile."""
+    monkeypatch.setattr(sdk_bridge, "TURN_END_SETTLE_S", 0.5)
+    br, state, _sent = _bridge()
+
+    async def go():
+        br._turn_ended_at = time.monotonic()      # a turn has just ended
+        await _ghost_begin(br)                    # and the CLI started one
+        state.queued_prompts.append("my prompt")
+        # A wakeup that does not stand aside for what is queued behind it,
+        # as the queue's own poke does.
+        br.event_queue.put_nowait(("wakeup", "bg-all-done"))
+        br.event_queue.put_nowait(("quit", ""))
+        started = time.monotonic()
+        got = await asyncio.wait_for(br._await_next_prompt(), 2.0)
+        return got, time.monotonic() - started
+
+    got, took = asyncio.run(go())
+
+    assert got is None, "the quit was not seen"
+    assert took < 0.25, f"the worker waited {took:.2f}s on a prompt it could not send"
+    assert list(state.queued_prompts) == ["my prompt"]
 
 
 # --------------------------------------------------------------------------

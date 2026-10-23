@@ -1806,12 +1806,16 @@ fix is to not send it, rather than to send it and wait.
 `_await_interrupt_settled` already guarded this exact race when an *interrupt*
 caused it. Nothing guarded it when a background task did.
 
-The fix is one decline, in the `wakeup` branch of `_await_next_prompt()`,
-alongside the identical `state.connecting` one: **do not pop a queued prompt
-while `state.busy`**. At that park point a real `run_turn` cannot be active —
-the worker would be inside it, not parked — so `state.busy` there means
-precisely "a ghost turn is streaming". Declining leaves the prompt in the queue
-pane, visibly pending, instead of echoing it into the transcript and losing it.
+The fix is one decline: **do not pop a queued prompt while `state.busy`**.
+It was first made in the `wakeup` branch of `_await_next_prompt()`, beside
+the `state.connecting` one. Since 2026-10-23 it lives in the pop itself
+(`_held_by_a_turn`, asked before and after the settle), so every caller gets
+it. Asking first means a worker poked during a ghost turn declines at once,
+instead of sleeping out the settle while a quit or a `/model` waits behind it.
+At a park point a real `run_turn` cannot be active (the worker would be inside
+it, not parked), so `state.busy` there means "a ghost turn is streaming".
+Declining leaves the prompt in the queue pane, visibly pending, instead of
+echoing it into the transcript and losing it.
 
 Declining is safe because `_end_ghost_turn()` **already** poked the worker with
 `queue-edit-done` for exactly this case; that poke was written for ghost turns

@@ -6450,6 +6450,16 @@ class SDKBridge:
         except Exception as exc:      # pragma: no cover — unbounded queue
             log.warning("queue poke failed: %r", exc)
 
+    def _held_by_a_turn(self) -> bool:
+        """Whether a turn is under way that a queued prompt must not go into:
+        ours (``turn_active``) or one the CLI started (a ghost turn, which
+        sets only ``state.busy``).  Says so in the log when it is."""
+        if not (self.state.busy or self.turn_active.is_set()):
+            return False
+        log.info("queued prompt held: a turn is under way (%d queued)",
+                 len(self.state.queued_prompts))
+        return True
+
     async def _wait_out_cli_turn_start(self) -> bool:
         """Wait until ``TURN_END_SETTLE_S`` has passed since a turn or a
         background task last ended: a moment the CLI may start a turn of its
@@ -6492,18 +6502,21 @@ class SDKBridge:
         state = self.state
         if not state.queued_prompts or state.queue_editing_index == 0:
             return None
-        # Not in the instant a turn or a background task ends: the CLI may be
-        # starting a turn of its own, and a prompt sent into that would be
-        # folded into it rather than get a turn.  If it does start one, that
-        # begins a ghost turn, and this prompt waits for it -- None is "wait
-        # for a poke", which every caller handles, and _end_ghost_turn pokes.
+        # Never into a turn: the CLI folds a prompt that arrives during one
+        # into it, or runs it after, and the turn this prompt starts here
+        # would end on that turn's result.  Asked first so that a worker poked
+        # during a turn is not kept from everything else for the settle.
+        # None is "wait for a poke", which every caller handles, and the
+        # turn's end pokes (_end_ghost_turn).
+        if self._held_by_a_turn():
+            return None
+        # Nor in the instant a turn or a background task ends: the CLI may be
+        # starting a turn of its own, which shows itself only after that.
         if not await self._wait_out_cli_turn_start():
             return None
         if not state.queued_prompts or state.queue_editing_index == 0:
             return None
-        if state.busy or self.turn_active.is_set():
-            log.info("queued prompt held: the CLI is in a turn of its own "
-                     "(%d queued)", len(state.queued_prompts))
+        if self._held_by_a_turn():
             return None
         prompt = state.queued_prompts.popleft()
         state.queue_editing_index = None
@@ -7402,9 +7415,11 @@ class SDKBridge:
                 # to state.queued_prompts by server.py.  If the ghost turn's
                 # queue-edit-done poke doesn't reach us (e.g. the bg task
                 # completes first and fires bg-all-done instead), nothing
-                # else would send it and the prompt sits unsent.  A queued
-                # user prompt is always sendable once we're back to waiting.
-                # Skip only when the first item is being edited in the UI.
+                # else would send it and the prompt sits unsent.  The pop
+                # itself declines what must wait: a head being edited in the
+                # UI, a turn under way -- here a ghost turn, the CLI
+                # mid-answer while the worker is parked -- and the instant a
+                # turn or a background task ends.  The turn's end pokes again.
                 #
                 # ...or when a connect is in flight.  ``_poke_for_queued_prompt``
                 # fires the instant a prompt is appended, and a prompt appended
@@ -7415,26 +7430,6 @@ class SDKBridge:
                 # client is actually usable.
                 if self.state.connecting:
                     log.debug("queue poke while connecting — deferred to connect()")
-                    continue
-                # ...or while a *ghost* turn is streaming.  A ghost turn holds
-                # no ``turn_active``, so the worker is parked right here while
-                # the CLI is mid-answer, and "we are waiting, therefore it is
-                # idle" is wrong.  Popping anyway sent the prompt into a busy
-                # CLI and left this turn to consume the *ghost* turn's
-                # terminating ResultMessage, which ended it on someone else's
-                # result with the prompt unanswered.  Reported 2026-09-16:
-                # "it showed it sent as a You: message, but it just kept
-                # working and never answered me" -- 08:56:17 ghost turn begin,
-                # 08:59:14 run_turn start with state.busy=True, 09:18:33 that
-                # turn exits on a 1159 s result that was not its own.
-                #
-                # A real ``run_turn`` can never be active here (the worker
-                # would be inside it, not parked), so ``state.busy`` at this
-                # point means precisely "a ghost turn is streaming".
-                # Declining is safe because _end_ghost_turn() re-pokes.
-                if self.state.busy:
-                    log.info("queue poke during a ghost turn — deferred to "
-                             "its end (%d queued)", len(self.state.queued_prompts))
                     continue
                 # The queue poke is the *lowest-priority* signal here, and it
                 # is the only wakeup that can arrive without the user having
