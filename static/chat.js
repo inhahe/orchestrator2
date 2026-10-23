@@ -1843,12 +1843,103 @@ const Chat = (() => {
   /**
    * Lightweight markdown → HTML for assistant text.
    * Handles: fenced code blocks, inline code, bold, italic, headers,
-   * bullet/numbered lists, horizontal rules, and links.
+   * bullet/numbered lists (nested), tables, horizontal rules, and links.
    */
   function _md(raw) {
     if (!raw) return '';
-    const text = _esc(raw);
-    const lines = text.split('\n');
+    return _blocks(_esc(raw).split('\n'));
+  }
+
+  // A list item's first line: its indentation, its marker, the gap after the
+  // marker, and its text.
+  const LIST_ITEM = /^([ \t]*)([-*+]|\d+[.)])([ \t]+)(.*)$/;
+
+  /** The column a line's leading text reaches, a tab going to the next
+   *  multiple of 4 (CommonMark's tab stop). */
+  function _width(s) {
+    let col = 0;
+    for (const ch of s) col = ch === '\t' ? col + 4 - (col % 4) : col + 1;
+    return col;
+  }
+
+  /** The column at which *line*'s text starts. */
+  function _indentOf(line) {
+    return _width(line.match(/^[ \t]*/)[0]);
+  }
+
+  /** *line* without its first *cols* columns of indentation, or without all
+   *  of it if it has fewer. */
+  function _dedent(line, cols) {
+    let col = 0;
+    let k = 0;
+    while (k < line.length && col < cols && (line[k] === ' ' || line[k] === '\t')) {
+      col = line[k] === '\t' ? col + 4 - (col % 4) : col + 1;
+      k++;
+    }
+    return line.slice(k);
+  }
+
+  /**
+   * The list whose first item is lines[i]: [its HTML, the index of the first
+   * line after it].
+   *
+   * An item holds every line after it indented past its marker -- text that
+   * continues it, a nested list, a code block -- rendered as a document of
+   * its own, so lists nest to any depth, and a numbered list keeps counting
+   * across the sub-items between its items.  A sub-list indented by less
+   * than the item's text, as in "1. step" over "  - detail", is still the
+   * item's.  Blank lines between items do not end the list; a line at or
+   * left of the marker that is not one of the list's items does, as does an
+   * item of the other kind (numbered or not) at the list's indentation.
+   */
+  function _list(lines, i) {
+    const first = lines[i].match(LIST_ITEM);
+    const indent = _width(first[1]);
+    const ordered = /\d/.test(first[2]);
+    const isItem = (m) => !!m && _width(m[1]) === indent && /\d/.test(m[2]) === ordered;
+    const items = [];
+    while (i < lines.length) {
+      const m = lines[i].match(LIST_ITEM);
+      if (!isItem(m)) break;
+      // The column the item's text starts at, after the marker and its gap:
+      // the indentation its later lines lose.
+      const textCol = _width(m[1] + m[2] + m[3]);
+      const body = [m[4]];
+      i++;
+      while (i < lines.length) {
+        if (lines[i].trim() === '') {
+          let j = i + 1;
+          while (j < lines.length && lines[j].trim() === '') j++;
+          if (j >= lines.length || _indentOf(lines[j]) <= indent) break;
+          // The item goes on after the blank: keep the blank in its text,
+          // but not ahead of a sub-list, which has its own margin.
+          if (!LIST_ITEM.test(lines[j])) body.push('');
+          i = j;
+          continue;
+        }
+        if (_indentOf(lines[i]) <= indent) break;
+        body.push(_dedent(lines[i], textCol));
+        i++;
+      }
+      items.push(_blocks(body));
+      // Blank lines, then the list's next item, go on with the list.
+      let j = i;
+      while (j < lines.length && lines[j].trim() === '') j++;
+      if (j < lines.length && isItem(lines[j].match(LIST_ITEM))) i = j;
+      else break;
+    }
+    const lis = items.map(t => `<li>${t}</li>`).join('');
+    if (!ordered) return [`<ul class="md-list">${lis}</ul>`, i];
+    // The first item's own number, which the model wrote: a list interrupted
+    // by a paragraph goes on counting from where it left off.
+    const start = parseInt(first[2], 10);
+    const startAttr = start !== 1 ? ` start="${start}"` : '';
+    return [`<ol class="md-list"${startAttr}>${lis}</ol>`, i];
+  }
+
+  /** Already-escaped markdown *lines* → HTML: the blocks of a message, or of
+   *  one list item. */
+  function _blocks(lines) {
     // Each entry: {html, block}.  We track block-ness so the final join
     // can emit '\n' ONLY between adjacent text entries.  The container
     // uses white-space: pre-wrap, so a literal '\n' renders as a line
@@ -1899,69 +1990,11 @@ const Chat = (() => {
         continue;
       }
 
-      // --- Bullet list ---
-      // Spans blank lines: a blank line is only a list break if the
-      // next non-blank line isn't another bullet.  Without this, lists
-      // Claude formats with blank lines between items render as a run
-      // of single-item lists.
-      if (/^[\s]*[-*+]\s/.test(line)) {
-        const items = [];
-        while (i < lines.length) {
-          if (/^[\s]*[-*+]\s/.test(lines[i])) {
-            items.push(_inlineMd(lines[i].replace(/^[\s]*[-*+]\s/, '')));
-            i++;
-          } else if (lines[i].trim() === '') {
-            // Peek for another bullet after the blank run.
-            let j = i + 1;
-            while (j < lines.length && lines[j].trim() === '') j++;
-            if (j < lines.length && /^[\s]*[-*+]\s/.test(lines[j])) {
-              i = j;
-            } else {
-              break;
-            }
-          } else {
-            break;
-          }
-        }
-        pushBlock('<ul class="md-list">' + items.map(t => `<li>${t}</li>`).join('') + '</ul>');
-        continue;
-      }
-
-      // --- Numbered list ---
-      // Same blank-line-tolerant scan as bullets.  Without this, each
-      // item ended up in its own <ol>, which restarts the counter — so
-      // every item rendered as "1.".
-      //
-      // We also preserve the FIRST item's number from the source
-      // (e.g. "2." → ``<ol start="2">``).  Numbered lists are
-      // routinely interrupted by paragraphs, sub-bullets, or block
-      // quotes between items — in those cases the scan terminates
-      // early and a fresh <ol> opens for the continuation.  Without
-      // the ``start`` attribute, item 2 would render as 1, item 3 as
-      // 1 or 2, etc.  Using the literal source number is the proper
-      // fix because it's the ground truth the model emitted.
-      if (/^[\s]*\d+[.)]\s/.test(line)) {
-        const startMatch = line.match(/^[\s]*(\d+)[.)]\s/);
-        const startNum = startMatch ? parseInt(startMatch[1], 10) : 1;
-        const items = [];
-        while (i < lines.length) {
-          if (/^[\s]*\d+[.)]\s/.test(lines[i])) {
-            items.push(_inlineMd(lines[i].replace(/^[\s]*\d+[.)]\s/, '')));
-            i++;
-          } else if (lines[i].trim() === '') {
-            let j = i + 1;
-            while (j < lines.length && lines[j].trim() === '') j++;
-            if (j < lines.length && /^[\s]*\d+[.)]\s/.test(lines[j])) {
-              i = j;
-            } else {
-              break;
-            }
-          } else {
-            break;
-          }
-        }
-        const startAttr = startNum !== 1 ? ` start="${startNum}"` : '';
-        pushBlock(`<ol class="md-list"${startAttr}>` + items.map(t => `<li>${t}</li>`).join('') + '</ol>');
+      // --- List (bulleted or numbered, nested to any depth) ---
+      if (LIST_ITEM.test(line)) {
+        const [html, next] = _list(lines, i);
+        pushBlock(html);
+        i = next;
         continue;
       }
 

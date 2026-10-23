@@ -6847,6 +6847,46 @@ CWD_SERVER_MUTATIONS = [
      "        out.append(a)"),
 ]
 
+# The agent's lists keep their nesting: an item holds every line indented past
+# its marker, rendered as a document of its own.  tests/markdown_lists.test.js.
+MD_LISTS_MUTATIONS = [
+    ("an item holds none of the lines under it",
+     "        if (_indentOf(lines[i]) <= indent) break;\n",
+     "        break;\n"),
+
+    ("an item's lines are run together as one line of text",
+     "      items.push(_blocks(body));",
+     "      items.push(_inlineMd(body.join(' ')));"),
+
+    ("a sub-list indented less than the item's text loses its marker",
+     "        body.push(_dedent(lines[i], textCol));",
+     "        body.push(lines[i].slice(textCol));"),
+
+    ("a tab is one column",
+     "    for (const ch of s) col = ch === '\\t' ? col + 4 - (col % 4) : col + 1;",
+     "    for (const ch of s) col = col + 1;"),
+
+    ("a blank line ends an item that goes on under it",
+     "          if (j >= lines.length || _indentOf(lines[j]) <= indent) break;",
+     "          break;"),
+
+    ("a blank line above a sub-list is kept as a gap",
+     "          if (!LIST_ITEM.test(lines[j])) body.push('');",
+     "          body.push('');"),
+
+    ("a list ends after its first item",
+     "      if (j < lines.length && isItem(lines[j].match(LIST_ITEM))) i = j;",
+     "      if (false) i = j;"),
+
+    ("numbered and bulleted items share a list",
+     "    const isItem = (m) => !!m && _width(m[1]) === indent && /\\d/.test(m[2]) === ordered;",
+     "    const isItem = (m) => !!m && _width(m[1]) === indent;"),
+
+    ("a numbered list always starts at 1",
+     "    const startAttr = start !== 1 ? ` start=\"${start}\"` : '';",
+     "    const startAttr = '';"),
+]
+
 COMPACTION_CMD_MUTATIONS = [
     ("/autocompact hides that the CLI has yet to take it",
      "    if cli is not None and compaction_env(*cli) != compaction_env(at, on):\n",
@@ -8045,6 +8085,8 @@ TARGETS = {
                        COMPACTION_HUB_MUTATIONS, "pytest"),
     "compaction-cmd": ("commands.py", "tests/test_cli_compaction.py",
                        COMPACTION_CMD_MUTATIONS, "pytest"),
+    "md-lists": ("static/chat.js", "tests/markdown_lists.test.js",
+                 MD_LISTS_MUTATIONS, "node"),
     "cwd-config": ("config.py", "tests/test_cwd_arg.py",
                    CWD_CONFIG_MUTATIONS, "pytest"),
     "cwd-server": ("server.py", "tests/test_cwd_arg.py",
