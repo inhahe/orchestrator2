@@ -6855,16 +6855,44 @@ CWD_SERVER_MUTATIONS = [
 # its marker, rendered as a document of its own.  tests/markdown_lists.test.js.
 MD_LISTS_MUTATIONS = [
     ("an item holds none of the lines under it",
-     "        if (line.trim() !== '' && _indentOf(line) <= indent) break;",
+     "        if (ind <= at || (!fence && isNextItem(line))) break;",
      "        break;"),
 
     ("an item's lines are run together as one line of text",
-     "      items.push(_blocks([m[4], ...body.map((l) => _dedent(l, shared))], depth + 1));",
-     "      items.push(_inlineMd([m[4], ...body].join(' ')));"),
+     "      items.push(_blocks(body, depth + 1));",
+     "      items.push(_inlineMd(body.join(' ')));"),
 
-    ("an item's lines all lose the item's text column, flattening what is between",
-     "      const shared = Math.min(textCol, ...body.filter((l) => l.trim() !== '').map(_indentOf));",
-     "      const shared = textCol;"),
+    ("a sub-list written short loses its shape: every line loses the item's "
+     "text column",
+     "        const d = _dedent(line, sub ? sub.at : textCol);",
+     "        const d = _dedent(line, textCol);"),
+
+    ("a sub-list written short is not taken for one",
+     "          if (!sub && n && ind < textCol) sub = { at: ind, textCol: 0 };\n",
+     ""),
+
+    ("what follows a sub-list written short stays in it",
+     "          if (sub && !(ind >= sub.textCol || (n && ind <= sub.at + 1))) sub = null;\n",
+     ""),
+
+    ("a sub-list written short never learns where its items' text is, so it "
+     "holds everything after it",
+     "          if (sub && n && ind <= sub.at + 1) sub.textCol = _width(n[1] + n[2] + n[3]);\n",
+     ""),
+
+    ("the next item may be indented to the text, flattening a sub-list of "
+     "its own kind written short -- the regression the review found",
+     "          && _width(n[1]) <= at + 1;",
+     "          && _width(n[1]) < textCol;"),
+
+    ("the next item must be at the marker's column exactly",
+     "          && _width(n[1]) <= at + 1;",
+     "          && _width(n[1]) <= at;"),
+
+    ("every item is measured from the first one's indentation, so one further "
+     "left loses what is under it",
+     "      m = lines[j].match(LIST_ITEM);\n",
+     "      const n2 = lines[j].match(LIST_ITEM); n2[1] = m[1]; m = n2;\n"),
 
     ("a tab is one column",
      "    return ch === '\\t' ? col + 4 - (col % 4) : col + 1;",
@@ -6875,27 +6903,39 @@ MD_LISTS_MUTATIONS = [
      "    return line.slice(k);"),
 
     ("a blank line ends an item that goes on under it",
-     "          if (j >= lines.length || _indentOf(lines[j]) <= indent\n",
-     "          if (true\n"),
+     "          if (j >= lines.length || _indentOf(lines[j]) <= at) break;\n",
+     "          break;\n"),
 
     ("a blank line above a sub-list is kept as a gap",
      "          if (!LIST_ITEM.test(lines[j])) for (let k = i; k < j; k++) body.push('');",
      "          for (let k = i; k < j; k++) body.push('');"),
 
-    ("a code block in an item is read as list lines",
-     "        if (ticks && fence === null) fence = ticks[0];",
-     "        if (false) fence = ticks[0];"),
+    ("a blank line in an item's code block is taken for the end of a paragraph",
+     "          if (fence) { body.push(''); i++; continue; }\n",
+     ""),
 
-    ("an item of the list's kind indented less than the text nests",
-     "      const isNextItem = (n) => !!n && /\\d/.test(n[2]) === ordered && _width(n[1]) < textCol;",
-     "      const isNextItem = (n) => !!n && /\\d/.test(n[2]) === ordered && _width(n[1]) <= indent;"),
+    ("a code block in an item is read as list lines",
+     "        else fence = _fenceOpen(d);\n",
+     "        else fence = null;\n"),
+
+    ("a code block opened on the item's own line is not seen",
+     "      let fence = _fenceOpen(m[4]);",
+     "      let fence = null;"),
+
+    ("a code block in an item never closes, taking the next item with it",
+     "        if (fence) { if (_fenceCloses(d, fence)) fence = null; }\n",
+     "        if (fence) { /* never closed */ }\n"),
 
     ("numbered and bulleted items share a list",
-     "      const isNextItem = (n) => !!n && /\\d/.test(n[2]) === ordered && _width(n[1]) < textCol;",
-     "      const isNextItem = (n) => !!n && _width(n[1]) < textCol;"),
+     "        return !!n && !THEMATIC_BREAK.test(line) && /\\d/.test(n[2]) === ordered\n",
+     "        return !!n && !THEMATIC_BREAK.test(line)\n"),
+
+    ("a rule between items is taken for one",
+     "        return !!n && !THEMATIC_BREAK.test(line) && /\\d/.test(n[2]) === ordered\n",
+     "        return !!n && /\\d/.test(n[2]) === ordered\n"),
 
     ("a list ends after its first item",
-     "      if (!isNextItem(next)) break;",
+     "      if (j >= lines.length || !isNextItem(lines[j])) break;",
      "      break;"),
 
     ("a numbered list always starts at 1",
@@ -6915,19 +6955,85 @@ MD_LISTS_MUTATIONS = [
      ""),
 
     ("a code fence must start at the margin",
-     "  const FENCE = /^( {0,3})(`{3,})([\\w-]*)\\s*$/;",
-     "  const FENCE = /^()(`{3,})([\\w-]*)\\s*$/;"),
+     "  const FENCE = /^( {0,3})(`{3,}|~{3,})(.*)$/;",
+     "  const FENCE = /^()(`{3,}|~{3,})(.*)$/;"),
 
     ("code lines keep the fence's own indentation",
-     "          codeLines.push(_dedent(lines[i], fenceIndent));",
+     "          codeLines.push(_dedent(lines[i], open.indent));",
      "          codeLines.push(lines[i]);"),
+
+    ("an item's lines are rendered with the whole renderer's call, one argument "
+     "per line, which an engine refuses past its limit",
+     "      items.push(_blocks(body, depth + 1));",
+     "      items.push(_blocks(body, depth + 1, Math.min(...body.map(_indentOf))));"),
+]
+
+# The chat page runs only its own scripts, and error pages do not run the URL's
+# markup.  tests/test_chat_page_policy.py.
+PAGEPOLICY_MUTATIONS = [
+    ("the chat page is served without its script policy",
+     "                       csp=CHAT_PAGE_CSP)",
+     "                       csp=None)"),
+
+    ("the policy is never sent",
+     "        headers[\"Content-Security-Policy\"] = csp\n",
+     "        pass\n"),
+
+    ("the policy allows inline script",
+     "CHAT_PAGE_CSP = \"script-src 'self'; object-src 'none'; base-uri 'self'\"",
+     "CHAT_PAGE_CSP = \"script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'\""),
+
+    ("the resume error page runs the URL's markup -- the hole",
+     "                f\"<h1>Resume failed</h1><p>{html_escape(err)}</p>\"",
+     "                f\"<h1>Resume failed</h1><p>{err}</p>\""),
+
+    ("so does the directory error page",
+     "            return HTMLResponse(f\"<h1>Error</h1><p>{html_escape(err)}</p>\",",
+     "            return HTMLResponse(f\"<h1>Error</h1><p>{err}</p>\","),
+]
+
+# Code is shown as written: a code span out of reach of emphasis, a code block
+# open on any info string and closed only by its own kind of fence.
+# tests/markdown_code.test.js.
+MD_CODE_MUTATIONS = [
+    ("a code span's text reaches the emphasis around it",
+     "      hold(`<code class=\"md-code\">${code}</code>`, whole));",
+     "      `<code class=\"md-code\">${code}</code>`);"),
+
+    ("the info string is a word or nothing, so ```c++ is not a fence -- as it was",
+     "  const FENCE = /^( {0,3})(`{3,}|~{3,})(.*)$/;",
+     "  const FENCE = /^( {0,3})(`{3,}|~{3,})([\\w-]*)\\s*$/;"),
+
+    ("the whole info string is taken for the language",
+     "    return { indent: m[1].length, fence: m[2], lang: m[3].trim().split(/\\s+/)[0] };",
+     "    return { indent: m[1].length, fence: m[2], lang: m[3].trim() };"),
+
+    ("a backtick in the info string still opens a fence",
+     "    if (!m || (m[2][0] === '`' && m[3].includes('`'))) return null;",
+     "    if (!m) return null;"),
+
+    ("only a fence exactly as long as the opening one closes it",
+     "    return !!m && m[1][0] === open.fence[0] && m[1].length >= open.fence.length;",
+     "    return !!m && m[1][0] === open.fence[0] && m[1].length === open.fence.length;"),
+
+    ("any fence closes it, however short",
+     "    return !!m && m[1][0] === open.fence[0] && m[1].length >= open.fence.length;",
+     "    return !!m && m[1][0] === open.fence[0];"),
+
+    ("a fence of the other character closes it",
+     "    return !!m && m[1][0] === open.fence[0] && m[1].length >= open.fence.length;",
+     "    return !!m && m[1].length >= open.fence.length;"),
+
+    ("tildes are not a fence",
+     "  const FENCE = /^( {0,3})(`{3,}|~{3,})(.*)$/;",
+     "  const FENCE = /^( {0,3})(`{3,})(.*)$/;"),
 ]
 
 # A link the agent writes can only navigate.  tests/markdown_links.test.js.
 MD_LINKS_MUTATIONS = [
     ("any target becomes a link",
-     "        SAFE_HREF.test(href)\n",
-     "        true\n"),
+     "      return hold(SAFE_HREF.test(target)\n",
+     "      return hold(true\n"),
 
     ("a scheme anywhere in the target passes",
      "  const SAFE_HREF = /^(https?:|mailto:)/i;",
@@ -6942,12 +7048,36 @@ MD_LINKS_MUTATIONS = [
      "  const SAFE_HREF = /^(https?:)/i;"),
 
     ("a target is cut at its first parenthesis",
-     "      .replace(/\\[([^\\]]+)\\]\\(((?:[^()]|\\([^()]*\\))+)\\)/g, (whole, text, href) =>",
-     "      .replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, (whole, text, href) =>"),
+     "    s = s.replace(/\\[([^\\]]+)\\]\\(((?:[^()]|\\([^()]*\\))+)\\)/g, (whole, text, href) => {",
+     "    s = s.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, (whole, text, href) => {"),
 
     ("a refused link loses its text",
-     "          : `<span class=\"md-link-inert\" title=\"${href}\">${text}</span>`);",
-     "          : '');"),
+     "        : `<span class=\"md-link-inert\" title=\"${target}\">${label}</span>`, whole);",
+     "        : '', whole);"),
+
+    ("a target carries the markup of a code span in it into its attribute",
+     "      const target = restore(href, 1);",
+     "      const target = restore(href, 0);"),
+
+    ("a link is not held out of the line, so emphasis reaches into its target",
+     "      return hold(SAFE_HREF.test(target)\n"
+     "        ? `<a href=\"${target}\" target=\"_blank\" rel=\"noopener\">${label}</a>`\n"
+     "        : `<span class=\"md-link-inert\" title=\"${target}\">${label}</span>`, whole);",
+     "      return (SAFE_HREF.test(target)\n"
+     "        ? `<a href=\"${target}\" target=\"_blank\" rel=\"noopener\">${label}</a>`\n"
+     "        : `<span class=\"md-link-inert\" title=\"${target}\">${label}</span>`);"),
+
+    ("a link's text loses its emphasis",
+     "      const label = restore(_emphasis(text), 0);",
+     "      const label = restore(text, 0);"),
+
+    ("a link's text shows its code spans as written",
+     "      const label = restore(_emphasis(text), 0);",
+     "      const label = restore(_emphasis(text), 1);"),
+
+    ("a code span written as a link becomes one",
+     "    s = s.replace(/`([^`]+?)`/g, (whole, code) =>\n",
+     "    s = s.replace(/`([^`]+?)`/g, (whole, code) => code.startsWith('[') ? whole :\n"),
 ]
 
 # A finished background task's turn begins when the task ends, not at its
@@ -8402,6 +8532,10 @@ TARGETS = {
                  MD_LISTS_MUTATIONS, "node"),
     "md-links": ("static/chat.js", "tests/markdown_links.test.js",
                  MD_LINKS_MUTATIONS, "node"),
+    "md-code": ("static/chat.js", "tests/markdown_code.test.js",
+                MD_CODE_MUTATIONS, "node"),
+    "pagepolicy": ("server.py", "tests/test_chat_page_policy.py",
+                   PAGEPOLICY_MUTATIONS, "pytest"),
     "cwd-config": ("config.py", "tests/test_cwd_arg.py",
                    CWD_CONFIG_MUTATIONS, "pytest"),
     "cwd-server": ("server.py", "tests/test_cwd_arg.py",

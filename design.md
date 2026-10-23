@@ -3114,6 +3114,61 @@ reconnection and dispatches every inbound message type to a module:
 Styling: `styles.css` holds layout/structure; `theme.py` generates the CSS
 variables it consumes, so themes never require CSS edits.
 
+### How the chat renders what the model writes
+
+`chat.js`'s `_md` turns an assistant message into HTML. The message is
+HTML-escaped whole before anything else, so nothing the model writes is ever
+markup until the renderer makes it so. Then `_blocks` reads it line by line:
+code blocks, headings, rules, lists and tables. Every other line is text, with
+no `<p>`, in a `pre-wrap` container, so line breaks show as the model wrote
+them, exactly as the streaming view shows them. `_inlineMd` handles code spans,
+links, bold and italic within a line.
+
+It is close to CommonMark, which models write, with deliberate differences:
+
+- **Lists nest as models write them** (`_list`). An item holds every line
+  indented past its marker. The list's next item is a line of its kind at the
+  marker's column or one off it, as in `" 9."` over `"10."` or `"- a"` over
+  `" - b"`. A line indented further is a sub-list. That includes one of the
+  list's own kind written short: `"  1. sub"` two spaces under `"1. step"`,
+  where CommonMark wants three and would flatten it, which was the reported
+  bug. Such a sub-list's lines lose only its own indentation, keeping its
+  shape. Lines after it, back at the item's text, belong to the item again.
+- **A rule is never a list item.** `"- - -"` and `"* * *"` are tested before
+  lists, and `_list` will not take one for its next item.
+- **Code blocks.** A fence is three or more backticks or tildes, indented by up
+  to three spaces. Its info string is anything without a backtick (`c++`,
+  `c#`, `python title=x`), and its first word is the language. It closes on a
+  fence of the same character at least as long. An unclosed block runs to the
+  end of the message. `_list` tracks fences with the same helpers
+  (`_fenceOpen`, `_fenceCloses`), so a code block inside an item, even one
+  opened on the item's own line, neither ends the item nor lets a line inside
+  it be taken for the next item.
+- **Code spans first, then links, then emphasis** (`_inlineMd`). Each finished
+  piece is held out of the line as a placeholder until the end. A code span is
+  shown as written, so `` `*args` `` keeps its asterisk and `` `[a](b)` `` stays
+  text. A link's target is kept as written, with no markup in its attribute.
+- **Links go to the web or an address only** (`SAFE_HREF`: `http(s):`,
+  `mailto:`). A model can be led by what it reads into writing
+  `[text](javascript:...)`. Any other target, including a file path, which
+  would resolve against the hub, is shown as its text with the target in a
+  tooltip (`.md-link-inert`).
+
+The page that renders all this, `index.html`, is served under a
+Content-Security-Policy, `CHAT_PAGE_CSP`: `script-src 'self'`, so only its own
+script files run. That closes the whole class (inline script, `javascript:`
+URLs, event handlers written into the page) rather than each way in. The page
+needs none of those itself, which a test pins. Other pages (`resume.html`,
+`settings.html`) have inline script and no policy. The error pages that
+`?resume=` and `?cwd=` produce escape the error they show, because it repeats
+the URL's own text.
+
+Tests: `markdown_lists.test.js`, `markdown_code.test.js` and
+`markdown_links.test.js` (jsdom, through `tests/md_harness.js`, which fails a
+test on any warning or error the renderer logs), and
+`test_chat_page_policy.py`. Mutation targets: `md-lists`, `md-code`,
+`md-links`, `pagepolicy`.
+
 ### The tab's icon shows the session's state
 
 Asked for so that a session can be read from the tab strip without switching

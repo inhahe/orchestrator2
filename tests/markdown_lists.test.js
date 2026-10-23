@@ -8,55 +8,9 @@
  * the page renders an assistant message.
  */
 
-const fs = require('fs');
-const path = require('path');
-const { JSDOM } = require('jsdom');
+const { rendered, suite } = require('./md_harness');
 
-const CHAT_JS = fs.readFileSync(
-  path.join(__dirname, '..', 'static', 'chat.js'), 'utf8');
-
-let failures = 0;
-let ran = 0;
-
-function test(name, fn) {
-  ran++;
-  try {
-    fn();
-    console.log(`  ok    ${name}`);
-  } catch (e) {
-    failures++;
-    console.log(`  FAIL  ${name}\n        ${e && e.message}`);
-  }
-}
-
-function assert(cond, msg) {
-  if (!cond) throw new Error(msg || 'assertion failed');
-}
-
-/* The rendered message for assistant text *text*. */
-function rendered(text) {
-  const dom = new JSDOM(
-    '<!doctype html><html><body><div id="messages"></div></body></html>',
-    { runScripts: 'outside-only' });
-  const win = dom.window;
-  const pending = [];
-  win.setTimeout = (fn) => { pending.push(fn); return pending.length; };
-  win.clearTimeout = () => {};
-  win.requestAnimationFrame = (fn) => { pending.push(() => fn(0)); return pending.length; };
-  win.cancelAnimationFrame = () => {};
-  win.console = Object.assign(Object.create(console), {
-    warn: (...a) => { throw new Error('chat.js warned: ' + a.join(' ')); },
-    error: (...a) => { throw new Error('chat.js errored: ' + a.join(' ')); },
-    log: () => {},
-  });
-  win.eval(CHAT_JS + '\n;window.Chat = Chat;');
-  win.Chat.init();
-  win.Chat.handleMessage({ type: 'assistant_text', content: text, delta: false });
-  for (let g = 0; pending.length && g < 200; g++) pending.shift()();
-  const el = win.document.querySelector('.md-rendered');
-  assert(el, 'nothing rendered');
-  return el;
-}
+const { test, assert, done } = suite('markdown lists');
 
 /* A list as a compact string: ul(a, b(ul(c))) -- each item its own text,
  * then any list inside it; ol carries a start other than 1 as ol@3(...). */
@@ -84,8 +38,6 @@ function is(text, expected, what) {
   const got = lists(text).join(' | ');
   assert(got === expected, `${what}:\n          expected ${expected}\n          got      ${got}`);
 }
-
-console.log('\nmarkdown lists\n');
 
 // ---- nesting ---------------------------------------------------------------
 
@@ -120,11 +72,45 @@ test('nesting holds under items numbered 10 and up', () => {
   is('10. step\n  - a\n    - b\n11. next', 'ol@10(step(ul(a(ul(b)))), next)', 'step 10');
 });
 
-test('an item of the list\'s own kind indented less than the text is the next item', () => {
+test('so does a sub-list of the list\'s own kind, written short', () => {
+  // The flattening that was reported, in the numbered form.
+  is('1. step\n  1. sub a\n  2. sub b\n2. next', 'ol(step(ol(sub a, sub b)), next)',
+     'two spaces under "1. "');
+  is('10. step\n   1. sub\n11. next', 'ol@10(step(ol(sub)), next)', 'three under "10. "');
+  is('- a\n  - b\n- c', 'ul(a(ul(b)), c)', 'bullets');
+});
+
+test('the next item is at the marker\'s column or one off it', () => {
   is('- a\n - b', 'ul(a, b)', 'one space in');
   is(' 9. nine\n10. ten', 'ol@9(nine, ten)', 'right-aligned numbers');
   is('  - a\n- b', 'ul(a, b)', 'second item further left');
   is('- a\n    - b\n  - c', 'ul(a(ul(b, c)))', 'sub-items at two indentations');
+});
+
+test('an item further left than the first keeps what is indented under it', () => {
+  is('  - a\n- b\n  - c', 'ul(a, b(ul(c)))', 'a sub-list under the second item');
+  is('- a\n    - b\n  - c\n    - d', 'ul(a(ul(b, c(ul(d)))))', 'the same, one level down');
+});
+
+test('what follows a sub-list written short goes back to the item', () => {
+  // The code block under step 1, not inside "needs node".
+  const el = rendered('1. Install:\n  - needs node\n   ```bash\n   npm install\n   ```\n2. Run');
+  const step = el.querySelector('ol > li');
+  const code = step.querySelector(':scope > .code-block code');
+  assert(code && code.textContent === 'npm install', 'the code block left step 1: '
+         + step.innerHTML.slice(0, 160));
+  assert(!step.querySelector('ul li .code-block'), 'the code block went into the sub-item');
+  // A paragraph after a blank line, likewise.
+  const el2 = rendered('1. a\n  - sub\n\n   more about a\n2. b');
+  const a = el2.querySelector('ol > li');
+  assert(!a.querySelector('ul li').textContent.includes('more'), 'the paragraph went into the sub-item');
+  assert(a.textContent.includes('more about a'), 'the paragraph left the item');
+});
+
+test('a line continuing an item, written short, carries no stray indent', () => {
+  const el = rendered('1. first\n  continued\n  - sub\n2. next');
+  const li = el.querySelector('ol > li');
+  assert(/^first\ncontinued<ul/.test(li.innerHTML), JSON.stringify(li.innerHTML.slice(0, 40)));
 });
 
 test('a tab that reaches past an item\'s text keeps the columns beyond it', () => {
@@ -171,6 +157,25 @@ test('a code block in an item keeps its lines as written', () => {
   assert(code, 'no code block in the item');
   assert(code.textContent === 'foo:\n\n- bar\n\n\nbaz', JSON.stringify(code.textContent));
   assert(el.querySelectorAll('ol > li').length === 2, 'the code block split the list');
+});
+
+test('a code block in an item does not end it, nor take its next item', () => {
+  // Every line here is past the margin, so only the code block's end lets
+  // " - b" be seen as the next item.
+  const el = rendered('- a\n  ```\n  x\n  ```\n - b');
+  const items = el.querySelectorAll(':scope > ul > li');
+  assert(items.length === 2, `${items.length} items, not 2`);
+  const code = items[0].querySelector('.code-block code');
+  assert(code && code.textContent === 'x', 'no code block in a');
+  assert(items[1].textContent === 'b', JSON.stringify(items[1].textContent));
+});
+
+test('nor does one opened on the item\'s own line', () => {
+  const el = rendered('- ```bash\n  ls\n  ```\n - b');
+  const items = el.querySelectorAll(':scope > ul > li');
+  assert(items.length === 2, `${items.length} items, not 2`);
+  const code = items[0].querySelector('.code-block code');
+  assert(code && code.textContent === 'ls', code ? JSON.stringify(code.textContent) : 'no code');
 });
 
 test('a code fence may be indented up to three spaces', () => {
@@ -229,6 +234,25 @@ test('a rule written with spaces is a rule, not lists inside lists', () => {
   }
 });
 
+test('so it is after a list, and between items', () => {
+  const el = rendered('- one\n- two\n\n* * *\n\nAfter');
+  assert(el.querySelector('hr'), 'no rule after the list');
+  assert(lists('- one\n- two\n\n* * *\n\nAfter').join(' | ') === 'ul(one, two)',
+         'the rule joined the list');
+  const el2 = rendered('- a\n- - -\n- b');
+  assert(el2.querySelector('hr'), 'no rule between the items');
+  assert(lists('- a\n- - -\n- b').join(' | ') === 'ul(a) | ul(b)', lists('- a\n- - -\n- b').join(' | '));
+  const el3 = rendered('- a\n * * *');
+  assert(el3.querySelector('ul > li hr'), 'a rule indented under an item is the item\'s');
+});
+
+test('an item of thousands of lines renders', () => {
+  // Not built with a call taking one argument per line, which an engine
+  // refuses past its limit.
+  const el = rendered('- the log:\n' + '  line\n'.repeat(200000) + '- next');
+  assert(el.querySelectorAll('ul > li').length === 2, 'not two items');
+});
+
 test('markers nested thousands deep render, as text past a depth', () => {
   const el = rendered('- '.repeat(3000) + 'x');
   assert(el.textContent.includes('x'), 'the text was lost');
@@ -246,5 +270,4 @@ test('text around lists is kept, in order', () => {
          'out of order: ' + t);
 });
 
-console.log(`\n${ran - failures}/${ran} passed`);
-process.exit(failures ? 1 : 0);
+done();

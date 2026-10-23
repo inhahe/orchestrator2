@@ -41,6 +41,7 @@ import socket as _socket
 import sys
 import time
 from collections import OrderedDict
+from html import escape as html_escape
 from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
@@ -3357,8 +3358,12 @@ async def index(request: Request):
         # ?resume=<id> → reconfigure and redirect.
         ok, err = await _reconfigure(resume=resume_param, cwd=cwd_param)
         if not ok:
+            # Escaped: the error repeats the URL's own text ("session not
+            # found: <id>"), so a crafted link would otherwise run script
+            # here, in the page that drives the sessions.
             return HTMLResponse(
-                f"<h1>Resume failed</h1><p>{err}</p><p><a href='/?resume'>Pick another</a></p>",
+                f"<h1>Resume failed</h1><p>{html_escape(err)}</p>"
+                f"<p><a href='/?resume'>Pick another</a></p>",
                 status_code=400,
             )
         return RedirectResponse("/", status_code=303)
@@ -3366,18 +3371,31 @@ async def index(request: Request):
     if not _client_launch and cwd_param is not None:
         ok, err = await _reconfigure(cwd=cwd_param)
         if not ok:
-            return HTMLResponse(f"<h1>Error</h1><p>{err}</p>", status_code=400)
+            return HTMLResponse(f"<h1>Error</h1><p>{html_escape(err)}</p>",
+                                status_code=400)
         return RedirectResponse("/", status_code=303)
 
     # --- Normal page serve ---
     if _picker_mode:
         return _serve_page("resume.html", fallback="<h1>Session Picker</h1>")
 
-    return _serve_page("index.html", fallback="<h1>orchestrator2</h1><p>No index.html yet.</p>")
+    return _serve_page("index.html", fallback="<h1>orchestrator2</h1><p>No index.html yet.</p>",
+                       csp=CHAT_PAGE_CSP)
 
 
-def _serve_page(filename: str, *, fallback: str = "") -> HTMLResponse:
-    """Read an HTML file from STATIC_DIR, inject theme CSS, and return it."""
+#: The chat page runs only its own script files: no inline script, no
+#: ``javascript:`` URL, no event handler written into the page.  It renders
+#: what models write, and a model can be led by what it reads into writing
+#: markup -- a ``[text](javascript:...)`` link got through once.  The page has
+#: none of those itself (tests/test_chat_page_policy.py), so this costs it
+#: nothing, and closes the whole class rather than each way in.
+CHAT_PAGE_CSP = "script-src 'self'; object-src 'none'; base-uri 'self'"
+
+
+def _serve_page(filename: str, *, fallback: str = "",
+                csp: str | None = None) -> HTMLResponse:
+    """Read an HTML file from STATIC_DIR, inject theme CSS, and return it,
+    under the Content-Security-Policy *csp* if one is given."""
     page = STATIC_DIR / filename
     if not page.exists():
         return HTMLResponse(fallback)
@@ -3387,10 +3405,10 @@ def _serve_page(filename: str, *, fallback: str = "") -> HTMLResponse:
         if css:
             inject = f'<style id="theme-overrides">\n{css}\n</style>'
             html = html.replace("</head>", f"{inject}\n</head>", 1)
-    return HTMLResponse(
-        html,
-        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
-    )
+    headers = {"Cache-Control": "no-store, no-cache, must-revalidate"}
+    if csp:
+        headers["Content-Security-Policy"] = csp
+    return HTMLResponse(html, headers=headers)
 
 
 async def _reconfigure(

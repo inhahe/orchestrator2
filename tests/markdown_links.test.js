@@ -7,53 +7,9 @@
  * renders an assistant message.
  */
 
-const fs = require('fs');
-const path = require('path');
-const { JSDOM } = require('jsdom');
+const { rendered, suite } = require('./md_harness');
 
-const CHAT_JS = fs.readFileSync(
-  path.join(__dirname, '..', 'static', 'chat.js'), 'utf8');
-
-let failures = 0;
-let ran = 0;
-
-function test(name, fn) {
-  ran++;
-  try {
-    fn();
-    console.log(`  ok    ${name}`);
-  } catch (e) {
-    failures++;
-    console.log(`  FAIL  ${name}\n        ${e && e.message}`);
-  }
-}
-
-function assert(cond, msg) {
-  if (!cond) throw new Error(msg || 'assertion failed');
-}
-
-/* The rendered message for assistant text *text*. */
-function rendered(text) {
-  const dom = new JSDOM(
-    '<!doctype html><html><body><div id="messages"></div></body></html>',
-    { runScripts: 'outside-only' });
-  const win = dom.window;
-  const pending = [];
-  win.setTimeout = (fn) => { pending.push(fn); return pending.length; };
-  win.clearTimeout = () => {};
-  win.requestAnimationFrame = (fn) => { pending.push(() => fn(0)); return pending.length; };
-  win.cancelAnimationFrame = () => {};
-  win.console = Object.assign(Object.create(console), { log: () => {} });
-  win.eval(CHAT_JS + '\n;window.Chat = Chat;');
-  win.Chat.init();
-  win.Chat.handleMessage({ type: 'assistant_text', content: text, delta: false });
-  for (let g = 0; pending.length && g < 200; g++) pending.shift()();
-  const el = win.document.querySelector('.md-rendered');
-  assert(el, 'nothing rendered');
-  return el;
-}
-
-console.log('\nmarkdown links\n');
+const { test, assert, done } = suite('markdown links');
 
 test('a web link is a link, opening in a new tab', () => {
   const a = rendered('see [the docs](https://example.com/a?b=1&c=2)').querySelector('a');
@@ -99,5 +55,29 @@ test('nor is a target without a scheme', () => {
   assert(el.querySelector('.md-link-inert').textContent === 'main.rs', 'the text was lost');
 });
 
-console.log(`\n${ran - failures}/${ran} passed`);
-process.exit(failures ? 1 : 0);
+test('a target is kept as written, whatever markdown is in it', () => {
+  // Code spans and emphasis used to be rendered first, into the target --
+  // and a quote of the markup ended the attribute, spilling the rest.
+  for (const href of ['https://x.com/`p`', 'https://a.com/*b*/c', 'https://a.com/**b**']) {
+    const a = rendered(`see [docs](${href}) now`).querySelector('a');
+    assert(a, `${href}: no link`);
+    assert(a.getAttribute('href') === href, `${href}: href ${a.getAttribute('href')}`);
+    assert(a.textContent === 'docs' && a.target === '_blank' && a.rel === 'noopener',
+           `${href}: ${a.outerHTML}`);
+  }
+});
+
+test('its text may have emphasis and code in it', () => {
+  const a = rendered('[**the** `docs`](https://x.com)').querySelector('a');
+  assert(a && a.querySelector('strong') && a.querySelector('code.md-code'),
+         a ? a.innerHTML : 'no link');
+});
+
+test('a link written in a code span is shown as written', () => {
+  const el = rendered('write `[docs](https://x.com)` for a link');
+  assert(!el.querySelector('a'), 'the code span became a link');
+  assert(el.querySelector('code.md-code').textContent === '[docs](https://x.com)',
+         el.innerHTML);
+});
+
+done();

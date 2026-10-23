@@ -1854,13 +1854,35 @@ const Chat = (() => {
   // marker, and its text.
   const LIST_ITEM = /^([ \t]*)([-*+]|\d+[.)])([ \t]+)(.*)$/;
   // A horizontal rule: three or more of one of - * _, spaces between allowed.
-  // Tested before lists, which "- - -" would otherwise be, nested.
+  // Never a list item, which "- - -" would otherwise be, nested.
   const THEMATIC_BREAK = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
-  // A code fence, indented by up to three spaces: [line, indent, fence, lang].
-  const FENCE = /^( {0,3})(`{3,})([\w-]*)\s*$/;
+  // A code fence's opening line, indented by up to three spaces: [line,
+  // indent, fence, info string].  See _fenceOpen.
+  const FENCE = /^( {0,3})(`{3,}|~{3,})(.*)$/;
+  // A code fence's closing line: [line, fence].  See _fenceCloses.
+  const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
   // Lists nested deeper than this are taken as text: far past any real list,
   // and short of the recursion a line of thousands of "- " would run out of.
   const MAX_LIST_DEPTH = 16;
+  // A link target that can only navigate: http(s) or mailto, and nothing in
+  // front of the scheme that a browser would strip (spaces, control bytes).
+  const SAFE_HREF = /^(https?:|mailto:)/i;
+
+  /** The code block *line* opens: {indent, fence, lang}, or null.  Its info
+   *  string is anything without a backtick, as in CommonMark ("c++", "c#",
+   *  "python title=x"), and its first word is the language. */
+  function _fenceOpen(line) {
+    const m = line.match(FENCE);
+    if (!m || (m[2][0] === '`' && m[3].includes('`'))) return null;
+    return { indent: m[1].length, fence: m[2], lang: m[3].trim().split(/\s+/)[0] };
+  }
+
+  /** Whether *line* closes the code block *open* began: a fence of its
+   *  character at least as long as its own, indented by up to three. */
+  function _fenceCloses(line, open) {
+    const m = line.match(FENCE_CLOSE);
+    return !!m && m[1][0] === open.fence[0] && m[1].length >= open.fence.length;
+  }
 
   /** The column after *ch* at column *col*: a tab goes to the next multiple
    *  of 4, CommonMark's tab stop. */
@@ -1906,53 +1928,71 @@ const Chat = (() => {
    * An item holds every line after it indented past its marker -- text that
    * continues it, a nested list, a code block -- rendered as a document of
    * its own, so lists nest, and a numbered list keeps counting across the
-   * sub-items between its items.  Its lines keep their indentation relative
-   * to one another; a code block's are kept as written.  A line of the
-   * list's own kind indented less than the item's text is the next item, as
-   * in CommonMark; a sub-list of the other kind is the item's however little
-   * it is indented, as in "1. step" over "  - detail", which models write.
-   * Blank lines between items do not end the list; a line at or left of the
-   * list's marker that is not one of its items does.
+   * sub-items between its items.  The list's next item is a line of its own
+   * kind at its marker's column or one off it (" 9." over "10.", "- a" over
+   * " - b"); one indented further is the item's, as a sub-list.
+   *
+   * The item's lines lose the indentation of its text, as in CommonMark,
+   * with one difference.  A sub-list may begin short of the item's text, as
+   * models write it -- "  - detail" under "1. step", "  1. sub" under it, two
+   * spaces where CommonMark wants three -- and its lines then lose only that
+   * sub-list's own indentation, keeping its shape; the item's lines that
+   * follow it, back at the item's text, are the item's again.  A code block's
+   * lines are kept as written.  Blank lines between items do not end the
+   * list; a line at or left of the item's marker that is not the next item
+   * does.
    */
   function _list(lines, i, depth) {
     let m = lines[i].match(LIST_ITEM);
-    const indent = _width(m[1]);
     const ordered = /\d/.test(m[2]);
     const start = parseInt(m[2], 10);
     const items = [];
     for (;;) {
+      const at = _width(m[1]);
       const textCol = _width(m[1] + m[2] + m[3]);
-      const isNextItem = (n) => !!n && /\d/.test(n[2]) === ordered && _width(n[1]) < textCol;
-      const body = [];
-      let fence = null;      // the code fence open among the item's lines
+      const isNextItem = (line) => {
+        const n = line.match(LIST_ITEM);
+        return !!n && !THEMATIC_BREAK.test(line) && /\d/.test(n[2]) === ordered
+          && _width(n[1]) <= at + 1;
+      };
+      const body = [m[4]];
+      let fence = _fenceOpen(m[4]);   // the code block open in the item
+      let sub = null;      // a sub-list begun short of textCol: {at, textCol}
       i++;
       while (i < lines.length) {
         const line = lines[i];
-        if (fence === null && line.trim() === '') {
+        if (line.trim() === '') {
+          if (fence) { body.push(''); i++; continue; }
           const j = _skipBlank(lines, i);
-          if (j >= lines.length || _indentOf(lines[j]) <= indent
-              || isNextItem(lines[j].match(LIST_ITEM))) break;
+          if (j >= lines.length || _indentOf(lines[j]) <= at) break;
           // The item goes on after the blank lines.  Keep them, but not ahead
           // of a sub-list, which has a margin of its own.
           if (!LIST_ITEM.test(lines[j])) for (let k = i; k < j; k++) body.push('');
           i = j;
           continue;
         }
-        if (line.trim() !== '' && _indentOf(line) <= indent) break;
-        if (fence === null && isNextItem(line.match(LIST_ITEM))) break;
-        body.push(line);
-        const ticks = line.trimStart().match(/^`{3,}/);
-        if (ticks && fence === null) fence = ticks[0];
-        else if (ticks && fence !== null && line.trim() === fence) fence = null;
+        const ind = _indentOf(line);
+        if (ind <= at || (!fence && isNextItem(line))) break;
+        // In a sub-list begun short: its items, and what is indented under
+        // them.  Anything else is the item's again.  A code block's lines
+        // stay where its first line put them.
+        if (!fence) {
+          const n = line.match(LIST_ITEM);
+          if (sub && !(ind >= sub.textCol || (n && ind <= sub.at + 1))) sub = null;
+          if (!sub && n && ind < textCol) sub = { at: ind, textCol: 0 };
+          if (sub && n && ind <= sub.at + 1) sub.textCol = _width(n[1] + n[2] + n[3]);
+        }
+        const d = _dedent(line, sub ? sub.at : textCol);
+        body.push(d);
+        if (fence) { if (_fenceCloses(d, fence)) fence = null; }
+        else fence = _fenceOpen(d);
         i++;
       }
-      const shared = Math.min(textCol, ...body.filter((l) => l.trim() !== '').map(_indentOf));
-      items.push(_blocks([m[4], ...body.map((l) => _dedent(l, shared))], depth + 1));
+      items.push(_blocks(body, depth + 1));
       // Blank lines, then the list's next item, go on with the list.
       const j = _skipBlank(lines, i);
-      const next = j < lines.length ? lines[j].match(LIST_ITEM) : null;
-      if (!isNextItem(next)) break;
-      m = next;
+      if (j >= lines.length || !isNextItem(lines[j])) break;
+      m = lines[j].match(LIST_ITEM);
       i = j;
     }
     const lis = items.map(t => `<li>${t}</li>`).join('');
@@ -1983,20 +2023,18 @@ const Chat = (() => {
 
       // --- Fenced code block ---
       // Its lines lose as much indentation as the opening fence has, as in
-      // CommonMark; the closing fence may be indented by up to three.
-      const fenceMatch = line.match(FENCE);
-      if (fenceMatch) {
-        const fenceIndent = fenceMatch[1].length;
-        const fence = fenceMatch[2];
-        const lang = fenceMatch[3];
-        const closing = new RegExp('^ {0,3}' + fence + '\\s*$');
+      // CommonMark.  One never closed runs to the end of the message.
+      const open = _fenceOpen(line);
+      if (open) {
         const codeLines = [];
         i++;
-        while (i < lines.length && !closing.test(lines[i])) {
-          codeLines.push(_dedent(lines[i], fenceIndent));
+        while (i < lines.length && !_fenceCloses(lines[i], open)) {
+          codeLines.push(_dedent(lines[i], open.indent));
           i++;
         }
         i++;  // skip closing fence
+        // Escaped with the rest of the message, so safe in an attribute.
+        const lang = open.lang;
         const langAttr = lang ? ` data-lang="${lang}"` : '';
         const langLabel = lang ? `<span class="code-lang">${lang}</span>` : '';
         pushBlock(`<div class="code-block"${langAttr}>${langLabel}<pre><code>${codeLines.join('\n')}</code></pre></div>`);
@@ -2082,32 +2120,47 @@ const Chat = (() => {
     return cells.map(c => c.trim());
   }
 
-  /** Inline markdown: bold, italic, inline code, links. */
+  /**
+   * Inline markdown in *s*, a line already escaped: code spans, links, bold,
+   * italic.
+   *
+   * Each finished piece is held out of the line as a placeholder until the
+   * end, so that no later pass reaches into it: a code span is shown as
+   * written ("`*args`" keeps its asterisk, "`[a](b)`" stays text), and a
+   * link's target is kept as written, in an attribute no markup is put into.
+   */
   function _inlineMd(s) {
-    return s
-      // Inline code (must come before bold/italic to avoid conflicts)
-      .replace(/`([^`]+?)`/g, '<code class="md-code">$1</code>')
-      // Bold+italic
-      .replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>')
-      // Bold
-      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-      // Italic
-      .replace(/\*(.+?)\*/g, '<em>$1</em>')
-      // Links: to the web or to an address only.  A model can be led by what
-      // it reads into writing [text](javascript:...), which would run in this
-      // page when clicked.  Any other target -- that, or a file path, which
-      // would resolve against this page's own server -- is shown as its text,
-      // the target in a tooltip.  (Escaped already, so inert in an attribute.)
-      // The target may hold balanced parentheses, as Wikipedia's do.
-      .replace(/\[([^\]]+)\]\(((?:[^()]|\([^()]*\))+)\)/g, (whole, text, href) =>
-        SAFE_HREF.test(href)
-          ? `<a href="${href}" target="_blank" rel="noopener">${text}</a>`
-          : `<span class="md-link-inert" title="${href}">${text}</span>`);
+    const held = [];          // [as shown, as written]
+    const hold = (shown, written) => {
+      held.push([shown, written]);
+      return `\u0000${held.length - 1}\u0000`;
+    };
+    const restore = (t, form) => t.replace(/\u0000(\d+)\u0000/g, (_, k) => held[+k][form]);
+    s = s.replace(/`([^`]+?)`/g, (whole, code) =>
+      hold(`<code class="md-code">${code}</code>`, whole));
+    // Links: to the web or to an address only.  A model can be led by what
+    // it reads into writing [text](javascript:...), which would run in this
+    // page when clicked.  Any other target -- that, or a file path, which
+    // would resolve against this page's own server -- is shown as its text,
+    // the target in a tooltip.  The target may hold balanced parentheses, as
+    // Wikipedia's do.
+    s = s.replace(/\[([^\]]+)\]\(((?:[^()]|\([^()]*\))+)\)/g, (whole, text, href) => {
+      const target = restore(href, 1);
+      const label = restore(_emphasis(text), 0);
+      return hold(SAFE_HREF.test(target)
+        ? `<a href="${target}" target="_blank" rel="noopener">${label}</a>`
+        : `<span class="md-link-inert" title="${target}">${label}</span>`, whole);
+    });
+    return restore(_emphasis(s), 0);
   }
 
-  // A link target that can only navigate: http(s) or mailto, and nothing in
-  // front of the scheme that a browser would strip (spaces, control bytes).
-  const SAFE_HREF = /^(https?:|mailto:)/i;
+  /** Bold and italic in *s*. */
+  function _emphasis(s) {
+    return s
+      .replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>')
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*(.+?)\*/g, '<em>$1</em>');
+  }
 
   function setCollapseTools(v) { _collapseTools = !!v; }
   function getCollapseTools() { return _collapseTools; }
