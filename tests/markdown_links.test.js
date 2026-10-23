@@ -56,11 +56,15 @@ test('nor is a target without a scheme', () => {
   const el = rendered('[main.rs](src/main.rs)');
   assert(!el.querySelector('a'), 'a relative path became a link');
   assert(el.querySelector('.md-link-inert').textContent === 'main.rs', 'the text was lost');
+  // Its tooltip is the path as written, not as a link's target is encoded.
+  const win = rendered('[server.py](D:\\proj\\my%20file.py)');
+  assert(win.querySelector('.md-link-inert').title === 'D:\\proj\\my file.py',
+         win.querySelector('.md-link-inert').title);
 });
 
 test('a target is kept as written, whatever markdown is in it', () => {
-  // Code spans and emphasis used to be rendered first, into the target --
-  // and a quote of the markup ended the attribute, spilling the rest.
+  // No markup may reach the attribute: a quote in it would end the
+  // attribute and spill the rest into the page.
   for (const href of ['https://x.com/`p`', 'https://a.com/*b*/c', 'https://a.com/**b**']) {
     const a = rendered(`see [docs](${href}) now`).querySelector('a');
     assert(a, `${href}: no link`);

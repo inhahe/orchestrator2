@@ -25,6 +25,41 @@ test('a blank line is a new paragraph', () => {
   assert(el.querySelectorAll('p').length === 2, el.innerHTML);
 });
 
+test('a Windows path is shown as written', () => {
+  // "\." is an escaped "." to CommonMark, and "_x_" emphasis.
+  for (const path of ['C:\\Users\\Computer\\.claude\\settings.json',
+                      'C:\\_tmp\\my_dir_\\x_y.txt', 'C:\\', '\\\\server\\share\\.cache',
+                      'D:\\visual studio projects\\.claude\\settings.json',
+                      'C:\\Program Files (x86)\\Foo\\a*b.txt']) {
+    const el = rendered(`Saved to ${path} today.`);
+    assert(el.textContent === `Saved to ${path} today.`, `${path}: ${JSON.stringify(el.textContent)}`);
+    assert(!el.querySelector('em, strong, br'), `${path}: ${el.innerHTML}`);
+  }
+});
+
+test('and markdown around it still is markdown', () => {
+  const el = rendered('**C:\\x\\my_dir** and (see C:\\a\\.b), [D:\\x\\y](https://x.com)');
+  assert(el.querySelector('strong').textContent === 'C:\\x\\my_dir', el.innerHTML);
+  assert(el.textContent.includes('(see C:\\a\\.b),'), el.textContent);
+  assert(el.querySelector('a').textContent === 'D:\\x\\y', el.innerHTML);
+  // An escape away from a path is an escape still.
+  assert(rendered('a \\* b').textContent === 'a * b', 'an escape');
+  // A drive is a letter on its own: "foo:" is no drive, and "\_" after it
+  // an escaped "_".
+  assert(rendered('foo:\\_bar_').textContent === 'foo:_bar_', 'a word taken for a drive');
+  // A path stops at the next drive, whatever is between.
+  assert(rendered('C:\\a _see_ D:\\b').querySelector('em'), 'swallowed up to the next drive');
+  // And the emphasis closing around it is emphasis.
+  assert(rendered('_C:\\x\\y_.').querySelector('em'), 'the closing _ was taken into the path');
+});
+
+test('a dunder name is a name, not bold', () => {
+  const el = rendered('edit __init__.py, then __name__ == "__main__"; **bold** stays');
+  assert(el.textContent === 'edit __init__.py, then __name__ == "__main__"; bold stays',
+         JSON.stringify(el.textContent));
+  assert(el.querySelectorAll('strong').length === 1, el.innerHTML);
+});
+
 test('raw HTML is shown as text', () => {
   const el = rendered('a <b>bold</b> claim <script>alert(1)</script> <img src=x onerror=alert(2)>');
   assert(!el.querySelector('b, script, img'), 'made an element: ' + el.innerHTML);

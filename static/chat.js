@@ -1862,7 +1862,23 @@ const Chat = (() => {
     const text = String(raw).replace(/\r\n?/g, '\n');
     if (!md) return _esc(text).replace(/\n/g, '<br>');
     const starts = new Map();
-    return md.render(_asMeant(text, starts), { starts }).trimEnd();
+    return md.render(_asMeant(text, starts, _codeLines(md, text)), { starts }).trimEnd();
+  }
+
+  /** The lines of *text* that markdown-it reads as code, by index: a fenced
+   *  or indented block's -- but for a list item's own line its code starts
+   *  on ("- ```sh", "-      x"), which is the item's, for _asMeant to read. */
+  function _codeLines(md, text) {
+    const tokens = [];
+    md.block.parse(text, md, {}, tokens);
+    const code = new Set();
+    tokens.forEach((t, k) => {
+      if (t.type !== 'fence' && t.type !== 'code_block') return;
+      const before = tokens[k - 1];
+      const own = before && before.type === 'list_item_open' && before.map[0] === t.map[0];
+      for (let i = t.map[0] + (own ? 1 : 0); i < t.map[1]; i++) code.add(i);
+    });
+    return code;
   }
 
   let _markdownIt = null;
@@ -1888,6 +1904,8 @@ const Chat = (() => {
     md.validateLink = () => true;
     md.core.ruler.push('neuter_links', _neuterLinks);
     md.core.ruler.push('list_starts', _listStarts);
+    md.inline.ruler.before('escape', 'windows_path', _windowsPath);
+    md.inline.ruler.before('emphasis', 'dunder', _dunder);
     const r = md.renderer.rules;
     const esc = md.utils.escapeHtml;
     r.code_inline = (tokens, i) => `<code class="md-code">${esc(tokens[i].content)}</code>`;
@@ -1935,7 +1953,8 @@ const Chat = (() => {
           if (inert) {
             t.type = 'link_inert_open';
             t.tag = 'span';
-            t.attrs = [['class', 'md-link-inert'], ['title', href]];
+            // Readable: "D:\x", not the "D:%5Cx" a link's target is kept as.
+            t.attrs = [['class', 'md-link-inert'], ['title', state.md.normalizeLinkText(href)]];
           } else {
             t.attrSet('target', '_blank');
             t.attrSet('rel', 'noopener');
@@ -1959,18 +1978,62 @@ const Chat = (() => {
     }
   }
 
-  // A list item's first line: [line, indentation, marker, the gap after it].
-  const LIST_ITEM = /^( *)(\d{1,9}[.)]|[-*+])( +)\S/;
+  // A Windows path, from its first "\" to the end of its last segment.  A
+  // segment may hold spaces where another "\" follows it ("D:\visual studio
+  // projects\x"), and none of what a Windows name may not (: * ? " < > |),
+  // nor a bracket or a backtick: so it stops at the next drive, at markup,
+  // and at the end of a link's text.
+  const WIN_PATH = /^\\(?:[^\s\\`[\]<>:*?"|]+(?: [^\s\\`[\]<>:*?"|]+)*\\)*[^\s\\`[\]<>:*?"|]*/;
+  // What closes around a path or ends its sentence, not the path's.
+  const PATH_TAIL = /[.,;!?')_]+$/;
+
+  /**
+   * A markdown-it inline rule: a Windows path in prose is text as written --
+   * after a drive's "C:", or a share's "\\server\".  CommonMark would take
+   * the "\." in "C:\Users\me\.claude" for an escaped ".", and the "_"s of
+   * "C:\my_dir\x_y" for emphasis.  *state* and *silent* are markdown-it's.
+   */
+  function _windowsPath(state, silent) {
+    const { src, pos } = state;
+    if (src.charCodeAt(pos) !== 0x5C) return false;
+    const drive = /(?:^|[^A-Za-z0-9])[A-Za-z]:$/.test(src.slice(Math.max(0, pos - 3), pos));
+    const share = !drive && /^\\\\[\w.$-]+\\/.test(src.slice(pos, pos + 260))
+      && (pos === 0 || /[\s(["']/.test(src[pos - 1]));
+    if (!drive && !share) return false;
+    const from = share ? pos + 1 : pos;
+    const path = src.slice(pos, from)
+      + src.slice(from).match(WIN_PATH)[0].replace(PATH_TAIL, '');
+    if (!silent) state.pending += path;
+    state.pos += path.length;
+    return true;
+  }
+
+  // A "dunder" name: "__init__" is a name, not "init" in bold.
+  const DUNDER = /^__[A-Za-z0-9]\w*?__(?![A-Za-z0-9])/;
+
+  /** A markdown-it inline rule: a dunder name in prose is text as written. */
+  function _dunder(state, silent) {
+    const { src, pos } = state;
+    if (src.charCodeAt(pos) !== 0x5F) return false;
+    const m = src.slice(pos, pos + 200).match(DUNDER);
+    if (!m) return false;
+    if (!silent) state.pending += m[0];
+    state.pos += m[0].length;
+    return true;
+  }
+
+  // A list item's first line: [line, indentation, marker, the gap after it,
+  // undefined for an empty item].
+  const LIST_ITEM = /^( *)(\d{1,9}[.)]|[-*+])(?:( +)\S| *$)/;
   // A line's indentation and the list markers on it, with the gaps after them.
   const LEAD = /^[ \t]*(?:(?:\d{1,9}[.)]|[-*+])[ \t]+)*/;
-  // A code fence's opening, on a line without its indentation or list marker:
-  // [line, backticks, tildes].  An info string after backticks holds none,
-  // or the line is a code span.
-  const FENCE_OPEN = /^(?:(`{3,})[^`]*|(~{3,}).*)$/;
   // Lists stacked deeper than this on one line ("- - - - x") are text from
-  // there on: markdown-it drops what is nested past its own limit.
+  // there on: markdown-it drops what is nested past its own limit.  [the
+  // line up to the marker past the limit, and that marker's digits].  The
+  // indentation is matched once, so no two parts compete for the same spaces.
   const MAX_STACKED = 16;
-  const STACKED = new RegExp(`^((?: *(?:[-*+]|\\d{1,9}[.)]) +){${MAX_STACKED}})(.*)$`);
+  const STACKED = new RegExp(
+    `^ *(?:(?:[-*+]|\\d{1,9}[.)]) +){${MAX_STACKED}}\\d{0,9}(?=[-*+.)](?: |$))`);
 
   /**
    * *src* as the model meant it, where CommonMark reads it otherwise.
@@ -1992,25 +2055,25 @@ const Chat = (() => {
    * - Markers stacked past MAX_STACKED on one line are text from there on.
    *
    * Tabs in a line's indentation, and after its markers, are read as the
-   * spaces they stand for, to the next multiple of four.  Code blocks are
-   * left as written.
+   * spaces they stand for, to the next multiple of four.  The lines of
+   * *code* (their indexes, from _codeLines) are left as written, only moved
+   * in with a sub-list they are under.
    */
-  function _asMeant(src, starts) {
+  function _asMeant(src, starts, code) {
     const out = [];
     const items = [];        // the open items: {at, text}, marker and text columns
     const shifts = [];       // short sub-lists being moved in: {from, by}, innermost last
-    let fence = null;
-    for (const raw of src.split('\n')) {
+    const lines = src.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const raw = lines[i];
       let line = _untab(raw);
       const ind = _indent(line);
       // Moved in by every short sub-list it is under: those begun at or left
       // of where it starts, as written.
       const by = shifts.reduce((n, s) => n + (s.from <= ind ? s.by : 0), 0);
-      if (fence) {
-        // Closed by its own character alone on a line, at least as many.
-        const t = line.trim();
-        if (t.length >= fence.length && t === fence[0].repeat(t.length)) fence = null;
-        out.push(by ? ' '.repeat(by) + line : raw);
+      if (code.has(i)) {
+        // Its tabs too: a Makefile's recipe line is a tab.
+        out.push(' '.repeat(by) + raw);
         continue;
       }
       if (line.trim() === '') { out.push(line); continue; }
@@ -2018,7 +2081,10 @@ const Chat = (() => {
       line = ' '.repeat(by) + line;
       const at = _indent(line);
       let m = line.match(LIST_ITEM);
-      if (!m && items.length && at <= items[0].at && out[out.length - 1].trim() !== '') {
+      // Not after code: a blank line would be the code's, in a block this
+      // line ends by ending its item.
+      if (!m && items.length && at <= items[0].at && out[out.length - 1].trim() !== ''
+          && !code.has(i - 1)) {
         out.push('');
       }
       while (items.length && at <= items[items.length - 1].at) items.pop();
@@ -2031,19 +2097,22 @@ const Chat = (() => {
         }
         // Wherever it needs to or not -- after a blank line, or an item
         // after the first, whose number does not count -- for the same result.
+        // Not an empty item: it may not break into text at all, and its
+        // number is shown as written.
         const n = parseInt(m[2], 10);
-        if (parent && /^\d/.test(m[2]) && n !== 1) {
+        if (parent && m[3] && /^\d/.test(m[2]) && n !== 1) {
           const digits = m[2].length - 1;
           starts.set(out.length, n);
           line = m[1] + '1'.padStart(digits, '0') + line.slice(m[1].length + digits);
         }
-        items.push({ at: m[1].length, text: m[1].length + m[2].length + m[3].length });
+        // Its text one past the marker when there is none, or when five
+        // spaces or more follow it: they begin a code block in the item.
+        const gap = m[3] && m[3].length <= 4 ? m[3].length : 1;
+        items.push({ at: m[1].length, text: m[1].length + m[2].length + gap });
+        // An escaped marker is no marker: "\-", "12\.".
         const stacked = line.match(STACKED);
-        if (stacked) line = stacked[1] + '\\' + stacked[2];
+        if (stacked) line = stacked[0] + '\\' + line.slice(stacked[0].length);
       }
-      // An item's code block may open on the item's own line.
-      const f = (m ? line.slice(m[0].length - 1) : line).trim().match(FENCE_OPEN);
-      if (f) fence = f[1] || f[2];
       out.push(line);
     }
     return out.join('\n');

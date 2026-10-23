@@ -126,6 +126,33 @@ test('and the lists around it stay tight', () => {
   }
 });
 
+test('an empty item is an item', () => {
+  is('- a\n-\n- b', 'ul(a, , b)', 'an empty bullet');
+  assert(!rendered('- a\n-\n- b').querySelector('li > p'), 'the list was spaced apart');
+  // Under an item, an empty numbered one keeps its number, and is not a list.
+  assert(rendered('1. a\n   2023.').textContent.includes('2023.'), 'its number was rewritten');
+});
+
+test('five spaces after a marker begin code in the item, its text one past it', () => {
+  // "- b" two in is the item's, not moved four further into its code.
+  const el = rendered('-\t\ta\n  - b');
+  assert(el.querySelector('ul > li .code-block'), el.innerHTML);
+  assert(el.querySelector('ul > li > ul > li') && el.querySelectorAll('.code-block').length === 1,
+         el.innerHTML);
+  // Only the item's own line: code under it on the next is code.
+  const below = rendered('-\n      3. x').querySelector('.code-block code');
+  assert(below && below.textContent === '3. x', below ? JSON.stringify(below.textContent) : 'no code');
+  // And a sub-list written short of that text is moved in to it, not past.
+  const ten = rendered('10.      x\n  - b');
+  assert(ten.querySelector('ol > li > ul > li') && ten.querySelectorAll('.code-block').length === 1,
+         ten.innerHTML);
+});
+
+test('a rule one space under an item ends the list', () => {
+  const el = rendered('- a\n * * *');
+  assert(el.querySelector('ul + hr') && !el.querySelector('li hr'), el.innerHTML);
+});
+
 test('a tab after a marker is a gap like any other', () => {
   is('-\ta\n-\tb\n\t-\tc', 'ul(a, b(ul(c)))', 'tabs after the markers');
   is('1.\ta\n  - b', 'ol(a(ul(b)))', 'a tab after a number, a sub-list short of its text');
@@ -243,9 +270,33 @@ test('nor does one opened on the item\'s own line', () => {
   assert(code && code.textContent === 'ls', code ? JSON.stringify(code.textContent) : 'no code');
 });
 
+test('a code line\'s tabs are kept, under a sub-list written short too', () => {
+  // A Makefile's recipe line starts with a tab, and fails without one.
+  const el = rendered('1. Build\n  - with make:\n    ```make\n    all:\n    \tgo build\n    ```');
+  const code = el.querySelector('ul li .code-block code');
+  assert(code && code.textContent === 'all:\n\tgo build', code ? JSON.stringify(code.textContent) : el.innerHTML);
+});
+
+test('an indented code block is code, not list lines', () => {
+  const el = rendered('Example:\n\n    1. foo\n       2. bar\n    text');
+  const code = el.querySelector('.code-block code');
+  assert(code && code.textContent === '1. foo\n   2. bar\ntext', code ? JSON.stringify(code.textContent) : el.innerHTML);
+});
+
+test('a code block ended by its item\'s end is over there', () => {
+  // The fence at the margin opens a block of its own, holding "more".
+  const el = rendered('1. x\n   ```\n   a\n```\nmore');
+  const codes = [...el.querySelectorAll('.code-block code')].map((c) => c.textContent);
+  assert(JSON.stringify(codes) === JSON.stringify(['a', 'more']), JSON.stringify(codes));
+  // Text there likewise: no blank line goes into the code before it.
+  const text = rendered('1. x\n   ```\n   a\nmore');
+  const code = text.querySelector('.code-block code');
+  assert(code && code.textContent === 'a', code ? JSON.stringify(code.textContent) : text.innerHTML);
+});
+
 test('lists after a code block keep their nesting, however the block was written', () => {
-  // Each block here once left the renderer thinking a code block was still
-  // open after it, or one had opened: the short sub-list after it flattened.
+  // Each a code block CommonMark closes, or never opens, where a simpler
+  // reading would not: the short sub-list after it must still nest.
   const after = '\n1. a\n  - b\n2. c';
   is('```\n```js\n```' + after, 'ol(a(ul(b)), c)', 'a fence with a language inside one');
   is('```x``` is a code span' + after, 'ol(a(ul(b)), c)', 'three backticks around a word');
@@ -254,6 +305,8 @@ test('lists after a code block keep their nesting, however the block was written
   is('~~~\n```\n~~~' + after, 'ol(a(ul(b)), c)', 'backticks inside tildes');
   is('1. ```\n   steps:\n     - run: x\n   ```\n2. b\n  - c',
      'ol(steps: - run: x, b(ul(c)))', 'a block opened on an item\'s own line');
+  is('1. a\n  - ```\n    x\n    ```\n2. b', 'ol(a(ul(x)), b)',
+     'opened on the line of a sub-item written short');
 });
 
 test('a code fence may be indented up to three spaces', () => {
@@ -333,6 +386,22 @@ test('markers nested thousands deep render, as text past a depth', () => {
   const el = rendered('- '.repeat(3000) + 'x');
   assert(el.textContent.includes('x'), 'the text was lost');
   assert(el.querySelectorAll('ul').length <= 32, 'not capped');
+  const numbered = rendered('1. '.repeat(40) + 'x');
+  assert(numbered.textContent.includes('1. 1. x') && !numbered.textContent.includes('\\'),
+         'numbered markers past the depth: ' + JSON.stringify(numbered.textContent.slice(-40)));
+});
+
+test('markers up to that depth are lists, and leave no mark', () => {
+  const el = rendered('- '.repeat(16) + 'x');
+  assert(el.querySelectorAll('ul').length === 16, `${el.querySelectorAll('ul').length} lists`);
+  assert(!el.textContent.includes('\\'), JSON.stringify(el.textContent));
+});
+
+test('a line of markers spaced wide is read in no time', () => {
+  // Read by trying every split of every gap, it took minutes.
+  const started = Date.now();
+  rendered(Array(12).fill('-').join('      ') + '\n\n' + Array(12).fill('1.').join('      '));
+  assert(Date.now() - started < 1000, `${Date.now() - started} ms`);
 });
 
 test('a message with Windows line endings still has its lists', () => {

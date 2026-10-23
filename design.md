@@ -3157,14 +3157,26 @@ fences, emphasis inside links) had been a bug report of its own.
   `SAFE_HREF`: `http(s):`, `mailto:`). A model can be led by what it reads
   into writing `[text](javascript:...)`. Any other target, including a file
   path, which would resolve against the hub, is shown as its text with the
-  target in a tooltip (`.md-link-inert`). `validateLink` passes everything so
-  that such a link is parsed, and shown as its text rather than as the
-  markdown it was written in. A web link opens in a new tab, `noopener`.
+  target in a tooltip (`.md-link-inert`), as written rather than as encoded
+  (`normalizeLinkText`). `validateLink` passes everything so that such a link
+  is parsed, and shown as its text rather than as the markdown it was written
+  in. A web link opens in a new tab, `noopener`.
+- **A Windows path in prose is shown as written** (`_windowsPath`, an inline
+  rule before `escape`): after a drive's `C:` or starting a share's `\\`, to
+  the end of its last segment (`WIN_PATH`). CommonMark would take the `\.` in
+  `C:\Users\me\.claude` for an escaped `.`, and its `_`s for emphasis. A
+  segment may hold spaces when another `\` follows it, and none of what a
+  Windows name may not, so a path stops at the next drive and at markup; what
+  closes around it (`**`, `_`, a sentence's `.`) is not its (`PATH_TAIL`).
+- **A dunder name is a name** (`_dunder`, before `emphasis`): `__init__` is not
+  `init` in bold.
 
 Before parsing, `_asMeant` rewrites the few things CommonMark reads otherwise
-than a model means them, line by line, leaving code blocks as written (it
-tracks fences as CommonMark does: a closing fence is the opening's character
-alone, at least as long; one may open on a list item's own line):
+than a model means them, line by line. The lines markdown-it reads as code
+(`_codeLines`, a block-level parse of the text first: a fenced or indented
+block's, but for a list item's own line its code starts on, `- ```sh` or
+`-      x`, which is the item's to read) are left as written, tabs and all,
+only moved in with a sub-list they are under:
 
 - **A sub-list written short of its item's text nests.** CommonMark nests a
   line under an item only if it reaches the item's text, three columns under
@@ -3173,16 +3185,21 @@ alone, at least as long; one may open on a list item's own line):
   marker but short of its text is moved in, with everything under it (`shifts`).
 - **Text at the margin straight after a list ends it.** CommonMark would read
   it as the last item's paragraph going on ("lazy continuation"); a blank
-  line goes before it.
+  line goes before it, unless code is before it, whose block the line ends.
 - **A numbered sub-list starting past 1 starts.** CommonMark lets only a list
   starting at 1 interrupt its item's text. Such an item is written as `1.`
   (`01.` for `12.`, keeping its width), and `_listStarts`, a core rule, puts
   its number back from the line it was on. A blank line would have done it
   too, but would make the whole list loose, every item a spaced paragraph.
 - **Tabs** in a line's indentation and after its markers become the spaces
-  they stand for, to the next multiple of four, as CommonMark reads them.
+  they stand for, to the next multiple of four, as CommonMark reads them. An
+  item's text is where CommonMark has it: one past the marker for an empty
+  item, or one followed by five spaces or more (code in the item).
 - **Markers stacked past 16 on one line** (`- - - - … x`) are text from there
-  on: markdown-it drops what is nested past its own limit.
+  on: markdown-it drops what is nested past its own limit. The 17th marker is
+  escaped (`\-`, `12\.`). `STACKED` matches the indentation once, so that no
+  two of its parts compete for the same spaces: a line of markers spaced six
+  apart took the old pattern 32 s.
 
 Should the library fail to load, a message is shown as its text, escaped,
 and the console says so once.

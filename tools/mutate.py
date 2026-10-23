@@ -6871,29 +6871,46 @@ MD_LISTS_MUTATIONS = [
      "      const by = shifts.reduce((n, s) => n + s.by, 0);\n"),
 
     ("text at the margin goes on as the last item's paragraph",
-     "      if (!m && items.length && at <= items[0].at && out[out.length - 1].trim() !== '') {\n"
+     "      if (!m && items.length && at <= items[0].at && out[out.length - 1].trim() !== ''\n"
+     "          && !code.has(i - 1)) {\n"
      "        out.push('');\n      }\n",
      ""),
 
     ("a line continuing an item is set apart from it",
-     "      if (!m && items.length && at <= items[0].at && out[out.length - 1].trim() !== '') {\n",
-     "      if (!m && items.length && out[out.length - 1].trim() !== '') {\n"),
+     "      if (!m && items.length && at <= items[0].at && out[out.length - 1].trim() !== ''\n",
+     "      if (!m && items.length && out[out.length - 1].trim() !== ''\n"),
+
+    ("an item's own line its code starts on is taken for code, so it opens no item",
+     "      const own = before && before.type === 'list_item_open' && before.map[0] === t.map[0];\n",
+     "      const own = false;\n"),
 
     ("items stay open after a line left of them",
      "      while (items.length && at <= items[items.length - 1].at) items.pop();\n",
      ""),
 
     ("a numbered sub-list starting past 1 runs on as text",
-     "        if (parent && /^\\d/.test(m[2]) && n !== 1) {\n",
+     "        if (parent && m[3] && /^\\d/.test(m[2]) && n !== 1) {\n",
      "        if (false) {\n"),
 
     ("a bulleted sub-list is renumbered",
-     "        if (parent && /^\\d/.test(m[2]) && n !== 1) {\n",
-     "        if (parent && n !== 1) {\n"),
+     "        if (parent && m[3] && /^\\d/.test(m[2]) && n !== 1) {\n",
+     "        if (parent && m[3] && n !== 1) {\n"),
 
     ("a numbered list at the margin after text is one, as CommonMark has it not",
-     "        if (parent && /^\\d/.test(m[2]) && n !== 1) {\n",
-     "        if (/^\\d/.test(m[2]) && n !== 1) {\n"),
+     "        if (parent && m[3] && /^\\d/.test(m[2]) && n !== 1) {\n",
+     "        if (m[3] && /^\\d/.test(m[2]) && n !== 1) {\n"),
+
+    ("an empty numbered item is renumbered: \"2023.\" shown as \"0001.\"",
+     "        if (parent && m[3] && /^\\d/.test(m[2]) && n !== 1) {\n",
+     "        if (parent && /^\\d/.test(m[2]) && n !== 1) {\n"),
+
+    ("an empty item is taken for text, spacing its list apart",
+     "  const LIST_ITEM = /^( *)(\\d{1,9}[.)]|[-*+])(?:( +)\\S| *$)/;",
+     "  const LIST_ITEM = /^( *)(\\d{1,9}[.)]|[-*+])( +)\\S/;"),
+
+    ("five spaces after a marker are its gap, moving a sub-list into code",
+     "        const gap = m[3] && m[3].length <= 4 ? m[3].length : 1;\n",
+     "        const gap = m[3] ? m[3].length : 1;\n"),
 
     ("a numbered sub-list starts at 1 whatever it was written to start at",
      "          starts.set(out.length, n);\n",
@@ -6912,8 +6929,21 @@ MD_LISTS_MUTATIONS = [
      "      if (t.type === 'ordered_list_open') {\n"),
 
     ("markers stacked thousands deep lose the text after them",
-     "        if (stacked) line = stacked[1] + '\\\\' + stacked[2];\n",
+     "        if (stacked) line = stacked[0] + '\\\\' + line.slice(stacked[0].length);\n",
      ""),
+
+    ("a line of markers is read by trying every split of every gap -- the "
+     "freeze the review found",
+     "    `^ *(?:(?:[-*+]|\\\\d{1,9}[.)]) +){${MAX_STACKED}}\\\\d{0,9}(?=[-*+.)](?: |$))`);\n",
+     "    `^(?: *(?:[-*+]|\\\\d{1,9}[.)]) +){${MAX_STACKED}}\\\\d{0,9}(?=[-*+.)](?: |$))`);\n"),
+
+    ("a line of just the depth's markers, then text, gets a stray backslash",
+     "    `^ *(?:(?:[-*+]|\\\\d{1,9}[.)]) +){${MAX_STACKED}}\\\\d{0,9}(?=[-*+.)](?: |$))`);\n",
+     "    `^ *(?:(?:[-*+]|\\\\d{1,9}[.)]) +){${MAX_STACKED}}`);\n"),
+
+    ("a numbered marker past the depth is escaped before its digits",
+     "    `^ *(?:(?:[-*+]|\\\\d{1,9}[.)]) +){${MAX_STACKED}}\\\\d{0,9}(?=[-*+.)](?: |$))`);\n",
+     "    `^ *(?:(?:[-*+]|\\\\d{1,9}[.)]) +){${MAX_STACKED}}(?=[-*+]|\\\\d)`);\n"),
 
     ("a tab is one column",
      "      const next = ch === '\\t' ? col + 4 - (col % 4) : col + 1;\n",
@@ -6927,41 +6957,33 @@ MD_LISTS_MUTATIONS = [
      "  const LEAD = /^[ \\t]*(?:(?:\\d{1,9}[.)]|[-*+])[ \\t]+)*/;",
      "  const LEAD = /^[ \\t]*/;"),
 
-    ("a code block's lines are read as list lines",
-     "      if (f) fence = f[1] || f[2];\n",
-     ""),
+    ("code lines are read as list lines",
+     "      if (code.has(i)) {\n",
+     "      if (false) {\n"),
 
-    ("a code block never ends, so nothing after it is read",
-     "        if (t.length >= fence.length && t === fence[0].repeat(t.length)) fence = null;\n",
-     ""),
+    ("an indented code block is read as list lines",
+     "      if (t.type !== 'fence' && t.type !== 'code_block') return;\n",
+     "      if (t.type !== 'fence') return;\n"),
 
-    ("a fence with a language in it ends a code block",
-     "        if (t.length >= fence.length && t === fence[0].repeat(t.length)) fence = null;\n",
-     "        if (t.startsWith(fence)) fence = null;\n"),
+    ("the line of any item before a block is taken for the item's own",
+     "      const own = before && before.type === 'list_item_open' && before.map[0] === t.map[0];\n",
+     "      const own = before && before.type === 'list_item_open';\n"),
 
-    ("a shorter fence ends one",
-     "        if (t.length >= fence.length && t === fence[0].repeat(t.length)) fence = null;\n",
-     "        if (t === fence[0].repeat(t.length)) fence = null;\n"),
-
-    ("a fence of the other character ends one",
-     "        if (t.length >= fence.length && t === fence[0].repeat(t.length)) fence = null;\n",
-     "        if (t.length >= fence.length && /^(`+|~+)$/.test(t)) fence = null;\n"),
-
-    ("a code span of three backticks opens a code block",
-     "  const FENCE_OPEN = /^(?:(`{3,})[^`]*|(~{3,}).*)$/;",
-     "  const FENCE_OPEN = /^(?:(`{3,}).*|(~{3,}).*)$/;"),
-
-    ("tildes open no code block",
-     "  const FENCE_OPEN = /^(?:(`{3,})[^`]*|(~{3,}).*)$/;",
-     "  const FENCE_OPEN = /^(?:(`{3,})[^`]*)$/;"),
-
-    ("a code block opened on an item's own line is not seen",
-     "      const f = (m ? line.slice(m[0].length - 1) : line).trim().match(FENCE_OPEN);\n",
-     "      const f = line.trim().match(FENCE_OPEN);\n"),
+    ("no line is left to be read, opening lines and all",
+     "      for (let i = t.map[0] + (own ? 1 : 0); i < t.map[1]; i++) code.add(i);\n",
+     "      for (let i = t.map[0]; i < t.map[1]; i++) code.add(i);\n"),
 
     ("code under a sub-list written short is left where it was",
-     "        out.push(by ? ' '.repeat(by) + line : raw);\n",
+     "        out.push(' '.repeat(by) + raw);\n",
      "        out.push(raw);\n"),
+
+    ("a code line's tabs become spaces",
+     "        out.push(' '.repeat(by) + raw);\n",
+     "        out.push(' '.repeat(by) + line);\n"),
+
+    ("a blank line goes into the code a margin line ends",
+     "          && !code.has(i - 1)) {\n",
+     "          ) {\n"),
 
     ("a carriage return alone ends no line",
      "    const text = String(raw).replace(/\\r\\n?/g, '\\n');\n",
@@ -7028,7 +7050,7 @@ MD_CODE_MUTATIONS = [
      "        + `<span class=\"code-lang\">${l}</span>`\n"),
 
     ("a code line's leading tab is spaces",
-     "        out.push(by ? ' '.repeat(by) + line : raw);\n",
+     "        out.push(' '.repeat(by) + raw);\n",
      "        out.push(' '.repeat(by) + line);\n"),
 ]
 
@@ -7075,12 +7097,16 @@ MD_LINKS_MUTATIONS = [
      "        } else if (t.type === 'link_close') {\n"),
 
     ("a refused link's target is not in its tooltip",
-     "            t.attrs = [['class', 'md-link-inert'], ['title', href]];\n",
+     "            t.attrs = [['class', 'md-link-inert'], ['title', state.md.normalizeLinkText(href)]];\n",
      "            t.attrs = [['class', 'md-link-inert']];\n"),
 
     ("a refused link looks like any text",
-     "            t.attrs = [['class', 'md-link-inert'], ['title', href]];\n",
-     "            t.attrs = [['title', href]];\n"),
+     "            t.attrs = [['class', 'md-link-inert'], ['title', state.md.normalizeLinkText(href)]];\n",
+     "            t.attrs = [['title', state.md.normalizeLinkText(href)]];\n"),
+
+    ("a refused link's tooltip is its target as encoded, D:%5Cx",
+     "            t.attrs = [['class', 'md-link-inert'], ['title', state.md.normalizeLinkText(href)]];\n",
+     "            t.attrs = [['class', 'md-link-inert'], ['title', href]];\n"),
 
     ("a web address written out is not a link",
      "    const md = markdownit({ html: false, linkify: true, breaks: true, typographer: false });\n",
@@ -7150,6 +7176,34 @@ MD_TEXT_MUTATIONS = [
 
     ("without the library the console is told with every message",
      "        _markdownMissing = true;\n",
+     ""),
+
+    ("a Windows path is read as markdown: C:\\x\\.y loses a backslash",
+     "    md.inline.ruler.before('escape', 'windows_path', _windowsPath);\n",
+     ""),
+
+    ("a share's path is",
+     "    if (!drive && !share) return false;\n",
+     "    if (!drive) return false;\n"),
+
+    ("a path ends at its first space",
+     r'''  const WIN_PATH = /^\\(?:[^\s\\`[\]<>:*?"|]+(?: [^\s\\`[\]<>:*?"|]+)*\\)*[^\s\\`[\]<>:*?"|]*/;''',
+     r'''  const WIN_PATH = /^\\(?:[^\s\\`[\]<>:*?"|]+\\)*[^\s\\`[\]<>:*?"|]*/;'''),
+
+    ("a path runs on to the next drive, taking the markup between",
+     r'''  const WIN_PATH = /^\\(?:[^\s\\`[\]<>:*?"|]+(?: [^\s\\`[\]<>:*?"|]+)*\\)*[^\s\\`[\]<>:*?"|]*/;''',
+     r'''  const WIN_PATH = /^\\(?:[^\s\\`[\]<>*?"|]+(?: [^\s\\`[\]<>*?"|]+)*\\)*[^\s\\`[\]<>*?"|]*/;'''),
+
+    ("the markup closing around a path is taken into it",
+     "      + src.slice(from).match(WIN_PATH)[0].replace(PATH_TAIL, '');\n",
+     "      + src.slice(from).match(WIN_PATH)[0];\n"),
+
+    ("any letter before a backslash is a drive",
+     "    const drive = /(?:^|[^A-Za-z0-9])[A-Za-z]:$/.test(src.slice(Math.max(0, pos - 3), pos));\n",
+     "    const drive = /[A-Za-z]:$/.test(src.slice(Math.max(0, pos - 3), pos));\n"),
+
+    ("a dunder name is bold",
+     "    md.inline.ruler.before('emphasis', 'dunder', _dunder);\n",
      ""),
 ]
 
