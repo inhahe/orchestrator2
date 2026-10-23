@@ -726,20 +726,18 @@ def _moved_to(entry: dict[str, Any], listed: list[dict[str, Any]],
               known: set[str | None]) -> dict[str, Any] | None:
     """Where the session of list *entry* was moved: the copy's
     ``session_id``, ``title``, ``cwd`` and ``account`` -- or None, if it was
-    not moved, the copy is gone (not among *known*, every session id the
-    scan found or running), or the original has been worked in since the
-    move, which makes it a session of its own again.  The title is the
-    copy's own now, if it is running (in *live_titles*, session id to title)
-    or in *listed* (the session list being built), else what the move named
-    it."""
+    not moved (or has been worked in since: forget_moved), or the copy is
+    gone: not among *known*, every session id the scan found or running, nor
+    on disk where the move put it.  The title is the copy's own now, if it is
+    running (in *live_titles*, session id to title) or in *listed* (the
+    session list being built), else what the move named it."""
     rec = load_moved_record(entry["session_id"], entry["account"])
     if rec is None:
         return None
     to = rec["to"]
-    if to["session_id"] not in known:
-        return None
-    # A second of slack for a file system's coarse times.
-    if (entry.get("mtime") or 0) > rec["moved_at"] + 1:
+    # An account the scan does not cover is looked in itself.
+    if (to["session_id"] not in known
+            and find_session_dir(to["session_id"], to["account"]) is None):
         return None
     title = (live_titles.get(to["session_id"])
              or next((s.get("title") for s in listed
@@ -2003,6 +2001,15 @@ async def _deferred_bridge_startup(*, start: bool) -> None:
 # Runtime lifecycle — spin up / tear down live sessions on demand
 # ---------------------------------------------------------------------------
 
+def _refuse_if_trashing(sid: str | None) -> None:
+    """Raise if session *sid* is being sent to the Recycle Bin by a move
+    (_trashing_sids): a runtime must not open it meanwhile."""
+    if sid and sid in _trashing_sids:
+        raise RuntimeError(
+            "that session is being sent to the Recycle Bin, having been "
+            "moved -- open its copy instead")
+
+
 async def _create_runtime(
     *,
     cwd: str | None = None,
@@ -2068,10 +2075,7 @@ async def _create_runtime(
     Registers the runtime, starts its bridge, and refreshes the lobby.
     """
     for sid in (resume, seed_id):
-        if sid and sid in _trashing_sids:
-            raise RuntimeError(
-                "that session is being sent to the Recycle Bin, having been "
-                "moved -- open its copy instead")
+        _refuse_if_trashing(sid)
     assert config is not None
     resolved_cwd = (
         str(Path(cwd).resolve(strict=False)) if cwd else config.cwd
@@ -2140,6 +2144,8 @@ async def _create_runtime(
     if seed_id is None:
         seed_id = _session_to_open(resume, resolved_cwd, config_dir,
                                    continue_recent=not no_continue)
+        # "The most recent in cwd" may be one a move is deleting.
+        _refuse_if_trashing(seed_id)
     # Set every time, never inherited, like the name: the hub's config is its
     # launch's session's, and that launch's key is that session's alone.
     overrides["api_key"] = _session_key(seed_id, api_key)
@@ -5660,7 +5666,8 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
     await asyncio.to_thread(functools.partial(
         save_moved_record, sid, {
             "session_id": new_id, "title": new_name, "cwd": dest_cwd,
-            "account": target_cfg}, src_cfg, delete=delete_original))
+            "account": target_cfg}, src_cfg, delete=delete_original,
+        deleter=_this_hub() if delete_original else None))
     _forget_disk_sessions()
     await _push_session_list()
     if delete_original:
@@ -5781,6 +5788,9 @@ async def _delete_moved_original(src_jsonl: Path, dest_jsonl: Path,
         return "it was opened again", []
     _trashing_sids.add(sid)
     try:
+        # The record goes to the Recycle Bin with the session, and comes back
+        # with it: it must not say to delete it again.
+        await asyncio.to_thread(_keep_moved_original, sid, src_cfg)
         left = await asyncio.to_thread(trash_session, src_jsonl, src_cfg)
     except Exception as exc:
         log.warning("move: could not trash the original %s", src_jsonl,
@@ -5792,12 +5802,45 @@ async def _delete_moved_original(src_jsonl: Path, dest_jsonl: Path,
     return None, left
 
 
+def _this_hub() -> dict[str, Any]:
+    """This hub's process, as a moved record names the hub deleting an
+    original: its pid, and its start time, which a reused pid does not share
+    (None if psutil cannot say)."""
+    try:
+        import psutil
+        return {"pid": os.getpid(), "started": psutil.Process().create_time()}
+    except Exception:
+        return {"pid": os.getpid(), "started": None}
+
+
+def _another_hub_running(deleter: dict[str, Any] | None) -> bool:
+    """Whether *deleter* -- a moved record's, see _this_hub -- names a hub
+    process other than this one that is running still.  When that cannot be
+    told, it is taken to be: the deletion waits for a start that can."""
+    if not isinstance(deleter, dict) or not isinstance(deleter.get("pid"), int):
+        return False
+    if deleter["pid"] == os.getpid():
+        return False
+    try:
+        import psutil
+    except ImportError:
+        return True
+    try:
+        started = psutil.Process(deleter["pid"]).create_time()
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.Error:
+        return True
+    want = deleter.get("started")
+    return not isinstance(want, (int, float)) or abs(started - want) < 0.01
+
+
 def _keep_moved_original(sid: str, config_dir: str | None) -> None:
     """Keep the original of a move after all: its record no longer says it
     is to be deleted, so no restart tries again."""
     rec = load_moved_record(sid, config_dir)
     if rec is not None:
-        save_moved_record(sid, rec["to"], config_dir, moved_at=rec["moved_at"])
+        save_moved_record(sid, rec["to"], config_dir)
 
 
 async def _finish_interrupted_deletions() -> None:
@@ -5810,6 +5853,11 @@ async def _finish_interrupted_deletions() -> None:
         for sid in await asyncio.to_thread(moved_ids, cfg):
             rec = await asyncio.to_thread(load_moved_record, sid, cfg)
             if rec is None or not rec["delete"]:
+                continue
+            if await asyncio.to_thread(_another_hub_running, rec["deleter"]):
+                # Not cut short: that hub is waiting for its copy still.
+                log.info("move: the deletion of %s is another hub's, under way",
+                         sid[:8])
                 continue
             to = rec["to"]
             src_dir = await asyncio.to_thread(find_session_dir, sid, cfg)

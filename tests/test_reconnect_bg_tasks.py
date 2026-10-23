@@ -488,6 +488,23 @@ def test_the_context_trim_is_skipped_while_tasks_run(monkeypatch):
     assert state.background_tasks
 
 
+def test_the_context_trim_is_skipped_under_a_turn_the_cli_goes_on_to(monkeypatch):
+    """After our result the CLI may go straight on to a turn of its own -- a
+    task's, a peer's message -- saying "running" and no "idle".  The trim's
+    reconnect would cut it off; skipped like the task case, for the same
+    reason, and tried after the next turn."""
+    monkeypatch.setattr(sdk_bridge, "TURN_END_SETTLE_S", 0.05)
+    br, state, sent, connects, trims = _trim_bridge(monkeypatch, bg=False)
+
+    async def go():
+        br._set_cli_state("running")
+        await br._between_turns("done", False)
+    asyncio.run(go())
+
+    assert trims == [] and connects == []
+    assert state.session_id == "sess-old"
+
+
 def test_the_context_trim_still_happens_when_nothing_is_running(monkeypatch):
     """The skip must not have disabled the rolling window outright."""
     br, state, sent, connects, trims = _trim_bridge(monkeypatch, bg=False)

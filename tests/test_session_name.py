@@ -774,7 +774,7 @@ def test_the_cli_saying_it_started_a_turn_is_recorded():
     first output flips ``state.busy``; "running" is the only early signal."""
     br, _st, _cli, _sent = _live()
 
-    asyncio.run(br._handle_async_message(_state_msg("running")))
+    asyncio.run(br._route(_state_msg("running")))
 
     assert br._cli_state == "running"
 
@@ -900,7 +900,7 @@ def test_the_clis_idle_wakes_a_worker_that_found_it_still_running():
     while not br.event_queue.empty():
         br.event_queue.get_nowait()
 
-    asyncio.run(br._handle_async_message(_state_msg("idle")))
+    asyncio.run(br._route(_state_msg("idle")))
 
     assert br._cli_state == "idle"
     assert br.event_queue.get_nowait() == ("cli-command", "")

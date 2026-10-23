@@ -419,6 +419,26 @@ def test_and_leaves_no_mark_behind(mv):
     assert load_moved_record(SID, mv["src_cfg"]) is None
 
 
+def test_restored_from_the_bin_it_is_not_deleted_again(mv, monkeypatch):
+    """The move's record goes to the Recycle Bin with the original, and comes
+    back with it when the user restores it: still saying to delete it, the
+    next start would."""
+    binned_records = []
+    to_bin = send2trash.send2trash      # the recycle_bin fixture's
+
+    def reading_records(path):
+        p = Path(path)
+        if p.parent.name == "moved":
+            binned_records.append(json.loads(p.read_text(encoding="utf-8")))
+        to_bin(path)
+    monkeypatch.setattr(send2trash, "send2trash", reading_records)
+
+    mv["run"](delete_original=True)
+
+    assert len(binned_records) == 1, mv["binned"]
+    assert not binned_records[0].get("delete"), binned_records[0]
+
+
 def test_the_deletion_is_recorded_before_it_starts(mv, monkeypatch):
     """The hub stopping while the deletion waits for the copy must not forget
     it: the record the move saves says the original is to go, for the next
@@ -431,6 +451,7 @@ def test_the_deletion_is_recorded_before_it_starts(mv, monkeypatch):
 
     rec = load_moved_record(SID, mv["src_cfg"])
     assert rec is not None and rec["delete"]
+    assert rec["deleter"] == server._this_hub(), "no hub named as doing it"
     assert mv["src_jsonl"].exists()
 
 
@@ -649,12 +670,55 @@ def test_a_copy_that_is_gone_is_not_pointed_at(listing):
 
 def test_an_original_worked_in_since_is_its_own_session_again(listing):
     """Opened from "open the original" and carried on in: clicking it must
-    not then lead to the copy, whose history stops at the move."""
+    not then lead to the copy, whose history stops at the move.  A turn of
+    ours run in it is what says so."""
+    from config import parse_args
+    from sdk_bridge import SDKBridge
+    from state import init_state_from_config
+
+    cfg = parse_args(["--config-dir", str(listing["a"])])
+    st = init_state_from_config(cfg)
+    st.session_id = OLD
+
+    async def bcast(_m):
+        pass
+    br = SDKBridge(config=cfg, state=st, broadcaster=bcast)
+
+    class Client:
+        async def query(self, prompt):
+            br.turn_msg_queue.put_nowait(_turn_result())
+
+        async def interrupt(self):  # pragma: no cover
+            pass
+    br.client = Client()
+
+    asyncio.run(br.run_turn("carry on here"))
+
+    assert not listing["listed"]()[OLD].get("moved_to")
+
+
+def _turn_result():
+    from claude_agent_sdk import ResultMessage
+    return ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1,
+                         is_error=False, num_turns=1, session_id=OLD)
+
+
+def test_but_not_by_its_file_being_touched(listing):
+    """Opening it to look writes to it, and so does a backup tool: neither is
+    working in it."""
     original = listing["a"] / "projects" / "D--work" / f"{OLD}.jsonl"
     later = time.time() + 60
     os.utime(original, (later, later))
 
-    assert not listing["listed"]()[OLD].get("moved_to")
+    assert listing["listed"]()[OLD]["moved_to"]["session_id"] == NEW
+
+
+def test_a_copy_where_the_scan_does_not_look_is_found_where_it_is(listing, monkeypatch):
+    """An account the session list does not cover -- a CLAUDE_CONFIG_DIR of
+    its own -- still holds the copy."""
+    monkeypatch.setattr(copy_session, "discover_claude_dirs", lambda: [listing["a"]])
+
+    assert listing["listed"]()[OLD]["moved_to"]["session_id"] == NEW
 
 
 # --------------------------------------------------------------------------
@@ -680,6 +744,18 @@ def test_a_session_being_deleted_cannot_be_opened(monkeypatch):
         asyncio.run(server._create_runtime(resume="gone-1"))
 
 
+def test_nor_as_the_most_recent_session_in_its_directory(monkeypatch, tmp_path):
+    """Opening a directory continues its most recent session -- which, while
+    a move deletes it, is still on disk to be found."""
+    from config import parse_args
+    monkeypatch.setattr(server, "_trashing_sids", {"gone-1"})
+    monkeypatch.setattr(server, "config", parse_args([]))
+    monkeypatch.setattr(server, "_session_to_open", lambda *a, **k: "gone-1")
+
+    with pytest.raises(RuntimeError, match="Recycle Bin"):
+        asyncio.run(server._create_runtime(cwd=str(tmp_path)))
+
+
 def test_a_deletion_cut_short_by_a_restart_is_finished(monkeypatch, tmp_path, recycle_bin):
     a, b = tmp_path / "acct-a", tmp_path / "acct-b"
     for cfg, sid in ((a, OLD), (b, NEW)):
@@ -694,6 +770,51 @@ def test_a_deletion_cut_short_by_a_restart_is_finished(monkeypatch, tmp_path, re
     asyncio.run(server._finish_interrupted_deletions())
 
     assert str(a / "projects" / "D--work" / f"{OLD}.jsonl") in recycle_bin
+
+
+def _cut_short(tmp_path, monkeypatch, deleter):
+    """An original whose move's deletion *deleter* was doing; returns the
+    original's transcript."""
+    a, b = tmp_path / "acct-a", tmp_path / "acct-b"
+    for cfg, sid in ((a, OLD), (b, NEW)):
+        _write(cfg / "projects" / "D--work" / f"{sid}.jsonl",
+               [{"type": "user", "sessionId": sid, "cwd": CWD}])
+    save_moved_record(OLD, {"session_id": NEW, "account": str(b)}, str(a),
+                      delete=True, deleter=deleter)
+    monkeypatch.setattr(copy_session, "discover_claude_dirs", lambda: [a, b])
+    monkeypatch.setattr(server, "runtimes", {})
+    monkeypatch.setattr(proc_guard, "find_foreign_claude_for_session",
+                        lambda sid, strict=False: [])
+    return a / "projects" / "D--work" / f"{OLD}.jsonl"
+
+
+def test_but_not_one_another_hub_is_doing_still(monkeypatch, tmp_path, recycle_bin):
+    """A second hub started while the first waits for its copy: the copy may
+    yet fail to start, and the original be wanted."""
+    psutil = pytest.importorskip("psutil")
+    parent = psutil.Process(os.getppid())
+    original = _cut_short(tmp_path, monkeypatch,
+                          {"pid": parent.pid, "started": parent.create_time()})
+
+    asyncio.run(server._finish_interrupted_deletions())
+
+    assert recycle_bin == [] and original.exists()
+    assert load_moved_record(OLD, str(tmp_path / "acct-a"))["delete"], \
+        "the hub doing it would find the record gone"
+
+
+def test_a_hub_that_has_stopped_is_not_doing_it(monkeypatch, tmp_path, recycle_bin):
+    """Its pid gone, or another process's now: the deletion is finished."""
+    psutil = pytest.importorskip("psutil")
+    parent = psutil.Process(os.getppid())
+    for deleter in ({"pid": 2 ** 30, "started": 1.0},
+                    {"pid": parent.pid, "started": parent.create_time() - 100}):
+        recycle_bin.clear()
+        original = _cut_short(tmp_path, monkeypatch, deleter)
+
+        asyncio.run(server._finish_interrupted_deletions())
+
+        assert str(original) in recycle_bin, deleter
 
 
 def test_the_hub_finishes_them_when_it_starts(monkeypatch):

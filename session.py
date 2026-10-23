@@ -1406,21 +1406,35 @@ def _save_session_record(kind: str, session_id: str, record: dict[str, Any],
 # The original of a move is stopped and kept (unless the move deleted it), and
 # looks in the session list just as it did -- an invitation to carry on in the
 # copy's past.  So the move leaves a record with the original saying where the
-# work went, and the list shows it.
+# work went, and the list shows it -- until a turn is run in the original,
+# which makes it a session of its own again (forget_moved).
 
 
 def save_moved_record(session_id: str, to: dict[str, Any],
-                      config_dir: str | None = None, *,
-                      moved_at: float | None = None, delete: bool = False) -> None:
+                      config_dir: str | None = None, *, delete: bool = False,
+                      deleter: dict[str, Any] | None = None) -> None:
     """Record that *session_id* of account *config_dir* was moved to *to* --
-    the copy's ``session_id``, ``title``, ``cwd`` and ``account`` -- at
-    *moved_at* (``time.time()``; now if not given).  *delete* says that the
-    move is to send the original to the Recycle Bin and has not yet, so that
-    a hub restarted in between can finish it."""
-    record: dict[str, Any] = {"to": to, "moved_at": moved_at or time.time()}
+    the copy's ``session_id``, ``title``, ``cwd`` and ``account``.  *delete*
+    says that the move is to send the original to the Recycle Bin and has not
+    yet, so that a hub restarted in between can finish it; *deleter* names
+    the hub process doing it, so that another hub started meanwhile leaves it
+    be."""
+    record: dict[str, Any] = {"to": to}
     if delete:
         record["delete"] = True
+        if deleter is not None:
+            record["deleter"] = deleter
     _save_session_record("moved", session_id, record, config_dir)
+
+
+def forget_moved(session_id: str, config_dir: str | None = None) -> bool:
+    """Drop the record that *session_id* of account *config_dir* was moved:
+    it is being worked in again.  Whether there was one."""
+    try:
+        _session_record_file("moved", session_id, config_dir).unlink()
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def moved_ids(config_dir: str | None = None) -> set[str]:
@@ -1435,17 +1449,16 @@ def moved_ids(config_dir: str | None = None) -> set[str]:
 def load_moved_record(session_id: str,
                       config_dir: str | None = None) -> dict[str, Any] | None:
     """The record ``save_moved_record`` kept of *session_id* of account
-    *config_dir* -- ``to``, ``moved_at``, and ``delete`` if it is set -- or
+    *config_dir* -- ``to``, ``delete`` and its ``deleter`` (or None) -- or
     None if it was not moved, or the record is not usable."""
     rec = _load_session_record("moved", session_id, config_dir) or {}
     to = rec.get("to")
     if not (isinstance(to, dict) and isinstance(to.get("session_id"), str)
             and isinstance(to.get("account"), str)):
         return None
-    moved_at = rec.get("moved_at")
-    if not isinstance(moved_at, (int, float)):
-        moved_at = rec.get("saved_at") if isinstance(rec.get("saved_at"), (int, float)) else 0.0
-    return {"to": to, "moved_at": float(moved_at), "delete": bool(rec.get("delete"))}
+    deleter = rec.get("deleter")
+    return {"to": to, "delete": bool(rec.get("delete")),
+            "deleter": deleter if isinstance(deleter, dict) else None}
 
 
 def trash_session(jsonl: Path, config_dir: str | None = None) -> list[str]:

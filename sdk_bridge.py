@@ -179,6 +179,7 @@ from session import (
     save_persisted_bg_tasks,
     describe_integrity_problem,
     find_session_dir,
+    forget_moved,
     read_session_title,
     load_session_cost,
     save_session_cost,
@@ -480,6 +481,14 @@ TURN_END_SETTLE_S = 1.5
 # (_on_cli_idle).  The dispatcher notes it itself (_note_cli_state): an "idle"
 # that comes with a turn's result goes to that turn's queue, which stops being
 # read at the result.
+#
+# A "running" with no turn open -- ours, or one begun at the CLI's init --
+# lasts milliseconds, until the init.  One that lasts CLI_RUNNING_UNSEEN_S is
+# a CLI that will not say "idle" (an error path the measurements did not
+# reach), and is taken for "idle", loudly (_cli_running_unseen): all it holds
+# back would otherwise wait for it for good.
+CLI_RUNNING_UNSEEN_S = 30.0
+CLI_RUNNING_POLL_S = 1.0
 
 # --- Recovering from a dead CLI subprocess ---------------------------------
 #
@@ -958,6 +967,12 @@ class SDKBridge:
         # on (_await_ghost_settled).  Kept with _cli_state by _set_cli_state.
         self._cli_quiet = asyncio.Event()
         self._cli_quiet.set()
+        # Watches a "running" for a turn to come of it (_cli_running_unseen).
+        self._cli_running_watch: asyncio.Task | None = None
+        # The session a turn of ours last ran in (_note_worked_in).
+        self._worked_in_sid: str | None = None
+        # The CLI has been found not to say its state (_say_the_cli_is_wordless).
+        self._said_wordless = False
 
         self._dispatcher_task: asyncio.Task | None = None
         self._worker_task: asyncio.Task | None = None
@@ -2168,8 +2183,10 @@ class SDKBridge:
         **When it is safe.**  Three conditions, all required:
 
         * *No turn in flight.*  A recycle mid-turn discards the in-flight tool
-          result.  Guaranteed by the call site — this runs from
+          result.  Ours: guaranteed by the call site — this runs from
           :meth:`_between_turns`, after the queued-prompt and compact branches.
+          One the CLI goes straight on to after ours, for a task or a peer's
+          message: :meth:`_cli_free`.
         * *No background tasks.*  The CLI's task registry is in-memory
           (``AppStateStore``'s ``tasks: {}``) and ``--resume`` does not
           rehydrate it, so a recycle loses the completion notification and the
@@ -2244,6 +2261,18 @@ class SDKBridge:
                 )
                 return False
 
+        # Nor under a turn the CLI has gone straight on to after ours -- a
+        # task's, a peer's message -- which a reconnect would cut off.
+        if not await self._cli_free():
+            if force:
+                await self.broadcast({
+                    "type": "system_msg", "subtype": "error",
+                    "data": {"message": (
+                        "Not recycling: the CLI is in a turn of its own. Try "
+                        "again when the session is idle."
+                    )},
+                })
+            return False
         base = state.cli_mem_baseline
         log.warning(
             "recycling claude.exe pid %s: %s private (limit %.2f GiB, "
@@ -2256,6 +2285,8 @@ class SDKBridge:
         )
         grew = "" if cur is None else (
             f" — it had grown to {cur / _GB:.1f} GiB of committed memory")
+        # Said first: the resume can take minutes, and the tab would sit in
+        # "reconnecting" with no cause given.
         await self.broadcast({
             "type": "system_msg",
             "subtype": "info",
@@ -2264,6 +2295,14 @@ class SDKBridge:
                 f"The conversation is unaffected."
             )},
         })
+        if self._cli_busy():
+            # A turn of the CLI's began while that was said.
+            await self.broadcast({
+                "type": "system_msg", "subtype": "info",
+                "data": {"message": "The recycle waits: the CLI started a turn "
+                                    "of its own."},
+            })
+            return False
         self._cli_recycled_at = now
         state.cli_recycled_at = time.time()
         state.cli_recycles += 1
@@ -3187,15 +3226,8 @@ class SDKBridge:
         Returns True if the reconnect happened now.
         """
         running = self._active_bg_tasks()
-        if not running and not self.state.busy and self._cli_state == "running":
-            # Just after a turn of ours, whose "idle" may be on its way -- or
-            # the start of one of the CLI's own.  A moment tells them apart.
-            # (No task starts outside a turn, so *running* still holds.)
-            try:
-                await asyncio.wait_for(self._cli_quiet.wait(), TURN_END_SETTLE_S)
-            except asyncio.TimeoutError:
-                pass
-        if not running and (self.state.busy or self._cli_state == "running"):
+        # (No task starts outside a turn, so *running* holds across the wait.)
+        if not running and not await self._cli_free():
             self._deferred_reconnect = reason
             log.info("deferring reconnect (%s): the CLI is in a turn of its own",
                      reason)
@@ -3226,6 +3258,25 @@ class SDKBridge:
             )},
         })
         return False
+
+    async def _cli_free(self) -> bool:
+        """Whether no turn runs in the CLI -- a ghost turn, or one it has said
+        "running" for and not yet shown -- for a reconnect, which would cut it
+        off.  Just after a turn of ours, whose "idle" may be on its way, or at
+        the start of one of the CLI's own, it waits out the moment that tells
+        the two apart (TURN_END_SETTLE_S).  Nothing it awaits after deciding,
+        so a caller that reconnects straight after acts on what it says; one
+        that awaits first asks again (_cli_busy)."""
+        if not self.state.busy and self._cli_state == "running":
+            try:
+                await asyncio.wait_for(self._cli_quiet.wait(), TURN_END_SETTLE_S)
+            except asyncio.TimeoutError:
+                pass
+        return not self._cli_busy()
+
+    def _cli_busy(self) -> bool:
+        """A turn runs in the CLI: a ghost turn, or one it says "running" for."""
+        return self.state.busy or self._cli_state == "running"
 
     def _reconnect_blocked(self) -> bool:
         """Whether a deferred reconnect must wait still: background tasks run,
@@ -4876,6 +4927,38 @@ class SDKBridge:
         else:
             self._cli_quiet.set()
 
+    async def _cli_running_unseen(self) -> None:
+        """Take the CLI's "running" for "idle" once no turn has been open for
+        CLI_RUNNING_UNSEEN_S of it: a CLI that will not say "idle" (see
+        CLI_RUNNING_UNSEEN_S).  Ends when it says anything else, or the
+        bridge stops; a CLI being replaced will say it afresh."""
+        unseen_since: float | None = None
+        while self._cli_state == "running" and not self.stop_event.is_set():
+            if self.state.busy or self.turn_active.is_set() or self.state.connecting:
+                unseen_since = None
+            elif unseen_since is None:
+                unseen_since = time.monotonic()
+            elif time.monotonic() - unseen_since >= CLI_RUNNING_UNSEEN_S:
+                log.warning("the CLI has said it is running for %.0fs with no "
+                            "turn to show for it: taken as idle",
+                            CLI_RUNNING_UNSEEN_S)
+                self._set_cli_state("idle")
+                await self._on_cli_idle()
+                return
+            await asyncio.sleep(CLI_RUNNING_POLL_S)
+
+    @staticmethod
+    def _cli_word(msg: Any) -> str | None:
+        """What *msg* says of the CLI's state, if it is a
+        ``session_state_changed`` -- "running", "idle", "requires_action" --
+        else None.  The state lives in ``msg.data['state']``: a SystemMessage
+        carries only ``subtype`` and ``data``."""
+        if not (isinstance(msg, SystemMessage)
+                and getattr(msg, "subtype", None) == "session_state_changed"):
+            return None
+        d = msg.data if isinstance(msg.data, dict) else {}
+        return d.get("state") or None
+
     def _note_cli_state(self, msg: Any) -> None:
         """Note what *msg* says of the CLI's state, if it is a
         ``session_state_changed``: called by the dispatcher on every message,
@@ -4883,19 +4966,20 @@ class SDKBridge:
 
         An "idle" that comes with one of our turns' results goes to that
         turn's queue, which stops being read at the result -- so it is noted
-        here, and what waited for the CLI to be free is woken here too.
+        here, and what waited for the CLI to be free is woken here too.  A
+        "running" is watched for a turn to come of it (_cli_running_unseen).
         """
-        if not (isinstance(msg, SystemMessage)
-                and getattr(msg, "subtype", None) == "session_state_changed"):
-            return
-        d = msg.data if isinstance(msg.data, dict) else {}
-        value = d.get("state")
+        value = self._cli_word(msg)
         if not value:
             return
         was = self._cli_state
         self._set_cli_state(value)
         if value == "idle" and was == "running" and self.turn_active.is_set():
             self._poke_after_ghost_turn()
+        if value == "running" and (self._cli_running_watch is None
+                                   or self._cli_running_watch.done()):
+            self._cli_running_watch = asyncio.create_task(
+                self._cli_running_unseen(), name="cli-running-watch")
 
     async def _on_cli_idle(self) -> None:
         """The CLI has nothing left to run: close a ghost turn it never sent
@@ -4907,9 +4991,10 @@ class SDKBridge:
             await self._broadcast_status()
         # The CLI ran a turn for a finished background task, and the model
         # has dealt with it.  Not if the session is about to work again (a
-        # prompt waits to go) or has more work in the background, whose own
-        # end will say so.
-        more_work = bool(state.queued_prompts or self._active_bg_tasks())
+        # prompt waits to go: not one being edited, which waits for the user)
+        # or has more work in the background, whose own end will say so.
+        more_work = bool((state.queued_prompts and state.queue_editing_index != 0)
+                         or self._active_bg_tasks())
         if self._turn_for_task and not more_work:
             ring_bell(state, "bg-done")
             await self._flush_bell()
@@ -5424,19 +5509,12 @@ class SDKBridge:
             return
 
         elif subtype == "session_state_changed":
-            # The session lifecycle state lives in ``msg.data['state']``
-            # (SystemMessage only carries ``subtype`` + ``data``).  Emitted
-            # only when CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS is set, which
-            # we do in _make_options.
-            # The dispatcher noted it as it arrived (_note_cli_state).  A turn
-            # reads its queue later, by which time the CLI may have said
-            # something newer, so only between turns -- read as it arrives --
-            # is it noted again here (for a caller that hands it straight
-            # here), and acted on.
-            d = msg.data if isinstance(msg.data, dict) else {}
-            session_state = d.get("state")
-            if session_state and not during_turn:
-                self._set_cli_state(session_state)
+            # Emitted only when CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS is set,
+            # which we do in _make_options.  The dispatcher noted it as it
+            # arrived (_note_cli_state); here it is only acted on, between
+            # turns -- a turn reads its queue later, by which time the CLI may
+            # have said something newer.
+            session_state = self._cli_word(msg)
             # "running" begins nothing itself: the init that opens the turn
             # comes with it (and see init, above).
             if (not during_turn and not self.turn_active.is_set()
@@ -5673,6 +5751,42 @@ class SDKBridge:
     # run_turn() — process one complete turn
     # ------------------------------------------------------------------
 
+    async def _say_the_cli_is_wordless(self) -> None:
+        """A whole turn of ours ran and the CLI said nothing of its state: a
+        build that does not have CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, so
+        nothing holds a prompt back from a turn it starts by itself (see "The
+        CLI says when it is working").  Said once per bridge, and in the log."""
+        if self._said_wordless:
+            return
+        self._said_wordless = True
+        log.warning("the CLI did not say whether it was working during a whole "
+                    "turn: queued prompts may be folded into its own turns")
+        await self.broadcast({
+            "type": "system_msg", "subtype": "warning",
+            "data": {"message": (
+                "This Claude CLI does not say when it is working, so a prompt "
+                "sent while it runs a turn by itself -- for a finished "
+                "background task, a peer's message -- can be folded into that "
+                "turn and go unanswered. A newer CLI does say."
+            )},
+        })
+
+    async def _note_worked_in(self) -> None:
+        """Drop the moved record of the session a turn of ours is about to
+        run in (forget_moved): asked once per session id."""
+        sid = self.state.session_id
+        if not sid or sid == self._worked_in_sid:
+            return
+        self._worked_in_sid = sid
+        try:
+            if await asyncio.to_thread(forget_moved, sid,
+                                       getattr(self.config, "config_dir", None)):
+                log.info("move: %s is worked in again, no longer marked as moved",
+                         sid[:8])
+        except OSError:
+            log.warning("move: could not drop the moved record of %s", sid[:8],
+                        exc_info=True)
+
     async def run_turn(self, prompt_text: str) -> tuple[str, bool]:
         """Send a prompt and process the full turn.
 
@@ -5710,10 +5824,18 @@ class SDKBridge:
         # handler) before we claim the message queue.
         await self._await_interrupt_settled()
 
+        # Nor in the instant a turn or a background task has ended: the CLI
+        # may be starting a turn of its own, which it says 20-80 ms later.
+        await self._wait_out_cli_turn_start()
+
         # Likewise a ghost turn, which owns the stream without holding
         # ``turn_active``.  The park point already declines to pop a prompt
         # while one is streaming; this covers every other way into run_turn.
         await self._await_ghost_settled()
+
+        # A turn in the original of a /move makes it a session of its own
+        # again: the session list stops pointing at the copy.
+        await self._note_worked_in()
 
         # The session's compaction, if its CLI does not have it yet.  Here and
         # nowhere else: see _apply_compaction_before_turn.
@@ -6302,6 +6424,8 @@ class SDKBridge:
             # hours" symptom needs a paper trail).
             if normal_completion:
                 log.info("run_turn exit: normal (turns=%d)", state.turns)
+                if self._cli_state is None:
+                    await self._say_the_cli_is_wordless()
             elif exit_exc is not None:
                 log.warning(
                     "run_turn exit: exception %s: %s",
@@ -7289,9 +7413,11 @@ class SDKBridge:
         # CLI is not resumed on.  Declining to trim at all keeps the two in
         # agreement, and costs nothing — a session parked in bg-wait is not
         # accumulating context, and the check runs again after the next turn.
+        # Skipped too under a turn the CLI has gone straight on to (_cli_free),
+        # last: the reconnect follows with nothing awaited between.
         max_ctx = getattr(state, "_max_context_tokens", config.max_context_tokens)
         if (max_ctx > 0 and state.context_tokens > max_ctx and state.session_id
-                and not self._active_bg_tasks()):
+                and not self._active_bg_tasks() and await self._cli_free()):
             proj = project_dir_for_cwd(config.cwd,
                                        getattr(config, "config_dir", None))
             new_sid = trim_session(state.session_id, proj, max_ctx)

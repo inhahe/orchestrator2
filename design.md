@@ -1951,25 +1951,44 @@ So:
 - **Nothing is sent to the CLI while it says "running".** That covers a queued
   prompt (`_held_by_a_turn`), a turn of ours (`_await_ghost_settled`, which
   waits on `_cli_quiet` as well as `_ghost_settled`), a deferred reconnect
-  (`_reconnect_blocked`), and a `/model`, `/effort` or `/thinking` typed during
-  one of its turns. That last is deferred by `_reconnect_or_defer` until it is
-  idle; just after a turn of ours it waits a moment first, because that turn's
-  "idle" may be on its way.
+  (`_reconnect_blocked`), and the reconnects that come between turns: a
+  `/model`, `/effort` or `/thinking` typed during one of its turns (deferred
+  by `_reconnect_or_defer` until it is idle), the memory recycle and the
+  context trim (skipped until after the next turn). All three ask `_cli_free`,
+  which just after a turn of ours waits a moment first, because that turn's
+  "idle" may be on its way; the recycle asks again (`_cli_busy`) after
+  announcing itself, before it reconnects.
+- **Nor in the instant after a task ends.** The CLI's "running" comes 20 to
+  80 ms after. A turn of ours waits out `_wait_out_cli_turn_start` first, as
+  a queued prompt does, so a prompt typed in that instant is not folded into
+  the task's turn.
+- **A "running" no turn comes of is taken for "idle".** Every turn opens with
+  an `init` within milliseconds of its "running", or of the result before it.
+  "Running" with no turn open (no ghost turn, none of ours, no connect) for
+  `CLI_RUNNING_UNSEEN_S` (30 s) is a CLI that will not say "idle", on a path
+  the measurements did not reach. `_cli_running_unseen`, started by
+  `_note_cli_state` at each "running", logs a warning and runs `_on_cli_idle`:
+  everything held back would otherwise wait for good.
 - **Its "idle" lets them go.** `_on_cli_idle` wakes the worker for queued
   prompts, a deferred reconnect and a `/rename`.
 - **The word is noted as it arrives, whoever reads it.** `_route`, the
-  dispatcher's routing, calls `_note_cli_state` for every message. An "idle"
-  that comes with one of our results goes to that turn's queue, which stops
-  being read at the result. A turn reads its queue late, so
-  `_handle_system_message` does not take the state from a message it reads
-  during a turn: the CLI may have said something newer since.
+  dispatcher's routing, calls `_note_cli_state` for every message, and only it
+  sets the state. An "idle" that comes with one of our results goes to that
+  turn's queue, which stops being read at the result; and a turn reads its
+  queue late, by which time the CLI may have said something newer.
+  `_handle_system_message` only acts on the word, between turns (`_cli_word`
+  reads it for both).
 - **What a CLI that says nothing still has.** `_wait_out_cli_turn_start` waits
   `TURN_END_SETTLE_S` past the later of a turn's end and a background task's
-  end (`_task_ended_at`), re-checking after each wait.
+  end (`_task_ended_at`), re-checking after each wait. Nothing holds a prompt
+  back from a turn such a CLI starts by itself, so a whole turn of ours with
+  no word from it is said once, as a warning in the session
+  (`_say_the_cli_is_wordless`); see `known-issues.md`.
 - **bg-done.** A ghost turn whose result says it was for a task
   (`origin.kind == "task-notification"`) and was not interrupted marks
   `_turn_for_task`. The bell rings at the CLI's next "idle", unless a prompt
-  waits to go or background work is still running. By then the model has dealt
+  waits to go (not one being edited, which waits for the user) or background
+  work is still running. By then the model has dealt
   with the task and the session waits for the user. The 10 s timer remains for
   a task whose end starts no turn, because "running" cancels it at once.
 
@@ -3954,13 +3973,17 @@ output that is no longer there.
 
 **The record.** A successful move saves `orchestrator2/moved/<id>.json` in the
 original's account (`session.save_moved_record`). It holds the copy's id, name,
-cwd and account, `moved_at`, and `delete` while a deletion is still to happen.
+cwd and account, and, while a deletion is still to happen, `delete` and the
+`deleter`: the hub process doing it (`_this_hub`: pid and start time).
 `_recent_disk_sessions` lists the `moved/` folder once per account and attaches
 `moved_to` to those entries (`_moved_to`). The mark is dropped if the copy is
-gone: its id is not among those the scan just found, so no further lookup is
-needed. It is also dropped if the original's transcript is newer than the move,
-since an original opened again and worked in is a session of its own. The mark
-uses the copy's current title where it can see one. The lobby (`lobby.js`
+gone: its id is not among those the scan just found, nor on disk in the account
+the move put it in (`find_session_dir`, for an account the scan does not
+cover). A turn of ours run in the original drops the record itself
+(`SDKBridge._note_worked_in`, `session.forget_moved`, once per session id): an
+original carried on in is a session of its own. Only a turn does, not the
+transcript's mtime, which opening the session to look, or a backup tool, also
+moves. The mark uses the copy's current title where it can see one. The lobby (`lobby.js`
 `_recentItem`) dims such an item, says "moved → copy" (the account too, when
 the copy is in another), and opens the copy. The original stays a smaller
 "open the original" link away, which the copy's name gives way to on a narrow
@@ -3985,27 +4008,33 @@ given minutes). Then `_delete_moved_original` keeps the original if:
   is not "nobody has it";
 - it is running here again (`_live_runtime_for`). This is asked last, with no
   await between it and adding the id to `_trashing_sids`. That set makes
-  `_create_runtime` refuse to open the session until the deletion is over.
+  `_create_runtime` refuse to open the session until the deletion is over, as
+  named or as the most recent in its directory (`_refuse_if_trashing`).
 
 Otherwise `session.trash_session` sends the transcript to the Recycle Bin
 (`send2trash`) and, only if that worked, its folder, its `file-history` and
 every hub record named for the id (`orchestrator2/*/*<id>*.json`: cost,
 compaction, queue, background tasks, the moved record). Restoring the session
-from the bin restores all of that. The CLI's `session-env/<id>`, of no use
+from the bin restores all of that. The moved record is first saved again
+without `delete`, so that a session restored from the bin is not deleted again
+at the next start. The CLI's `session-env/<id>`, of no use
 without it, is deleted outright. A refused or failed deletion keeps the
 original, marked, with `delete` cleared, and the copy's tabs are told why. A
 successful one is told too, as a warning if files were left behind.
 
 A deletion the hub's stop cut short is finished at the next start
 (`_finish_interrupted_deletions`, from the moved records still marked
-`delete`). The copy may never have come up under the old hub, so its complete
-transcript stands in for that proof; every other check is as before.
+`delete`). Not one whose `deleter` is a hub still running
+(`_another_hub_running`: that pid alive with that start time, or no way to
+tell): a second hub started while the first waits for its copy leaves the
+deletion to it. The copy may never have come up under the old hub, so its
+complete transcript stands in for that proof; every other check is as before.
 
-Pinned by `tests/test_move_delete_original.py` (41), `tests/lobby_moved.test.js`
-(8) and `tests/move_overlay.test.js`'s last four, with mutation targets
-`movewhole-copy` (`copy_session.py` × 14), `movewhole-trash` (`session.py` × 5),
-`movewhole-server` (`server.py` × 23), `movewhole-lobby` (`static/lobby.js` × 6)
-and `movewhole-ui` (`static/move.js` × 6).
+Pinned by `tests/test_move_delete_original.py`, `tests/lobby_moved.test.js`
+and `tests/move_overlay.test.js`'s last four, with mutation targets
+`movewhole-copy` (`copy_session.py`), `movewhole-trash` (`session.py`),
+`movewhole-server` (`server.py`), `movewhole-bridge` (`sdk_bridge.py`),
+`movewhole-lobby` (`static/lobby.js`) and `movewhole-ui` (`static/move.js`).
 
 #### `copy_session.py` no longer imports `textual`
 

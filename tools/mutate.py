@@ -432,12 +432,16 @@ RECONNECT_MUTATIONS = [
      "                prompt = await self._pop_queued_prompt()"),
 
     ("the context trim runs under a background task and swaps the session id",
-     '        if (max_ctx > 0 and state.context_tokens > max_ctx and state.session_id\n                and not self._active_bg_tasks()):',
-     '        if max_ctx > 0 and state.context_tokens > max_ctx and state.session_id:'),
+     '                and not self._active_bg_tasks() and await self._cli_free()):',
+     '                and await self._cli_free()):'),
 
     ("the trim is skipped unconditionally, disabling the rolling window",
-     '                and not self._active_bg_tasks()):',
+     '                and not self._active_bg_tasks() and await self._cli_free()):',
      '                and not state.session_id):'),
+
+    ("the trim cuts off a turn the CLI went straight on to",
+     '                and not self._active_bg_tasks() and await self._cli_free()):',
+     '                and not self._active_bg_tasks()):'),
 
     ("/clear discards the tasks without saying which",
      '        await self._orphan_bg_tasks("/clear")\n',
@@ -2849,9 +2853,8 @@ SESSIONNAME_MUTATIONS = [
      "                or self.turn_active.is_set() or self._transport_dead):\n"),
 
     ("the CLI's own report that it started a turn is ignored",
-     "            if session_state and not during_turn:\n"
-     "                self._set_cli_state(session_state)\n",
-     ""),
+     "        was = self._cli_state\n        self._set_cli_state(value)\n",
+     "        was = self._cli_state\n"),
 
     ("the CLI going idle does not wake a worker that deferred a rename, which "
      "then waits for the next prompt",
@@ -7254,13 +7257,50 @@ CLITURN_MUTATIONS = [
      "        was = self._cli_state\n        self._set_cli_state(value)\n",
      "        was = self._cli_state\n"),
 
-    ("a word read late, by a turn, overrides what the CLI said since",
-     "            if session_state and not during_turn:\n",
-     "            if session_state:\n"),
-
     ("a /model typed during one of the CLI's turns cuts it off",
-     "        if not running and (self.state.busy or self._cli_state == \"running\"):\n",
+     "        if not running and not await self._cli_free():\n",
      "        if False:\n"),
+
+    ("the CLI's 'running' is not a turn to a reconnect",
+     "        return self.state.busy or self._cli_state == \"running\"\n",
+     "        return self.state.busy\n"),
+
+    ("a recycle cuts off a turn the CLI went straight on to",
+     "        if not await self._cli_free():\n            if force:\n",
+     "        if False:\n            if force:\n"),
+
+    ("one the CLI began while the recycle was announced",
+     "        if self._cli_busy():\n            # A turn of the CLI's began while that was said.\n",
+     "        if False:\n            # A turn of the CLI's began while that was said.\n"),
+
+    ("a turn of ours goes in, in the instant after a task's end",
+     "        await self._wait_out_cli_turn_start()\n",
+     ""),
+
+    ("a CLI that says nothing of its state is not named",
+     "                if self._cli_state is None:\n"
+     "                    await self._say_the_cli_is_wordless()\n",
+     ""),
+
+    ("it is named after every turn",
+     "        if self._said_wordless:\n            return\n",
+     ""),
+
+    ("a 'running' no turn comes of holds everything for good",
+     "            elif time.monotonic() - unseen_since >= CLI_RUNNING_UNSEEN_S:\n",
+     "            elif False:\n"),
+
+    ("its watch is never started",
+     "        if value == \"running\" and (self._cli_running_watch is None\n",
+     "        if False and (self._cli_running_watch is None\n"),
+
+    ("a turn the CLI runs, slow to show, is taken for idle",
+     "            if self.state.busy or self.turn_active.is_set() or self.state.connecting:\n",
+     "            if self.turn_active.is_set() or self.state.connecting:\n"),
+
+    ("taken for idle, what waits for it is not woken",
+     "                self._set_cli_state(\"idle\")\n                await self._on_cli_idle()\n",
+     "                self._set_cli_state(\"idle\")\n"),
 
     ("one typed just after a turn of ours waits for nothing it can see",
      "            try:\n"
@@ -7305,12 +7345,16 @@ CLITURN_MUTATIONS = [
      "                if True:\n"),
 
     ("bg-done rings though a prompt waits to go",
-     "        more_work = bool(state.queued_prompts or self._active_bg_tasks())\n",
-     "        more_work = bool(self._active_bg_tasks())\n"),
+     "        more_work = bool((state.queued_prompts and state.queue_editing_index != 0)\n",
+     "        more_work = bool((False)\n"),
+
+    ("bg-done waits for a prompt being edited, which waits for the user",
+     "        more_work = bool((state.queued_prompts and state.queue_editing_index != 0)\n",
+     "        more_work = bool((state.queued_prompts)\n"),
 
     ("bg-done rings though the turn left more work running",
-     "        more_work = bool(state.queued_prompts or self._active_bg_tasks())\n",
-     "        more_work = bool(state.queued_prompts)\n"),
+     "                         or self._active_bg_tasks())\n",
+     "                         )\n"),
 
     ("bg-done rings for a task's turn that was interrupted",
      "            # Stopped, not dealt with: nothing for bg-done to announce.\n"
@@ -7401,6 +7445,17 @@ MOVEWHOLE_TRASH_MUTATIONS = [
     ("the rest goes even when the transcript would not",
      "    send2trash(str(jsonl))\n",
      "    try:\n        send2trash(str(jsonl))\n    except OSError:\n        pass\n"),
+
+    ("the hub deleting it is not kept",
+     "            record[\"deleter\"] = deleter\n",
+     "            pass\n"),
+]
+
+# A turn run in a moved original makes it a session of its own again.
+MOVEWHOLE_BRIDGE_MUTATIONS = [
+    ("a turn in the original leaves it marked as moved",
+     "        await self._note_worked_in()\n",
+     ""),
 ]
 
 MOVEWHOLE_SERVER_MUTATIONS = [
@@ -7417,8 +7472,30 @@ MOVEWHOLE_SERVER_MUTATIONS = [
      "    await asyncio.to_thread(functools.partial(\n        lambda *a, **k: None, sid, {\n"),
 
     ("the deletion asked for is not recorded, so a restart forgets it",
-     "            \"account\": target_cfg}, src_cfg, delete=delete_original))\n",
-     "            \"account\": target_cfg}, src_cfg))\n"),
+     "            \"account\": target_cfg}, src_cfg, delete=delete_original,\n",
+     "            \"account\": target_cfg}, src_cfg,\n"),
+
+    ("the hub doing it is not named",
+     "        deleter=_this_hub() if delete_original else None))\n",
+     "        deleter=None))\n"),
+
+    ("the record goes to the bin saying to delete, so a restored session is "
+     "deleted again",
+     "        await asyncio.to_thread(_keep_moved_original, sid, src_cfg)\n"
+     "        left = await asyncio.to_thread(trash_session, src_jsonl, src_cfg)\n",
+     "        left = await asyncio.to_thread(trash_session, src_jsonl, src_cfg)\n"),
+
+    ("a hub started meanwhile finishes another's deletion",
+     "            if await asyncio.to_thread(_another_hub_running, rec[\"deleter\"]):\n",
+     "            if False:\n"),
+
+    ("a stopped hub is taken for a running one",
+     "    except psutil.NoSuchProcess:\n        return False\n",
+     "    except psutil.NoSuchProcess:\n        return True\n"),
+
+    ("a stopped hub's pid, now another process's, is taken for it",
+     "    return not isinstance(want, (int, float)) or abs(started - want) < 0.01\n",
+     "    return True\n"),
 
     ("a refused deletion stays recorded, so a restart tries it again",
      "        await asyncio.to_thread(_keep_moved_original, src_jsonl.stem, src_cfg)\n",
@@ -7429,8 +7506,8 @@ MOVEWHOLE_SERVER_MUTATIONS = [
      ""),
 
     ("a session being deleted can be opened meanwhile",
-     "        if sid and sid in _trashing_sids:\n",
-     "        if False:\n"),
+     "    if sid and sid in _trashing_sids:\n",
+     "    if False:\n"),
 
     ("a copy that did not start is left behind",
      "        left = await asyncio.to_thread(discard_session, dest_jsonl, target_cfg)\n",
@@ -7446,9 +7523,15 @@ MOVEWHOLE_SERVER_MUTATIONS = [
      "                            \"subtype\": \"info\" if why is None and not left else \"warning\",\n",
      "                            \"subtype\": \"info\" if why is None else \"warning\",\n"),
 
-    ("an original worked in since the move still opens the stale copy",
-     "    if (entry.get(\"mtime\") or 0) > rec[\"moved_at\"] + 1:\n",
-     "    if False:\n"),
+    ("a copy in an account the scan does not cover is taken for gone",
+     "    if (to[\"session_id\"] not in known\n"
+     "            and find_session_dir(to[\"session_id\"], to[\"account\"]) is None):\n",
+     "    if (to[\"session_id\"] not in known):\n"),
+
+    ("the most recent session in a directory opens while a move deletes it",
+     "        # \"The most recent in cwd\" may be one a move is deleting.\n"
+     "        _refuse_if_trashing(seed_id)\n",
+     ""),
 
     ("the deletion does not wait for the copy",
      '        if getattr(br, "client", None) is not None and not st.connecting:\n',
@@ -7489,7 +7572,8 @@ MOVEWHOLE_SERVER_MUTATIONS = [
      "            pass\n"),
 
     ("a copy that is gone is still pointed at",
-     '    if to["session_id"] not in known:\n',
+     "    if (to[\"session_id\"] not in known\n"
+     "            and find_session_dir(to[\"session_id\"], to[\"account\"]) is None):\n",
      "    if False:\n"),
 
     ("the copy's title is what the move named it, not what it is now",
@@ -8773,6 +8857,8 @@ TARGETS = {
                         MOVEWHOLE_TRASH_MUTATIONS, "pytest"),
     "movewhole-server": ("server.py", "tests/test_move_delete_original.py",
                          MOVEWHOLE_SERVER_MUTATIONS, "pytest"),
+    "movewhole-bridge": ("sdk_bridge.py", "tests/test_move_delete_original.py",
+                         MOVEWHOLE_BRIDGE_MUTATIONS, "pytest"),
     "movewhole-lobby": ("static/lobby.js", "tests/lobby_moved.test.js",
                         MOVEWHOLE_LOBBY_MUTATIONS, "node"),
     "movewhole-ui": ("static/move.js", "tests/move_overlay.test.js",

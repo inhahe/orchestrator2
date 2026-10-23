@@ -1,5 +1,20 @@
 # Known issues / tech debt — orchestrator2
 
+## A CLI that does not report its state cannot be kept from folding a prompt into its own turn — OPEN (2026-10-23)
+
+What holds a prompt back from a turn the CLI starts by itself (for a finished
+background task, a peer's message) is the CLI's own `session_state_changed`,
+sent only by a build that knows `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS` (see
+design.md, "The CLI says when it is working"). A session given an older CLI
+(`cli_path`) gets none, and has only the settle after a turn's or a task's end
+(`_wait_out_cli_turn_start`), which covers the 20-80 ms before the CLI would say
+"running" but not the seconds before its turn's first output. So a prompt sent
+then can go into that turn, unanswered. The hub says so once in the session
+(`_say_the_cli_is_wordless`) after a turn of ours with no word from the CLI.
+The fix is a newer CLI; a fallback (a task's end taken as the start of a turn
+until its first output, as before 9cbf9ab) would be a second mechanism kept
+for builds that may not be in use.
+
 ## The stall probe looks for a `D:` session's output under the UNC name — OPEN (2026-10-21)
 
 `bg_stall.task_output_path` resolves the session's cwd (`Path.resolve`) before

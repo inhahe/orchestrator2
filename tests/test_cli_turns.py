@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 
 import pytest
 
@@ -258,8 +259,8 @@ def _reconnects(monkeypatch, br, state):
 
 
 def test_a_switch_deferred_for_the_tasks_waits_for_their_turn(monkeypatch):
-    """The last task's end used to apply it at once, and the reconnect cut off
-    the turn the CLI had started for that task."""
+    """The last task's end starts the CLI's turn for that task, which a
+    reconnect then would cut off: the switch waits for that turn too."""
     br, state, _sent = _bridge("b1")
     done = _reconnects(monkeypatch, br, state)
     br._deferred_reconnect = "model → claude-x"
@@ -468,6 +469,22 @@ def test_not_when_a_prompt_waits_to_go():
     assert _bells(sent) == []
 
 
+def test_but_when_the_one_waiting_is_being_edited():
+    """It goes when the user has finished editing it: until then the session
+    waits for the user, and the bell is the user's to hear."""
+    br, state, sent = _bridge("b1")
+
+    async def go():
+        await _task_ends(br, "b1")
+        state.queued_prompts.append("next th")
+        state.queue_editing_index = 0
+        await _send(br, _output(), _result(TASK), _cli("idle"))
+
+    asyncio.run(go())
+
+    assert _bells(sent) == ["bg-done"]
+
+
 def test_not_when_the_turn_left_more_work_running():
     br, state, sent = _bridge("b1")
 
@@ -515,3 +532,216 @@ def test_nor_for_a_turn_no_task_started():
     asyncio.run(_send(br, _cli("running"), _init(), _output(), _result(), _cli("idle")))
 
     assert _bells(sent) == []
+
+
+# --------------------------------------------------------------------------
+# A "running" no turn comes of
+# --------------------------------------------------------------------------
+
+UNSEEN = 0.5      # past SETTLE, so a prompt still held after it is held by this
+
+
+@pytest.fixture
+def quick_watch(monkeypatch):
+    monkeypatch.setattr(sdk_bridge, "CLI_RUNNING_UNSEEN_S", UNSEEN)
+    monkeypatch.setattr(sdk_bridge, "CLI_RUNNING_POLL_S", 0.01)
+
+
+def test_a_running_no_turn_comes_of_is_taken_for_idle(quick_watch, caplog):
+    """A turn ends and the CLI says "running" still, with no ``init`` and no
+    "idle" after it: a CLI that will not say "idle", on a path the
+    measurements did not reach.  What it holds back must not wait for good."""
+    br, state, sent = _bridge()
+
+    async def go():
+        await br._begin_ghost_turn_if_needed()
+        await _send(br, _cli("running"))
+        state.queued_prompts.append("my question")
+        waiter = asyncio.create_task(br._await_next_prompt())
+        await asyncio.sleep(0.02)
+        await _send(br, _output(), _result())
+        await asyncio.sleep(SETTLE + 0.1)
+        assert not waiter.done(), "sent while the CLI said it was running"
+        return await asyncio.wait_for(waiter, 3)
+
+    with caplog.at_level("WARNING"):
+        assert asyncio.run(go()) == "my question"
+    assert br._cli_state == "idle"
+    assert "taken as idle" in caplog.text
+
+
+def test_but_a_turn_the_cli_runs_is_not(quick_watch):
+    """Its turn shows nothing for seconds, up to 82 measured: still a turn."""
+    br, state, sent = _bridge()
+
+    async def go():
+        await _send(br, _cli("running"), _init())
+        await asyncio.sleep(UNSEEN * 3)
+
+    asyncio.run(go())
+
+    assert state.busy and br._cli_state == "running"
+
+
+# --------------------------------------------------------------------------
+# Nor does a recycle cut one off
+# --------------------------------------------------------------------------
+
+GIB = 1024 ** 3
+
+
+def _recyclable():
+    """A bridge whose CLI has leaked past its limit, between turns."""
+    cfg = parse_args(["--cli-recycle-at", "8"])
+    state = init_state_from_config(cfg)
+    state.cli_mem_baseline = 1 * GIB
+    sent: list[dict] = []
+
+    async def bcast(msg: dict) -> None:
+        sent.append(msg)
+
+    br = SDKBridge(config=cfg, state=state, broadcaster=bcast)
+    br._set_cli_state("idle")
+    br.client = object()
+    reconnects: list[int] = []
+
+    async def reconnect():
+        reconnects.append(1)
+
+    async def measure():
+        state.cli_mem = 99 * GIB
+        return 99 * GIB
+
+    br.reconnect = reconnect
+    br._measure_cli_memory = measure
+    return br, state, sent, reconnects
+
+
+def _said(sent) -> str:
+    return " | ".join((m.get("data") or {}).get("message", "")
+                      for m in sent if m.get("type") == "system_msg")
+
+
+def test_a_recycle_waits_for_a_turn_the_cli_goes_on_to():
+    """Our result, and the CLI straight on to a peer's message: "running",
+    no "idle".  Forced or not, the recycle is not made under it."""
+    br, state, sent, reconnects = _recyclable()
+
+    async def go():
+        br._set_cli_state("running")
+        return (await br._maybe_recycle_cli(),
+                await br._maybe_recycle_cli(force=True))
+
+    assert asyncio.run(go()) == (False, False)
+    assert reconnects == []
+    assert "the CLI is in a turn of its own" in _said(sent)
+
+
+def test_but_is_made_once_the_cli_says_it_is_idle():
+    br, state, sent, reconnects = _recyclable()
+
+    async def go():
+        br._set_cli_state("running")
+        recycling = asyncio.create_task(br._maybe_recycle_cli())
+        await asyncio.sleep(0.02)
+        await _send(br, _cli("idle"))
+        return await recycling
+
+    assert asyncio.run(go()) is True
+    assert reconnects == [1]
+
+
+def test_nor_under_one_that_begins_while_it_is_announced():
+    br, state, sent, reconnects = _recyclable()
+
+    async def bcast(msg: dict) -> None:
+        sent.append(msg)
+        if "Recycling" in (msg.get("data") or {}).get("message", ""):
+            br._set_cli_state("running")
+    br.broadcast = bcast
+
+    assert asyncio.run(br._maybe_recycle_cli()) is False
+    assert reconnects == []
+    assert "The recycle waits" in _said(sent)
+
+
+# --------------------------------------------------------------------------
+# A turn of ours, in the instant after a task's end
+# --------------------------------------------------------------------------
+
+def _answering_client(br, queried):
+    """A CLI that answers every prompt with a result, noting when it got it."""
+    class Client:
+        async def query(self, prompt):
+            queried.append(time.monotonic())
+            br.turn_msg_queue.put_nowait(_result())
+
+        async def interrupt(self):  # pragma: no cover
+            pass
+    return Client()
+
+
+def test_a_turn_of_ours_waits_out_the_instant_after_a_tasks_end():
+    """The CLI says "running" 20-80 ms after a task ends: a prompt typed in
+    between, while all looks idle, must not go in first and be folded into
+    the task's turn."""
+    br, state, sent = _bridge("b1")
+    queried: list[float] = []
+    br.client = _answering_client(br, queried)
+
+    async def go():
+        await _send(br, _updated("b1"), _notified("b1"))
+        turn = asyncio.create_task(br.run_turn("typed meanwhile"))
+        await asyncio.sleep(0.05)
+        await _send(br, _cli("running"), _init(), _output(), _result(TASK), _cli("idle"))
+        tasks_turn_ended = time.monotonic()
+        await asyncio.wait_for(turn, 5)
+        return tasks_turn_ended
+
+    tasks_turn_ended = asyncio.run(go())
+
+    assert queried and queried[0] >= tasks_turn_ended, "sent into the task's turn"
+
+
+# --------------------------------------------------------------------------
+# A CLI that does not say
+# --------------------------------------------------------------------------
+
+def _warnings(sent):
+    return [(m.get("data") or {}).get("message", "") for m in sent
+            if m.get("type") == "system_msg" and m.get("subtype") == "warning"]
+
+
+def test_a_cli_that_says_nothing_of_its_state_is_named_once():
+    """A build without the state events: nothing can hold a prompt back from
+    its own turns, and the user should know why one goes unanswered."""
+    br, state, sent = _bridge()
+    br._set_cli_state(None)
+    br.client = _answering_client(br, [])
+
+    async def go():
+        await br.run_turn("first")
+        await br.run_turn("second")
+
+    asyncio.run(go())
+
+    said = [w for w in _warnings(sent) if "does not say when it is working" in w]
+    assert len(said) == 1, _warnings(sent)
+
+
+def test_but_one_that_does_is_not():
+    br, state, sent = _bridge()
+    br._set_cli_state(None)
+
+    class Client:
+        async def query(self, prompt):
+            await br._route(_cli("running"))
+            br.turn_msg_queue.put_nowait(_result())
+
+        async def interrupt(self):  # pragma: no cover
+            pass
+    br.client = Client()
+
+    asyncio.run(br.run_turn("first"))
+
+    assert not [w for w in _warnings(sent) if "does not say" in w]
