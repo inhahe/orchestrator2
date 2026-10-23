@@ -6851,40 +6851,72 @@ CWD_SERVER_MUTATIONS = [
 # its marker, rendered as a document of its own.  tests/markdown_lists.test.js.
 MD_LISTS_MUTATIONS = [
     ("an item holds none of the lines under it",
-     "        if (_indentOf(lines[i]) <= indent) break;\n",
-     "        break;\n"),
+     "        if (line.trim() !== '' && _indentOf(line) <= indent) break;",
+     "        break;"),
 
     ("an item's lines are run together as one line of text",
-     "      items.push(_blocks(body));",
-     "      items.push(_inlineMd(body.join(' ')));"),
+     "      items.push(_blocks([m[4], ...body.map((l) => _dedent(l, shared))], depth + 1));",
+     "      items.push(_inlineMd([m[4], ...body].join(' ')));"),
 
-    ("a sub-list indented less than the item's text loses its marker",
-     "        body.push(_dedent(lines[i], textCol));",
-     "        body.push(lines[i].slice(textCol));"),
+    ("an item's lines all lose the item's text column, flattening what is between",
+     "      const shared = Math.min(textCol, ...body.filter((l) => l.trim() !== '').map(_indentOf));",
+     "      const shared = textCol;"),
 
     ("a tab is one column",
-     "    for (const ch of s) col = ch === '\\t' ? col + 4 - (col % 4) : col + 1;",
-     "    for (const ch of s) col = col + 1;"),
+     "    return ch === '\\t' ? col + 4 - (col % 4) : col + 1;",
+     "    return col + 1;"),
+
+    ("a tab reaching past the column is swallowed whole",
+     "    return ' '.repeat(Math.max(0, col - cols)) + line.slice(k);",
+     "    return line.slice(k);"),
 
     ("a blank line ends an item that goes on under it",
-     "          if (j >= lines.length || _indentOf(lines[j]) <= indent) break;",
-     "          break;"),
+     "          if (j >= lines.length || _indentOf(lines[j]) <= indent\n",
+     "          if (true\n"),
 
     ("a blank line above a sub-list is kept as a gap",
-     "          if (!LIST_ITEM.test(lines[j])) body.push('');",
-     "          body.push('');"),
+     "          if (!LIST_ITEM.test(lines[j])) for (let k = i; k < j; k++) body.push('');",
+     "          for (let k = i; k < j; k++) body.push('');"),
 
-    ("a list ends after its first item",
-     "      if (j < lines.length && isItem(lines[j].match(LIST_ITEM))) i = j;",
-     "      if (false) i = j;"),
+    ("a code block in an item is read as list lines",
+     "        if (ticks && fence === null) fence = ticks[0];",
+     "        if (false) fence = ticks[0];"),
+
+    ("an item of the list's kind indented less than the text nests",
+     "      const isNextItem = (n) => !!n && /\\d/.test(n[2]) === ordered && _width(n[1]) < textCol;",
+     "      const isNextItem = (n) => !!n && /\\d/.test(n[2]) === ordered && _width(n[1]) <= indent;"),
 
     ("numbered and bulleted items share a list",
-     "    const isItem = (m) => !!m && _width(m[1]) === indent && /\\d/.test(m[2]) === ordered;",
-     "    const isItem = (m) => !!m && _width(m[1]) === indent;"),
+     "      const isNextItem = (n) => !!n && /\\d/.test(n[2]) === ordered && _width(n[1]) < textCol;",
+     "      const isNextItem = (n) => !!n && _width(n[1]) < textCol;"),
+
+    ("a list ends after its first item",
+     "      if (!isNextItem(next)) break;",
+     "      break;"),
 
     ("a numbered list always starts at 1",
      "    const startAttr = start !== 1 ? ` start=\"${start}\"` : '';",
      "    const startAttr = '';"),
+
+    ("a rule written with spaces is taken for nested lists",
+     "      if (THEMATIC_BREAK.test(line)) {",
+     "      if (/^[-*_]{3,}\\s*$/.test(line)) {"),
+
+    ("lists nest without limit",
+     "      if (depth < MAX_LIST_DEPTH && LIST_ITEM.test(line)) {",
+     "      if (LIST_ITEM.test(line)) {"),
+
+    ("a carriage return is left on every line",
+     ".replace(/\\r\\n?/g, '\\n')",
+     ""),
+
+    ("a code fence must start at the margin",
+     "  const FENCE = /^( {0,3})(`{3,})([\\w-]*)\\s*$/;",
+     "  const FENCE = /^()(`{3,})([\\w-]*)\\s*$/;"),
+
+    ("code lines keep the fence's own indentation",
+     "          codeLines.push(_dedent(lines[i], fenceIndent));",
+     "          codeLines.push(lines[i]);"),
 ]
 
 COMPACTION_CMD_MUTATIONS = [

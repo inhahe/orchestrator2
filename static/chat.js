@@ -1847,18 +1847,31 @@ const Chat = (() => {
    */
   function _md(raw) {
     if (!raw) return '';
-    return _blocks(_esc(raw).split('\n'));
+    return _blocks(_esc(raw).replace(/\r\n?/g, '\n').split('\n'), 0);
   }
 
   // A list item's first line: its indentation, its marker, the gap after the
   // marker, and its text.
   const LIST_ITEM = /^([ \t]*)([-*+]|\d+[.)])([ \t]+)(.*)$/;
+  // A horizontal rule: three or more of one of - * _, spaces between allowed.
+  // Tested before lists, which "- - -" would otherwise be, nested.
+  const THEMATIC_BREAK = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
+  // A code fence, indented by up to three spaces: [line, indent, fence, lang].
+  const FENCE = /^( {0,3})(`{3,})([\w-]*)\s*$/;
+  // Lists nested deeper than this are taken as text: far past any real list,
+  // and short of the recursion a line of thousands of "- " would run out of.
+  const MAX_LIST_DEPTH = 16;
 
-  /** The column a line's leading text reaches, a tab going to the next
-   *  multiple of 4 (CommonMark's tab stop). */
+  /** The column after *ch* at column *col*: a tab goes to the next multiple
+   *  of 4, CommonMark's tab stop. */
+  function _tabStop(col, ch) {
+    return ch === '\t' ? col + 4 - (col % 4) : col + 1;
+  }
+
+  /** The column the text *s* reaches. */
   function _width(s) {
     let col = 0;
-    for (const ch of s) col = ch === '\t' ? col + 4 - (col % 4) : col + 1;
+    for (const ch of s) col = _tabStop(col, ch);
     return col;
   }
 
@@ -1868,78 +1881,91 @@ const Chat = (() => {
   }
 
   /** *line* without its first *cols* columns of indentation, or without all
-   *  of it if it has fewer. */
+   *  of it if it has fewer.  A tab that reaches past *cols* leaves the columns
+   *  beyond it as spaces. */
   function _dedent(line, cols) {
     let col = 0;
     let k = 0;
     while (k < line.length && col < cols && (line[k] === ' ' || line[k] === '\t')) {
-      col = line[k] === '\t' ? col + 4 - (col % 4) : col + 1;
+      col = _tabStop(col, line[k]);
       k++;
     }
-    return line.slice(k);
+    return ' '.repeat(Math.max(0, col - cols)) + line.slice(k);
+  }
+
+  /** The index of the first line at or after *i* that is not blank. */
+  function _skipBlank(lines, i) {
+    while (i < lines.length && lines[i].trim() === '') i++;
+    return i;
   }
 
   /**
-   * The list whose first item is lines[i]: [its HTML, the index of the first
-   * line after it].
+   * The list whose first item is lines[i], nested *depth* lists deep: [its
+   * HTML, the index of the first line after it].
    *
    * An item holds every line after it indented past its marker -- text that
    * continues it, a nested list, a code block -- rendered as a document of
-   * its own, so lists nest to any depth, and a numbered list keeps counting
-   * across the sub-items between its items.  A sub-list indented by less
-   * than the item's text, as in "1. step" over "  - detail", is still the
-   * item's.  Blank lines between items do not end the list; a line at or
-   * left of the marker that is not one of the list's items does, as does an
-   * item of the other kind (numbered or not) at the list's indentation.
+   * its own, so lists nest, and a numbered list keeps counting across the
+   * sub-items between its items.  Its lines keep their indentation relative
+   * to one another; a code block's are kept as written.  A line of the
+   * list's own kind indented less than the item's text is the next item, as
+   * in CommonMark; a sub-list of the other kind is the item's however little
+   * it is indented, as in "1. step" over "  - detail", which models write.
+   * Blank lines between items do not end the list; a line at or left of the
+   * list's marker that is not one of its items does.
    */
-  function _list(lines, i) {
-    const first = lines[i].match(LIST_ITEM);
-    const indent = _width(first[1]);
-    const ordered = /\d/.test(first[2]);
-    const isItem = (m) => !!m && _width(m[1]) === indent && /\d/.test(m[2]) === ordered;
+  function _list(lines, i, depth) {
+    let m = lines[i].match(LIST_ITEM);
+    const indent = _width(m[1]);
+    const ordered = /\d/.test(m[2]);
+    const start = parseInt(m[2], 10);
     const items = [];
-    while (i < lines.length) {
-      const m = lines[i].match(LIST_ITEM);
-      if (!isItem(m)) break;
-      // The column the item's text starts at, after the marker and its gap:
-      // the indentation its later lines lose.
+    for (;;) {
       const textCol = _width(m[1] + m[2] + m[3]);
-      const body = [m[4]];
+      const isNextItem = (n) => !!n && /\d/.test(n[2]) === ordered && _width(n[1]) < textCol;
+      const body = [];
+      let fence = null;      // the code fence open among the item's lines
       i++;
       while (i < lines.length) {
-        if (lines[i].trim() === '') {
-          let j = i + 1;
-          while (j < lines.length && lines[j].trim() === '') j++;
-          if (j >= lines.length || _indentOf(lines[j]) <= indent) break;
-          // The item goes on after the blank: keep the blank in its text,
-          // but not ahead of a sub-list, which has its own margin.
-          if (!LIST_ITEM.test(lines[j])) body.push('');
+        const line = lines[i];
+        if (fence === null && line.trim() === '') {
+          const j = _skipBlank(lines, i);
+          if (j >= lines.length || _indentOf(lines[j]) <= indent
+              || isNextItem(lines[j].match(LIST_ITEM))) break;
+          // The item goes on after the blank lines.  Keep them, but not ahead
+          // of a sub-list, which has a margin of its own.
+          if (!LIST_ITEM.test(lines[j])) for (let k = i; k < j; k++) body.push('');
           i = j;
           continue;
         }
-        if (_indentOf(lines[i]) <= indent) break;
-        body.push(_dedent(lines[i], textCol));
+        if (line.trim() !== '' && _indentOf(line) <= indent) break;
+        if (fence === null && isNextItem(line.match(LIST_ITEM))) break;
+        body.push(line);
+        const ticks = line.trimStart().match(/^`{3,}/);
+        if (ticks && fence === null) fence = ticks[0];
+        else if (ticks && fence !== null && line.trim() === fence) fence = null;
         i++;
       }
-      items.push(_blocks(body));
+      const shared = Math.min(textCol, ...body.filter((l) => l.trim() !== '').map(_indentOf));
+      items.push(_blocks([m[4], ...body.map((l) => _dedent(l, shared))], depth + 1));
       // Blank lines, then the list's next item, go on with the list.
-      let j = i;
-      while (j < lines.length && lines[j].trim() === '') j++;
-      if (j < lines.length && isItem(lines[j].match(LIST_ITEM))) i = j;
-      else break;
+      const j = _skipBlank(lines, i);
+      const next = j < lines.length ? lines[j].match(LIST_ITEM) : null;
+      if (!isNextItem(next)) break;
+      m = next;
+      i = j;
     }
     const lis = items.map(t => `<li>${t}</li>`).join('');
     if (!ordered) return [`<ul class="md-list">${lis}</ul>`, i];
     // The first item's own number, which the model wrote: a list interrupted
     // by a paragraph goes on counting from where it left off.
-    const start = parseInt(first[2], 10);
     const startAttr = start !== 1 ? ` start="${start}"` : '';
     return [`<ol class="md-list"${startAttr}>${lis}</ol>`, i];
   }
 
   /** Already-escaped markdown *lines* → HTML: the blocks of a message, or of
-   *  one list item. */
-  function _blocks(lines) {
+   *  a list item nested *depth* lists deep. */
+  function _blocks(lines, depth) {
     // Each entry: {html, block}.  We track block-ness so the final join
     // can emit '\n' ONLY between adjacent text entries.  The container
     // uses white-space: pre-wrap, so a literal '\n' renders as a line
@@ -1956,14 +1982,18 @@ const Chat = (() => {
       const line = lines[i];
 
       // --- Fenced code block ---
-      const fenceMatch = line.match(/^(`{3,})([\w-]*)\s*$/);
+      // Its lines lose as much indentation as the opening fence has, as in
+      // CommonMark; the closing fence may be indented by up to three.
+      const fenceMatch = line.match(FENCE);
       if (fenceMatch) {
-        const fence = fenceMatch[1];
-        const lang = fenceMatch[2];
+        const fenceIndent = fenceMatch[1].length;
+        const fence = fenceMatch[2];
+        const lang = fenceMatch[3];
+        const closing = new RegExp('^ {0,3}' + fence + '\\s*$');
         const codeLines = [];
         i++;
-        while (i < lines.length && !lines[i].match(new RegExp('^' + fence + '\\s*$'))) {
-          codeLines.push(lines[i]);
+        while (i < lines.length && !closing.test(lines[i])) {
+          codeLines.push(_dedent(lines[i], fenceIndent));
           i++;
         }
         i++;  // skip closing fence
@@ -1984,15 +2014,15 @@ const Chat = (() => {
       }
 
       // --- Horizontal rule ---
-      if (/^[-*_]{3,}\s*$/.test(line)) {
+      if (THEMATIC_BREAK.test(line)) {
         pushBlock('<hr class="md-hr">');
         i++;
         continue;
       }
 
-      // --- List (bulleted or numbered, nested to any depth) ---
-      if (LIST_ITEM.test(line)) {
-        const [html, next] = _list(lines, i);
+      // --- List (bulleted or numbered, nested) ---
+      if (depth < MAX_LIST_DEPTH && LIST_ITEM.test(line)) {
+        const [html, next] = _list(lines, i, depth);
         pushBlock(html);
         i = next;
         continue;

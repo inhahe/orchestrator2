@@ -1,11 +1,11 @@
 /* The agent's lists keep their nesting.
  *
- * Reported 2026-10-23: "i think orchestrator2 might be flattening lists of
- * lists that are emitted by the agent."  A list item holds every line
- * indented past its marker -- a sub-list, text continuing it, a code block --
- * so lists nest to any depth, and a numbered list keeps counting across the
- * sub-items between its steps.  Driven through Chat.handleMessage, as the
- * page renders an assistant message.
+ * A list item holds every line indented past its marker -- a sub-list, text
+ * continuing it, a code block -- so lists nest, numbered and bulleted mixed,
+ * and a numbered list keeps counting across the sub-items between its steps.
+ * An item's lines keep their indentation relative to one another, and a code
+ * block's lines are kept as written.  Driven through Chat.handleMessage, as
+ * the page renders an assistant message.
  */
 
 const fs = require('fs');
@@ -114,6 +114,23 @@ test('a sub-list indented less than its item\'s text is still the item\'s', () =
   is('1. step\n  - detail\n2. next', 'ol(step(ul(detail)), next)', 'two-space sub-list');
 });
 
+test('nesting holds under items numbered 10 and up', () => {
+  // Their text starts a column further in, which must not flatten what is
+  // indented between the marker and the text.
+  is('10. step\n  - a\n    - b\n11. next', 'ol@10(step(ul(a(ul(b)))), next)', 'step 10');
+});
+
+test('an item of the list\'s own kind indented less than the text is the next item', () => {
+  is('- a\n - b', 'ul(a, b)', 'one space in');
+  is(' 9. nine\n10. ten', 'ol@9(nine, ten)', 'right-aligned numbers');
+  is('  - a\n- b', 'ul(a, b)', 'second item further left');
+  is('- a\n    - b\n  - c', 'ul(a(ul(b, c)))', 'sub-items at two indentations');
+});
+
+test('a tab that reaches past an item\'s text keeps the columns beyond it', () => {
+  is('- a\n  - b\n\t- c', 'ul(a(ul(b(ul(c)))))', 'tab under two spaces, under a');
+});
+
 test('tabs indent a sub-list too', () => {
   is('- a\n\t- b\n- c', 'ul(a(ul(b)), c)', 'tab-indented');
 });
@@ -145,6 +162,25 @@ test('a code block in an item stays in it', () => {
   assert(items.length === 2, `${items.length} items, not 2`);
   const code = items[0].querySelector('.code-block code');
   assert(code && code.textContent === 'cargo test', 'no code block in the first item');
+});
+
+test('a code block in an item keeps its lines as written', () => {
+  // Blank lines, a run of them, and a line that looks like a list item.
+  const el = rendered('1. Edit:\n   ```yaml\n   foo:\n\n   - bar\n\n\n   baz\n   ```\n2. Done');
+  const code = el.querySelector('ol > li .code-block code');
+  assert(code, 'no code block in the item');
+  assert(code.textContent === 'foo:\n\n- bar\n\n\nbaz', JSON.stringify(code.textContent));
+  assert(el.querySelectorAll('ol > li').length === 2, 'the code block split the list');
+});
+
+test('a code fence may be indented up to three spaces', () => {
+  const el = rendered('1. Run:\n    ```bash\n    ls\n    ```\n2. next');
+  const code = el.querySelector('ol > li .code-block code');
+  assert(code && code.textContent === 'ls', 'fence four in under "1. " not taken');
+  const top = rendered('   ```\n   x\n     y\n   ```');
+  const c2 = top.querySelector('.code-block code');
+  assert(c2 && c2.textContent === 'x\n  y', 'top-level fence three in: '
+         + (c2 ? JSON.stringify(c2.textContent) : 'none'));
 });
 
 test('a paragraph after a blank line, indented under the item, is the item\'s', () => {
@@ -183,6 +219,24 @@ test('a numbered list starts at the number the model wrote', () => {
 
 test('a dash that is not a marker is not a list', () => {
   assert(lists('-5 degrees, and -x').length === 0, 'made a list of a minus sign');
+});
+
+test('a rule written with spaces is a rule, not lists inside lists', () => {
+  for (const r of ['* * *', '- - -', '_ _ _', '- - - - - - - -']) {
+    const el = rendered('above\n' + r + '\nbelow');
+    assert(el.querySelector('hr'), `${r}: no rule`);
+    assert(!el.querySelector('ul'), `${r}: made a list`);
+  }
+});
+
+test('markers nested thousands deep render, as text past a depth', () => {
+  const el = rendered('- '.repeat(3000) + 'x');
+  assert(el.textContent.includes('x'), 'the text was lost');
+  assert(el.querySelectorAll('ul').length <= 32, 'not capped');
+});
+
+test('a message with Windows line endings still has its lists', () => {
+  is('- a\r\n- b\r\n  - c\r\n', 'ul(a, b(ul(c)))', 'CRLF');
 });
 
 test('text around lists is kept, in order', () => {
