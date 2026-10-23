@@ -429,9 +429,14 @@ def _heavy_lock() -> asyncio.Lock:
 # The fix is to make the claim survive a moment's scrutiny: arm the ring, wait,
 # and only ring if the session is *still* idle when the timer fires.  Any
 # resumption -- ghost turn or real turn -- cancels it at the point ``busy``
-# flips True.  The grace is generously above the observed 5.0 s worst case,
-# because a bell that is a few seconds late costs nothing and a bell that
+# flips True.  A bell that is a few seconds late costs nothing and a bell that
 # should never have rung costs the user's attention.
+#
+# The wait turned out to be too short as well: 5% of those turns showed
+# themselves more than 10 s after the task ended (TASK_TURN_SHOW_TIMEOUT_S).
+# Such a turn now begins when the task ends, so the bell rings when it is over
+# (_end_ghost_turn): the model has dealt with the task, and the session waits
+# for the user.  The timer is left for a task whose end starts no turn.
 BG_DONE_BELL_GRACE = 10.0
 
 # --- A queued prompt waits for the CLI's own queue --------------------------
@@ -448,10 +453,38 @@ BG_DONE_BELL_GRACE = 10.0
 # message was never answered.
 #
 # So a queued prompt is not sent until this long after a turn ends.  A turn the
-# CLI starts itself announces itself within milliseconds -- its first message
-# begins a ghost turn -- and the prompt then waits for that turn, getting one
-# of its own after it.  1.5 s costs a queued prompt nothing it would notice.
+# CLI starts for a peer's message announces itself within milliseconds -- the
+# CLI streams the message, which begins a ghost turn -- and the prompt then
+# waits for that turn, getting one of its own after it.  A turn for a finished
+# background task does not announce itself that way (next section).  1.5 s
+# costs a queued prompt nothing it would notice.
 TURN_END_SETTLE_S = 1.5
+
+# --- A finished background task's turn begins when the task ends ------------
+#
+# The CLI streams nothing at the start of the turn it runs for a finished
+# background task: not the ``<task-notification>`` it gives the model, only the
+# model's first output, once that exists.  Measured over 2868 such turns
+# (2026-10-23): 3.5 s later at the median, 27 s at p99, 82 s at most.  The
+# SDK's ``task_notification`` message, though, arrives within milliseconds of
+# the CLI queueing the notification, and a CLI with no turn running starts
+# one for it at once.
+#
+# A ghost turn begun only at that first output left the session looking idle
+# for those seconds, and everything that waits for an idle session went
+# through the gap into the CLI's turn: the queued prompt the task's end
+# released ("bg-all-done"), a typed one, a loop's wakeup, a /model switch
+# deferred until the tasks were done (whose reconnect cut the turn off).  The
+# CLI folded the prompt into the task's turn or ran it after, and this
+# bridge's turn ended on the task's result.  Reported: "sometimes when a
+# background task completes and it sends a queued prompt, the background task
+# eats up the prompt and the model never sees it."  The bg-done bell rang into
+# the same gap, mid-work.
+#
+# So that message begins the ghost turn (``_begin_turn_for_task``).  If the
+# turn shows nothing for this long, it is let go, loudly -- above the longest
+# measured, since letting go early reopens the gap.
+TASK_TURN_SHOW_TIMEOUT_S = 180.0
 
 # --- Recovering from a dead CLI subprocess ---------------------------------
 #
@@ -917,6 +950,17 @@ class SDKBridge:
         # When the last turn -- ours or a ghost -- ended (monotonic).  A queued
         # prompt waits TURN_END_SETTLE_S past it; see _pop_queued_prompt().
         self._turn_ended_at: float | None = None
+        # When a background task last finished between turns (monotonic), and
+        # so the CLI may be starting a turn for it.  A queued prompt waits
+        # TURN_END_SETTLE_S past it too: the SDK can report the end of a task
+        # (task_updated) a few milliseconds before the message that begins its
+        # turn here (task_notification).
+        self._task_ended_at: float | None = None
+        # The ghost turn under way was begun for a finished background task
+        # (_begin_turn_for_task): its end is when bg-done rings.
+        self._turn_for_task = False
+        # Lets go of a task's turn that never shows (TASK_TURN_SHOW_TIMEOUT_S).
+        self._task_turn_backstop: asyncio.Task | None = None
 
         self._dispatcher_task: asyncio.Task | None = None
         self._worker_task: asyncio.Task | None = None
@@ -3161,6 +3205,13 @@ class SDKBridge:
         })
         return False
 
+    def _reconnect_blocked(self) -> bool:
+        """Whether a deferred reconnect must wait still: background tasks run,
+        which it would kill, or a turn does -- ours holds ``turn_active``, one
+        the CLI started (a ghost turn) only ``state.busy`` -- or a connect."""
+        return bool(self._active_bg_tasks() or self.turn_active.is_set()
+                    or self.state.busy or self.state.connecting)
+
     async def _flush_deferred_reconnect(self) -> bool:
         """Apply a reconnect :meth:`_reconnect_or_defer` postponed, if it is now safe.
 
@@ -3168,13 +3219,19 @@ class SDKBridge:
         :meth:`_between_turns` (background tasks drained during a turn) and the
         wakeup branch of :meth:`_await_next_prompt` (they drained while we were
         parked, which is the common case — ``bg-all-done`` fires exactly then).
-        Cheap and idempotent, so extra call sites cost nothing.
+        Idempotent, and it waits (out the settle) only when there is a
+        reconnect to apply, so extra call sites cost nothing.
         """
+        if self._deferred_reconnect is None or self._reconnect_blocked():
+            return False
+        # The last task's end starts a turn, which shows itself only after
+        # the settle; _end_ghost_turn pokes again when it is over.
+        if not await self._wait_out_cli_turn_start():
+            return False
         reason = self._deferred_reconnect
         if reason is None:
             return False
-        if (self._active_bg_tasks() or self.turn_active.is_set()
-                or self.state.connecting):
+        if self._reconnect_blocked():
             return False
         await self.broadcast({
             "type": "system_msg",
@@ -3224,26 +3281,28 @@ class SDKBridge:
         # read "working" ever after with nothing running.  If the new CLI
         # picks the turn up again, that is a new ghost turn, and says so.
         if self.state.busy and not self.turn_active.is_set():
-            self._abandon_ghost_turn()
+            self._abandon_ghost_turn("its CLI is being replaced")
         await self.disconnect()
         await self.connect(resume_id=sid, recovering=recovering)
 
-    def _abandon_ghost_turn(self) -> None:
-        """Close a ghost turn whose CLI is being replaced, without its result.
+    def _abandon_ghost_turn(self, why: str) -> None:
+        """Close a ghost turn without its result, *why* being the reason, in
+        words, for the log.
 
         What :meth:`_end_ghost_turn` does to the state, minus booking a turn
-        that never finished.  The status reaches the tabs with the connect's
-        own ``status_update``.
+        that never finished.  The caller says so to the tabs: a reconnect with
+        its own ``status_update``, the task-turn backstop with one of its own.
         """
         state = self.state
         elapsed = time.monotonic() - (state.turn_started_at or time.monotonic())
-        log.warning("ghost turn abandoned: its CLI is being replaced "
-                    "(elapsed=%.1fs)", elapsed)
+        log.warning("ghost turn abandoned: %s (elapsed=%.1fs)", why, elapsed)
         state.busy = False
         state.turn_started_at = None
         state.active_tools.clear()
         self._ghost_settled.set()
         self._turn_ended_at = time.monotonic()
+        self._turn_for_task = False
+        self._cancel_task_turn_backstop()
 
     # ------------------------------------------------------------------
     # Message dispatcher
@@ -4557,11 +4616,14 @@ class SDKBridge:
     # Ghost-turn helpers
     # ------------------------------------------------------------------
 
-    async def _begin_ghost_turn_if_needed(self) -> bool:
+    async def _begin_ghost_turn_if_needed(
+            self, cause: str = "SDK streaming without active run_turn") -> bool:
         """Mark a ghost turn active and push a status_update once.
 
-        Called on every async assistant/user message.  Idempotent: only
-        flips state once, until ``_end_ghost_turn`` clears it.
+        Called on every async assistant/user message, and by
+        ``_begin_turn_for_task`` before there is one; *cause* says which, in
+        the log.  Idempotent: only flips state once, until ``_end_ghost_turn``
+        clears it.
 
         Returns False when the caller should *not* render the message, because
         a real ``run_turn`` already owns the stream and will render it itself.
@@ -4576,6 +4638,8 @@ class SDKBridge:
         if self.turn_active.is_set():
             return False
         if state.busy:
+            # A task's turn begun before its output: this is that output.
+            self._cancel_task_turn_backstop()
             return True
         # This ghost turn IS the post-compact continuation that the deferred
         # turn_end was waiting for — it will book the turn and emit its own
@@ -4601,9 +4665,8 @@ class SDKBridge:
         # history -- as in run_turn.
         state.open_notices = []
         log.warning(
-            "ghost turn begin: SDK streaming without active run_turn "
-            "(session_id=%s resumed_interrupted_turn=%s)",
-            (state.session_id or "?")[:12], unprompted_resume,
+            "ghost turn begin: %s (session_id=%s resumed_interrupted_turn=%s)",
+            cause, (state.session_id or "?")[:12], unprompted_resume,
         )
         if unprompted_resume:
             await self._announce_resumed_interrupted_turn()
@@ -4682,6 +4745,8 @@ class SDKBridge:
         state = self.state
         was_compact = state.compact_during_last_turn
         duration = time.monotonic() - (state.turn_started_at or time.monotonic())
+        for_task, self._turn_for_task = self._turn_for_task, False
+        self._cancel_task_turn_backstop()
 
         # Mirror run_turn's finally cleanup.
         state.busy = False
@@ -4725,27 +4790,76 @@ class SDKBridge:
         await self._after_limit_turn(
             interrupted=interrupted or self._ghost_interrupted)
 
-        # If the user queued a prompt while this ghost turn was running,
-        # server.py saw state.busy == True and routed it to
-        # state.queued_prompts rather than the event_queue.  The worker
-        # loop is parked in _await_next_prompt() blocked on event_queue
-        # and has no idea a prompt is waiting, so it would sit unsent
-        # forever.  Poke the worker with a queue-edit-done wakeup (the
-        # same path used after a queue edit) so it pops and sends the
-        # queued prompt.  Skip if the first item is being edited.
-        if state.queued_prompts and state.queue_editing_index != 0:
+        # The model has dealt with the task that started this turn, and the
+        # session waits for the user -- unless it has started more work in
+        # the background, whose own end will say so.
+        more_work = bool(self._active_bg_tasks())
+        if for_task and not more_work and not (interrupted or self._ghost_interrupted):
+            ring_bell(state, "bg-done")
+            await self._flush_bell()
+
+        self._poke_after_ghost_turn()
+
+    def _poke_after_ghost_turn(self) -> None:
+        """Wake the parked worker for what waited out a ghost turn.
+
+        A prompt queued during it: server.py saw ``state.busy`` and routed it
+        to ``state.queued_prompts`` rather than the event queue, and the
+        worker, parked in ``_await_next_prompt``, has no idea it is there.  A
+        reconnect deferred until the background tasks were done: the
+        ``bg-all-done`` wakeup that would have applied it was declined while
+        the turn ran.  A CLI command (``/rename``): declined likewise.  The
+        wakeup is the same one a finished queue edit sends; it is skipped when
+        the queue's head is being edited and nothing else waits.
+        """
+        state = self.state
+        if ((state.queued_prompts and state.queue_editing_index != 0)
+                or self._deferred_reconnect is not None):
             try:
                 self.event_queue.put_nowait(("wakeup", "queue-edit-done"))
             except Exception as exc:
                 log.warning("ghost-turn queue poke failed: %r", exc)
-        # Likewise a CLI command that arrived while this ghost turn held the
-        # CLI: the parked worker declined it then, and nothing else would wake
-        # it for this.
         if self._pending_cli_command:
             try:
                 self.event_queue.put_nowait(("cli-command", ""))
             except Exception as exc:
                 log.warning("ghost-turn CLI-command poke failed: %r", exc)
+
+    async def _begin_turn_for_task(self) -> None:
+        """Begin the turn the CLI is starting for a background task that has
+        just finished, between turns -- now, not at its first output.
+
+        See ``TASK_TURN_SHOW_TIMEOUT_S`` for why.  Nothing to do while a turn
+        runs: the CLI hands the notification to that turn instead.
+        """
+        if self.turn_active.is_set() or self.state.busy:
+            return
+        self._turn_for_task = True
+        self._cancel_task_turn_backstop()
+        self._task_turn_backstop = asyncio.create_task(
+            self._let_go_of_silent_task_turn(), name="task-turn-backstop")
+        await self._begin_ghost_turn_if_needed(cause="a background task finished")
+
+    def _cancel_task_turn_backstop(self) -> None:
+        task, self._task_turn_backstop = self._task_turn_backstop, None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _let_go_of_silent_task_turn(self) -> None:
+        """End a task's turn that has shown nothing in
+        ``TASK_TURN_SHOW_TIMEOUT_S``, so that what waits for it goes."""
+        try:
+            await asyncio.sleep(TASK_TURN_SHOW_TIMEOUT_S)
+        except asyncio.CancelledError:
+            return
+        self._task_turn_backstop = None
+        if self.turn_active.is_set() or not self.state.busy:
+            return
+        self._abandon_ghost_turn(
+            f"a finished background task's turn showed nothing in "
+            f"{TASK_TURN_SHOW_TIMEOUT_S:.0f}s")
+        await self._broadcast_status()
+        self._poke_after_ghost_turn()
 
     # ------------------------------------------------------------------
     # Deferred compact turn_end helpers
@@ -4977,6 +5091,8 @@ class SDKBridge:
         wakeup prompt.
         """
         state = self.state
+        if not self.turn_active.is_set():
+            self._task_ended_at = time.monotonic()
         known = (task_id in state.background_tasks
                  or task_id in state.current_turn_bg)
         entry = complete_bg_task(state, task_id, status, summary=summary)
@@ -5136,7 +5252,12 @@ class SDKBridge:
             data = {"error": str(error_info) if error_info else None}
 
         elif subtype == "task_notification":
-            # Background task completion.
+            # Background task completion.  Between turns, the CLI has just
+            # queued this for the model and is starting a turn for it, which
+            # begins here: before the completion is announced, so that what
+            # the announcement wakes (bg-all-done) finds the session busy.
+            if not during_turn:
+                await self._begin_turn_for_task()
             task_id = getattr(msg, "task_id", None) or ""
             status = getattr(msg, "status", None) or "completed"
             summary = getattr(msg, "summary", None)
@@ -6329,6 +6450,23 @@ class SDKBridge:
         except Exception as exc:      # pragma: no cover — unbounded queue
             log.warning("queue poke failed: %r", exc)
 
+    async def _wait_out_cli_turn_start(self) -> bool:
+        """Wait until ``TURN_END_SETTLE_S`` has passed since a turn or a
+        background task last ended: a moment the CLI may start a turn of its
+        own, which shows here only once it has.  Re-checked after each wait,
+        since another end can come during one -- the SDK reports a task's end
+        twice, a few milliseconds apart, and only the second begins its turn.
+        False if the bridge is stopping."""
+        while True:
+            since = max((t for t in (self._turn_ended_at, self._task_ended_at)
+                         if t is not None), default=None)
+            wait = 0.0 if since is None else since + TURN_END_SETTLE_S - time.monotonic()
+            if wait <= 0:
+                return True
+            await asyncio.sleep(wait)
+            if self.stop_event.is_set():
+                return False
+
     async def _pop_queued_prompt(self) -> str | None:
         """Take the head of the pending-prompt queue and hand it to the UI.
 
@@ -6354,24 +6492,19 @@ class SDKBridge:
         state = self.state
         if not state.queued_prompts or state.queue_editing_index == 0:
             return None
-        # Not in the instant a turn ends: the CLI may be starting one of its
-        # own, and a prompt sent into that would be folded into it rather than
-        # get a turn (TURN_END_SETTLE_S).  If it does start one, that begins a
-        # ghost turn, and this prompt waits for it -- None is "wait for a
-        # poke", which every caller handles, and _end_ghost_turn pokes.
-        if self._turn_ended_at is not None:
-            wait = self._turn_ended_at + TURN_END_SETTLE_S - time.monotonic()
-            if wait > 0:
-                await asyncio.sleep(wait)
-                if self.stop_event.is_set():
-                    return None
-                if state.busy or self.turn_active.is_set():
-                    log.info("queued prompt held: the CLI started a turn of its "
-                             "own as the last one ended (%d queued)",
-                             len(state.queued_prompts))
-                    return None
-                if not state.queued_prompts or state.queue_editing_index == 0:
-                    return None
+        # Not in the instant a turn or a background task ends: the CLI may be
+        # starting a turn of its own, and a prompt sent into that would be
+        # folded into it rather than get a turn.  If it does start one, that
+        # begins a ghost turn, and this prompt waits for it -- None is "wait
+        # for a poke", which every caller handles, and _end_ghost_turn pokes.
+        if not await self._wait_out_cli_turn_start():
+            return None
+        if not state.queued_prompts or state.queue_editing_index == 0:
+            return None
+        if state.busy or self.turn_active.is_set():
+            log.info("queued prompt held: the CLI is in a turn of its own "
+                     "(%d queued)", len(state.queued_prompts))
+            return None
         prompt = state.queued_prompts.popleft()
         state.queue_editing_index = None
         state.needs_user_attention = None

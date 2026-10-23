@@ -397,8 +397,8 @@ RECONNECT_MUTATIONS = [
      '                f"— takes effect once the {n} running background "'),
 
     ("the flush ignores tasks still running, which un-does the deferral",
-     '        if (self._active_bg_tasks() or self.turn_active.is_set()\n                or self.state.connecting):\n            return False\n',
-     ''),
+     "        return bool(self._active_bg_tasks() or self.turn_active.is_set()\n",
+     "        return bool(self.turn_active.is_set()\n"),
 
     ("nothing is ever flushed, so a deferred switch never applies",
      "        reason = self._deferred_reconnect\n        if reason is None:\n"
@@ -3622,16 +3622,16 @@ RESUME_STATUS_MUTATIONS = [
 # and tests/peer_message.test.js.
 CLIQUEUE_BRIDGE_MUTATIONS = [
     ("a queued prompt goes out the instant a turn ends -- the report",
-     "        if self._turn_ended_at is not None:\n"
-     "            wait = self._turn_ended_at + TURN_END_SETTLE_S - time.monotonic()",
-     "        if False:\n"
-     "            wait = self._turn_ended_at + TURN_END_SETTLE_S - time.monotonic()"),
+     "        while True:\n"
+     "            since = max((t for t in (self._turn_ended_at, self._task_ended_at)",
+     "        return True\n        while True:\n"
+     "            since = max((t for t in (self._turn_ended_at, self._task_ended_at)"),
 
     ("it waits, but goes into the turn the CLI started anyway",
-     "                if state.busy or self.turn_active.is_set():\n"
-     "                    log.info(\"queued prompt held:",
-     "                if False:\n"
-     "                    log.info(\"queued prompt held:"),
+     "        if state.busy or self.turn_active.is_set():\n"
+     "            log.info(\"queued prompt held:",
+     "        if False:\n"
+     "            log.info(\"queued prompt held:"),
 
     ("a ghost turn's end does not start the settle",
      "        self._ghost_settled.set()\n        self._turn_ended_at = time.monotonic()\n"
@@ -3643,14 +3643,14 @@ CLIQUEUE_BRIDGE_MUTATIONS = [
      "            state.turn_started_at = None\n"),
 
     ("a stopped bridge still sends the prompt",
-     "                if self.stop_event.is_set():\n                    return None\n"
-     "                if state.busy or self.turn_active.is_set():",
-     "                if state.busy or self.turn_active.is_set():"),
+     "            await asyncio.sleep(wait)\n"
+     "            if self.stop_event.is_set():\n                return False\n",
+     "            await asyncio.sleep(wait)\n"),
 
     ("a head put under edit during the settle is sent half-typed",
-     "                if not state.queued_prompts or state.queue_editing_index == 0:\n"
-     "                    return None\n        prompt = state.queued_prompts.popleft()",
-     "        prompt = state.queued_prompts.popleft()"),
+     "        if not state.queued_prompts or state.queue_editing_index == 0:\n"
+     "            return None\n        if state.busy or self.turn_active.is_set():",
+     "        if state.busy or self.turn_active.is_set():"),
 
     ("a peer's message is not recognised as one",
      "        if isinstance(origin, dict) and origin.get(\"kind\") == \"peer\":\n"
@@ -6130,24 +6130,23 @@ DEADCLI_RECOVERY_MUTATIONS = [
 
     ("a ghost turn outlives its CLI, reading working for good -- the report",
      "        if self.state.busy and not self.turn_active.is_set():\n"
-     "            self._abandon_ghost_turn()",
+     "            self._abandon_ghost_turn(\"its CLI is being replaced\")",
      "        pass"),
 
     ("a turn of ours is closed under it",
      "        if self.state.busy and not self.turn_active.is_set():\n"
-     "            self._abandon_ghost_turn()",
+     "            self._abandon_ghost_turn(\"its CLI is being replaced\")",
      "        if self.state.busy:\n"
-     "            self._abandon_ghost_turn()"),
+     "            self._abandon_ghost_turn(\"its CLI is being replaced\")"),
 
     ("abandoning a ghost turn leaves it busy",
-     "                    \"(elapsed=%.1fs)\", elapsed)\n        state.busy = False\n",
-     "                    \"(elapsed=%.1fs)\", elapsed)\n"),
+     "(elapsed=%.1fs)\", why, elapsed)\n        state.busy = False\n",
+     "(elapsed=%.1fs)\", why, elapsed)\n"),
 
     ("abandoning a ghost turn leaves a prompt waiting on its end",
-     "        state.active_tools.clear()\n        self._ghost_settled.set()\n"
-     "        self._turn_ended_at = time.monotonic()\n\n    # ----",
-     "        state.active_tools.clear()\n"
-     "        self._turn_ended_at = time.monotonic()\n\n    # ----"),
+     "        self._ghost_settled.set()\n"
+     "        self._turn_ended_at = time.monotonic()\n        self._turn_for_task = False\n",
+     "        self._turn_ended_at = time.monotonic()\n        self._turn_for_task = False\n"),
 
     ("a death mid-turn is answered with re-send your last prompt -- the report",
      "        if self._last_reconnect_recovered:\n            text = (",
@@ -6946,6 +6945,74 @@ MD_LINKS_MUTATIONS = [
     ("a refused link loses its text",
      "          : `<span class=\"md-link-inert\" title=\"${href}\">${text}</span>`);",
      "          : '');"),
+]
+
+# A finished background task's turn begins when the task ends, not at its
+# first output (tests/test_task_turn_begins_early.py).
+TASKTURN_MUTATIONS = [
+    ("the task's turn begins at its first output again -- the report",
+     "            if not during_turn:\n                await self._begin_turn_for_task()\n",
+     ""),
+
+    ("a second turn is begun under a ghost turn",
+     "        if self.turn_active.is_set() or self.state.busy:\n            return\n"
+     "        self._turn_for_task = True\n",
+     "        if self.turn_active.is_set():\n            return\n"
+     "        self._turn_for_task = True\n"),
+
+    ("a turn that never shows is never let go",
+     "        self._task_turn_backstop = asyncio.create_task(\n"
+     "            self._let_go_of_silent_task_turn(), name=\"task-turn-backstop\")\n",
+     "        self._task_turn_backstop = None\n"),
+
+    ("a turn that shows is let go anyway",
+     "            self._cancel_task_turn_backstop()\n            return True\n",
+     "            return True\n"),
+
+    ("letting go of it leaves what waited for it waiting",
+     "        await self._broadcast_status()\n        self._poke_after_ghost_turn()\n",
+     "        await self._broadcast_status()\n"),
+
+    ("a reconnect leaves the backstop armed",
+     "        self._turn_for_task = False\n        self._cancel_task_turn_backstop()\n\n",
+     "        self._turn_for_task = False\n\n"),
+
+    ("a task's end does not start the settle",
+     "        if not self.turn_active.is_set():\n            self._task_ended_at = time.monotonic()\n",
+     ""),
+
+    ("the settle is not re-checked, so the patch's end slips past it",
+     "            if wait <= 0:\n                return True\n",
+     "            if True:\n                return True\n"),
+
+    ("a deferred reconnect runs under a turn the CLI started",
+     "                    or self.state.busy or self.state.connecting)\n",
+     "                    or self.state.connecting)\n"),
+
+    ("a deferred reconnect does not wait out the settle",
+     "        if not await self._wait_out_cli_turn_start():\n            return False\n"
+     "        reason = self._deferred_reconnect\n",
+     "        reason = self._deferred_reconnect\n"),
+
+    ("a ghost turn's end does not wake the worker for a deferred reconnect",
+     "                or self._deferred_reconnect is not None):\n",
+     "                or False):\n"),
+
+    ("bg-done does not ring when the task's turn is over",
+     "            ring_bell(state, \"bg-done\")\n            await self._flush_bell()\n",
+     "            pass\n"),
+
+    ("bg-done rings for any ghost turn",
+     "        if for_task and not more_work and not (interrupted or self._ghost_interrupted):\n",
+     "        if not more_work and not (interrupted or self._ghost_interrupted):\n"),
+
+    ("bg-done rings though the turn left more work running",
+     "        if for_task and not more_work and not (interrupted or self._ghost_interrupted):\n",
+     "        if for_task and not (interrupted or self._ghost_interrupted):\n"),
+
+    ("bg-done rings for an interrupted turn",
+     "        if for_task and not more_work and not (interrupted or self._ghost_interrupted):\n",
+     "        if for_task and not more_work:\n"),
 ]
 
 # /move copies the whole session and can delete the original, or marks it
@@ -8336,6 +8403,8 @@ TARGETS = {
                    CWD_CONFIG_MUTATIONS, "pytest"),
     "cwd-server": ("server.py", "tests/test_cwd_arg.py",
                    CWD_SERVER_MUTATIONS, "pytest"),
+    "taskturn": ("sdk_bridge.py", "tests/test_task_turn_begins_early.py",
+                 TASKTURN_MUTATIONS, "pytest"),
     "movewhole-copy": ("copy_session.py", "tests/test_move_delete_original.py",
                        MOVEWHOLE_COPY_MUTATIONS, "pytest"),
     "movewhole-trash": ("session.py", "tests/test_move_delete_original.py",

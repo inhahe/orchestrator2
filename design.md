@@ -974,6 +974,13 @@ wherever `busy` flips True — `run_turn` and `_begin_ghost_turn_if_needed` — 
 resumption that both starts *and* ends inside the grace still silences it. One
 pending timer at a time, so a burst of completions is one bell.
 
+**Since 2026-10-23 bg-done rings mostly at the end of the task's turn.** The
+grace proved too short: 5% of those turns streamed their first output more than
+10 s after the task ended. The turn now begins when the task ends (§ "A finished
+background task's turn begins when the task ends"), and the bell rings when that
+turn is over: not interrupted, and leaving no further background work running.
+The timer is left for a task whose end starts no turn.
+
 Both the ring and the flush log — including *suppressed* rings — with the
 event, session id and title. Before that, a bell left no trace anywhere, and in
 a hub hosting several sessions a bell from a background tab is indistinguishable
@@ -1882,6 +1889,74 @@ make for this signal.
 
 Tests: `tests/test_cli_queue_race.py`, `tests/peer_message.test.js`; mutation
 targets `cliqueue-bridge`, `cliqueue-history`, `cliqueue-chat`.
+
+### A finished background task's turn begins when the task ends
+
+The section above assumed that a turn the CLI starts shows itself within
+milliseconds. That holds for a peer's message, which the CLI streams. It does
+not hold for the turn the CLI runs when a background task finishes between
+turns. The CLI streams nothing at that turn's start, neither the
+`<task-notification>` it gives the model nor anything else, until the model's
+first output exists. Measured over 2868 such turns on 2026-10-23, that took
+3.5 s at the median, 27 s at p99 and 82 s at most. For that long the session
+looked idle, and everything that waits for an idle session went through the
+gap into the CLI's turn:
+
+- **The queued prompt the task's end released.** The `bg-all-done` wakeup pops
+  the queue, and the settle counted only from the last turn's end.
+- **A typed prompt.** `server.py` routes by `state.busy`, so it went straight
+  to the CLI.
+- **A loop's wakeup.** It defers only while `state.busy`.
+- **A `/model` (or `/effort`, `/thinking`) switch deferred until the tasks
+  were done.** It was applied on `bg-all-done`, and its reconnect cut the task's
+  turn off.
+
+The CLI folded the prompt into the task's turn as a `queued_command`, or ran it
+after that turn, and `run_turn` ended on the task's result. The hub log has
+twelve of these ("run_turn ended on a turn that was not ours:
+origin=task-notification"). In the 2026-10-20 one the prompt went out 0.56 s
+after the task ended. Reported 2026-10-23: *"sometimes when a background task
+completes and it sends a queued prompt, the background task eats up the prompt
+and the model never sees it."* The bg-done bell rang into the same gap: its
+10 s wait was shorter than 5% of those turns, so it rang while the model was
+working.
+
+The SDK's `task_notification` message, though, arrives within milliseconds of
+the CLI queueing the notification, and a CLI with no turn running starts one
+for it at once. So that message, between turns, begins the ghost turn
+(`_begin_turn_for_task`). It does so before the completion is announced, so the
+`bg-all-done` it wakes finds the session busy. After that the existing
+machinery holds everything back: `server.py` queues, the worker declines, the
+wakeup defers, `run_turn` waits on `_ghost_settled`. The turn's first output
+continues the same ghost turn, and its result ends it. `_end_ghost_turn` then
+wakes the worker, for queued prompts and for a deferred reconnect.
+
+Four details:
+
+- **Two reports of one end.** The SDK reports a task's end twice, a few
+  milliseconds apart: the `task_updated` patch first, then `task_notification`,
+  which alone means a notification went to the model. Any end stamps
+  `_task_ended_at`. `_wait_out_cli_turn_start` waits `TURN_END_SETTLE_S` past the
+  later of that stamp and `_turn_ended_at`, re-checking after each wait. Both
+  `_pop_queued_prompt` and `_flush_deferred_reconnect` use it. A task that ends
+  without a notification therefore costs a queued prompt the settle and no
+  more.
+- **The deferred reconnect.** `_reconnect_blocked` adds `state.busy` to its
+  guard, because a ghost turn holds no `turn_active`.
+- **A turn that never shows.** It is let go after `TASK_TURN_SHOW_TIMEOUT_S`
+  (180 s, above the longest measured), loudly. Its first output cancels the
+  backstop. A reconnect abandons the turn, with a reason
+  (`_abandon_ghost_turn(why)`).
+- **bg-done.** It rings when the task's turn ends, provided the turn was not
+  interrupted and left no further background work running. By then the model
+  has dealt with the task and the session is waiting for the user. The 10 s
+  timer remains for a task whose end starts no turn.
+
+`_announce_if_not_our_turn` stays, for what cannot be seen coming: a peer's
+message arriving inside the settle, or the milliseconds between a prompt
+leaving and the CLI reading it.
+
+Tests: `tests/test_task_turn_begins_early.py`; mutation target `taskturn`.
 
 ### A launch's `--initial-prompt`
 

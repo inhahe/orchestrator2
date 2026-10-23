@@ -460,10 +460,11 @@ You can see which a session uses. The status bar's plan field reads **`API $1.23
 
 Valid events: `turn-done`, `interrupt`, `bg-done`, `requires-action`, `rate-hit`
 
-`bg-done` rings only when a background task finishes **while the session is
-parked waiting on it** (the "bg wait" status) — not when the model spawned the
-task mid-turn and kept working, since a routine mid-turn completion isn't worth
-alerting you about.
+`bg-done` rings when a background task that finished **while the session was
+parked waiting on it** (the "bg wait" status) has been dealt with: the model's
+turn about it is over, and it left no further background work running. It does
+not ring when the model spawned the task mid-turn and kept working, since a
+routine mid-turn completion isn't worth alerting you about.
 
 The flag accepts the same three forms as the `/bell` command:
 
