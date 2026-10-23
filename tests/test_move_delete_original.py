@@ -21,6 +21,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -107,6 +108,17 @@ def test_the_sessions_folder_comes_along(sess):
     assert (nf / "tool-results" / "b1.txt").read_text(encoding="utf-8") == "the whole output"
     assert (nf / "subagents" / "agent-a1.meta.json").exists()
     assert (nf / "subagents" / "agent-a1.jsonl").exists()
+
+
+def test_a_tools_saved_output_is_copied_as_it_is(sess):
+    """JSON lines a command printed, saved by the CLI: the tool's data, not
+    a transcript, and not to be rewritten."""
+    out = sess["folder"] / "tool-results" / "b2.jsonl"
+    raw = b'{"sessionId": "' + OLD.encode() + b'", "cwd": "/tool/own"}\r\nnot json\n'
+    out.write_bytes(raw)
+    _copy(sess, new_cwd="E:\\moved")
+
+    assert (sess["new_folder"] / "tool-results" / "b2.jsonl").read_bytes() == raw
 
 
 def test_but_not_the_originals_name(sess):
@@ -264,11 +276,16 @@ def test_a_session_goes_to_the_recycle_bin_whole(sess, recycle_bin):
     env = sess["src_cfg"] / "session-env" / OLD
     env.mkdir(parents=True)
 
+    records = sorted(str(p) for p in session._orch2_state_dir(cfg).glob(f"*/*{OLD}*.json"))
+
     left = trash_session(sess["jsonl"], cfg)
 
     assert left == []
-    assert recycle_bin == [str(sess["jsonl"]), str(sess["folder"]),
-                           str(sess["src_cfg"] / "file-history" / OLD)]
+    # The hub's records too, so a session restored from the bin keeps what
+    # it cost, how it compacts and where it was moved.
+    assert recycle_bin[:3] == [str(sess["jsonl"]), str(sess["folder"]),
+                               str(sess["src_cfg"] / "file-history" / OLD)]
+    assert sorted(recycle_bin[3:]) == records and len(records) == 2
     assert not env.exists()
     assert _hub_records(cfg, OLD) == []
 
@@ -340,7 +357,8 @@ def mv(move, monkeypatch, recycle_bin):
     # Short, so a copy wrongly waited for fails a test rather than holding
     # it for the real fifteen minutes.
     monkeypatch.setattr(server, "_MOVE_TRASH_WAIT_S", 2.0)
-    monkeypatch.setattr(proc_guard, "find_foreign_claude_for_session", lambda sid: [])
+    monkeypatch.setattr(proc_guard, "find_foreign_claude_for_session",
+                        lambda sid, strict=False: [])
 
     def run(**extra):
         async def go():
@@ -389,9 +407,11 @@ def test_not_asked_it_is_kept_and_marked(mv):
     mv["run"]()
 
     assert mv["src_jsonl"].exists() and mv["binned"] == []
-    to = load_moved_record(SID, mv["src_cfg"])
+    rec = load_moved_record(SID, mv["src_cfg"])
+    to = rec["to"]
     assert to["title"] == "the copy" and to["account"] == mv["dst_cfg"]
     assert to["session_id"] == next(kw["resume"] for kw in mv["created"])
+    assert not rec["delete"], "a restart would delete what was to be kept"
     assert "marks it as moved" in _said(mv)
 
 
@@ -428,7 +448,9 @@ def test_a_copy_that_comes_up_late_is_waited_for(mv):
 
 def _kept(mv, why):
     assert mv["src_jsonl"].exists() and mv["binned"] == []
-    assert load_moved_record(SID, mv["src_cfg"]) is not None, "not marked"
+    rec = load_moved_record(SID, mv["src_cfg"])
+    assert rec is not None, "not marked"
+    assert not rec["delete"], "a restart would try the deletion again"
     told = _told(mv)
     assert "The original session was kept" in told and why in told, told
 
@@ -482,11 +504,24 @@ def test_an_original_opened_again_is_kept(mv, monkeypatch):
 
 def test_an_original_another_process_has_open_is_kept(mv, monkeypatch):
     monkeypatch.setattr(proc_guard, "find_foreign_claude_for_session",
-                        lambda sid: ["a claude"] if sid == SID else [])
+                        lambda sid, strict=False: ["a claude"] if sid == SID else [])
 
     mv["run"](delete_original=True)
 
     _kept(mv, "another Claude process")
+
+
+def test_an_original_no_scan_could_check_is_kept(mv, monkeypatch):
+    """"Could not look" is not "nobody has it" -- not before a deletion."""
+    def cannot_look(sid, strict=False):
+        if strict:
+            raise proc_guard.ForeignScanFailed("psutil is not installed")
+        return []
+    monkeypatch.setattr(proc_guard, "find_foreign_claude_for_session", cannot_look)
+
+    mv["run"](delete_original=True)
+
+    _kept(mv, "could not be checked")
 
 
 def test_a_copy_short_of_records_keeps_the_original(mv, monkeypatch):
@@ -562,3 +597,104 @@ def test_a_copy_that_is_gone_is_not_pointed_at(listing):
     (listing["b"] / "projects" / "D--work" / f"{NEW}.jsonl").unlink()
 
     assert not listing["listed"]()[OLD].get("moved_to")
+
+
+def test_an_original_worked_in_since_is_its_own_session_again(listing):
+    """Opened from "open the original" and carried on in: clicking it must
+    not then lead to the copy, whose history stops at the move."""
+    original = listing["a"] / "projects" / "D--work" / f"{OLD}.jsonl"
+    later = time.time() + 60
+    os.utime(original, (later, later))
+
+    assert not listing["listed"]()[OLD].get("moved_to")
+
+
+# --------------------------------------------------------------------------
+# A move that ends badly
+# --------------------------------------------------------------------------
+
+def test_a_copy_that_will_not_start_is_not_left_behind(move, monkeypatch):
+    """The original is put back; the copy, which nobody has seen, would be a
+    second session under the move's name."""
+    move["fail"]["copy_runtime"] = True
+
+    move["run"]()
+
+    dst = Path(move["dst_cfg"])
+    assert not list(dst.glob("projects/*/*.jsonl")), "the copy's transcript is still there"
+    assert not list(dst.glob("orchestrator2/*/*.json")), "the hub's records of it too"
+
+
+def test_a_session_being_deleted_cannot_be_opened(monkeypatch):
+    monkeypatch.setattr(server, "_trashing_sids", {"gone-1"})
+
+    with pytest.raises(RuntimeError, match="Recycle Bin"):
+        asyncio.run(server._create_runtime(resume="gone-1"))
+
+
+def test_a_deletion_cut_short_by_a_restart_is_finished(monkeypatch, tmp_path, recycle_bin):
+    a, b = tmp_path / "acct-a", tmp_path / "acct-b"
+    for cfg, sid in ((a, OLD), (b, NEW)):
+        _write(cfg / "projects" / "D--work" / f"{sid}.jsonl",
+               [{"type": "user", "sessionId": sid, "cwd": CWD}])
+    save_moved_record(OLD, {"session_id": NEW, "account": str(b)}, str(a), delete=True)
+    monkeypatch.setattr(copy_session, "discover_claude_dirs", lambda: [a, b])
+    monkeypatch.setattr(server, "runtimes", {})
+    monkeypatch.setattr(proc_guard, "find_foreign_claude_for_session",
+                        lambda sid, strict=False: [])
+
+    asyncio.run(server._finish_interrupted_deletions())
+
+    assert str(a / "projects" / "D--work" / f"{OLD}.jsonl") in recycle_bin
+
+
+def test_but_kept_if_the_copy_falls_short_and_not_tried_again(monkeypatch, tmp_path, recycle_bin):
+    a, b = tmp_path / "acct-a", tmp_path / "acct-b"
+    _write(a / "projects" / "D--work" / f"{OLD}.jsonl",
+           [{"type": "user", "sessionId": OLD}, {"type": "user", "sessionId": OLD}])
+    _write(b / "projects" / "D--work" / f"{NEW}.jsonl", [{"type": "user", "sessionId": NEW}])
+    save_moved_record(OLD, {"session_id": NEW, "account": str(b)}, str(a), delete=True)
+    monkeypatch.setattr(copy_session, "discover_claude_dirs", lambda: [a, b])
+    monkeypatch.setattr(server, "runtimes", {})
+
+    asyncio.run(server._finish_interrupted_deletions())
+
+    assert recycle_bin == []
+    rec = load_moved_record(OLD, str(a))
+    assert rec is not None and not rec["delete"]
+
+
+def test_the_wait_for_the_copy_holds_for_a_real_bridge_that_is_connecting(monkeypatch):
+    """The wait reads state.connecting, which a real bridge sets as it
+    starts: a copy still connecting is waited for, not taken for one that
+    did not start."""
+    import sdk_bridge
+    from config import parse_args
+    from session_runtime import SessionRuntime
+    from state import init_state_from_config
+
+    cfg = parse_args([])
+    st = init_state_from_config(cfg)
+    rt = SessionRuntime(config=cfg, state=st, rid="copy")
+
+    async def bcast(m):
+        pass
+    br = sdk_bridge.SDKBridge(config=cfg, state=st, broadcaster=bcast)
+    rt.bridge = br
+    monkeypatch.setattr(server, "runtimes", {"copy": rt})
+    monkeypatch.setattr(server, "_MOVE_TRASH_POLL_S", 0.01)
+
+    async def connect(*a, **k):
+        await asyncio.sleep(0.2)
+        br.client = object()
+        st.connecting = False
+    monkeypatch.setattr(br, "connect", connect)
+
+    async def go():
+        await br.start()
+        why = await asyncio.wait_for(server._wait_for_the_copy(rt), 5)
+        br.stop_event.set()
+        br._worker_task.cancel()
+        return why
+
+    assert asyncio.run(go()) is None

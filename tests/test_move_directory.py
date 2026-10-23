@@ -209,6 +209,18 @@ def test_a_plain_copy_is_still_byte_identical(tmp_path):
     assert dst.read_bytes() == src.read_bytes()
 
 
+def test_a_rewritten_copy_keeps_the_clis_line_ends(tmp_path):
+    """The CLI writes LF and appends LF; a copy in the platform's line ends
+    would be CRLF on Windows, and then mixed once the CLI appends to it."""
+    src = tmp_path / "old" / "s.jsonl"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_bytes(b'{"sessionId":"s","cwd":"x"}\n{"sessionId":"s","cwd":"x"}\n')
+    dst = tmp_path / "new" / "n.jsonl"
+    copy_session_file(src, dst, "n", new_cwd=NEW_CWD)
+    data = dst.read_bytes()
+    assert b"\r" not in data and data.count(b"\n") == 2, data
+
+
 def test_an_unparseable_line_survives_a_move(tmp_path):
     src = tmp_path / "old" / "s.jsonl"
     src.parent.mkdir(parents=True, exist_ok=True)

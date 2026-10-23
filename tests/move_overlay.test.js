@@ -270,5 +270,19 @@ test('the box is as the last move left it', () => {
   assert(!p.deleteBox.checked, 'unticking not remembered');
 });
 
+test('the button says when this move deletes, remembered or ticked', () => {
+  const p = opened();
+  const btn = () => p.win.document.querySelector('.move-go');
+  assert(!/delete/i.test(btn().textContent), btn().textContent);
+  p.deleteBox.click();
+  assert(/delete the original/i.test(btn().textContent), 'ticking: ' + btn().textContent);
+  assert(btn().classList.contains('move-go-delete'), 'it does not look like a deletion');
+  p.go();
+  p.open();
+  p.list();
+  p.pickAccount(0);
+  assert(/delete the original/i.test(btn().textContent), 'remembered: ' + btn().textContent);
+});
+
 console.log(`\n${ran - failures}/${ran} passed`);
 process.exit(failures ? 1 : 0);

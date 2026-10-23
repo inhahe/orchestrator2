@@ -2102,16 +2102,25 @@ html, body {
 /* A session /move left behind: dimmed, so its copy is what the eye finds. */
 .lobby-item-moved { opacity: 0.6; }
 .lobby-item-moved:hover { opacity: 1; }
+/* The copy's name gives way to a narrow card, never the link back to the
+   original: once the item opens the copy, that link is the only way there. */
 .lobby-item-moved-to {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
   font-size: 11px;
   color: var(--text-dim);
   margin-top: 2px;
+}
+.lobby-item-moved-where {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .lobby-item-original {
-  margin-left: 8px;
+  flex: none;
   color: var(--text-dim);
 }
 
@@ -2320,6 +2329,9 @@ html, body {
 }
 .move-actions button:hover { border-color: var(--border-light); }
 .move-actions .move-go:hover { background: var(--accent-dim); }
+/* This press deletes something: it looks it. */
+.move-actions .move-go.move-go-delete { background: var(--red-dim); border-color: var(--red); color: #fff; }
+.move-actions .move-go.move-go-delete:hover { background: var(--red); }
 
 .move-msg {
   margin-top: 10px;

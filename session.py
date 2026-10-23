@@ -1410,10 +1410,17 @@ def _save_session_record(kind: str, session_id: str, record: dict[str, Any],
 
 
 def save_moved_record(session_id: str, to: dict[str, Any],
-                      config_dir: str | None = None) -> None:
-    """Record that *session_id* of account *config_dir* was moved to *to*:
-    the copy's ``session_id``, ``title``, ``cwd`` and ``account``."""
-    _save_session_record("moved", session_id, {"to": to}, config_dir)
+                      config_dir: str | None = None, *,
+                      moved_at: float | None = None, delete: bool = False) -> None:
+    """Record that *session_id* of account *config_dir* was moved to *to* --
+    the copy's ``session_id``, ``title``, ``cwd`` and ``account`` -- at
+    *moved_at* (``time.time()``; now if not given).  *delete* says that the
+    move is to send the original to the Recycle Bin and has not yet, so that
+    a hub restarted in between can finish it."""
+    record: dict[str, Any] = {"to": to, "moved_at": moved_at or time.time()}
+    if delete:
+        record["delete"] = True
+    _save_session_record("moved", session_id, record, config_dir)
 
 
 def moved_ids(config_dir: str | None = None) -> set[str]:
@@ -1427,13 +1434,18 @@ def moved_ids(config_dir: str | None = None) -> set[str]:
 
 def load_moved_record(session_id: str,
                       config_dir: str | None = None) -> dict[str, Any] | None:
-    """Where *session_id* of account *config_dir* was moved to, as
-    ``save_moved_record`` kept it; None if it was not, or nothing usable."""
-    to = (_load_session_record("moved", session_id, config_dir) or {}).get("to")
+    """The record ``save_moved_record`` kept of *session_id* of account
+    *config_dir* -- ``to``, ``moved_at``, and ``delete`` if it is set -- or
+    None if it was not moved, or the record is not usable."""
+    rec = _load_session_record("moved", session_id, config_dir) or {}
+    to = rec.get("to")
     if not (isinstance(to, dict) and isinstance(to.get("session_id"), str)
             and isinstance(to.get("account"), str)):
         return None
-    return to
+    moved_at = rec.get("moved_at")
+    if not isinstance(moved_at, (int, float)):
+        moved_at = rec.get("saved_at") if isinstance(rec.get("saved_at"), (int, float)) else 0.0
+    return {"to": to, "moved_at": float(moved_at), "delete": bool(rec.get("delete"))}
 
 
 def trash_session(jsonl: Path, config_dir: str | None = None) -> list[str]:
@@ -1441,28 +1453,58 @@ def trash_session(jsonl: Path, config_dir: str | None = None) -> list[str]:
     to the Recycle Bin, with what the CLI and the hub keep of it elsewhere.
 
     The transcript goes first; if it cannot (``OSError``), nothing else is
-    touched.  Its folder (``subagents/``, ``tool-results/``) and its
-    ``file-history`` follow it to the Recycle Bin, so restoring the session is
-    restoring those.  What is no use without it is deleted outright: the CLI's
-    ``session-env`` folder for it, and the hub's records of it (cost,
-    compaction, queue, background tasks, where it was moved).
+    touched.  Its folder (``subagents/``, ``tool-results/``), its
+    ``file-history`` and the hub's records of it (cost, compaction, queue,
+    background tasks, where it was moved) follow it to the Recycle Bin, so
+    restoring the session is restoring those.  The CLI's ``session-env``
+    folder for it, of no use without it, is deleted outright.
 
     Returns what could not be removed, a line per item, [] when everything
     was.  The caller must know no CLI is running the session.
     """
     from send2trash import send2trash
-    sid = jsonl.stem
-    acct = account_dir(config_dir)
+    restorable, disposable = _session_files(jsonl, config_dir)
     send2trash(str(jsonl))
     left: list[str] = []
-    for path in (jsonl.with_suffix(""), acct / "file-history" / sid):
+    for path in restorable[1:]:
         if path.exists():
             try:
                 send2trash(str(path))
             except OSError as exc:
                 left.append(f"{path}: {exc}")
-    records = list(_orch2_state_dir(config_dir).glob(f"*/*{_sanitize_cwd(sid)}*.json"))
-    for path in [acct / "session-env" / sid, *records]:
+    return left + _delete(disposable)
+
+
+def discard_session(jsonl: Path, config_dir: str | None = None) -> list[str]:
+    """Delete outright the session whose transcript is *jsonl*, in account
+    *config_dir*, and everything :func:`trash_session` would take with it --
+    for a copy a move made and then could not start, which nobody has seen.
+    Returns what could not be removed, as ``trash_session`` does."""
+    restorable, disposable = _session_files(jsonl, config_dir)
+    return _delete(restorable + disposable)
+
+
+def _session_files(jsonl: Path, config_dir: str | None
+                   ) -> tuple[list[Path], list[Path]]:
+    """The files of the session whose transcript is *jsonl*, in account
+    *config_dir*: (what restoring it needs -- the transcript first, then its
+    folder, its ``file-history`` and every record the hub keeps named for its
+    id: cost, compaction, queue, background tasks, where it was moved -- and
+    what is of no use without it: the CLI's ``session-env`` for it).  Those
+    that exist, but for the transcript, which is always first."""
+    sid = jsonl.stem
+    acct = account_dir(config_dir)
+    restorable = [jsonl] + [p for p in (jsonl.with_suffix(""), acct / "file-history" / sid)
+                            if p.exists()]
+    restorable += _orch2_state_dir(config_dir).glob(f"*/*{_sanitize_cwd(sid)}*.json")
+    return restorable, [acct / "session-env" / sid]
+
+
+def _delete(paths: list[Path]) -> list[str]:
+    """Delete each of *paths*, a file or a folder; what could not be, a line
+    each (a path already gone is not one)."""
+    left: list[str] = []
+    for path in paths:
         try:
             if path.is_dir():
                 shutil.rmtree(path)

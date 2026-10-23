@@ -894,9 +894,7 @@ const Lobby = (() => {
     const viewers = typeof m.viewers === 'number' ? m.viewers : null;
     const viewerLabel = viewers === 1 ? '1 viewer' : `${viewers} viewers`;
     // Show a short account tag for cross-account sessions.
-    const acct = m.account
-      ? m.account.replace(/\\/g, '/').split('/').pop() || ''
-      : '';
+    const acct = m.account ? _acctName(m.account) : '';
 
     // Idle-teardown countdown: shown only when the server has armed a timer
     // (viewer-less session that will be closed when it expires).
@@ -995,7 +993,8 @@ const Lobby = (() => {
       const where = [to.title || (to.session_id || '').substring(0, 8)];
       if (to.account && _acctName(to.account) !== acct) where.push(_acctName(to.account));
       moved = `
-      <div class="lobby-item-moved-to">moved &rarr; ${_esc(where.join(' · '))}
+      <div class="lobby-item-moved-to"><span class="lobby-item-moved-where"
+        >moved &rarr; ${_esc(where.join(' · '))}</span>
         <a class="lobby-item-original"
            data-sid="${_esc(s.session_id || '')}" data-cwd="${_esc(s.cwd || '')}"
            data-account="${_esc(s.account || '')}"

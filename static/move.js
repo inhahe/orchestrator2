@@ -191,8 +191,20 @@ const Move = (() => {
     const input = elBody.querySelector('#move-name');
     input.value = _currentTitle || '';
     const del = elBody.querySelector('#move-delete');
+    const goBtn = elBody.querySelector('.move-go');
+    // The box is as the last move left it, so the button says what this one
+    // will do: a deletion is never a surprise at the moment of pressing.
+    const sayWhatGoDoes = () => {
+      goBtn.textContent = del.checked ? 'Copy, continue & delete the original'
+                                      : 'Copy & continue';
+      goBtn.classList.toggle('move-go-delete', del.checked);
+    };
     del.checked = _deleteWanted();
-    del.addEventListener('change', () => _rememberDelete(del.checked));
+    sayWhatGoDoes();
+    del.addEventListener('change', () => {
+      _rememberDelete(del.checked);
+      sayWhatGoDoes();
+    });
 
     // `/move <path>` already said which directory, so the remaining
     // decision is the name; otherwise the directory is the first field.
@@ -212,7 +224,7 @@ const Move = (() => {
         accounts: _accounts, has_session: true, current_title: _currentTitle,
       }));
     const go = () => _submit(input.value, cwdInput.value, del.checked);
-    elBody.querySelector('.move-go').addEventListener('click', go);
+    goBtn.addEventListener('click', go);
     [input, cwdInput].forEach((el) => {
       el.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') { e.preventDefault(); go(); }

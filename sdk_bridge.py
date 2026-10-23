@@ -432,11 +432,10 @@ def _heavy_lock() -> asyncio.Lock:
 # flips True.  A bell that is a few seconds late costs nothing and a bell that
 # should never have rung costs the user's attention.
 #
-# The wait turned out to be too short as well: 5% of those turns showed
-# themselves more than 10 s after the task ended (TASK_TURN_SHOW_TIMEOUT_S).
-# Such a turn now begins when the task ends, so the bell rings when it is over
-# (_end_ghost_turn): the model has dealt with the task, and the session waits
-# for the user.  The timer is left for a task whose end starts no turn.
+# A CLI that says when it is working ("The CLI says when it is working",
+# below) starts the task's turn within milliseconds, which cancels this; the
+# bell then rings when the CLI goes idle again, the task dealt with
+# (_on_cli_idle).  The timer is for a task whose end starts no turn.
 BG_DONE_BELL_GRACE = 10.0
 
 # --- A queued prompt waits for the CLI's own queue --------------------------
@@ -460,31 +459,27 @@ BG_DONE_BELL_GRACE = 10.0
 # costs a queued prompt nothing it would notice.
 TURN_END_SETTLE_S = 1.5
 
-# --- A finished background task's turn begins when the task ends ------------
+# --- The CLI says when it is working ----------------------------------------
 #
-# The CLI streams nothing at the start of the turn it runs for a finished
-# background task: not the ``<task-notification>`` it gives the model, only the
-# model's first output, once that exists.  Measured over 2868 such turns
-# (2026-10-23): 3.5 s later at the median, 27 s at p99, 82 s at most.  The
-# SDK's ``task_notification`` message, though, arrives within milliseconds of
-# the CLI queueing the notification, and a CLI with no turn running starts
-# one for it at once.
+# A turn the CLI starts by itself -- for a finished background task, a peer's
+# message -- streams nothing until the model's first output, seconds later (a
+# median of 3.5 s, up to 82 s, over 2868 such turns).  Anything sent to the
+# CLI meanwhile goes into that turn, or runs after it, and the turn that sent
+# it ends on the other turn's result.  So the CLI's own word is what counts:
+# its ``session_state_changed`` (CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS) says
+# "running" the moment it starts working and "idle" only once it has nothing
+# left to run, and every turn it starts opens with an ``init``.  Measured
+# against CLI 2.1.280: a task's end, then "running" 20 ms later and the first
+# output 3.3 s after that; two task turns and a queued prompt one after
+# another, with no "idle" between them, only an ``init`` at each start.
 #
-# A ghost turn begun only at that first output left the session looking idle
-# for those seconds, and everything that waits for an idle session went
-# through the gap into the CLI's turn: the queued prompt the task's end
-# released ("bg-all-done"), a typed one, a loop's wakeup, a /model switch
-# deferred until the tasks were done (whose reconnect cut the turn off).  The
-# CLI folded the prompt into the task's turn or ran it after, and this
-# bridge's turn ended on the task's result.  Reported: "sometimes when a
-# background task completes and it sends a queued prompt, the background task
-# eats up the prompt and the model never sees it."  The bg-done bell rang into
-# the same gap, mid-work.
-#
-# So that message begins the ghost turn (``_begin_turn_for_task``).  If the
-# turn shows nothing for this long, it is let go, loudly -- above the longest
-# measured, since letting go early reopens the gap.
-TASK_TURN_SHOW_TIMEOUT_S = 180.0
+# So, between turns, "running" -- and an ``init`` while the CLI is running --
+# begins a ghost turn, and nothing is sent to the CLI while it says "running":
+# not a queued prompt (_held_by_a_turn), a turn (_await_ghost_settled), or a
+# reconnect (_reconnect_blocked).  Its "idle" lets them go
+# (_on_cli_idle).  The dispatcher notes it itself (_note_cli_state): an "idle"
+# that comes with a turn's result goes to that turn's queue, which stops being
+# read at the result.
 
 # --- Recovering from a dead CLI subprocess ---------------------------------
 #
@@ -952,15 +947,17 @@ class SDKBridge:
         self._turn_ended_at: float | None = None
         # When a background task last finished between turns (monotonic), and
         # so the CLI may be starting a turn for it.  A queued prompt waits
-        # TURN_END_SETTLE_S past it too: the SDK can report the end of a task
-        # (task_updated) a few milliseconds before the message that begins its
-        # turn here (task_notification).
+        # TURN_END_SETTLE_S past it too, for a CLI that does not say when it
+        # is working.
         self._task_ended_at: float | None = None
-        # The ghost turn under way was begun for a finished background task
-        # (_begin_turn_for_task): its end is when bg-done rings.
+        # The CLI has run a turn for a finished background task since it was
+        # last idle (a result whose origin says so): bg-done rings when it is
+        # idle again (_on_cli_idle).
         self._turn_for_task = False
-        # Lets go of a task's turn that never shows (TASK_TURN_SHOW_TIMEOUT_S).
-        self._task_turn_backstop: asyncio.Task | None = None
+        # Set whenever the CLI is not saying "running" -- for run_turn to wait
+        # on (_await_ghost_settled).  Kept with _cli_state by _set_cli_state.
+        self._cli_quiet = asyncio.Event()
+        self._cli_quiet.set()
 
         self._dispatcher_task: asyncio.Task | None = None
         self._worker_task: asyncio.Task | None = None
@@ -1904,7 +1901,7 @@ class SDKBridge:
         # still recognised as a death rather than a first one.
         self._transport_dead = False
         # A new process has said nothing about its state yet.
-        self._cli_state = None
+        self._set_cli_state(None)
 
         # Join the cross-account agent registry now that the session id is
         # known: a resumed session inherits its prior identity by that id,
@@ -3183,9 +3180,34 @@ class SDKBridge:
         there is nothing to defer to when the CLI is already gone, and an
         explicit ``/connect`` is the user overruling us on purpose.
 
+        Nor at the price of a turn the CLI is running by itself -- for a
+        finished task, a peer's message -- which a reconnect would cut off.
+        That one is waited for too, and the switch made when the CLI is idle.
+
         Returns True if the reconnect happened now.
         """
         running = self._active_bg_tasks()
+        if not running and not self.state.busy and self._cli_state == "running":
+            # Just after a turn of ours, whose "idle" may be on its way -- or
+            # the start of one of the CLI's own.  A moment tells them apart.
+            # (No task starts outside a turn, so *running* still holds.)
+            try:
+                await asyncio.wait_for(self._cli_quiet.wait(), TURN_END_SETTLE_S)
+            except asyncio.TimeoutError:
+                pass
+        if not running and (self.state.busy or self._cli_state == "running"):
+            self._deferred_reconnect = reason
+            log.info("deferring reconnect (%s): the CLI is in a turn of its own",
+                     reason)
+            await self.broadcast({
+                "type": "system_msg",
+                "subtype": "info",
+                "data": {"message": (
+                    f"{reason} — takes effect when the turn the session is in "
+                    f"ends. Use /connect to apply it immediately anyway."
+                )},
+            })
+            return False
         if not running:
             await self.reconnect()
             return True
@@ -3208,9 +3230,11 @@ class SDKBridge:
     def _reconnect_blocked(self) -> bool:
         """Whether a deferred reconnect must wait still: background tasks run,
         which it would kill, or a turn does -- ours holds ``turn_active``, one
-        the CLI started (a ghost turn) only ``state.busy`` -- or a connect."""
+        the CLI started (a ghost turn) ``state.busy`` or, before it shows,
+        only the CLI's "running" -- or a connect."""
         return bool(self._active_bg_tasks() or self.turn_active.is_set()
-                    or self.state.busy or self.state.connecting)
+                    or self.state.busy or self._cli_state == "running"
+                    or self.state.connecting)
 
     async def _flush_deferred_reconnect(self) -> bool:
         """Apply a reconnect :meth:`_reconnect_or_defer` postponed, if it is now safe.
@@ -3236,8 +3260,12 @@ class SDKBridge:
         await self.broadcast({
             "type": "system_msg",
             "subtype": "info",
-            "data": {"message": f"Background tasks finished — applying {reason}."},
+            "data": {"message": f"Applying {reason} now."},
         })
+        # The broadcast may have let the CLI start a turn of its own: asked
+        # again with nothing awaited before the reconnect.  Its end pokes.
+        if self._reconnect_blocked():
+            return False
         await self.reconnect()
         return True
 
@@ -3300,9 +3328,11 @@ class SDKBridge:
         state.turn_started_at = None
         state.active_tools.clear()
         self._ghost_settled.set()
+        # Its stream has stopped, as a result would have said: a turn waiting
+        # on an interrupt of it need not sit out the timeout.
+        self._interrupt_settled.set()
         self._turn_ended_at = time.monotonic()
         self._turn_for_task = False
-        self._cancel_task_turn_backstop()
 
     # ------------------------------------------------------------------
     # Message dispatcher
@@ -3324,6 +3354,19 @@ class SDKBridge:
         tokens = call_context_tokens(getattr(msg, "usage", None))
         if tokens:
             self.state.context_tokens = tokens
+
+    async def _route(self, msg: Any) -> None:
+        """Hand SDK message *msg* to whoever reads it: a turn of ours while
+        ``turn_active`` is set, the between-turns path otherwise -- having
+        first noted what it says of the context and of the CLI's state, which
+        hold whoever reads it, and however far."""
+        if isinstance(msg, (AssistantMessage, SystemMessage)):
+            self._note_context(msg)
+        self._note_cli_state(msg)
+        if self.turn_active.is_set():
+            await self.turn_msg_queue.put(msg)
+        else:
+            await self._handle_async_message(msg)
 
     async def _message_dispatcher(self, *, gen: int) -> None:
         """Read SDK messages and route to turn queue or async handler.
@@ -3366,12 +3409,7 @@ class SDKBridge:
                         type(msg).__name__, active,
                     )
                     break
-                if isinstance(msg, (AssistantMessage, SystemMessage)):
-                    self._note_context(msg)
-                if active:
-                    await self.turn_msg_queue.put(msg)
-                else:
-                    await self._handle_async_message(msg)
+                await self._route(msg)
         except asyncio.CancelledError:
             log.info(
                 "dispatcher cancelled: gen=%d msgs=%d",
@@ -3631,9 +3669,15 @@ class SDKBridge:
             # cleanup that run_turn's finally block does so the UI
             # returns to idle and the next turn can start clean.
             if state.busy and not self.turn_active.is_set():
-                await self._end_ghost_turn(subtype, interrupted=getattr(
-                    msg, "terminal_reason", None) in ("aborted_streaming",
-                                                      "aborted_tools"))
+                interrupted = getattr(msg, "terminal_reason", None) in (
+                    "aborted_streaming", "aborted_tools")
+                # The CLI's own word on what the turn was for: one it ran for
+                # a finished background task is what bg-done announces once
+                # the CLI is idle (unless it was stopped: _end_ghost_turn).
+                origin = getattr(msg, "origin", None)
+                if isinstance(origin, dict) and origin.get("kind") == "task-notification":
+                    self._turn_for_task = True
+                await self._end_ghost_turn(subtype, interrupted=interrupted)
             self._ghost_interrupted = False
 
         else:
@@ -4620,9 +4664,9 @@ class SDKBridge:
             self, cause: str = "SDK streaming without active run_turn") -> bool:
         """Mark a ghost turn active and push a status_update once.
 
-        Called on every async assistant/user message, and by
-        ``_begin_turn_for_task`` before there is one; *cause* says which, in
-        the log.  Idempotent: only flips state once, until ``_end_ghost_turn``
+        Called on every async assistant/user message, and when the CLI says
+        it has started a turn, before there is one; *cause* says which, in the
+        log.  Idempotent: only flips state once, until ``_end_ghost_turn``
         clears it.
 
         Returns False when the caller should *not* render the message, because
@@ -4638,8 +4682,6 @@ class SDKBridge:
         if self.turn_active.is_set():
             return False
         if state.busy:
-            # A task's turn begun before its output: this is that output.
-            self._cancel_task_turn_backstop()
             return True
         # This ghost turn IS the post-compact continuation that the deferred
         # turn_end was waiting for — it will book the turn and emit its own
@@ -4745,8 +4787,9 @@ class SDKBridge:
         state = self.state
         was_compact = state.compact_during_last_turn
         duration = time.monotonic() - (state.turn_started_at or time.monotonic())
-        for_task, self._turn_for_task = self._turn_for_task, False
-        self._cancel_task_turn_backstop()
+        if interrupted or self._ghost_interrupted:
+            # Stopped, not dealt with: nothing for bg-done to announce.
+            self._turn_for_task = False
 
         # Mirror run_turn's finally cleanup.
         state.busy = False
@@ -4790,18 +4833,11 @@ class SDKBridge:
         await self._after_limit_turn(
             interrupted=interrupted or self._ghost_interrupted)
 
-        # The model has dealt with the task that started this turn, and the
-        # session waits for the user -- unless it has started more work in
-        # the background, whose own end will say so.
-        more_work = bool(self._active_bg_tasks())
-        if for_task and not more_work and not (interrupted or self._ghost_interrupted):
-            ring_bell(state, "bg-done")
-            await self._flush_bell()
-
         self._poke_after_ghost_turn()
 
     def _poke_after_ghost_turn(self) -> None:
-        """Wake the parked worker for what waited out a ghost turn.
+        """Wake the parked worker for what waited out a ghost turn, or the
+        CLI's whole run of turns.
 
         A prompt queued during it: server.py saw ``state.busy`` and routed it
         to ``state.queued_prompts`` rather than the event queue, and the
@@ -4810,7 +4846,8 @@ class SDKBridge:
         ``bg-all-done`` wakeup that would have applied it was declined while
         the turn ran.  A CLI command (``/rename``): declined likewise.  The
         wakeup is the same one a finished queue edit sends; it is skipped when
-        the queue's head is being edited and nothing else waits.
+        the queue's head is being edited and nothing else waits.  Each of them
+        still checks for itself that the CLI is free.
         """
         state = self.state
         if ((state.queued_prompts and state.queue_editing_index != 0)
@@ -4825,40 +4862,58 @@ class SDKBridge:
             except Exception as exc:
                 log.warning("ghost-turn CLI-command poke failed: %r", exc)
 
-    async def _begin_turn_for_task(self) -> None:
-        """Begin the turn the CLI is starting for a background task that has
-        just finished, between turns -- now, not at its first output.
+    # ------------------------------------------------------------------
+    # The CLI's own word on whether it is working
+    # ------------------------------------------------------------------
 
-        See ``TASK_TURN_SHOW_TIMEOUT_S`` for why.  Nothing to do while a turn
-        runs: the CLI hands the notification to that turn instead.
+    def _set_cli_state(self, value: str | None) -> None:
+        """Keep *value* as the CLI's last word on whether it is working --
+        "running", "idle", "requires_action", or None for a CLI that has said
+        nothing yet -- with the event run_turn waits on."""
+        self._cli_state = value
+        if value == "running":
+            self._cli_quiet.clear()
+        else:
+            self._cli_quiet.set()
+
+    def _note_cli_state(self, msg: Any) -> None:
+        """Note what *msg* says of the CLI's state, if it is a
+        ``session_state_changed``: called by the dispatcher on every message,
+        whoever reads it next.
+
+        An "idle" that comes with one of our turns' results goes to that
+        turn's queue, which stops being read at the result -- so it is noted
+        here, and what waited for the CLI to be free is woken here too.
         """
-        if self.turn_active.is_set() or self.state.busy:
+        if not (isinstance(msg, SystemMessage)
+                and getattr(msg, "subtype", None) == "session_state_changed"):
             return
-        self._turn_for_task = True
-        self._cancel_task_turn_backstop()
-        self._task_turn_backstop = asyncio.create_task(
-            self._let_go_of_silent_task_turn(), name="task-turn-backstop")
-        await self._begin_ghost_turn_if_needed(cause="a background task finished")
+        d = msg.data if isinstance(msg.data, dict) else {}
+        value = d.get("state")
+        if not value:
+            return
+        was = self._cli_state
+        self._set_cli_state(value)
+        if value == "idle" and was == "running" and self.turn_active.is_set():
+            self._poke_after_ghost_turn()
 
-    def _cancel_task_turn_backstop(self) -> None:
-        task, self._task_turn_backstop = self._task_turn_backstop, None
-        if task is not None and not task.done():
-            task.cancel()
-
-    async def _let_go_of_silent_task_turn(self) -> None:
-        """End a task's turn that has shown nothing in
-        ``TASK_TURN_SHOW_TIMEOUT_S``, so that what waits for it goes."""
-        try:
-            await asyncio.sleep(TASK_TURN_SHOW_TIMEOUT_S)
-        except asyncio.CancelledError:
-            return
-        self._task_turn_backstop = None
-        if self.turn_active.is_set() or not self.state.busy:
-            return
-        self._abandon_ghost_turn(
-            f"a finished background task's turn showed nothing in "
-            f"{TASK_TURN_SHOW_TIMEOUT_S:.0f}s")
-        await self._broadcast_status()
+    async def _on_cli_idle(self) -> None:
+        """The CLI has nothing left to run: close a ghost turn it never sent
+        a result for, ring bg-done for a background task it has dealt with,
+        and wake what waited for it."""
+        state = self.state
+        if state.busy and not self.turn_active.is_set():
+            self._abandon_ghost_turn("the CLI went idle without its result")
+            await self._broadcast_status()
+        # The CLI ran a turn for a finished background task, and the model
+        # has dealt with it.  Not if the session is about to work again (a
+        # prompt waits to go) or has more work in the background, whose own
+        # end will say so.
+        more_work = bool(state.queued_prompts or self._active_bg_tasks())
+        if self._turn_for_task and not more_work:
+            ring_bell(state, "bg-done")
+            await self._flush_bell()
+        self._turn_for_task = False
         self._poke_after_ghost_turn()
 
     # ------------------------------------------------------------------
@@ -4987,26 +5042,41 @@ class SDKBridge:
         someone else's result -- "it showed it sent as a You: message, but it
         just kept working and never answered me".
 
+        Held, too, while the CLI says it is running and nothing has shown:
+        between one of its own turns' result and the next one's ``init``, or
+        before a turn it has just started shows anything.
+
         The timeout is long because a ghost turn is real work and can run for
         tens of minutes (the reported one ran 19), and starting early is the
         bug.  It is finite only so a ghost turn whose terminator never lands
         cannot wedge the session forever; that case logs loudly rather than
         failing silently.
         """
-        if self._ghost_settled.is_set():
+        def settled() -> bool:
+            return self._ghost_settled.is_set() and self._cli_quiet.is_set()
+
+        if settled():
             return
-        log.info("run_turn: waiting for a ghost turn to finish before starting")
+        log.info("run_turn: waiting for the CLI's own turn to finish before starting")
+
+        async def both() -> None:
+            while not settled():
+                await self._ghost_settled.wait()
+                await self._cli_quiet.wait()
+
         try:
-            await asyncio.wait_for(self._ghost_settled.wait(), timeout)
+            await asyncio.wait_for(both(), timeout)
         except asyncio.TimeoutError:
             log.warning(
-                "run_turn: ghost turn still streaming after %.0fs — starting "
-                "anyway; this turn may consume its result", timeout,
+                "run_turn: the CLI is still in a turn of its own after %.0fs — "
+                "starting anyway; this turn may consume its result", timeout,
             )
         finally:
             # Either way the wait is over; a stale clear must not delay every
             # future turn.
             self._ghost_settled.set()
+            if not self._cli_quiet.is_set():
+                self._set_cli_state(None)
 
     async def flush_pending_turn_end(self) -> None:
         """Close out a deferred turn_end *before* echoing the next prompt.
@@ -5159,6 +5229,15 @@ class SDKBridge:
         data: dict[str, Any] = {}
 
         if subtype == "init":
+            # Every turn opens with one, a few milliseconds after the CLI says
+            # "running" -- or straight after its last result, when it goes on
+            # to another turn without going idle.  Between turns, while the CLI
+            # says it is running, this is a turn of its own starting: working
+            # from now, not from its first output, seconds away.
+            if (not during_turn and not self.turn_active.is_set()
+                    and self._cli_state == "running"):
+                await self._begin_ghost_turn_if_needed(
+                    cause="the CLI started a turn of its own")
             first_init = not state.init_seen
             state.init_seen = True
             # The init SystemMessage has no ``session_id`` attribute — it
@@ -5252,12 +5331,7 @@ class SDKBridge:
             data = {"error": str(error_info) if error_info else None}
 
         elif subtype == "task_notification":
-            # Background task completion.  Between turns, the CLI has just
-            # queued this for the model and is starting a turn for it, which
-            # begins here: before the completion is announced, so that what
-            # the announcement wakes (bg-all-done) finds the session busy.
-            if not during_turn:
-                await self._begin_turn_for_task()
+            # Background task completion.
             task_id = getattr(msg, "task_id", None) or ""
             status = getattr(msg, "status", None) or "completed"
             summary = getattr(msg, "summary", None)
@@ -5354,22 +5428,26 @@ class SDKBridge:
             # (SystemMessage only carries ``subtype`` + ``data``).  Emitted
             # only when CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS is set, which
             # we do in _make_options.
+            # The dispatcher noted it as it arrived (_note_cli_state).  A turn
+            # reads its queue later, by which time the CLI may have said
+            # something newer, so only between turns -- read as it arrives --
+            # is it noted again here (for a caller that hands it straight
+            # here), and acted on.
             d = msg.data if isinstance(msg.data, dict) else {}
             session_state = d.get("state")
-            if session_state:
-                self._cli_state = session_state
-            if session_state == "idle" and self._pending_cli_command:
-                # "idle" lands just *after* a turn's result, so the end-of-turn
-                # attempt at a waiting /rename can still have seen "running"
-                # and declined.  Nothing else would wake the worker for it.
-                self.event_queue.put_nowait(("cli-command", ""))
+            if session_state and not during_turn:
+                self._set_cli_state(session_state)
+            # "running" begins nothing itself: the init that opens the turn
+            # comes with it (and see init, above).
+            if (not during_turn and not self.turn_active.is_set()
+                    and session_state == "idle"):
+                await self._on_cli_idle()
             if session_state == "requires_action":
                 ring_bell(state, "requires-action")
                 await self._flush_bell()
                 data = {"state": "requires_action"}
             else:
-                # idle/running are lifecycle noise — orchestrator2 already
-                # tracks busy/idle itself via run_turn.  Don't surface them.
+                # Not shown: the status bar says working or idle already.
                 return
 
         elif subtype == "task_updated":
@@ -5982,12 +6060,6 @@ class SDKBridge:
                     if msg.session_id:
                         self._take_session_id(msg.session_id)
 
-                    # The CLI's own "idle" follows in the same instant --
-                    # measured -- and so is routed here too, into a queue that
-                    # the next turn start throws away unread.  The result *is*
-                    # the end of the turn it announced as "running".
-                    self._cli_state = "idle"
-
                     # Terminating result after a user interrupt: emit the
                     # deferred interrupted turn_end marker now (after the
                     # wind-down output), and don't book the aborted turn.
@@ -6452,9 +6524,11 @@ class SDKBridge:
 
     def _held_by_a_turn(self) -> bool:
         """Whether a turn is under way that a queued prompt must not go into:
-        ours (``turn_active``) or one the CLI started (a ghost turn, which
-        sets only ``state.busy``).  Says so in the log when it is."""
-        if not (self.state.busy or self.turn_active.is_set()):
+        ours (``turn_active``), or one the CLI started -- a ghost turn, which
+        sets only ``state.busy``, or one it has said it is running and not yet
+        shown.  Says so in the log when it is."""
+        if not (self.state.busy or self.turn_active.is_set()
+                or self._cli_state == "running"):
             return False
         log.info("queued prompt held: a turn is under way (%d queued)",
                  len(self.state.queued_prompts))
@@ -6617,9 +6691,6 @@ class SDKBridge:
                 if msg is INTERRUPT_SENTINEL:
                     continue
                 if isinstance(msg, ResultMessage):
-                    # As in run_turn: the "idle" that follows lands in the
-                    # queue we are about to stop reading.
-                    self._cli_state = "idle"
                     break
                 if isinstance(msg, SystemMessage):
                     # init (which carries the session id of a session this

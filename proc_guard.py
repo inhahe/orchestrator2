@@ -612,7 +612,13 @@ def _is_session_fork(argv: list[str]) -> bool:
     return "--fork-session" in argv
 
 
-def find_foreign_claude_for_session(session_id: str) -> list[ClaudeProc]:
+class ForeignScanFailed(RuntimeError):
+    """The process scan could not look: psutil is missing, or the walk itself
+    failed.  Raised only to a caller that asked for it (``strict``)."""
+
+
+def find_foreign_claude_for_session(session_id: str, *,
+                                    strict: bool = False) -> list[ClaudeProc]:
     """Find ``claude`` processes resuming *session_id* outside our own tree.
 
     A match means something else is already driving that conversation — an
@@ -622,12 +628,14 @@ def find_foreign_claude_for_session(session_id: str) -> list[ClaudeProc]:
 
     Returns [] when nothing matches, when *session_id* is falsy, or when the
     scan can't run (psutil missing). A best-effort detector must never be the
-    reason a session won't start, so every failure is a silent [].
+    reason a session won't start, so every failure is a silent [] -- unless
+    *strict*, for a caller about to destroy the session, to whom "could not
+    look" is not "nobody has it": then ``ForeignScanFailed`` is raised.
     """
     if not session_id:
         return []
     found: list[ClaudeProc] = []
-    for pid, sid, argv, created in _foreign_holders():
+    for pid, sid, argv, created in _foreign_holders(strict=strict):
         if sid != session_id:
             continue
         found.append(ClaudeProc(pid=pid, started=_started_text(created),
@@ -643,7 +651,7 @@ def _started_text(created) -> str:
         return ""
 
 
-def _foreign_holders(dirs=None):
+def _foreign_holders(dirs=None, *, strict: bool = False):
     """``(pid, session_id, argv, create_time)`` for each ``claude`` process
     outside our own tree that holds a session.
 
@@ -655,19 +663,27 @@ def _foreign_holders(dirs=None):
 
     Best effort throughout: a failure yields fewer holders, never an
     exception, and a session missing here is treated as not running
-    elsewhere -- what the callers did before this existed.
+    elsewhere -- what the callers did before this existed.  Unless *strict*:
+    then a scan that cannot run, or whose walk fails, raises
+    ``ForeignScanFailed``.  A single process that vanishes or may not be read
+    is skipped either way.
     """
     try:
         import psutil
     except ImportError:
+        if strict:
+            raise ForeignScanFailed("psutil is not installed") from None
         log.debug("foreign-holder scan: psutil not installed — skipped")
         return
     try:
         mine = _own_tree_pids()
         advertised = _advertised_sessions(dirs)
-    except Exception:
+        procs = list(psutil.process_iter(["pid", "name", "cmdline", "create_time"]))
+    except Exception as exc:
+        if strict:
+            raise ForeignScanFailed(f"the process scan failed: {exc}") from exc
         return
-    for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
+    for proc in procs:
         try:
             pid = proc.info["pid"]
             if pid in mine:

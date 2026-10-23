@@ -237,7 +237,7 @@ def test_the_deferred_switch_lands_once_the_tasks_finish():
     state.background_tasks.clear()
     assert asyncio.run(br._flush_deferred_reconnect()) is True
     assert len(connects) == 1
-    assert "applying model → opus" in _messages(sent)
+    assert "Applying model → opus" in _messages(sent)
 
 
 def test_the_flush_does_nothing_while_the_tasks_are_still_running():

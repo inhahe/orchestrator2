@@ -108,6 +108,7 @@ from state import (
     state_to_status_dict,
 )
 from session import (
+    discard_session,
     find_most_recent_session_for_cwd,
     find_session_cwd,
     find_session_dir,
@@ -706,9 +707,10 @@ def _recent_disk_sessions(limit: int = 40) -> list[dict[str, Any]]:
     out.sort(key=lambda s: s.get("mtime", 0), reverse=True)
     out = out[:limit]
     moved = {cdir: moved_ids(cdir) for cdir in config_dirs}
+    known = seen_sids | live_ids
     for s in out:
         if s["session_id"] in moved.get(s["account"], ()):
-            s["moved_to"] = _moved_to(s["session_id"], s["account"], out, live_titles)
+            s["moved_to"] = _moved_to(s, out, live_titles, known)
     # Persist any newly-resolved titles so the next process start is fast.
     try:
         from session import flush_title_index
@@ -719,15 +721,25 @@ def _recent_disk_sessions(limit: int = 40) -> list[dict[str, Any]]:
     return out
 
 
-def _moved_to(sid: str, account: str, listed: list[dict[str, Any]],
-              live_titles: dict[str | None, str | None]) -> dict[str, Any] | None:
-    """Where session *sid* of *account* was moved: the copy's ``session_id``,
-    ``title``, ``cwd`` and ``account`` -- or None, if it was not moved or the
-    copy is gone.  The title is the copy's own now, if it is running (in
-    *live_titles*, session id to title) or in *listed* (the session list being
-    built), else what the move named it."""
-    to = load_moved_record(sid, account)
-    if to is None or find_session_dir(to["session_id"], to["account"]) is None:
+def _moved_to(entry: dict[str, Any], listed: list[dict[str, Any]],
+              live_titles: dict[str | None, str | None],
+              known: set[str | None]) -> dict[str, Any] | None:
+    """Where the session of list *entry* was moved: the copy's
+    ``session_id``, ``title``, ``cwd`` and ``account`` -- or None, if it was
+    not moved, the copy is gone (not among *known*, every session id the
+    scan found or running), or the original has been worked in since the
+    move, which makes it a session of its own again.  The title is the
+    copy's own now, if it is running (in *live_titles*, session id to title)
+    or in *listed* (the session list being built), else what the move named
+    it."""
+    rec = load_moved_record(entry["session_id"], entry["account"])
+    if rec is None:
+        return None
+    to = rec["to"]
+    if to["session_id"] not in known:
+        return None
+    # A second of slack for a file system's coarse times.
+    if (entry.get("mtime") or 0) > rec["moved_at"] + 1:
         return None
     title = (live_titles.get(to["session_id"])
              or next((s.get("title") for s in listed
@@ -1887,6 +1899,8 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_resurrect_scheduled_wakeups(), name="wakeup-restore")
     # And any session that was waiting on a usage limit's reset.
     asyncio.create_task(_restore_limit_resumes(), name="limit-resume-restore")
+    # And the deletion of a moved session's original that a stop cut short.
+    asyncio.create_task(_finish_interrupted_deletions(), name="move-trash-restore")
 
     # Keep the live model-list cache warm off the event loop so /model (which
     # runs on the loop) can read it without blocking on a network call.
@@ -2053,6 +2067,11 @@ async def _create_runtime(
 
     Registers the runtime, starts its bridge, and refreshes the lobby.
     """
+    for sid in (resume, seed_id):
+        if sid and sid in _trashing_sids:
+            raise RuntimeError(
+                "that session is being sent to the Recycle Bin, having been "
+                "moved -- open its copy instead")
     assert config is not None
     resolved_cwd = (
         str(Path(cwd).resolve(strict=False)) if cwd else config.cwd
@@ -5608,6 +5627,12 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
             resume_after_limit=carry["resume_after_limit"])
     except Exception as exc:
         log.exception("move: failed to start runtime for copied session")
+        # Nobody has seen the copy, and left there it would be a second
+        # session under the move's name.
+        left = await asyncio.to_thread(discard_session, dest_jsonl, target_cfg)
+        if left:
+            log.warning("move: could not remove the copy that did not start: %s",
+                        "; ".join(left))
         await _move_failed(f"Couldn't start the moved session: {exc}")
         return
     # What was waiting in the original now waits here.  (The deque persists it
@@ -5632,9 +5657,10 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
     # The original says where the work went, whether it is to be deleted or
     # not: a deletion that does not happen leaves it marked all the same, and
     # one that does takes the record with it.
-    await asyncio.to_thread(save_moved_record, sid, {
-        "session_id": new_id, "title": new_name, "cwd": dest_cwd,
-        "account": target_cfg}, src_cfg)
+    await asyncio.to_thread(functools.partial(
+        save_moved_record, sid, {
+            "session_id": new_id, "title": new_name, "cwd": dest_cwd,
+            "account": target_cfg}, src_cfg, delete=delete_original))
     _forget_disk_sessions()
     await _push_session_list()
     if delete_original:
@@ -5668,6 +5694,9 @@ _MOVE_TRASH_WAIT_S = 900.0
 _MOVE_TRASH_POLL_S = 0.5
 #: The deletions waiting on a copy, held so none is collected mid-wait.
 _move_trash_tasks: set[asyncio.Task] = set()
+#: The sessions a move is sending to the Recycle Bin right now, by id: none
+#: of them may be opened meanwhile (_create_runtime refuses).
+_trashing_sids: set[str] = set()
 
 
 async def _trash_moved_original(new_rt: SessionRuntime, src_jsonl: Path,
@@ -5677,69 +5706,131 @@ async def _trash_moved_original(new_rt: SessionRuntime, src_jsonl: Path,
     *new_rt* is the copy's runtime, *src_jsonl* and *dest_jsonl* the two
     transcripts, *src_cfg* the original's account.  Deleting waits for the
     copy's CLI to have resumed it -- proof the copy is a session and not only
-    a file -- and is refused if the original is running again, here or in
-    another process, or if the copy holds fewer records than it.  A refused or
-    failed deletion keeps the original, marked as moved (``_do_move`` saved
-    the record), and the copy's tabs are told why either way.
+    a file -- and then goes as ``_delete_moved_original`` allows.  A refused
+    or failed deletion keeps the original, marked as moved (``_do_move``
+    saved the record), and the copy's tabs are told why either way.
     """
-    why = await _why_keep_moved_original(new_rt, src_jsonl, dest_jsonl)
+    why = await _wait_for_the_copy(new_rt)
     left: list[str] = []
     if why is None:
-        try:
-            left = await asyncio.to_thread(trash_session, src_jsonl, src_cfg)
-        except Exception as exc:
-            log.warning("move: could not trash the original %s", src_jsonl,
-                        exc_info=True)
-            why = f"it could not be sent to the Recycle Bin ({exc})"
+        why, left = await _delete_moved_original(src_jsonl, dest_jsonl, src_cfg)
     if why is None:
-        log.info("move: the original %s went to the Recycle Bin", src_jsonl)
         text = "The original session went to the Recycle Bin."
         if left:
             text += " Some of its files could not be removed:\n" + "\n".join(left)
     else:
         log.info("move: kept the original %s: %s", src_jsonl, why)
+        await asyncio.to_thread(_keep_moved_original, src_jsonl.stem, src_cfg)
         text = (f"The original session was kept: {why}. The session list "
                 f"marks it as moved.")
+    # Files left behind are the user's to clear up: a warning, as a refusal is.
     await new_rt.broadcast({"type": "system_msg",
-                            "subtype": "info" if why is None else "warning",
+                            "subtype": "info" if why is None and not left else "warning",
                             "data": {"message": text}})
     _forget_disk_sessions()
     await _push_session_list()
 
 
-async def _why_keep_moved_original(new_rt: SessionRuntime, src_jsonl: Path,
-                                   dest_jsonl: Path) -> str | None:
-    """Why the original of a move must not be deleted, in words for the user;
-    None once it may be.  Waits for the copy's CLI to come up first."""
-    from copy_session import count_records
+async def _wait_for_the_copy(new_rt: SessionRuntime) -> str | None:
+    """Wait for the copy's CLI, *new_rt*'s, to have resumed the copy; why
+    the original must be kept after all, in words for the user, if it does
+    not; None once it has."""
     deadline = time.monotonic() + _MOVE_TRASH_WAIT_S
     while True:
         if runtimes.get(new_rt.rid) is not new_rt:
             return "the copy was closed before it had started"
         br, st = new_rt.bridge, new_rt.state
         if getattr(br, "client", None) is not None and not st.connecting:
-            break
+            return None
         if not st.connecting:
             return "the copy did not start"
         if time.monotonic() >= deadline:
             return (f"the copy had not started after "
                     f"{_MOVE_TRASH_WAIT_S / 60:.0f} minutes")
         await asyncio.sleep(_MOVE_TRASH_POLL_S)
+
+
+async def _delete_moved_original(src_jsonl: Path, dest_jsonl: Path,
+                                 src_cfg: str | None) -> tuple[str | None, list[str]]:
+    """Send the original of a move, *src_jsonl* in account *src_cfg*, to the
+    Recycle Bin -- unless its copy *dest_jsonl* holds fewer records than it,
+    or something has it open, here or in another process.
+
+    Returns (why it was kept, in words for the user, or None if it went;
+    what of it could not be removed).  From the moment the checks pass until
+    the deletion is over, the session cannot be opened here: the last check,
+    and the mark that keeps it shut, come with no await between them.
+    """
+    from copy_session import count_records
     sid = src_jsonl.stem
-    if await asyncio.to_thread(proc_guard.find_foreign_claude_for_session, sid):
-        return "another Claude process has it open"
     try:
         theirs, ours = await asyncio.to_thread(
             lambda: (count_records(src_jsonl), count_records(dest_jsonl)))
     except OSError as exc:
-        return f"the two could not be compared ({exc})"
+        return f"the two could not be compared ({exc})", []
     if ours < theirs:
-        return f"the copy holds {ours} records and the original {theirs}"
-    # Last, and with no await after it before the deletion starts: the
-    # slower checks above give the user time to open it.
+        return f"the copy holds {ours} records and the original {theirs}", []
+    try:
+        holders = await asyncio.to_thread(functools.partial(
+            proc_guard.find_foreign_claude_for_session, sid, strict=True))
+    except proc_guard.ForeignScanFailed as exc:
+        return f"other Claude processes could not be checked for it ({exc})", []
+    if holders:
+        return "another Claude process has it open", []
     if _live_runtime_for(sid) is not None:
-        return "it was opened again"
-    return None
+        return "it was opened again", []
+    _trashing_sids.add(sid)
+    try:
+        left = await asyncio.to_thread(trash_session, src_jsonl, src_cfg)
+    except Exception as exc:
+        log.warning("move: could not trash the original %s", src_jsonl,
+                    exc_info=True)
+        return f"it could not be sent to the Recycle Bin ({exc})", []
+    finally:
+        _trashing_sids.discard(sid)
+    log.info("move: the original %s went to the Recycle Bin", src_jsonl)
+    return None, left
+
+
+def _keep_moved_original(sid: str, config_dir: str | None) -> None:
+    """Keep the original of a move after all: its record no longer says it
+    is to be deleted, so no restart tries again."""
+    rec = load_moved_record(sid, config_dir)
+    if rec is not None:
+        save_moved_record(sid, rec["to"], config_dir, moved_at=rec["moved_at"])
+
+
+async def _finish_interrupted_deletions() -> None:
+    """Finish what a move that was to delete its original had not, when the
+    hub stopped first: the copy may never have come up under it, so it is
+    taken as the complete copy it is, and the rest is as before -- a copy
+    short of records, or an original open somewhere, keeps it."""
+    from copy_session import discover_claude_dirs
+    for cfg in [str(p) for p in await asyncio.to_thread(discover_claude_dirs)]:
+        for sid in await asyncio.to_thread(moved_ids, cfg):
+            rec = await asyncio.to_thread(load_moved_record, sid, cfg)
+            if rec is None or not rec["delete"]:
+                continue
+            to = rec["to"]
+            src_dir = await asyncio.to_thread(find_session_dir, sid, cfg)
+            dest_dir = await asyncio.to_thread(
+                find_session_dir, to["session_id"], to["account"])
+            if src_dir is None or dest_dir is None:
+                log.info("move: an interrupted deletion of %s has nothing to "
+                         "finish (%s)", sid[:8],
+                         "the original is gone" if src_dir is None else "no copy")
+                await asyncio.to_thread(_keep_moved_original, sid, cfg)
+                continue
+            why, left = await _delete_moved_original(
+                src_dir / f"{sid}.jsonl", dest_dir / f"{to['session_id']}.jsonl", cfg)
+            if why is not None:
+                log.info("move: kept the original %s after a restart: %s",
+                         sid[:8], why)
+                await asyncio.to_thread(_keep_moved_original, sid, cfg)
+            elif left:
+                log.warning("move: parts of %s could not be removed: %s",
+                            sid[:8], "; ".join(left))
+    _forget_disk_sessions()
 
 
 def _move_where(dest_cwd: str | None, target_cfg: str | None) -> str:

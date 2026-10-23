@@ -385,12 +385,12 @@ RECONNECT_MUTATIONS = [
      ""),
 
     ("/model reconnects regardless, orphaning the tasks it was told about",
-     '        running = self._active_bg_tasks()\n        if not running:\n            await self.reconnect()\n            return True\n',
-     '        running = self._active_bg_tasks()\n        await self.reconnect()\n        return True\n'),
+     '        if not running:\n            await self.reconnect()\n            return True\n        n = len(running)\n',
+     '        await self.reconnect()\n        return True\n        n = len(running)\n'),
 
     ("the deferred request is never recorded, so it is simply dropped",
-     '        self._deferred_reconnect = reason\n',
-     ""),
+     '        self._deferred_reconnect = reason\n        log.info("deferring reconnect (%s): %d bg task(s) running", reason, n)\n',
+     '        log.info("deferring reconnect (%s): %d bg task(s) running", reason, n)\n'),
 
     ("the deferral is silent, so /model looks like it did nothing",
      '                f"{reason} — takes effect once the {n} running background "',
@@ -1070,22 +1070,19 @@ MOVECOPY_MUTATIONS = [
 
     ("the move is done as a blind text replacement, which falsifies the "
      "transcript along with the metadata",
-     '    tmp = dest_jsonl.with_name(dest_jsonl.name + ".tmp")\n'
-     '    try:\n'
-     '        with src_jsonl.open(encoding="utf-8", errors="replace") as fin, \\\n'
-     '                tmp.open("w", encoding="utf-8") as fout:\n'
      "            for line in fin:\n"
      "                stripped = line.strip()",
-     '    tmp = dest_jsonl.with_name(dest_jsonl.name + ".tmp")\n'
-     '    _old_cwd = _read_session_meta(src_jsonl).get("cwd") if new_cwd else None\n'
-     '    try:\n'
-     '        with src_jsonl.open(encoding="utf-8", errors="replace") as fin, \\\n'
-     '                tmp.open("w", encoding="utf-8") as fout:\n'
      "            for line in fin:\n"
+     '                _old_cwd = _read_session_meta(src_jsonl).get("cwd") if new_cwd else None\n'
      "                if _old_cwd:\n"
      "                    line = line.replace(json.dumps(_old_cwd)[1:-1],\n"
      "                                        json.dumps(new_cwd)[1:-1])\n"
      "                stripped = line.strip()"),
+
+    ("a rewritten copy is written with the platform's line ends, CRLF on "
+     "Windows",
+     '                tmp.open("w", encoding="utf-8", newline="") as fout:\n',
+     '                tmp.open("w", encoding="utf-8") as fout:\n'),
 
     ("the branch is carried into a tree it has nothing to do with",
      '                    if new_branch is not None and "gitBranch" in rec:\n'
@@ -2045,14 +2042,17 @@ LOSTBG_SESSION_MUTATIONS = [
 GHOSTQUEUE_MUTATIONS = [
     ("a prompt is popped while a ghost turn streams -- the reported bug: "
      "echoed as You:, then the turn dies on the ghost turn's result",
-     "        if not (self.state.busy or self.turn_active.is_set()):\n"
+     "        if not (self.state.busy or self.turn_active.is_set()\n"
+     "                or self._cli_state == \"running\"):\n"
      "            return False\n",
      "        return False\n"),
 
     ("the guard asks turn_active, which a ghost turn never sets -- the exact "
      "confusion that caused the bug",
-     "        if not (self.state.busy or self.turn_active.is_set()):\n",
-     "        if not self.turn_active.is_set():\n"),
+     "        if not (self.state.busy or self.turn_active.is_set()\n"
+     "                or self._cli_state == \"running\"):\n",
+     "        if not (self.turn_active.is_set()\n"
+     "                or self._cli_state == \"running\"):\n"),
 
     ("a poke during a ghost turn holds the worker for the settle, away from "
      "a quit or a /model",
@@ -2848,28 +2848,20 @@ SESSIONNAME_MUTATIONS = [
      '                or self._cli_state == "running"):\n',
      "                or self.turn_active.is_set() or self._transport_dead):\n"),
 
-    ("a turn's result does not end its 'running', so every rename made after "
-     "a real turn waits indefinitely -- the CLI's 'idle' lands in the turn's "
-     "queue and is thrown away (found end-to-end against CLI 2.1.280)",
-     '                    # the end of the turn it announced as "running".\n'
-     '                    self._cli_state = "idle"\n',
-     '                    # the end of the turn it announced as "running".\n'),
-
-    ("the exchange's own result does not end its 'running', so a second "
-     "rename waits indefinitely",
-     "                    # queue we are about to stop reading.\n"
-     '                    self._cli_state = "idle"\n',
-     "                    # queue we are about to stop reading.\n"),
-
     ("the CLI's own report that it started a turn is ignored",
-     "            if session_state:\n"
-     "                self._cli_state = session_state\n",
+     "            if session_state and not during_turn:\n"
+     "                self._set_cli_state(session_state)\n",
      ""),
 
     ("the CLI going idle does not wake a worker that deferred a rename, which "
      "then waits for the next prompt",
-     '            if session_state == "idle" and self._pending_cli_command:\n',
-     "            if False:\n"),
+     "        if self._pending_cli_command:\n"
+     "            try:\n"
+     '                self.event_queue.put_nowait(("cli-command", ""))\n'
+     "            except Exception as exc:\n"
+     '                log.warning("ghost-turn CLI-command poke failed: %r", exc)\n',
+     "        if False:\n"
+     "            pass\n"),
 
     ("the stream is not claimed, so the CLI's reply renders as a ghost turn",
      "        self.turn_active.set()\n        reply = \"\"\n",
@@ -6148,8 +6140,8 @@ DEADCLI_RECOVERY_MUTATIONS = [
 
     ("abandoning a ghost turn leaves a prompt waiting on its end",
      "        self._ghost_settled.set()\n"
-     "        self._turn_ended_at = time.monotonic()\n        self._turn_for_task = False\n",
-     "        self._turn_ended_at = time.monotonic()\n        self._turn_for_task = False\n"),
+     "        # Its stream has stopped, as a result would have said: a turn waiting\n",
+     "        # Its stream has stopped, as a result would have said: a turn waiting\n"),
 
     ("a death mid-turn is answered with re-send your last prompt -- the report",
      "        if self._last_reconnect_recovered:\n            text = (",
@@ -6783,8 +6775,8 @@ COMPACTION_BRIDGE_MUTATIONS = [
      "                or self.client is None):\n"),
 
     ("the context is never counted",
-     "                if isinstance(msg, (AssistantMessage, SystemMessage)):\n"
-     "                    self._note_context(msg)\n",
+     "        if isinstance(msg, (AssistantMessage, SystemMessage)):\n"
+     "            self._note_context(msg)\n",
      ""),
 
     ("a compaction leaves the old count standing",
@@ -7080,35 +7072,75 @@ MD_LINKS_MUTATIONS = [
      "    s = s.replace(/`([^`]+?)`/g, (whole, code) => code.startsWith('[') ? whole :\n"),
 ]
 
-# A finished background task's turn begins when the task ends, not at its
-# first output (tests/test_task_turn_begins_early.py).
-TASKTURN_MUTATIONS = [
-    ("the task's turn begins at its first output again -- the report",
-     "            if not during_turn:\n                await self._begin_turn_for_task()\n",
+# A turn the CLI runs by itself is a turn from the moment the CLI says so,
+# and nothing goes to the CLI while it says "running".
+# tests/test_cli_turns.py.
+CLITURN_MUTATIONS = [
+    ("a turn the CLI starts is not begun at its init, so it looks idle until "
+     "it shows -- the report",
+     "                await self._begin_ghost_turn_if_needed(\n"
+     "                    cause=\"the CLI started a turn of its own\")\n",
+     "                pass\n"),
+
+    ("any init between turns begins a turn, the CLI idle or not",
+     "                    and self._cli_state == \"running\"):\n"
+     "                await self._begin_ghost_turn_if_needed(\n",
+     "                    ):\n"
+     "                await self._begin_ghost_turn_if_needed(\n"),
+
+    ("the CLI going idle is not acted on: nothing waiting is woken",
+     "                    and session_state == \"idle\"):\n"
+     "                await self._on_cli_idle()\n",
+     "                    and False):\n"
+     "                await self._on_cli_idle()\n"),
+
+    ("a turn the CLI went idle on without a result stays open",
+     "        if state.busy and not self.turn_active.is_set():\n"
+     "            self._abandon_ghost_turn(\"the CLI went idle without its result\")\n",
+     "        if False:\n"
+     "            self._abandon_ghost_turn(\"the CLI went idle without its result\")\n"),
+
+    ("a queued prompt goes to a CLI that says it is running",
+     "        if not (self.state.busy or self.turn_active.is_set()\n"
+     "                or self._cli_state == \"running\"):\n",
+     "        if not (self.state.busy or self.turn_active.is_set()):\n"),
+
+    ("a turn of ours starts while the CLI says it is running",
+     "            return self._ghost_settled.is_set() and self._cli_quiet.is_set()\n",
+     "            return self._ghost_settled.is_set()\n"),
+
+    ("the dispatcher does not note the CLI's word, so what a turn of ours "
+     "hears is never noted -- its 'idle' lands in the turn's queue, read no "
+     "further than the result (found end-to-end against CLI 2.1.280)",
+     "        self._note_cli_state(msg)\n",
      ""),
 
-    ("a second turn is begun under a ghost turn",
-     "        if self.turn_active.is_set() or self.state.busy:\n            return\n"
-     "        self._turn_for_task = True\n",
-     "        if self.turn_active.is_set():\n            return\n"
-     "        self._turn_for_task = True\n"),
+    ("the CLI's word, noted, is not kept",
+     "        was = self._cli_state\n        self._set_cli_state(value)\n",
+     "        was = self._cli_state\n"),
 
-    ("a turn that never shows is never let go",
-     "        self._task_turn_backstop = asyncio.create_task(\n"
-     "            self._let_go_of_silent_task_turn(), name=\"task-turn-backstop\")\n",
-     "        self._task_turn_backstop = None\n"),
+    ("a word read late, by a turn, overrides what the CLI said since",
+     "            if session_state and not during_turn:\n",
+     "            if session_state:\n"),
 
-    ("a turn that shows is let go anyway",
-     "            self._cancel_task_turn_backstop()\n            return True\n",
-     "            return True\n"),
+    ("a /model typed during one of the CLI's turns cuts it off",
+     "        if not running and (self.state.busy or self._cli_state == \"running\"):\n",
+     "        if False:\n"),
 
-    ("letting go of it leaves what waited for it waiting",
-     "        await self._broadcast_status()\n        self._poke_after_ghost_turn()\n",
-     "        await self._broadcast_status()\n"),
+    ("one typed just after a turn of ours waits for nothing it can see",
+     "            try:\n"
+     "                await asyncio.wait_for(self._cli_quiet.wait(), TURN_END_SETTLE_S)\n",
+     "            try:\n"
+     "                pass\n"),
 
-    ("a reconnect leaves the backstop armed",
-     "        self._turn_for_task = False\n        self._cancel_task_turn_backstop()\n\n",
-     "        self._turn_for_task = False\n\n"),
+    ("a deferred reconnect runs under a turn the CLI said it is running",
+     "                    or self.state.busy or self._cli_state == \"running\"\n",
+     "                    or self.state.busy\n"),
+
+    ("a deferred reconnect does not ask again after its announcement",
+     "        # again with nothing awaited before the reconnect.  Its end pokes.\n"
+     "        if self._reconnect_blocked():\n            return False\n",
+     "        # again with nothing awaited before the reconnect.  Its end pokes.\n"),
 
     ("a task's end does not start the settle",
      "        if not self.turn_active.is_set():\n            self._task_ended_at = time.monotonic()\n",
@@ -7117,10 +7149,6 @@ TASKTURN_MUTATIONS = [
     ("the settle is not re-checked, so the patch's end slips past it",
      "            if wait <= 0:\n                return True\n",
      "            if True:\n                return True\n"),
-
-    ("a deferred reconnect runs under a turn the CLI started",
-     "                    or self.state.busy or self.state.connecting)\n",
-     "                    or self.state.connecting)\n"),
 
     ("a deferred reconnect does not wait out the settle",
      "        if not await self._wait_out_cli_turn_start():\n            return False\n"
@@ -7131,21 +7159,28 @@ TASKTURN_MUTATIONS = [
      "                or self._deferred_reconnect is not None):\n",
      "                or False):\n"),
 
-    ("bg-done does not ring when the task's turn is over",
-     "            ring_bell(state, \"bg-done\")\n            await self._flush_bell()\n",
-     "            pass\n"),
+    ("bg-done does not ring when the CLI is done with the task",
+     "            ring_bell(state, \"bg-done\")\n            await self._flush_bell()\n"
+     "        self._turn_for_task = False\n",
+     "            pass\n"
+     "        self._turn_for_task = False\n"),
 
-    ("bg-done rings for any ghost turn",
-     "        if for_task and not more_work and not (interrupted or self._ghost_interrupted):\n",
-     "        if not more_work and not (interrupted or self._ghost_interrupted):\n"),
+    ("bg-done rings for any turn the CLI ran",
+     "                if isinstance(origin, dict) and origin.get(\"kind\") == \"task-notification\":\n",
+     "                if True:\n"),
+
+    ("bg-done rings though a prompt waits to go",
+     "        more_work = bool(state.queued_prompts or self._active_bg_tasks())\n",
+     "        more_work = bool(self._active_bg_tasks())\n"),
 
     ("bg-done rings though the turn left more work running",
-     "        if for_task and not more_work and not (interrupted or self._ghost_interrupted):\n",
-     "        if for_task and not (interrupted or self._ghost_interrupted):\n"),
+     "        more_work = bool(state.queued_prompts or self._active_bg_tasks())\n",
+     "        more_work = bool(state.queued_prompts)\n"),
 
-    ("bg-done rings for an interrupted turn",
-     "        if for_task and not more_work and not (interrupted or self._ghost_interrupted):\n",
-     "        if for_task and not more_work:\n"),
+    ("bg-done rings for a task's turn that was interrupted",
+     "            # Stopped, not dealt with: nothing for bg-done to announce.\n"
+     "            self._turn_for_task = False\n",
+     "            # Stopped, not dealt with: nothing for bg-done to announce.\n"),
 ]
 
 # /move copies the whole session and can delete the original, or marks it
@@ -7160,8 +7195,12 @@ MOVEWHOLE_COPY_MUTATIONS = [
      "                if path.is_dir():\n"),
 
     ("a subagent's transcript is copied untouched",
-     '                if path.suffix == ".jsonl":\n',
+     '                if rel.parts[0] == "subagents" and path.suffix == ".jsonl":\n',
      "                if False:\n"),
+
+    ("every .jsonl in the folder is rewritten, a tool's saved output too",
+     '                if rel.parts[0] == "subagents" and path.suffix == ".jsonl":\n',
+     '                if path.suffix == ".jsonl":\n'),
 
     ("a subagent's transcript is rewritten as if it were the session's own",
      "                    copy_session_file(path, dest, new_id, old_id=old_id, **rewrite)\n",
@@ -7205,17 +7244,23 @@ MOVEWHOLE_COPY_MUTATIONS = [
 ]
 
 MOVEWHOLE_TRASH_MUTATIONS = [
-    ("the folder stays behind",
-     '    for path in (jsonl.with_suffix(""), acct / "file-history" / sid):\n',
-     '    for path in (acct / "file-history" / sid,):\n'),
+    ("the folder and the rewind backups stay behind",
+     "    for path in restorable[1:]:\n",
+     "    for path in []:\n"),
 
-    ("the hub's records of it stay behind",
-     "    for path in [acct / \"session-env\" / sid, *records]:\n",
-     "    for path in [acct / \"session-env\" / sid]:\n"),
+    ("the hub's records of it stay behind, or go for good",
+     "    restorable += _orch2_state_dir(config_dir).glob(f\"*/*{_sanitize_cwd(sid)}*.json\")\n",
+     ""),
 
     ("a deletion that half fails says nothing",
-     '                left.append(f"{path}: {exc}")\n    records',
-     "                pass\n    records"),
+     "            except OSError as exc:\n                left.append(f\"{path}: {exc}\")\n"
+     "    return left + _delete(disposable)\n",
+     "            except OSError as exc:\n                pass\n"
+     "    return left + _delete(disposable)\n"),
+
+    ("a copy that did not start keeps its folder and backups",
+     "    return _delete(restorable + disposable)\n",
+     "    return _delete(restorable[:1] + disposable)\n"),
 
     ("the rest goes even when the transcript would not",
      "    send2trash(str(jsonl))\n",
@@ -7232,8 +7277,42 @@ MOVEWHOLE_SERVER_MUTATIONS = [
      '    delete_original = msg.get("delete_original") is not None\n'),
 
     ("the original is not marked as moved",
-     "    await asyncio.to_thread(save_moved_record, sid, {\n",
-     "    await asyncio.to_thread(lambda *a: None, sid, {\n"),
+     "    await asyncio.to_thread(functools.partial(\n        save_moved_record, sid, {\n",
+     "    await asyncio.to_thread(functools.partial(\n        lambda *a, **k: None, sid, {\n"),
+
+    ("the deletion asked for is not recorded, so a restart forgets it",
+     "            \"account\": target_cfg}, src_cfg, delete=delete_original))\n",
+     "            \"account\": target_cfg}, src_cfg))\n"),
+
+    ("a refused deletion stays recorded, so a restart tries it again",
+     "        await asyncio.to_thread(_keep_moved_original, src_jsonl.stem, src_cfg)\n",
+     ""),
+
+    ("a deletion cut short by a restart is never finished",
+     "    asyncio.create_task(_finish_interrupted_deletions(), name=\"move-trash-restore\")\n",
+     ""),
+
+    ("a session being deleted can be opened meanwhile",
+     "        if sid and sid in _trashing_sids:\n",
+     "        if False:\n"),
+
+    ("a copy that did not start is left behind",
+     "        left = await asyncio.to_thread(discard_session, dest_jsonl, target_cfg)\n",
+     "        left = []\n"),
+
+    ("a scan that could not look is taken for nobody having it",
+     "    except proc_guard.ForeignScanFailed as exc:\n"
+     "        return f\"other Claude processes could not be checked for it ({exc})\", []\n",
+     "    except proc_guard.ForeignScanFailed as exc:\n"
+     "        holders = []\n"),
+
+    ("a deletion that left files behind is reported as plain news",
+     "                            \"subtype\": \"info\" if why is None and not left else \"warning\",\n",
+     "                            \"subtype\": \"info\" if why is None else \"warning\",\n"),
+
+    ("an original worked in since the move still opens the stale copy",
+     "    if (entry.get(\"mtime\") or 0) > rec[\"moved_at\"] + 1:\n",
+     "    if False:\n"),
 
     ("the deletion does not wait for the copy",
      '        if getattr(br, "client", None) is not None and not st.connecting:\n',
@@ -7252,12 +7331,12 @@ MOVEWHOLE_SERVER_MUTATIONS = [
      "        if False:\n"),
 
     ("an original opened again is deleted under it",
-     "    if _live_runtime_for(sid) is not None:\n        return \"it was opened again\"\n",
-     "    if False:\n        return \"it was opened again\"\n"),
+     "    if _live_runtime_for(sid) is not None:\n        return \"it was opened again\", []\n",
+     "    if False:\n        return \"it was opened again\", []\n"),
 
     ("an original another process has open is deleted under it",
-     "    if await asyncio.to_thread(proc_guard.find_foreign_claude_for_session, sid):\n",
-     "    if False:\n"),
+     "    if holders:\n        return \"another Claude process has it open\", []\n",
+     "    if False:\n        return \"another Claude process has it open\", []\n"),
 
     ("a copy short of records does not stop the deletion",
      "    if ours < theirs:\n",
@@ -7265,17 +7344,17 @@ MOVEWHOLE_SERVER_MUTATIONS = [
 
     ("a refused deletion is not said",
      "    await new_rt.broadcast({\"type\": \"system_msg\",\n"
-     "                            \"subtype\": \"info\" if why is None else \"warning\",\n",
+     "                            \"subtype\": \"info\" if why is None and not left else \"warning\",\n",
      "    (lambda m: None)({\"type\": \"system_msg\",\n"
-     "                            \"subtype\": \"info\" if why is None else \"warning\",\n"),
+     "                            \"subtype\": \"info\" if why is None and not left else \"warning\",\n"),
 
     ("a moved original is not marked in the list",
-     '            s["moved_to"] = _moved_to(s["session_id"], s["account"], out, live_titles)\n',
+     '            s["moved_to"] = _moved_to(s, out, live_titles, known)\n',
      "            pass\n"),
 
     ("a copy that is gone is still pointed at",
-     '    if to is None or find_session_dir(to["session_id"], to["account"]) is None:\n',
-     "    if to is None:\n"),
+     '    if to["session_id"] not in known:\n',
+     "    if False:\n"),
 
     ("the copy's title is what the move named it, not what it is now",
      "             or next((s.get(\"title\") for s in listed\n",
@@ -7322,8 +7401,16 @@ MOVEWHOLE_UI_MUTATIONS = [
      "      delete_original: true,\n"),
 
     ("the checkbox is not remembered",
-     "    del.addEventListener('change', () => _rememberDelete(del.checked));\n",
+     "      _rememberDelete(del.checked);\n",
      ""),
+
+    ("the button does not say a remembered deletion is coming",
+     "    del.checked = _deleteWanted();\n    sayWhatGoDoes();\n",
+     "    del.checked = _deleteWanted();\n"),
+
+    ("the button does not say a deletion just ticked is coming",
+     "      _rememberDelete(del.checked);\n      sayWhatGoDoes();\n",
+     "      _rememberDelete(del.checked);\n"),
 
     ("the checkbox does not start as last left",
      "    del.checked = _deleteWanted();\n",
@@ -8540,8 +8627,8 @@ TARGETS = {
                    CWD_CONFIG_MUTATIONS, "pytest"),
     "cwd-server": ("server.py", "tests/test_cwd_arg.py",
                    CWD_SERVER_MUTATIONS, "pytest"),
-    "taskturn": ("sdk_bridge.py", "tests/test_task_turn_begins_early.py",
-                 TASKTURN_MUTATIONS, "pytest"),
+    "cliturn": ("sdk_bridge.py", "tests/test_cli_turns.py",
+                CLITURN_MUTATIONS, "pytest"),
     "movewhole-copy": ("copy_session.py", "tests/test_move_delete_original.py",
                        MOVEWHOLE_COPY_MUTATIONS, "pytest"),
     "movewhole-trash": ("session.py", "tests/test_move_delete_original.py",

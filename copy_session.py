@@ -344,8 +344,10 @@ def copy_session_file(src_jsonl: Path, dest_jsonl: Path, new_id: str, *,
 
     tmp = dest_jsonl.with_name(dest_jsonl.name + ".tmp")
     try:
+        # newline="": the CLI writes and appends LF, and a text-mode write on
+        # Windows would make every copied record CRLF.
         with src_jsonl.open(encoding="utf-8", errors="replace") as fin, \
-                tmp.open("w", encoding="utf-8") as fout:
+                tmp.open("w", encoding="utf-8", newline="") as fout:
             for line in fin:
                 stripped = line.strip()
                 if not stripped:
@@ -440,7 +442,9 @@ def copy_whole_session(src_jsonl: Path, dest_jsonl: Path, new_id: str, *,
                     continue
                 dest = new_folder / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                if path.suffix == ".jsonl":
+                # Subagents' transcripts, not every .jsonl: a tool's output
+                # saved under tool-results/ is kept byte for byte.
+                if rel.parts[0] == "subagents" and path.suffix == ".jsonl":
                     copy_session_file(path, dest, new_id, old_id=old_id, **rewrite)
                 else:
                     shutil.copy2(path, dest)

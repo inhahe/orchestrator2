@@ -974,11 +974,13 @@ wherever `busy` flips True — `run_turn` and `_begin_ghost_turn_if_needed` — 
 resumption that both starts *and* ends inside the grace still silences it. One
 pending timer at a time, so a burst of completions is one bell.
 
-**Since 2026-10-23 bg-done rings mostly at the end of the task's turn.** The
+**Since 2026-10-23 bg-done rings when the CLI is done with the task.** The
 grace proved too short: 5% of those turns streamed their first output more than
-10 s after the task ended. The turn now begins when the task ends (§ "A finished
-background task's turn begins when the task ends"), and the bell rings when that
-turn is over: not interrupted, and leaving no further background work running.
+10 s after the task ended. The CLI says "running" within 80 ms of a task's end,
+which begins the turn and cancels the timer (§ "A turn the CLI runs by itself
+is a turn from the moment it says so"). The bell rings at its next "idle", after
+a turn its result says was for a task. It does not ring if that turn was
+interrupted, if a prompt waits to go, or if background work is still running.
 The timer is left for a task whose end starts no turn.
 
 Both the ring and the flush log — including *suppressed* rings — with the
@@ -1894,7 +1896,7 @@ make for this signal.
 Tests: `tests/test_cli_queue_race.py`, `tests/peer_message.test.js`; mutation
 targets `cliqueue-bridge`, `cliqueue-history`, `cliqueue-chat`.
 
-### A finished background task's turn begins when the task ends
+### A turn the CLI runs by itself is a turn from the moment it says so
 
 The section above assumed that a turn the CLI starts shows itself within
 milliseconds. That holds for a peer's message, which the CLI streams. It does
@@ -1925,42 +1927,57 @@ and the model never sees it."* The bg-done bell rang into the same gap: its
 10 s wait was shorter than 5% of those turns, so it rang while the model was
 working.
 
-The SDK's `task_notification` message, though, arrives within milliseconds of
-the CLI queueing the notification, and a CLI with no turn running starts one
-for it at once. So that message, between turns, begins the ghost turn
-(`_begin_turn_for_task`). It does so before the completion is announced, so the
-`bg-all-done` it wakes finds the session busy. After that the existing
-machinery holds everything back: `server.py` queues, the worker declines, the
-wakeup defers, `run_turn` waits on `_ghost_settled`. The turn's first output
-continues the same ghost turn, and its result ends it. `_end_ghost_turn` then
-wakes the worker, for queued prompts and for a deferred reconnect.
+**The CLI says when it is working, and its word is what holds things back.**
+With `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS`, which `_make_options` sets, its
+`session_state_changed` says "running" the moment it starts working and
+"idle" only once it has nothing left to run. Every turn it starts opens with an
+`init`. Measured against CLI 2.1.280 on 2026-10-23:
 
-Four details:
+- A task ends between turns: `task_updated`, then `task_notification`, then
+  "running" 20 to 80 ms later, then `init`. The first output comes 3.3 s after
+  that.
+- Two task turns and a queued prompt, one after another: each turn's result is
+  followed straight by the next one's `init`, with no "idle" in between. One
+  "idle" comes at the end.
+- An interrupted turn: its result (`error_during_execution`), then "idle".
 
-- **Two reports of one end.** The SDK reports a task's end twice, a few
-  milliseconds apart: the `task_updated` patch first, then `task_notification`,
-  which alone means a notification went to the model. Any end stamps
-  `_task_ended_at`. `_wait_out_cli_turn_start` waits `TURN_END_SETTLE_S` past the
-  later of that stamp and `_turn_ended_at`, re-checking after each wait. Both
-  `_pop_queued_prompt` and `_flush_deferred_reconnect` use it. A task that ends
-  without a notification therefore costs a queued prompt the settle and no
-  more.
-- **The deferred reconnect.** `_reconnect_blocked` adds `state.busy` to its
-  guard, because a ghost turn holds no `turn_active`.
-- **A turn that never shows.** It is let go after `TASK_TURN_SHOW_TIMEOUT_S`
-  (180 s, above the longest measured), loudly. Its first output cancels the
-  backstop. A reconnect abandons the turn, with a reason
-  (`_abandon_ghost_turn(why)`).
-- **bg-done.** It rings when the task's turn ends, provided the turn was not
-  interrupted and left no further background work running. By then the model
-  has dealt with the task and the session is waiting for the user. The 10 s
-  timer remains for a task whose end starts no turn.
+So:
 
-`_announce_if_not_our_turn` stays, for what cannot be seen coming: a peer's
-message arriving inside the settle, or the milliseconds between a prompt
-leaving and the CLI reading it.
+- **A turn of the CLI's own begins at its `init`**, between turns, while the
+  CLI says "running", rather than at its first output. The `init` follows
+  "running" within milliseconds, and opens each later turn too, which come with
+  no "idle" between them. A ghost turn the CLI goes idle on without a result is
+  closed (`_on_cli_idle`).
+- **Nothing is sent to the CLI while it says "running".** That covers a queued
+  prompt (`_held_by_a_turn`), a turn of ours (`_await_ghost_settled`, which
+  waits on `_cli_quiet` as well as `_ghost_settled`), a deferred reconnect
+  (`_reconnect_blocked`), and a `/model`, `/effort` or `/thinking` typed during
+  one of its turns. That last is deferred by `_reconnect_or_defer` until it is
+  idle; just after a turn of ours it waits a moment first, because that turn's
+  "idle" may be on its way.
+- **Its "idle" lets them go.** `_on_cli_idle` wakes the worker for queued
+  prompts, a deferred reconnect and a `/rename`.
+- **The word is noted as it arrives, whoever reads it.** `_route`, the
+  dispatcher's routing, calls `_note_cli_state` for every message. An "idle"
+  that comes with one of our results goes to that turn's queue, which stops
+  being read at the result. A turn reads its queue late, so
+  `_handle_system_message` does not take the state from a message it reads
+  during a turn: the CLI may have said something newer since.
+- **What a CLI that says nothing still has.** `_wait_out_cli_turn_start` waits
+  `TURN_END_SETTLE_S` past the later of a turn's end and a background task's
+  end (`_task_ended_at`), re-checking after each wait.
+- **bg-done.** A ghost turn whose result says it was for a task
+  (`origin.kind == "task-notification"`) and was not interrupted marks
+  `_turn_for_task`. The bell rings at the CLI's next "idle", unless a prompt
+  waits to go or background work is still running. By then the model has dealt
+  with the task and the session waits for the user. The 10 s timer remains for
+  a task whose end starts no turn, because "running" cancels it at once.
 
-Tests: `tests/test_task_turn_begins_early.py`; mutation target `taskturn`.
+`_announce_if_not_our_turn` stays, for what cannot be seen coming: the
+milliseconds between a prompt leaving and the CLI reading it.
+
+Tests: `tests/test_cli_turns.py`, whose message sequences are the measured
+ones, delivered through `_route`; mutation target `cliturn`.
 
 ### A launch's `--initial-prompt`
 
@@ -3883,8 +3900,11 @@ too large to keep inline goes, *with the transcript saying where*. The account
 also holds `file-history/<id>`, the backups `/rewind` restores from. All of it
 is copied under the new id, the subagent transcripts rewritten as the main one
 is, except the folder's `custom-title.json`: it holds the original's name,
-which the CLI would stamp back on the copy. A copy that fails partway removes
-what it wrote.
+which the CLI would stamp back on the copy. Only `subagents/` transcripts are
+rewritten; a `.jsonl` a tool's output was saved as is copied byte for byte.
+Rewritten files keep the CLI's LF line ends (`newline=""`). A copy that fails
+partway removes what it wrote, and one whose session then fails to start is
+removed too (`session.discard_session`), since nobody has seen it.
 
 That needed one exception to "only the top-level fields are rewritten" (above).
 The paths into the session's folder, and a compaction summary's pointer to the
@@ -3894,45 +3914,64 @@ with either separator and, on Windows, in any case (the CLI writes the path
 from its config dir as it was given it). A replacement keeps the separators of
 what it replaces, so a path inside JSON a tool printed stays escaped. Only a
 line that names the folder (its id followed by a separator or `.jsonl`) is
-walked, so the cost on a large transcript is a substring test per line. Without this, deleting the original would leave the
-copy's model reading tool output that is no longer there.
+walked, so the cost on a large transcript is a substring test per line.
+Without this, deleting the original would leave the copy's model reading tool
+output that is no longer there.
 
-**The record.** A successful move saves `orchestrator2/moved/<id>.json` in
-the original's account (`session.save_moved_record`): the copy's id, name, cwd
-and account. `_recent_disk_sessions` lists the `moved/` folder once per account
-and attaches `moved_to` to those entries (`_moved_to`). It drops the mark if the
-copy is gone, and uses the copy's current title where it can see one. The lobby
-(`lobby.js` `_recentItem`) dims such an item, says "moved → copy" (the account
-too, when the copy is in another), and opens the copy. The original stays a
-smaller "open the original" link away; the delegated click handler takes the
-nearest `[data-sid]`, so that link wins over its item.
+**The record.** A successful move saves `orchestrator2/moved/<id>.json` in the
+original's account (`session.save_moved_record`). It holds the copy's id, name,
+cwd and account, `moved_at`, and `delete` while a deletion is still to happen.
+`_recent_disk_sessions` lists the `moved/` folder once per account and attaches
+`moved_to` to those entries (`_moved_to`). The mark is dropped if the copy is
+gone: its id is not among those the scan just found, so no further lookup is
+needed. It is also dropped if the original's transcript is newer than the move,
+since an original opened again and worked in is a session of its own. The mark
+uses the copy's current title where it can see one. The lobby (`lobby.js`
+`_recentItem`) dims such an item, says "moved → copy" (the account too, when
+the copy is in another), and opens the copy. The original stays a smaller
+"open the original" link away, which the copy's name gives way to on a narrow
+card. The delegated click handler takes the nearest `[data-sid]`, so that link
+wins over its item.
 
-**The deletion** (`move_do`'s `delete_original`, which only a real `true`
-turns on; the overlay's checkbox, remembered in `localStorage`) runs as a task,
-`_trash_moved_original`, after the move has answered. It waits for the copy's
-CLI to have resumed the copy (`bridge.client` set and `state.connecting`
-clear). That is the proof the copy is a session and not only a file. It waits
-for up to `_MOVE_TRASH_WAIT_S` (15 min, since a large resume is given minutes),
-and then refuses if:
+**The deletion** is `move_do`'s `delete_original`, which only a real `true`
+turns on. The overlay's checkbox is remembered in `localStorage`, so the button
+then reads "Copy, continue & delete the original", in red: a remembered
+deletion is never a surprise at the moment of pressing. The deletion runs as a
+task, `_trash_moved_original`, after the move has answered. `_wait_for_the_copy`
+waits for the copy's CLI to have resumed the copy (`bridge.client` set and
+`state.connecting` clear). That is the proof the copy is a session and not only
+a file. It waits for up to `_MOVE_TRASH_WAIT_S` (15 min, since a large resume is
+given minutes). Then `_delete_moved_original` keeps the original if:
 
 - the copy was closed first, its connect gave up, or the wait ran out;
-- the original is running again, here (`_live_runtime_for`) or in another
-  process (`proc_guard.find_foreign_claude_for_session`);
-- the copy holds fewer records than the original (`count_records`).
+- the copy holds fewer records than the original (`count_records`);
+- another process has it open (`proc_guard.find_foreign_claude_for_session(
+  strict=True)`). A scan that cannot look (psutil missing, the walk failing)
+  raises `ForeignScanFailed`, which keeps the original as well: "could not look"
+  is not "nobody has it";
+- it is running here again (`_live_runtime_for`). This is asked last, with no
+  await between it and adding the id to `_trashing_sids`. That set makes
+  `_create_runtime` refuse to open the session until the deletion is over.
 
 Otherwise `session.trash_session` sends the transcript to the Recycle Bin
-(`send2trash`) and, only if that worked, its folder and `file-history` after
-it, so restoring the session is restoring those. It deletes outright what is no
-use without it: the CLI's `session-env/<id>` and every hub record named for the
-id (`orchestrator2/*/*<id>*.json`, including the moved record). A refused or
-failed deletion keeps the original, marked, and the copy's tabs are told why.
-A successful one is told too.
+(`send2trash`) and, only if that worked, its folder, its `file-history` and
+every hub record named for the id (`orchestrator2/*/*<id>*.json`: cost,
+compaction, queue, background tasks, the moved record). Restoring the session
+from the bin restores all of that. The CLI's `session-env/<id>`, of no use
+without it, is deleted outright. A refused or failed deletion keeps the
+original, marked, with `delete` cleared, and the copy's tabs are told why. A
+successful one is told too, as a warning if files were left behind.
 
-Pinned by `tests/test_move_delete_original.py` (32), `tests/lobby_moved.test.js`
-(8) and `tests/move_overlay.test.js`'s last three, with mutation targets
-`movewhole-copy` (`copy_session.py` × 13), `movewhole-trash` (`session.py` × 4),
-`movewhole-server` (`server.py` × 15), `movewhole-lobby` (`static/lobby.js` × 6)
-and `movewhole-ui` (`static/move.js` × 4).
+A deletion the hub's stop cut short is finished at the next start
+(`_finish_interrupted_deletions`, from the moved records still marked
+`delete`). The copy may never have come up under the old hub, so its complete
+transcript stands in for that proof; every other check is as before.
+
+Pinned by `tests/test_move_delete_original.py` (41), `tests/lobby_moved.test.js`
+(8) and `tests/move_overlay.test.js`'s last four, with mutation targets
+`movewhole-copy` (`copy_session.py` × 14), `movewhole-trash` (`session.py` × 5),
+`movewhole-server` (`server.py` × 23), `movewhole-lobby` (`static/lobby.js` × 6)
+and `movewhole-ui` (`static/move.js` × 6).
 
 #### `copy_session.py` no longer imports `textual`
 

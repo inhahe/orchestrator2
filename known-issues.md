@@ -142,7 +142,17 @@ tests in `tests/test_loop_control.py` that check the channel used to patch the
 hub-wide `broadcast`, so they passed against the leak. They now watch the
 session's broadcast, and five of them fail when the hub-wide one is put back.
 
-## A deferred `/model` can lose a finished background task's notification — OPEN (found 2026-10-21)
+## A deferred `/model` can lose a finished background task's notification — FIXED (2026-10-23)
+
+Fixed differently from the plan below. Nothing is sent to the CLI while it says
+"running", and the CLI says so within 80 ms of a task's end (design.md, "A turn
+the CLI runs by itself is a turn from the moment it says so"). So the
+`bg-all-done` flush finds `_reconnect_blocked()` true, and the deferred switch
+is applied when the CLI says "idle", after the task's turn: `_on_cli_idle`
+wakes the worker for it, and `_flush_deferred_reconnect` checks again after
+its announcement. A switch typed during one of the CLI's own turns is deferred
+the same way (`_reconnect_or_defer`). Pinned by `tests/test_cli_turns.py`.
+The original report follows.
 
 `/model`, `/effort` and `/thinking` issued while a background task runs are
 held by `_reconnect_or_defer` and applied by `_flush_deferred_reconnect`. One

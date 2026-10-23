@@ -547,10 +547,10 @@ def _as_measured(text):
 
 
 class _CLI:
-    """A connected CLI, delivered through the real dispatcher's routing rule:
-    to ``turn_msg_queue`` while ``turn_active`` is set, to the ghost-turn path
-    otherwise (see ``_message_dispatcher``).  One message per loop step, so
-    the rule is applied at delivery time, as it is for real."""
+    """A connected CLI, delivered through the real dispatcher's routing
+    (``_route``): to ``turn_msg_queue`` while ``turn_active`` is set, to the
+    ghost-turn path otherwise.  One message per loop step, so the rule is
+    applied at delivery time, as it is for real."""
 
     def __init__(self, br, script=_as_measured, burst=False):
         self.br = br
@@ -569,10 +569,7 @@ class _CLI:
         for m in msgs:
             if not self.burst:
                 await asyncio.sleep(0)
-            if self.br.turn_active.is_set():
-                await self.br.turn_msg_queue.put(m)
-            else:
-                await self.br._handle_async_message(m)
+            await self.br._route(m)
 
     async def settle(self):
         for t in self.feeds:
