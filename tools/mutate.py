@@ -7180,7 +7180,8 @@ CLITURN_MUTATIONS = [
     ("bg-done rings for a task's turn that was interrupted",
      "            # Stopped, not dealt with: nothing for bg-done to announce.\n"
      "            self._turn_for_task = False\n",
-     "            # Stopped, not dealt with: nothing for bg-done to announce.\n"),
+     "            # Stopped, not dealt with: nothing for bg-done to announce.\n"
+     "            pass\n"),
 ]
 
 # /move copies the whole session and can delete the original, or marks it
