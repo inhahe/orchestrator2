@@ -7640,8 +7640,8 @@ ACCOUNT_TRIM_MUTATIONS = [
     ("the trim keeps offsets into the transcript it replaced",
      "                state.cost_mark_size = None\n"
      "                state.cost_mark_saved = None\n"
-     "                self._take_session_id(new_sid)\n",
-     "                self._take_session_id(new_sid)\n"),
+     "                self._take_session_id(new_sid, same_conversation=True)\n",
+     "                self._take_session_id(new_sid, same_conversation=True)\n"),
 ]
 
 
