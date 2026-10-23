@@ -2093,9 +2093,21 @@ const Chat = (() => {
       .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
       // Italic
       .replace(/\*(.+?)\*/g, '<em>$1</em>')
-      // Links
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+      // Links: to the web or to an address only.  A model can be led by what
+      // it reads into writing [text](javascript:...), which would run in this
+      // page when clicked.  Any other target -- that, or a file path, which
+      // would resolve against this page's own server -- is shown as its text,
+      // the target in a tooltip.  (Escaped already, so inert in an attribute.)
+      // The target may hold balanced parentheses, as Wikipedia's do.
+      .replace(/\[([^\]]+)\]\(((?:[^()]|\([^()]*\))+)\)/g, (whole, text, href) =>
+        SAFE_HREF.test(href)
+          ? `<a href="${href}" target="_blank" rel="noopener">${text}</a>`
+          : `<span class="md-link-inert" title="${href}">${text}</span>`);
   }
+
+  // A link target that can only navigate: http(s) or mailto, and nothing in
+  // front of the scheme that a browser would strip (spaces, control bytes).
+  const SAFE_HREF = /^(https?:|mailto:)/i;
 
   function setCollapseTools(v) { _collapseTools = !!v; }
   function getCollapseTools() { return _collapseTools; }

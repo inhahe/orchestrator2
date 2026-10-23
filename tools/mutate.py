@@ -6919,6 +6919,33 @@ MD_LISTS_MUTATIONS = [
      "          codeLines.push(lines[i]);"),
 ]
 
+# A link the agent writes can only navigate.  tests/markdown_links.test.js.
+MD_LINKS_MUTATIONS = [
+    ("any target becomes a link",
+     "        SAFE_HREF.test(href)\n",
+     "        true\n"),
+
+    ("a scheme anywhere in the target passes",
+     "  const SAFE_HREF = /^(https?:|mailto:)/i;",
+     "  const SAFE_HREF = /(https?:|mailto:)/i;"),
+
+    ("a scheme in capitals is refused",
+     "  const SAFE_HREF = /^(https?:|mailto:)/i;",
+     "  const SAFE_HREF = /^(https?:|mailto:)/;"),
+
+    ("an address is refused",
+     "  const SAFE_HREF = /^(https?:|mailto:)/i;",
+     "  const SAFE_HREF = /^(https?:)/i;"),
+
+    ("a target is cut at its first parenthesis",
+     "      .replace(/\\[([^\\]]+)\\]\\(((?:[^()]|\\([^()]*\\))+)\\)/g, (whole, text, href) =>",
+     "      .replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, (whole, text, href) =>"),
+
+    ("a refused link loses its text",
+     "          : `<span class=\"md-link-inert\" title=\"${href}\">${text}</span>`);",
+     "          : '');"),
+]
+
 COMPACTION_CMD_MUTATIONS = [
     ("/autocompact hides that the CLI has yet to take it",
      "    if cli is not None and compaction_env(*cli) != compaction_env(at, on):\n",
@@ -8119,6 +8146,8 @@ TARGETS = {
                        COMPACTION_CMD_MUTATIONS, "pytest"),
     "md-lists": ("static/chat.js", "tests/markdown_lists.test.js",
                  MD_LISTS_MUTATIONS, "node"),
+    "md-links": ("static/chat.js", "tests/markdown_links.test.js",
+                 MD_LINKS_MUTATIONS, "node"),
     "cwd-config": ("config.py", "tests/test_cwd_arg.py",
                    CWD_CONFIG_MUTATIONS, "pytest"),
     "cwd-server": ("server.py", "tests/test_cwd_arg.py",
