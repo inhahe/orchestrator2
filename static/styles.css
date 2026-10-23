@@ -659,13 +659,18 @@ html, body {
   font-family: var(--font-sans);
   color: var(--assistant-text);
 }
-/* When markdown is rendered, keep pre-wrap so that single \n and blank
-   lines in the source remain visually present (matching what the user
-   saw during streaming).  Block elements (code, lists, tables,
-   headings) carry their own whitespace handling and are unaffected. */
+/* Rendered markdown is HTML, laid out as HTML: markdown-it puts newlines
+   between its blocks, which pre-wrap would show as blank lines.  The model's
+   own line breaks arrive as <br> (chat.js renders with ``breaks``), and its
+   paragraphs as <p>.  Code keeps its whitespace in its <pre>. */
 .msg-assistant .msg-content.md-rendered {
-  white-space: pre-wrap;
+  white-space: normal;
 }
+.md-rendered p { margin: 0 0 0.75em; line-height: 1.45; }
+.md-rendered p:last-child { margin-bottom: 0; }
+/* A list with blank lines between its items has a paragraph in each. */
+.md-rendered li > p { margin: 0 0 0.35em; }
+.md-rendered li > p:last-child { margin-bottom: 0; }
 
 /* --- Markdown elements --- */
 .code-block {
@@ -705,25 +710,17 @@ html, body {
   padding: 1px 5px;
   color: var(--text-dim);
 }
-.md-p {
-  /* Block paragraph spacing for assistant text.  Use display:block
-     explicitly to defend against the global "* { margin: 0 }" reset and
-     any browser quirks around inline-flowed <p> tags.
-     The margin matches one full line height so that flushing markdown
-     (which collapses each blank line in the source down to a single
-     paragraph break) doesn't visually shrink the message relative to
-     the streaming pre-wrap view that preceded it. */
-  display: block;
-  margin: 1.45em 0;
-  line-height: 1.45;
-}
-.md-p:first-child { margin-top: 0; }
-.md-p:last-child  { margin-bottom: 0; }
 .md-h { font-weight: 700; margin: 8px 0 4px; }
 .md-h1 { font-size: 1.3em; }
 .md-h2 { font-size: 1.15em; }
 .md-h3 { font-size: 1.05em; }
-.md-h4 { font-size: 1em; color: var(--text-dim); }
+.md-h4, .md-h5, .md-h6 { font-size: 1em; color: var(--text-dim); }
+.md-quote {
+  margin: 6px 0;
+  padding-left: 10px;
+  border-left: 3px solid var(--border);
+  color: var(--text-dim);
+}
 .md-list {
   margin: 4px 0;
   padding-left: 20px;

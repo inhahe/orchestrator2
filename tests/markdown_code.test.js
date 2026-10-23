@@ -44,8 +44,11 @@ test('a block opens on any info string, its first word the language', () => {
     assert(blocks.length === 1, `${info}: ${blocks.length} blocks`);
     assert(blocks[0].code === 'int *p = a * b;', `${info}: ${JSON.stringify(blocks[0].code)}`);
     assert(blocks[0].lang === lang, `${info}: language ${JSON.stringify(blocks[0].lang)}`);
+    const label = el.querySelector('.code-lang');
+    assert(lang ? label && label.textContent === lang : !label,
+           `${info}: labelled ${label ? JSON.stringify(label.textContent) : 'nothing'}`);
     assert(!el.querySelector('em'), `${info}: the code was taken for markdown`);
-    assert(el.textContent.endsWith('More text') && !el.querySelector('.code-block')
+    assert(el.textContent.trim().endsWith('More text') && !el.querySelector('.code-block')
              .textContent.includes('More'), `${info}: the text after it was swallowed`);
   }
 });
@@ -82,9 +85,26 @@ test('a fence never closed runs to the end, and loses nothing', () => {
   assert(blocks.length === 1 && blocks[0].code === 'x = 1\ny = 2', JSON.stringify(blocks));
 });
 
+test('a tab a code line starts with is kept', () => {
+  const el = rendered('```\n\tindented\n```');
+  const blocks = codeBlocks(el);
+  assert(blocks.length === 1 && blocks[0].code === '\tindented', JSON.stringify(blocks));
+});
+
+test('an indented code block is a code block too', () => {
+  const el = rendered('Text\n\n    let x = 1;\n    x *= 2;\n\nMore');
+  const blocks = codeBlocks(el);
+  assert(blocks.length === 1 && blocks[0].code === 'let x = 1;\nx *= 2;' && blocks[0].lang === '',
+         JSON.stringify(blocks));
+  assert(!el.querySelector('.code-lang'), 'a language label with no language');
+});
+
 test('the language is text, not markup', () => {
-  const el = rendered('```"><img src=x onerror=alert(1)>\nx\n```');
-  assert(!el.querySelector('img'), 'made an element');
+  // No spaces: only the info string's first word is the language.
+  const lang = '"><img/src=x/onerror=alert(1)>';
+  const el = rendered('```' + lang + '\nx\n```');
+  assert(!el.querySelector('img'), 'made an element: ' + el.innerHTML);
+  assert(codeBlocks(el)[0].lang === lang, el.innerHTML);
 });
 
 done();

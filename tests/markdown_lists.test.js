@@ -80,6 +80,57 @@ test('so does a sub-list of the list\'s own kind, written short', () => {
   is('- a\n  - b\n- c', 'ul(a(ul(b)), c)', 'bullets');
 });
 
+test('numbered lists nest in numbered lists, to any depth', () => {
+  // As CommonMark writes them: under the item's text.
+  is('1. a\n   1. a1\n   2. a2\n2. b\n   1. b1', 'ol(a(ol(a1, a2)), b(ol(b1)))', 'two levels');
+  is('1. a\n   1. b\n      1. c\n2. d', 'ol(a(ol(b(ol(c)))), d)', 'three levels');
+  is('10. a\n    1. b\n11. c', 'ol@10(a(ol(b)), c)', 'under 10');
+  is('- a\n  1. x\n  2. y', 'ul(a(ol(x, y)))', 'under a bullet');
+  // And short, as models can write them: two under "1. " at every level.
+  is('1. a\n  1. b\n    1. c\n2. d', 'ol(a(ol(b(ol(c)))), d)', 'three levels, short');
+  is('1. a\n  1. b\n    1. c\n      1. e\n2. d', 'ol(a(ol(b(ol(c(ol(e)))))), d)', 'four levels, short');
+});
+
+test('a sub-list written short moves in only what is under it', () => {
+  is('1. a\n  - b\n2. c\n  - d', 'ol(a(ul(b)), c(ul(d)))', 'the next item, and its own sub-list');
+  // Moved four, under "1000. ": "  - d" moved as far would be code under "- c".
+  is('1000. a\n  - b\n- c\n  - d', 'ol@1000(a(ul(b))) | ul(c(ul(d)))', 'a list after it');
+  // Measured against the item it is under, not the deeper one before it.
+  is('1. a\n   - b\n     - c\n  - d', 'ol(a(ul(b(ul(c)), d)))', 'after a deeper item');
+});
+
+test('a numbered sub-list keeps the number it starts at', () => {
+  // CommonMark lets only a list starting at 1 interrupt an item's text.
+  is('1. a\n   3. x\n   4. y\n2. b', 'ol(a(ol@3(x, y)), b)', 'a sub-list from 3');
+  is('1. a\n  12) x\n  13) y\n2. b', 'ol(a(ol@12(x, y)), b)', 'from 12, written short');
+  is('- a\n  - b\n  3. c\n  4. d', 'ul(a(ul(b))(ol@3(c, d)))', 'after a sub-list of the other kind');
+  is('1. a\n   5. x\n      - deep\n   6. y\n   7. z', 'ol(a(ol@5(x(ul(deep)), y, z)))',
+     'back from a deeper list');
+  assert(lists('Intro\n3. not a list').length === 0,
+         'a number at the margin after text started a list');
+});
+
+test('a sub-list renumbered keeps its width', () => {
+  // "12." written as "1." would put "y" four columns past x's text: code.
+  const el = rendered('1. a\n   12. x\n\n          y');
+  assert(!el.querySelector('.code-block'), el.innerHTML);
+  assert(el.querySelector('ol[start="12"] > li').textContent.includes('y'), el.innerHTML);
+});
+
+test('and the lists around it stay tight', () => {
+  // Spaced apart, every item's text would be a paragraph of its own.
+  for (const text of ['1. a\n   3. x\n   4. y\n2. b', '1. a\n   5. x\n      - deep\n   6. y',
+                      '- a\n  - b\n\t- c', '-\ta\n-\tb\n\t-\tc', '- first line\n  second line\n- next']) {
+    const el = rendered(text);
+    assert(!el.querySelector('li > p'), `${JSON.stringify(text)}: ${el.innerHTML}`);
+  }
+});
+
+test('a tab after a marker is a gap like any other', () => {
+  is('-\ta\n-\tb\n\t-\tc', 'ul(a, b(ul(c)))', 'tabs after the markers');
+  is('1.\ta\n  - b', 'ol(a(ul(b)))', 'a tab after a number, a sub-list short of its text');
+});
+
 test('the next item is at the marker\'s column or one off it', () => {
   is('- a\n - b', 'ul(a, b)', 'one space in');
   is(' 9. nine\n10. ten', 'ol@9(nine, ten)', 'right-aligned numbers');
@@ -110,7 +161,8 @@ test('what follows a sub-list written short goes back to the item', () => {
 test('a line continuing an item, written short, carries no stray indent', () => {
   const el = rendered('1. first\n  continued\n  - sub\n2. next');
   const li = el.querySelector('ol > li');
-  assert(/^first\ncontinued<ul/.test(li.innerHTML), JSON.stringify(li.innerHTML.slice(0, 40)));
+  assert(/^first<br>\s*continued\s*<ul/.test(li.innerHTML), JSON.stringify(li.innerHTML.slice(0, 40)));
+  assert(!/<br>\n? +continued/.test(li.innerHTML), 'a stray indent');
 });
 
 test('a tab that reaches past an item\'s text keeps the columns beyond it', () => {
@@ -129,8 +181,9 @@ test('a blank line above a sub-list adds no gap of its own', () => {
   // The sub-list has its margin; a kept blank line would add a second gap.
   const el = rendered('- item\n\n  - sub');
   const li = el.querySelector('ul > li');
-  assert(/^item<ul/.test(li.innerHTML), 'something between the item and its sub-list: '
-         + JSON.stringify(li.innerHTML.slice(0, 40)));
+  assert(!/<br>/.test(li.innerHTML) && !/<p>\s*<\/p>/.test(li.innerHTML),
+         'something between the item and its sub-list: ' + JSON.stringify(li.innerHTML.slice(0, 60)));
+  assert(li.querySelector(':scope > ul'), 'the sub-list left the item');
 });
 
 // ---- what else an item holds -------------------------------------------------
@@ -157,6 +210,18 @@ test('a code block in an item keeps its lines as written', () => {
   assert(code, 'no code block in the item');
   assert(code.textContent === 'foo:\n\n- bar\n\n\nbaz', JSON.stringify(code.textContent));
   assert(el.querySelectorAll('ol > li').length === 2, 'the code block split the list');
+  // A sub-list written short, in code, is code.
+  for (const fence of ['```', '~~~']) {
+    const c = rendered(`- a\n  ${fence}\n  1. x\n    - y\n  ${fence}`).querySelector('.code-block code');
+    assert(c && c.textContent === '1. x\n  - y', `${fence}: ${c ? JSON.stringify(c.textContent) : 'no code'}`);
+  }
+});
+
+test('a code block in a sub-list written short stays in it', () => {
+  const el = rendered('1. a\n  - b\n    ```\n    x\n    ```\n2. c');
+  const code = el.querySelector('ol > li > ul > li .code-block code');
+  assert(code && code.textContent === 'x', el.innerHTML);
+  assert(el.querySelectorAll(':scope > ol > li').length === 2, 'the list was split');
 });
 
 test('a code block in an item does not end it, nor take its next item', () => {
@@ -176,6 +241,19 @@ test('nor does one opened on the item\'s own line', () => {
   assert(items.length === 2, `${items.length} items, not 2`);
   const code = items[0].querySelector('.code-block code');
   assert(code && code.textContent === 'ls', code ? JSON.stringify(code.textContent) : 'no code');
+});
+
+test('lists after a code block keep their nesting, however the block was written', () => {
+  // Each block here once left the renderer thinking a code block was still
+  // open after it, or one had opened: the short sub-list after it flattened.
+  const after = '\n1. a\n  - b\n2. c';
+  is('```\n```js\n```' + after, 'ol(a(ul(b)), c)', 'a fence with a language inside one');
+  is('```x``` is a code span' + after, 'ol(a(ul(b)), c)', 'three backticks around a word');
+  is('~~~\n~~~ not the end\n~~~' + after, 'ol(a(ul(b)), c)', 'tildes with words after them');
+  is('````\n```\n````' + after, 'ol(a(ul(b)), c)', 'a shorter fence inside a longer one');
+  is('~~~\n```\n~~~' + after, 'ol(a(ul(b)), c)', 'backticks inside tildes');
+  is('1. ```\n   steps:\n     - run: x\n   ```\n2. b\n  - c',
+     'ol(steps: - run: x, b(ul(c)))', 'a block opened on an item\'s own line');
 });
 
 test('a code fence may be indented up to three spaces', () => {
@@ -242,8 +320,6 @@ test('so it is after a list, and between items', () => {
   const el2 = rendered('- a\n- - -\n- b');
   assert(el2.querySelector('hr'), 'no rule between the items');
   assert(lists('- a\n- - -\n- b').join(' | ') === 'ul(a) | ul(b)', lists('- a\n- - -\n- b').join(' | '));
-  const el3 = rendered('- a\n * * *');
-  assert(el3.querySelector('ul > li hr'), 'a rule indented under an item is the item\'s');
 });
 
 test('an item of thousands of lines renders', () => {
@@ -261,6 +337,7 @@ test('markers nested thousands deep render, as text past a depth', () => {
 
 test('a message with Windows line endings still has its lists', () => {
   is('- a\r\n- b\r\n  - c\r\n', 'ul(a, b(ul(c)))', 'CRLF');
+  is('1. a\r  - b\r2. c', 'ol(a(ul(b)), c)', 'a carriage return alone, a sub-list short');
 });
 
 test('text around lists is kept, in order', () => {

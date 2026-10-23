@@ -56,7 +56,7 @@ def test_the_chat_page_runs_only_its_own_scripts(monkeypatch):
 
 def _page_scripts() -> list[Path]:
     html = (STATIC / "index.html").read_text(encoding="utf-8")
-    return [STATIC / Path(src).name
+    return [STATIC / src.removeprefix("/static/")
             for src in re.findall(r'<script[^>]*\bsrc="([^"]+)"', html)]
 
 

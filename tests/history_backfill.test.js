@@ -23,8 +23,8 @@ const fs = require('fs');
 const path = require('path');
 const { JSDOM } = require('jsdom');
 
-const CHAT_JS = fs.readFileSync(
-  path.join(__dirname, '..', 'static', 'chat.js'), 'utf8');
+// chat.js after the markdown library, as the page loads it.
+const CHAT_JS = require('./chat_source');
 
 let failures = 0;
 let ran = 0;

@@ -39,12 +39,15 @@ test('a script link is not a link: its text, the target in a tooltip', () => {
                       ' javascript:alert(1)',
                       'data:text/html,<script>alert(1)</script>',
                       'vbscript:msgbox(1)']) {
-    const el = rendered(`see [docs](${href})`);
+    const el = rendered(`see [docs](${href}) now`);
     assert(!el.querySelector('a'), `${href}: became a link`);
     assert(!el.querySelector('script'), `${href}: made a script element`);
     const inert = el.querySelector('.md-link-inert');
-    assert(inert && inert.textContent === 'docs', `${href}: the text was lost`);
-    assert(inert.getAttribute('title') === href, `${href}: tooltip ${inert.getAttribute('title')}`);
+    assert(inert && inert.textContent === 'docs', `${href}: ${el.innerHTML}`);
+    // URL-encoded as an address must be (< is %3C), and otherwise as written.
+    assert(decodeURI(inert.getAttribute('title')) === href.trim(),
+           `${href}: tooltip ${inert.getAttribute('title')}`);
+    assert(el.textContent === 'see docs now', `${href}: ${JSON.stringify(el.textContent)}`);
   }
 });
 
@@ -61,7 +64,8 @@ test('a target is kept as written, whatever markdown is in it', () => {
   for (const href of ['https://x.com/`p`', 'https://a.com/*b*/c', 'https://a.com/**b**']) {
     const a = rendered(`see [docs](${href}) now`).querySelector('a');
     assert(a, `${href}: no link`);
-    assert(a.getAttribute('href') === href, `${href}: href ${a.getAttribute('href')}`);
+    // URL-encoded as an address must be (` is %60), and otherwise the same.
+    assert(decodeURI(a.getAttribute('href')) === href, `${href}: href ${a.getAttribute('href')}`);
     assert(a.textContent === 'docs' && a.target === '_blank' && a.rel === 'noopener',
            `${href}: ${a.outerHTML}`);
   }
@@ -71,6 +75,18 @@ test('its text may have emphasis and code in it', () => {
   const a = rendered('[**the** `docs`](https://x.com)').querySelector('a');
   assert(a && a.querySelector('strong') && a.querySelector('code.md-code'),
          a ? a.innerHTML : 'no link');
+});
+
+test('a web address written out is a link', () => {
+  const a = rendered('see https://example.com/x?y=1 now').querySelector('a');
+  assert(a && a.getAttribute('href') === 'https://example.com/x?y=1' && a.target === '_blank',
+         a ? a.outerHTML : 'no link');
+});
+
+test('a file name is not taken for one', () => {
+  // ".py" is a country's domain; "server.py" is still a file.
+  const el = rendered('edit server.py and notes.md, mail me at a@b.py');
+  assert(!el.querySelector('a'), el.innerHTML);
 });
 
 test('a link written in a code span is shown as written', () => {

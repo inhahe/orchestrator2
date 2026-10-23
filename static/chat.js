@@ -943,10 +943,7 @@ const Chat = (() => {
       } else {
         // Final markdown render now that the full text is available.
         const content = _streamingEl.querySelector('.msg-content');
-        if (content) {
-          content.innerHTML = _md(_streamingText);
-          content.classList.add('md-rendered');
-        }
+        if (content) content.innerHTML = _md(_streamingText);
         _maybeWarnToolCallText(_streamingText);
       }
     }
@@ -1841,325 +1838,235 @@ const Chat = (() => {
   }
 
   /**
-   * Lightweight markdown → HTML for assistant text.
-   * Handles: fenced code blocks, inline code, bold, italic, headers,
-   * bullet/numbered lists (nested), tables, horizontal rules, and links.
+   * Markdown → HTML for what the model writes, by markdown-it
+   * (static/vendor/markdown-it.min.js, loaded before this file): CommonMark,
+   * which is what models write, rendered with the chat's own markup for code,
+   * lists, tables, headings and rules (_markdown).
+   *
+   * Where it differs from plain CommonMark, it is on purpose:
+   * - a line break the model wrote is a line break (``breaks``), so a
+   *   "**Label**" line over its paragraph stays two lines;
+   * - lists are read as models write them (_asMeant): a sub-list written
+   *   short of its item's text still nests, text at the margin after a list
+   *   ends it, and a numbered sub-list may start past 1;
+   * - a link goes to the web or an address only; any other target is shown
+   *   as its text, the target in a tooltip (_neuterLinks);
+   * - raw HTML is shown as text, and an image as a link to it, never loaded.
+   *
+   * Should the library be missing, the text is shown as it is, escaped, its
+   * lines kept.
    */
   function _md(raw) {
     if (!raw) return '';
-    return _blocks(_esc(raw).replace(/\r\n?/g, '\n').split('\n'), 0);
+    const md = _markdown();
+    const text = String(raw).replace(/\r\n?/g, '\n');
+    if (!md) return _esc(text).replace(/\n/g, '<br>');
+    const starts = new Map();
+    return md.render(_asMeant(text, starts), { starts }).trimEnd();
   }
 
-  // A list item's first line: its indentation, its marker, the gap after the
-  // marker, and its text.
-  const LIST_ITEM = /^([ \t]*)([-*+]|\d+[.)])([ \t]+)(.*)$/;
-  // A horizontal rule: three or more of one of - * _, spaces between allowed.
-  // Never a list item, which "- - -" would otherwise be, nested.
-  const THEMATIC_BREAK = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
-  // A code fence's opening line, indented by up to three spaces: [line,
-  // indent, fence, info string].  See _fenceOpen.
-  const FENCE = /^( {0,3})(`{3,}|~{3,})(.*)$/;
-  // A code fence's closing line: [line, fence].  See _fenceCloses.
-  const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
-  // Lists nested deeper than this are taken as text: far past any real list,
-  // and short of the recursion a line of thousands of "- " would run out of.
-  const MAX_LIST_DEPTH = 16;
+  let _markdownIt = null;
+  let _markdownMissing = false;
+
+  /** The configured markdown-it instance; null, said once, if the library
+   *  did not load. */
+  function _markdown() {
+    if (_markdownIt) return _markdownIt;
+    if (typeof markdownit !== 'function') {
+      if (!_markdownMissing) {
+        _markdownMissing = true;
+        console.warn('markdown-it is not loaded: messages are shown as plain text');
+      }
+      return null;
+    }
+    const md = markdownit({ html: false, linkify: true, breaks: true, typographer: false });
+    // Links written out, not guessed: "server.py" is not a web address.
+    md.linkify.set({ fuzzyLink: false, fuzzyEmail: false });
+    // A link to an image stays a link; nothing is fetched because a model wrote it.
+    md.disable('image');
+    // Every link is parsed, so that one refused below keeps its text.
+    md.validateLink = () => true;
+    md.core.ruler.push('neuter_links', _neuterLinks);
+    md.core.ruler.push('list_starts', _listStarts);
+    const r = md.renderer.rules;
+    const esc = md.utils.escapeHtml;
+    r.code_inline = (tokens, i) => `<code class="md-code">${esc(tokens[i].content)}</code>`;
+    const codeBlock = (code, lang) => {
+      const l = esc(lang || '');
+      return `<div class="code-block"${l ? ` data-lang="${l}"` : ''}>`
+        + (l ? `<span class="code-lang">${l}</span>` : '')
+        + `<pre><code>${esc(code.replace(/\n$/, ''))}</code></pre></div>\n`;
+    };
+    // The info string's first word is the language: "python title=x" is python.
+    r.fence = (tokens, i) => codeBlock(tokens[i].content, tokens[i].info.trim().split(/\s+/)[0]);
+    r.code_block = (tokens, i) => codeBlock(tokens[i].content, '');
+    r.heading_open = (tokens, i) => `<div class="md-h md-${tokens[i].tag}">`;
+    r.heading_close = () => '</div>\n';
+    for (const [type, cls] of [['bullet_list_open', 'md-list'], ['ordered_list_open', 'md-list'],
+                               ['table_open', 'md-table'], ['hr', 'md-hr'],
+                               ['blockquote_open', 'md-quote']]) {
+      r[type] = (tokens, i, opts, env, self) => {
+        tokens[i].attrJoin('class', cls);
+        return self.renderToken(tokens, i, opts);
+      };
+    }
+    _markdownIt = md;
+    return md;
+  }
+
   // A link target that can only navigate: http(s) or mailto, and nothing in
   // front of the scheme that a browser would strip (spaces, control bytes).
   const SAFE_HREF = /^(https?:|mailto:)/i;
 
-  /** The code block *line* opens: {indent, fence, lang}, or null.  Its info
-   *  string is anything without a backtick, as in CommonMark ("c++", "c#",
-   *  "python title=x"), and its first word is the language. */
-  function _fenceOpen(line) {
-    const m = line.match(FENCE);
-    if (!m || (m[2][0] === '`' && m[3].includes('`'))) return null;
-    return { indent: m[1].length, fence: m[2], lang: m[3].trim().split(/\s+/)[0] };
-  }
-
-  /** Whether *line* closes the code block *open* began: a fence of its
-   *  character at least as long as its own, indented by up to three. */
-  function _fenceCloses(line, open) {
-    const m = line.match(FENCE_CLOSE);
-    return !!m && m[1][0] === open.fence[0] && m[1].length >= open.fence.length;
-  }
-
-  /** The column after *ch* at column *col*: a tab goes to the next multiple
-   *  of 4, CommonMark's tab stop. */
-  function _tabStop(col, ch) {
-    return ch === '\t' ? col + 4 - (col % 4) : col + 1;
-  }
-
-  /** The column the text *s* reaches. */
-  function _width(s) {
-    let col = 0;
-    for (const ch of s) col = _tabStop(col, ch);
-    return col;
-  }
-
-  /** The column at which *line*'s text starts. */
-  function _indentOf(line) {
-    return _width(line.match(/^[ \t]*/)[0]);
-  }
-
-  /** *line* without its first *cols* columns of indentation, or without all
-   *  of it if it has fewer.  A tab that reaches past *cols* leaves the columns
-   *  beyond it as spaces. */
-  function _dedent(line, cols) {
-    let col = 0;
-    let k = 0;
-    while (k < line.length && col < cols && (line[k] === ' ' || line[k] === '\t')) {
-      col = _tabStop(col, line[k]);
-      k++;
+  /**
+   * A markdown-it core rule: a link to the web or an address opens in a new
+   * tab; any other becomes its text, the target in a tooltip.  A model can be
+   * led by what it reads into writing [text](javascript:...), which would run
+   * in this page when clicked, and a file path would resolve against the hub.
+   */
+  function _neuterLinks(state) {
+    for (const block of state.tokens) {
+      if (block.type !== 'inline' || !block.children) continue;
+      let inert = false;     // the link open is refused (links do not nest)
+      for (const t of block.children) {
+        if (t.type === 'link_open') {
+          const href = t.attrGet('href') || '';
+          inert = !SAFE_HREF.test(href);
+          if (inert) {
+            t.type = 'link_inert_open';
+            t.tag = 'span';
+            t.attrs = [['class', 'md-link-inert'], ['title', href]];
+          } else {
+            t.attrSet('target', '_blank');
+            t.attrSet('rel', 'noopener');
+          }
+        } else if (t.type === 'link_close' && inert) {
+          t.type = 'link_inert_close';
+          t.tag = 'span';
+        }
+      }
     }
-    return ' '.repeat(Math.max(0, col - cols)) + line.slice(k);
   }
 
-  /** The index of the first line at or after *i* that is not blank. */
-  function _skipBlank(lines, i) {
-    while (i < lines.length && lines[i].trim() === '') i++;
-    return i;
+  /** A markdown-it core rule: each numbered list _asMeant wrote to start at
+   *  1 starts where the model wrote it to (env.starts: line → number). */
+  function _listStarts(state) {
+    const starts = state.env.starts;
+    for (const t of state.tokens) {
+      if (t.type === 'ordered_list_open' && starts.has(t.map[0])) {
+        t.attrSet('start', String(starts.get(t.map[0])));
+      }
+    }
   }
+
+  // A list item's first line: [line, indentation, marker, the gap after it].
+  const LIST_ITEM = /^( *)(\d{1,9}[.)]|[-*+])( +)\S/;
+  // A line's indentation and the list markers on it, with the gaps after them.
+  const LEAD = /^[ \t]*(?:(?:\d{1,9}[.)]|[-*+])[ \t]+)*/;
+  // A code fence's opening, on a line without its indentation or list marker:
+  // [line, backticks, tildes].  An info string after backticks holds none,
+  // or the line is a code span.
+  const FENCE_OPEN = /^(?:(`{3,})[^`]*|(~{3,}).*)$/;
+  // Lists stacked deeper than this on one line ("- - - - x") are text from
+  // there on: markdown-it drops what is nested past its own limit.
+  const MAX_STACKED = 16;
+  const STACKED = new RegExp(`^((?: *(?:[-*+]|\\d{1,9}[.)]) +){${MAX_STACKED}})(.*)$`);
 
   /**
-   * The list whose first item is lines[i], nested *depth* lists deep: [its
-   * HTML, the index of the first line after it].
+   * *src* as the model meant it, where CommonMark reads it otherwise.
    *
-   * An item holds every line after it indented past its marker -- text that
-   * continues it, a nested list, a code block -- rendered as a document of
-   * its own, so lists nest, and a numbered list keeps counting across the
-   * sub-items between its items.  The list's next item is a line of its own
-   * kind at its marker's column or one off it (" 9." over "10.", "- a" over
-   * " - b"); one indented further is the item's, as a sub-list.
+   * - A sub-list written short of its item's text nests.  CommonMark nests a
+   *   line under an item only if it reaches the item's text -- three columns
+   *   under "1. ", four under "10. " -- and a sub-list two spaces in ends the
+   *   list instead.  A list item indented at least two past its parent's
+   *   marker but short of its text is moved in, with everything under it.
+   * - Text at the margin straight after a list ends the list.  CommonMark
+   *   reads it as the last item's paragraph going on ("lazy continuation"),
+   *   a convenience for typing by hand that models do not mean; a blank line
+   *   is put before it.
+   * - A numbered sub-list starting past 1 starts.  CommonMark lets only a
+   *   list starting at 1 break into its item's text (which keeps a "1987."
+   *   from starting a list), so it is written to start at 1 -- "01." for
+   *   "10.", keeping its width -- and *starts* (output line → number) has
+   *   _listStarts put its number back.
+   * - Markers stacked past MAX_STACKED on one line are text from there on.
    *
-   * The item's lines lose the indentation of its text, as in CommonMark,
-   * with one difference.  A sub-list may begin short of the item's text, as
-   * models write it -- "  - detail" under "1. step", "  1. sub" under it, two
-   * spaces where CommonMark wants three -- and its lines then lose only that
-   * sub-list's own indentation, keeping its shape; the item's lines that
-   * follow it, back at the item's text, are the item's again.  A code block's
-   * lines are kept as written.  Blank lines between items do not end the
-   * list; a line at or left of the item's marker that is not the next item
-   * does.
+   * Tabs in a line's indentation, and after its markers, are read as the
+   * spaces they stand for, to the next multiple of four.  Code blocks are
+   * left as written.
    */
-  function _list(lines, i, depth) {
-    let m = lines[i].match(LIST_ITEM);
-    const ordered = /\d/.test(m[2]);
-    const start = parseInt(m[2], 10);
-    const items = [];
-    for (;;) {
-      const at = _width(m[1]);
-      const textCol = _width(m[1] + m[2] + m[3]);
-      const isNextItem = (line) => {
-        const n = line.match(LIST_ITEM);
-        return !!n && !THEMATIC_BREAK.test(line) && /\d/.test(n[2]) === ordered
-          && _width(n[1]) <= at + 1;
-      };
-      const body = [m[4]];
-      let fence = _fenceOpen(m[4]);   // the code block open in the item
-      let sub = null;      // a sub-list begun short of textCol: {at, textCol}
-      i++;
-      while (i < lines.length) {
-        const line = lines[i];
-        if (line.trim() === '') {
-          if (fence) { body.push(''); i++; continue; }
-          const j = _skipBlank(lines, i);
-          if (j >= lines.length || _indentOf(lines[j]) <= at) break;
-          // The item goes on after the blank lines.  Keep them, but not ahead
-          // of a sub-list, which has a margin of its own.
-          if (!LIST_ITEM.test(lines[j])) for (let k = i; k < j; k++) body.push('');
-          i = j;
-          continue;
-        }
-        const ind = _indentOf(line);
-        if (ind <= at || (!fence && isNextItem(line))) break;
-        // In a sub-list begun short: its items, and what is indented under
-        // them.  Anything else is the item's again.  A code block's lines
-        // stay where its first line put them.
-        if (!fence) {
-          const n = line.match(LIST_ITEM);
-          if (sub && !(ind >= sub.textCol || (n && ind <= sub.at + 1))) sub = null;
-          if (!sub && n && ind < textCol) sub = { at: ind, textCol: 0 };
-          if (sub && n && ind <= sub.at + 1) sub.textCol = _width(n[1] + n[2] + n[3]);
-        }
-        const d = _dedent(line, sub ? sub.at : textCol);
-        body.push(d);
-        if (fence) { if (_fenceCloses(d, fence)) fence = null; }
-        else fence = _fenceOpen(d);
-        i++;
-      }
-      items.push(_blocks(body, depth + 1));
-      // Blank lines, then the list's next item, go on with the list.
-      const j = _skipBlank(lines, i);
-      if (j >= lines.length || !isNextItem(lines[j])) break;
-      m = lines[j].match(LIST_ITEM);
-      i = j;
-    }
-    const lis = items.map(t => `<li>${t}</li>`).join('');
-    if (!ordered) return [`<ul class="md-list">${lis}</ul>`, i];
-    // The first item's own number, which the model wrote: a list interrupted
-    // by a paragraph goes on counting from where it left off.
-    const startAttr = start !== 1 ? ` start="${start}"` : '';
-    return [`<ol class="md-list"${startAttr}>${lis}</ol>`, i];
-  }
-
-  /** Already-escaped markdown *lines* → HTML: the blocks of a message, or of
-   *  a list item nested *depth* lists deep. */
-  function _blocks(lines, depth) {
-    // Each entry: {html, block}.  We track block-ness so the final join
-    // can emit '\n' ONLY between adjacent text entries.  The container
-    // uses white-space: pre-wrap, so a literal '\n' renders as a line
-    // break — which is what we want for text-to-text (matching the
-    // streaming view), but would double-up against the block element's
-    // own margin if emitted around block elements.
+  function _asMeant(src, starts) {
     const out = [];
-    let i = 0;
-
-    function pushBlock(html) { out.push({ html, block: true }); }
-    function pushText(html)  { out.push({ html, block: false }); }
-
-    while (i < lines.length) {
-      const line = lines[i];
-
-      // --- Fenced code block ---
-      // Its lines lose as much indentation as the opening fence has, as in
-      // CommonMark.  One never closed runs to the end of the message.
-      const open = _fenceOpen(line);
-      if (open) {
-        const codeLines = [];
-        i++;
-        while (i < lines.length && !_fenceCloses(lines[i], open)) {
-          codeLines.push(_dedent(lines[i], open.indent));
-          i++;
+    const items = [];        // the open items: {at, text}, marker and text columns
+    const shifts = [];       // short sub-lists being moved in: {from, by}, innermost last
+    let fence = null;
+    for (const raw of src.split('\n')) {
+      let line = _untab(raw);
+      const ind = _indent(line);
+      // Moved in by every short sub-list it is under: those begun at or left
+      // of where it starts, as written.
+      const by = shifts.reduce((n, s) => n + (s.from <= ind ? s.by : 0), 0);
+      if (fence) {
+        // Closed by its own character alone on a line, at least as many.
+        const t = line.trim();
+        if (t.length >= fence.length && t === fence[0].repeat(t.length)) fence = null;
+        out.push(by ? ' '.repeat(by) + line : raw);
+        continue;
+      }
+      if (line.trim() === '') { out.push(line); continue; }
+      while (shifts.length && ind < shifts[shifts.length - 1].from) shifts.pop();
+      line = ' '.repeat(by) + line;
+      const at = _indent(line);
+      let m = line.match(LIST_ITEM);
+      if (!m && items.length && at <= items[0].at && out[out.length - 1].trim() !== '') {
+        out.push('');
+      }
+      while (items.length && at <= items[items.length - 1].at) items.pop();
+      if (m) {
+        const parent = items[items.length - 1];
+        if (parent && at >= parent.at + 2 && at < parent.text) {
+          shifts.push({ from: ind, by: parent.text - at });
+          line = ' '.repeat(parent.text - at) + line;
+          m = line.match(LIST_ITEM);
         }
-        i++;  // skip closing fence
-        // Escaped with the rest of the message, so safe in an attribute.
-        const lang = open.lang;
-        const langAttr = lang ? ` data-lang="${lang}"` : '';
-        const langLabel = lang ? `<span class="code-lang">${lang}</span>` : '';
-        pushBlock(`<div class="code-block"${langAttr}>${langLabel}<pre><code>${codeLines.join('\n')}</code></pre></div>`);
-        continue;
-      }
-
-      // --- Heading ---
-      const headingMatch = line.match(/^(#{1,4})\s+(.+)$/);
-      if (headingMatch) {
-        const level = headingMatch[1].length;
-        const content = _inlineMd(headingMatch[2]);
-        pushBlock(`<div class="md-h md-h${level}">${content}</div>`);
-        i++;
-        continue;
-      }
-
-      // --- Horizontal rule ---
-      if (THEMATIC_BREAK.test(line)) {
-        pushBlock('<hr class="md-hr">');
-        i++;
-        continue;
-      }
-
-      // --- List (bulleted or numbered, nested) ---
-      if (depth < MAX_LIST_DEPTH && LIST_ITEM.test(line)) {
-        const [html, next] = _list(lines, i, depth);
-        pushBlock(html);
-        i = next;
-        continue;
-      }
-
-      // --- Table ---
-      if (/^\|/.test(line) && i + 1 < lines.length &&
-          /^\|[\s:|-]+$/.test(lines[i + 1]) && lines[i + 1].includes('---')) {
-        const headerCells = _tableCells(line);
-        i += 2;  // skip header + separator
-        const rows = [];
-        while (i < lines.length && /^\|/.test(lines[i])) {
-          rows.push(_tableCells(lines[i]));
-          i++;
+        // Wherever it needs to or not -- after a blank line, or an item
+        // after the first, whose number does not count -- for the same result.
+        const n = parseInt(m[2], 10);
+        if (parent && /^\d/.test(m[2]) && n !== 1) {
+          const digits = m[2].length - 1;
+          starts.set(out.length, n);
+          line = m[1] + '1'.padStart(digits, '0') + line.slice(m[1].length + digits);
         }
-        let html = '<table class="md-table"><thead><tr>';
-        for (const h of headerCells) html += `<th>${_inlineMd(h)}</th>`;
-        html += '</tr></thead><tbody>';
-        for (const row of rows) {
-          html += '<tr>';
-          for (const c of row) html += `<td>${_inlineMd(c)}</td>`;
-          html += '</tr>';
-        }
-        html += '</tbody></table>';
-        pushBlock(html);
-        continue;
+        items.push({ at: m[1].length, text: m[1].length + m[2].length + m[3].length });
+        const stacked = line.match(STACKED);
+        if (stacked) line = stacked[1] + '\\' + stacked[2];
       }
-
-      // --- Regular line (text or blank) ---
-      // No <p> wrapping or <br> insertion.  Pre-wrap on the container
-      // renders the '\n' separator between adjacent text entries as a
-      // line break — matching the pre-flush streaming view exactly.
-      pushText(_inlineMd(line));
-      i++;
+      // An item's code block may open on the item's own line.
+      const f = (m ? line.slice(m[0].length - 1) : line).trim().match(FENCE_OPEN);
+      if (f) fence = f[1] || f[2];
+      out.push(line);
     }
+    return out.join('\n');
+  }
 
-    // Custom join: '\n' between adjacent text entries (preserve the
-    // streaming line-break behavior), empty string around block entries
-    // (so their own margins control spacing without pre-wrap newlines
-    // adding a second gap on top).
-    let html = '';
-    for (let k = 0; k < out.length; k++) {
-      const cur = out[k];
-      if (k > 0) {
-        const prev = out[k - 1];
-        if (!prev.block && !cur.block) html += '\n';
-      }
-      html += cur.html;
+  /** How many spaces *line* starts with. */
+  function _indent(line) {
+    return line.match(/^ */)[0].length;
+  }
+
+  /** *line* with the tabs in its LEAD as the spaces they stand for, to the
+   *  next multiple of four, as CommonMark reads them. */
+  function _untab(line) {
+    const lead = line.match(LEAD)[0];
+    if (!lead.includes('\t')) return line;
+    let col = 0;
+    let out = '';
+    for (const ch of lead) {
+      const next = ch === '\t' ? col + 4 - (col % 4) : col + 1;
+      out += ch === '\t' ? ' '.repeat(next - col) : ch;
+      col = next;
     }
-    return html;
-  }
-
-  /** Split a markdown table row into trimmed cell values. */
-  function _tableCells(line) {
-    const cells = line.split('|').slice(1);  // drop leading empty
-    if (cells.length && cells[cells.length - 1].trim() === '') cells.pop();
-    return cells.map(c => c.trim());
-  }
-
-  /**
-   * Inline markdown in *s*, a line already escaped: code spans, links, bold,
-   * italic.
-   *
-   * Each finished piece is held out of the line as a placeholder until the
-   * end, so that no later pass reaches into it: a code span is shown as
-   * written ("`*args`" keeps its asterisk, "`[a](b)`" stays text), and a
-   * link's target is kept as written, in an attribute no markup is put into.
-   */
-  function _inlineMd(s) {
-    const held = [];          // [as shown, as written]
-    const hold = (shown, written) => {
-      held.push([shown, written]);
-      return `\u0000${held.length - 1}\u0000`;
-    };
-    const restore = (t, form) => t.replace(/\u0000(\d+)\u0000/g, (_, k) => held[+k][form]);
-    s = s.replace(/`([^`]+?)`/g, (whole, code) =>
-      hold(`<code class="md-code">${code}</code>`, whole));
-    // Links: to the web or to an address only.  A model can be led by what
-    // it reads into writing [text](javascript:...), which would run in this
-    // page when clicked.  Any other target -- that, or a file path, which
-    // would resolve against this page's own server -- is shown as its text,
-    // the target in a tooltip.  The target may hold balanced parentheses, as
-    // Wikipedia's do.
-    s = s.replace(/\[([^\]]+)\]\(((?:[^()]|\([^()]*\))+)\)/g, (whole, text, href) => {
-      const target = restore(href, 1);
-      const label = restore(_emphasis(text), 0);
-      return hold(SAFE_HREF.test(target)
-        ? `<a href="${target}" target="_blank" rel="noopener">${label}</a>`
-        : `<span class="md-link-inert" title="${target}">${label}</span>`, whole);
-    });
-    return restore(_emphasis(s), 0);
-  }
-
-  /** Bold and italic in *s*. */
-  function _emphasis(s) {
-    return s
-      .replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>')
-      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-      .replace(/\*(.+?)\*/g, '<em>$1</em>');
+    return out + line.slice(lead.length);
   }
 
   function setCollapseTools(v) { _collapseTools = !!v; }

@@ -803,6 +803,7 @@ static/
   panels.js        Sidebar panel rendering
   diff.js          Side-by-side diff computation
   usage.js         /usage: draws the plan limits in the modal
+  vendor/          markdown-it (MIT), which renders the model's markdown
 ```
 
 ### Key flows

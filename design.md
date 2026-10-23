@@ -3133,43 +3133,59 @@ variables it consumes, so themes never require CSS edits.
 
 ### How the chat renders what the model writes
 
-`chat.js`'s `_md` turns an assistant message into HTML. The message is
-HTML-escaped whole before anything else, so nothing the model writes is ever
-markup until the renderer makes it so. Then `_blocks` reads it line by line:
-code blocks, headings, rules, lists and tables. Every other line is text, with
-no `<p>`, in a `pre-wrap` container, so line breaks show as the model wrote
-them, exactly as the streaming view shows them. `_inlineMd` handles code spans,
-links, bold and italic within a line.
+`chat.js`'s `_md` turns an assistant message into HTML with **markdown-it**
+(14.3.3, MIT, vendored as `static/vendor/markdown-it.min.js` with its licence
+beside it, and loaded by `index.html` before `chat.js`). It is a CommonMark
+parser, and CommonMark is what models write. Asked for on 2026-10-23, in
+place of a hand-written renderer whose every CommonMark corner (nesting,
+fences, emphasis inside links) had been a bug report of its own.
 
-It is close to CommonMark, which models write, with deliberate differences:
+`_markdown` configures it once:
 
-- **Lists nest as models write them** (`_list`). An item holds every line
-  indented past its marker. The list's next item is a line of its kind at the
-  marker's column or one off it, as in `" 9."` over `"10."` or `"- a"` over
-  `" - b"`. A line indented further is a sub-list. That includes one of the
-  list's own kind written short: `"  1. sub"` two spaces under `"1. step"`,
-  where CommonMark wants three and would flatten it, which was the reported
-  bug. Such a sub-list's lines lose only its own indentation, keeping its
-  shape. Lines after it, back at the item's text, belong to the item again.
-- **A rule is never a list item.** `"- - -"` and `"* * *"` are tested before
-  lists, and `_list` will not take one for its next item.
-- **Code blocks.** A fence is three or more backticks or tildes, indented by up
-  to three spaces. Its info string is anything without a backtick (`c++`,
-  `c#`, `python title=x`), and its first word is the language. It closes on a
-  fence of the same character at least as long. An unclosed block runs to the
-  end of the message. `_list` tracks fences with the same helpers
-  (`_fenceOpen`, `_fenceCloses`), so a code block inside an item, even one
-  opened on the item's own line, neither ends the item nor lets a line inside
-  it be taken for the next item.
-- **Code spans first, then links, then emphasis** (`_inlineMd`). Each finished
-  piece is held out of the line as a placeholder until the end. A code span is
-  shown as written, so `` `*args` `` keeps its asterisk and `` `[a](b)` `` stays
-  text. A link's target is kept as written, with no markup in its attribute.
-- **Links go to the web or an address only** (`SAFE_HREF`: `http(s):`,
-  `mailto:`). A model can be led by what it reads into writing
-  `[text](javascript:...)`. Any other target, including a file path, which
-  would resolve against the hub, is shown as its text with the target in a
-  tooltip (`.md-link-inert`).
+- **The line breaks the model wrote are kept** (`breaks`), so a `**Label**`
+  line over its paragraph stays two lines. Blank lines make paragraphs.
+- **Raw HTML is shown as text** (`html: false`), and **an image is a link to
+  it**, never fetched (`image` disabled).
+- **Addresses written out are links** (`linkify`), but nothing is guessed
+  (`fuzzyLink`/`fuzzyEmail` off): `server.py` is a file, not a site in
+  Paraguay.
+- **The chat's own markup**: `code.md-code` for a code span; a
+  `div.code-block` with `data-lang` and a `span.code-lang` label for a code
+  block, the info string's first word its language; `div.md-h.md-hN` for a
+  heading; `md-list`, `md-table`, `md-hr` and `md-quote` on the rest.
+- **Links go to the web or an address only** (`_neuterLinks`, a core rule;
+  `SAFE_HREF`: `http(s):`, `mailto:`). A model can be led by what it reads
+  into writing `[text](javascript:...)`. Any other target, including a file
+  path, which would resolve against the hub, is shown as its text with the
+  target in a tooltip (`.md-link-inert`). `validateLink` passes everything so
+  that such a link is parsed, and shown as its text rather than as the
+  markdown it was written in. A web link opens in a new tab, `noopener`.
+
+Before parsing, `_asMeant` rewrites the few things CommonMark reads otherwise
+than a model means them, line by line, leaving code blocks as written (it
+tracks fences as CommonMark does: a closing fence is the opening's character
+alone, at least as long; one may open on a list item's own line):
+
+- **A sub-list written short of its item's text nests.** CommonMark nests a
+  line under an item only if it reaches the item's text, three columns under
+  `1. `, and a sub-list two spaces in ends the list instead: the flattening
+  that was reported. A list item at least two columns past its parent's
+  marker but short of its text is moved in, with everything under it (`shifts`).
+- **Text at the margin straight after a list ends it.** CommonMark would read
+  it as the last item's paragraph going on ("lazy continuation"); a blank
+  line goes before it.
+- **A numbered sub-list starting past 1 starts.** CommonMark lets only a list
+  starting at 1 interrupt its item's text. Such an item is written as `1.`
+  (`01.` for `12.`, keeping its width), and `_listStarts`, a core rule, puts
+  its number back from the line it was on. A blank line would have done it
+  too, but would make the whole list loose, every item a spaced paragraph.
+- **Tabs** in a line's indentation and after its markers become the spaces
+  they stand for, to the next multiple of four, as CommonMark reads them.
+- **Markers stacked past 16 on one line** (`- - - - … x`) are text from there
+  on: markdown-it drops what is nested past its own limit.
+
+Should the library fail to load, a message is shown as its text, escaped,
+and the console says so once.
 
 The page that renders all this, `index.html`, is served under a
 Content-Security-Policy, `CHAT_PAGE_CSP`: `script-src 'self'`, so only its own
@@ -3180,11 +3196,12 @@ needs none of those itself, which a test pins. Other pages (`resume.html`,
 `?resume=` and `?cwd=` produce escape the error they show, because it repeats
 the URL's own text.
 
-Tests: `markdown_lists.test.js`, `markdown_code.test.js` and
-`markdown_links.test.js` (jsdom, through `tests/md_harness.js`, which fails a
-test on any warning or error the renderer logs), and
-`test_chat_page_policy.py`. Mutation targets: `md-lists`, `md-code`,
-`md-links`, `pagepolicy`.
+Tests: `markdown_lists.test.js`, `markdown_code.test.js`,
+`markdown_links.test.js` and `markdown_text.test.js` (jsdom, through
+`tests/md_harness.js`, which loads the library and `chat.js` as the page does
+(`tests/chat_source.js`) and fails a test on any warning or error the renderer
+logs), and `test_chat_page_policy.py`. Mutation targets: `md-lists`,
+`md-code`, `md-links`, `md-text`, `pagepolicy`.
 
 ### The tab's icon shows the session's state
 

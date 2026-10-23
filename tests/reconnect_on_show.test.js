@@ -20,7 +20,8 @@ const { JSDOM } = require('jsdom');
 const ROOT = path.join(__dirname, '..');
 const STATIC = path.join(ROOT, 'static');
 const SCRIPTS = ['util.js', 'favicon.js', 'diff.js', 'status.js', 'panels.js',
-                 'commands.js', 'usage.js', 'chat.js', 'lobby.js', 'move.js', 'app.js'];
+                 'commands.js', 'usage.js', 'vendor/markdown-it.min.js', 'chat.js',
+                 'lobby.js', 'move.js', 'app.js'];
 
 let failures = 0;
 let passes = 0;
