@@ -13,13 +13,16 @@
  *   3. the server copies the conversation JSONL into that account under the
  *      destination directory's project slug (fresh id, cwd rewritten), titles
  *      it, starts a runtime resuming the copy, and re-attaches THIS socket to
- *      it — so the chat seamlessly continues in its new home.
+ *      it — so the chat seamlessly continues in its new home.  The original
+ *      is kept, marked in the session list as moved, or -- the checkbox,
+ *      remembered between moves -- sent to the Recycle Bin once the copy is
+ *      up.
  *
  * Directory and account are chosen independently: leaving either as it is
  * gives you the two single-axis moves, and changing both does them together.
  *
  * Wire protocol
- *   send:    move_list, move_do {config_dir, new_name, cwd}   (see note above)
+ *   send:    move_list, move_do {config_dir, new_name, cwd, delete_original}
  *   receive: move_accounts {accounts:[{config_dir,name,email,is_current}],
  *                             dirs:[{path,mtime}], has_session,
  *                             current_title, current_cwd},
@@ -172,6 +175,10 @@ const Move = (() => {
       'session</label>' +
       '<input id="move-name" class="move-name" type="text" ' +
       'placeholder="e.g. ' + _esc(_currentTitle || 'my session') + '">' +
+      '<label class="move-delete"><input id="move-delete" type="checkbox"> ' +
+      'Delete the original afterwards (to the Recycle Bin)</label>' +
+      '<div class="move-hint">Once the copy is up. Kept, the original is ' +
+      'marked in the session list as moved.</div>' +
       '<div class="move-actions">' +
       '  <button class="move-back">&larr; Back</button>' +
       '  <button class="move-go">Copy &amp; continue</button>' +
@@ -183,6 +190,9 @@ const Move = (() => {
     cwdInput.value = _prefillCwd || _currentCwd || '';
     const input = elBody.querySelector('#move-name');
     input.value = _currentTitle || '';
+    const del = elBody.querySelector('#move-delete');
+    del.checked = _deleteWanted();
+    del.addEventListener('change', () => _rememberDelete(del.checked));
 
     // `/move <path>` already said which directory, so the remaining
     // decision is the name; otherwise the directory is the first field.
@@ -201,7 +211,7 @@ const Move = (() => {
       .addEventListener('click', () => renderAccounts({
         accounts: _accounts, has_session: true, current_title: _currentTitle,
       }));
-    const go = () => _submit(input.value, cwdInput.value);
+    const go = () => _submit(input.value, cwdInput.value, del.checked);
     elBody.querySelector('.move-go').addEventListener('click', go);
     [input, cwdInput].forEach((el) => {
       el.addEventListener('keydown', (e) => {
@@ -210,7 +220,7 @@ const Move = (() => {
     });
   }
 
-  function _submit(name, cwd) {
+  function _submit(name, cwd, deleteOriginal) {
     name = (name || '').trim();
     cwd = (cwd || '').trim();
     const msgEl = elBody.querySelector('.move-msg');
@@ -235,7 +245,18 @@ const Move = (() => {
       config_dir: _selected.config_dir,
       new_name: name,
       cwd: cwd,
+      delete_original: !!deleteOriginal,
     });
+  }
+
+  // Whether to delete the original: the checkbox, as last left -- someone
+  // who moves sessions to tidy them up wants it every time.
+  const DELETE_KEY = 'orch2.move.deleteOriginal';
+  function _deleteWanted() {
+    try { return localStorage.getItem(DELETE_KEY) === '1'; } catch (e) { return false; }
+  }
+  function _rememberDelete(on) {
+    try { localStorage.setItem(DELETE_KEY, on ? '1' : '0'); } catch (e) { /* private mode */ }
   }
 
   // Case- and separator-insensitive path comparison, mirroring the server's

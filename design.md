@@ -3560,7 +3560,8 @@ started under a different `CLAUDE_CONFIG_DIR` still reopens correctly.
 
 **Wire protocol** — client → server: `list`, `lobby_watch {on}`, `detach`,
 `attach {rid}`, `open {session_id, cwd, account}`, `new {cwd}`, `close {rid}`,
-`move_list`, `move_do {config_dir, new_name, cwd}`, `lift_halt {id}` (§9a).
+`move_list`, `move_do {config_dir, new_name, cwd, delete_original}`,
+`lift_halt {id}` (§9a).
 Server → client:
 `session_list {running, recent, recent_pending, stale, halts}`,
 `attached {session}`,
@@ -3647,7 +3648,7 @@ a convenience, not the set of legal destinations, since moving a session
 somewhere Claude has never run is exactly the interesting case.
 
 Pinned by `tests/test_move_directory.py` (35), `tests/move_overlay.test.js`
-(16, jsdom) and four mutation targets: `movecopy` (`copy_session.py` × 8),
+(19, jsdom) and four mutation targets: `movecopy` (`copy_session.py` × 8),
 `moveserver` (`server.py` × 20), `moveui` (`static/move.js` × 13) and
 `movecmd` (`static/commands.js` × 5, how the command name is matched).
 `moveserver` (then `switchserver`) found three weak tests on its first run — a slug test whose
@@ -3733,6 +3734,71 @@ Pinned by `tests/test_move_stops_original.py` (20). It drives the real
 faking only the SDK side. Mutation targets: `movestop` (`server.py` × 19) and
 `movestop-wakeup` (`wakeup_store.py` × 1). Stop-before-copy is an ordering, not
 a line a string swap can move, so a test pins it rather than a mutant.
+
+#### The original afterwards: kept and marked, or deleted
+
+Asked for 2026-10-23: the option to delete the old conversation after moving.
+Built with it, because a kept original otherwise looks in the session list just
+as it did before the move: a mark saying where the work went.
+
+**The copy is the whole session** (`copy_session.copy_whole_session`), so that
+it stands without the original. Beside the transcript the CLI keeps a folder of
+the same name: `subagents/`, the transcripts of the agents it ran, which record
+the session's id and cwd like the main one, and `tool-results/`, where output
+too large to keep inline goes, *with the transcript saying where*. The account
+also holds `file-history/<id>`, the backups `/rewind` restores from. All of it
+is copied under the new id, the subagent transcripts rewritten as the main one
+is, except the folder's `custom-title.json`: it holds the original's name,
+which the CLI would stamp back on the copy. A copy that fails partway removes
+what it wrote.
+
+That needed one exception to "only the top-level fields are rewritten" (above).
+The paths into the session's folder, and a compaction summary's pointer to the
+transcript beside it, are the CLI's storage, not the user's files.
+`copy_session_file(relocate=(old, new))` points them at the copy's, matched
+with either separator and, on Windows, in any case (the CLI writes the path
+from its config dir as it was given it). A replacement keeps the separators of
+what it replaces, so a path inside JSON a tool printed stays escaped. Only a
+line that names the folder (its id followed by a separator or `.jsonl`) is
+walked, so the cost on a large transcript is a substring test per line. Without this, deleting the original would leave the
+copy's model reading tool output that is no longer there.
+
+**The record.** A successful move saves `orchestrator2/moved/<id>.json` in
+the original's account (`session.save_moved_record`): the copy's id, name, cwd
+and account. `_recent_disk_sessions` lists the `moved/` folder once per account
+and attaches `moved_to` to those entries (`_moved_to`). It drops the mark if the
+copy is gone, and uses the copy's current title where it can see one. The lobby
+(`lobby.js` `_recentItem`) dims such an item, says "moved → copy" (the account
+too, when the copy is in another), and opens the copy. The original stays a
+smaller "open the original" link away; the delegated click handler takes the
+nearest `[data-sid]`, so that link wins over its item.
+
+**The deletion** (`move_do`'s `delete_original`, which only a real `true`
+turns on; the overlay's checkbox, remembered in `localStorage`) runs as a task,
+`_trash_moved_original`, after the move has answered. It waits for the copy's
+CLI to have resumed the copy (`bridge.client` set and `state.connecting`
+clear). That is the proof the copy is a session and not only a file. It waits
+for up to `_MOVE_TRASH_WAIT_S` (15 min, since a large resume is given minutes),
+and then refuses if:
+
+- the copy was closed first, its connect gave up, or the wait ran out;
+- the original is running again, here (`_live_runtime_for`) or in another
+  process (`proc_guard.find_foreign_claude_for_session`);
+- the copy holds fewer records than the original (`count_records`).
+
+Otherwise `session.trash_session` sends the transcript to the Recycle Bin
+(`send2trash`) and, only if that worked, its folder and `file-history` after
+it, so restoring the session is restoring those. It deletes outright what is no
+use without it: the CLI's `session-env/<id>` and every hub record named for the
+id (`orchestrator2/*/*<id>*.json`, including the moved record). A refused or
+failed deletion keeps the original, marked, and the copy's tabs are told why.
+A successful one is told too.
+
+Pinned by `tests/test_move_delete_original.py` (32), `tests/lobby_moved.test.js`
+(8) and `tests/move_overlay.test.js`'s last three, with mutation targets
+`movewhole-copy` (`copy_session.py` × 13), `movewhole-trash` (`session.py` × 4),
+`movewhole-server` (`server.py` × 15), `movewhole-lobby` (`static/lobby.js` × 6)
+and `movewhole-ui` (`static/move.js` × 4).
 
 #### `copy_session.py` no longer imports `textual`
 

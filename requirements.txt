@@ -9,6 +9,10 @@ agent-comms @ git+https://github.com/inhahe/agent-comms@v1.0.0
 fastapi>=0.115
 graphifyy>=0.9.13
 psutil>=5.9
+# /move's "delete the original afterwards" sends it to the Recycle Bin, so a
+# deletion can be undone.  Imported only when a deletion runs: without it,
+# that deletion fails and keeps the original, and nothing else is lost.
+send2trash>=2.1
 uvicorn>=0.34
 websockets>=15.0
 

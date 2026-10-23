@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -1399,6 +1400,79 @@ def _save_session_record(kind: str, session_id: str, record: dict[str, Any],
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+# --- A session /move copied elsewhere and left in place ---------------------
+# The original of a move is stopped and kept (unless the move deleted it), and
+# looks in the session list just as it did -- an invitation to carry on in the
+# copy's past.  So the move leaves a record with the original saying where the
+# work went, and the list shows it.
+
+
+def save_moved_record(session_id: str, to: dict[str, Any],
+                      config_dir: str | None = None) -> None:
+    """Record that *session_id* of account *config_dir* was moved to *to*:
+    the copy's ``session_id``, ``title``, ``cwd`` and ``account``."""
+    _save_session_record("moved", session_id, {"to": to}, config_dir)
+
+
+def moved_ids(config_dir: str | None = None) -> set[str]:
+    """The sessions of account *config_dir* that have a moved record -- one
+    directory listing, so the session list asks only about those."""
+    try:
+        return {p.stem for p in (_orch2_state_dir(config_dir) / "moved").glob("*.json")}
+    except OSError:
+        return set()
+
+
+def load_moved_record(session_id: str,
+                      config_dir: str | None = None) -> dict[str, Any] | None:
+    """Where *session_id* of account *config_dir* was moved to, as
+    ``save_moved_record`` kept it; None if it was not, or nothing usable."""
+    to = (_load_session_record("moved", session_id, config_dir) or {}).get("to")
+    if not (isinstance(to, dict) and isinstance(to.get("session_id"), str)
+            and isinstance(to.get("account"), str)):
+        return None
+    return to
+
+
+def trash_session(jsonl: Path, config_dir: str | None = None) -> list[str]:
+    """Send the session whose transcript is *jsonl*, in account *config_dir*,
+    to the Recycle Bin, with what the CLI and the hub keep of it elsewhere.
+
+    The transcript goes first; if it cannot (``OSError``), nothing else is
+    touched.  Its folder (``subagents/``, ``tool-results/``) and its
+    ``file-history`` follow it to the Recycle Bin, so restoring the session is
+    restoring those.  What is no use without it is deleted outright: the CLI's
+    ``session-env`` folder for it, and the hub's records of it (cost,
+    compaction, queue, background tasks, where it was moved).
+
+    Returns what could not be removed, a line per item, [] when everything
+    was.  The caller must know no CLI is running the session.
+    """
+    from send2trash import send2trash
+    sid = jsonl.stem
+    acct = account_dir(config_dir)
+    send2trash(str(jsonl))
+    left: list[str] = []
+    for path in (jsonl.with_suffix(""), acct / "file-history" / sid):
+        if path.exists():
+            try:
+                send2trash(str(path))
+            except OSError as exc:
+                left.append(f"{path}: {exc}")
+    records = list(_orch2_state_dir(config_dir).glob(f"*/*{_sanitize_cwd(sid)}*.json"))
+    for path in [acct / "session-env" / sid, *records]:
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            left.append(f"{path}: {exc}")
+    return left
 
 
 def sessions_titled(title: str, cwd: str, config_dir: str | None = None

@@ -54,7 +54,9 @@ const HERE = 'D:\\here';
 
 function makePage() {
   const dom = new JSDOM('<!doctype html><html><body></body></html>',
-                        { runScripts: 'outside-only', pretendToBeVisual: false });
+                        { runScripts: 'outside-only', pretendToBeVisual: false,
+                          // An origin of its own, so the page has a localStorage.
+                          url: 'http://localhost/' });
   const win = dom.window;
   const sent = [];
   const sandbox = win;
@@ -76,6 +78,7 @@ function makePage() {
     },
     get cwdInput() { return win.document.querySelector('#move-cwd'); },
     get nameInput() { return win.document.querySelector('#move-name'); },
+    get deleteBox() { return win.document.querySelector('#move-delete'); },
     get dirButtons() {
       return Array.from(win.document.querySelectorAll('.move-dir'));
     },
@@ -233,6 +236,38 @@ test('a session-less tab is told so instead of being offered a copy', () => {
   assert(p.win.document.querySelector('.move-error'), 'no explanation shown');
   assert(!p.win.document.querySelector('.move-account'),
          'offered accounts for a session that does not exist');
+});
+
+// ---- deleting the original ---------------------------------------------------
+
+test('the original is kept unless the box is ticked', () => {
+  const p = opened();
+  assert(p.deleteBox && !p.deleteBox.checked, 'no box, or ticked to begin with');
+  p.go();
+  assert(p.last.delete_original === false, JSON.stringify(p.last.delete_original));
+});
+
+test('ticked, the move asks for the original to be deleted', () => {
+  const p = opened();
+  p.deleteBox.click();
+  p.go();
+  assert(p.last.delete_original === true, JSON.stringify(p.last.delete_original));
+});
+
+test('the box is as the last move left it', () => {
+  // Someone who moves sessions to tidy them up wants it every time.
+  const p = opened();
+  p.deleteBox.click();
+  p.go();
+  p.open();
+  p.list();
+  p.pickAccount(0);
+  assert(p.deleteBox.checked, 'not remembered');
+  p.deleteBox.click();
+  p.open();
+  p.list();
+  p.pickAccount(0);
+  assert(!p.deleteBox.checked, 'unticking not remembered');
 });
 
 console.log(`\n${ran - failures}/${ran} passed`);

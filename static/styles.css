@@ -2099,6 +2099,21 @@ html, body {
   color: var(--accent-dim, #7daea3);
   margin-top: 2px;
 }
+/* A session /move left behind: dimmed, so its copy is what the eye finds. */
+.lobby-item-moved { opacity: 0.6; }
+.lobby-item-moved:hover { opacity: 1; }
+.lobby-item-moved-to {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lobby-item-original {
+  margin-left: 8px;
+  color: var(--text-dim);
+}
 
 /* ===== /move overlay (account switch) ===== */
 .move-overlay {
@@ -2237,6 +2252,16 @@ html, body {
   font-size: 11px;
   line-height: 1.45;
   color: var(--text-muted);
+}
+
+.move-delete {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
 }
 
 /* One-click fills for directories Claude already knows about.  They wrap and

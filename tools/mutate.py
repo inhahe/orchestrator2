@@ -997,12 +997,12 @@ MOVEUI_MUTATIONS = [
      "      new_name: name,"),
 
     ("the directory field is rendered but never read",
-     "    const go = () => _submit(input.value, cwdInput.value);",
-     "    const go = () => _submit(input.value);"),
+     "    const go = () => _submit(input.value, cwdInput.value, del.checked);",
+     "    const go = () => _submit(input.value, undefined, del.checked);"),
 
     ("the name and the directory are swapped",
-     "    const go = () => _submit(input.value, cwdInput.value);",
-     "    const go = () => _submit(cwdInput.value, input.value);"),
+     "    const go = () => _submit(input.value, cwdInput.value, del.checked);",
+     "    const go = () => _submit(cwdInput.value, input.value, del.checked);"),
 
     ("the directory starts blank instead of where the session is",
      "    cwdInput.value = _prefillCwd || _currentCwd || '';",
@@ -1052,55 +1052,57 @@ MOVEUI_MUTATIONS = [
 
 MOVECOPY_MUTATIONS = [
     ("a move leaves the records naming the old directory (the original gap)",
-     '                if new_cwd is not None and "cwd" in rec:\n'
-     '                    rec["cwd"] = new_cwd',
-     "                pass"),
+     '                    if new_cwd is not None and "cwd" in rec:\n'
+     '                        rec["cwd"] = new_cwd',
+     "                    pass"),
 
     ("only the first cwd record is moved -- enough to fool sniff_session_cwd, "
      "so a /cwd session ends up split across two directories",
-     '                if new_cwd is not None and "cwd" in rec:\n'
-     '                    rec["cwd"] = new_cwd',
-     '                if new_cwd is not None and "cwd" in rec:\n'
-     '                    rec["cwd"] = new_cwd\n'
-     "                    new_cwd = None"),
+     '                    if new_cwd is not None and "cwd" in rec:\n'
+     '                        rec["cwd"] = new_cwd',
+     '                    if new_cwd is not None and "cwd" in rec:\n'
+     '                        rec["cwd"] = new_cwd\n'
+     "                        new_cwd = None"),
 
     ("every record is given a cwd, including ones that never had one",
-     '                if new_cwd is not None and "cwd" in rec:',
-     "                if new_cwd is not None:"),
+     '                    if new_cwd is not None and "cwd" in rec:',
+     "                    if new_cwd is not None:"),
 
     ("the move is done as a blind text replacement, which falsifies the "
      "transcript along with the metadata",
      '    tmp = dest_jsonl.with_name(dest_jsonl.name + ".tmp")\n'
-     '    with src_jsonl.open(encoding="utf-8", errors="replace") as fin, \\\n'
-     '            tmp.open("w", encoding="utf-8") as fout:\n'
-     "        for line in fin:\n"
-     "            stripped = line.strip()",
+     '    try:\n'
+     '        with src_jsonl.open(encoding="utf-8", errors="replace") as fin, \\\n'
+     '                tmp.open("w", encoding="utf-8") as fout:\n'
+     "            for line in fin:\n"
+     "                stripped = line.strip()",
      '    tmp = dest_jsonl.with_name(dest_jsonl.name + ".tmp")\n'
      '    _old_cwd = _read_session_meta(src_jsonl).get("cwd") if new_cwd else None\n'
-     '    with src_jsonl.open(encoding="utf-8", errors="replace") as fin, \\\n'
-     '            tmp.open("w", encoding="utf-8") as fout:\n'
-     "        for line in fin:\n"
-     "            if _old_cwd:\n"
-     "                line = line.replace(json.dumps(_old_cwd)[1:-1],\n"
-     "                                    json.dumps(new_cwd)[1:-1])\n"
-     "            stripped = line.strip()"),
+     '    try:\n'
+     '        with src_jsonl.open(encoding="utf-8", errors="replace") as fin, \\\n'
+     '                tmp.open("w", encoding="utf-8") as fout:\n'
+     "            for line in fin:\n"
+     "                if _old_cwd:\n"
+     "                    line = line.replace(json.dumps(_old_cwd)[1:-1],\n"
+     "                                        json.dumps(new_cwd)[1:-1])\n"
+     "                stripped = line.strip()"),
 
     ("the branch is carried into a tree it has nothing to do with",
-     '                if new_branch is not None and "gitBranch" in rec:\n'
-     '                    rec["gitBranch"] = new_branch',
-     "                pass"),
+     '                    if new_branch is not None and "gitBranch" in rec:\n'
+     '                        rec["gitBranch"] = new_branch',
+     "                    pass"),
 
     ('an empty branch is treated as "leave it alone"',
-     "                if new_branch is not None",
-     "                if new_branch"),
+     "                    if new_branch is not None",
+     "                    if new_branch"),
 
     ("the plain-copy shortcut is keyed on the id again, so a same-id move "
      "skips every rewrite",
-     "    if not rewrite_id and new_cwd is None and new_branch is None:",
+     "    if not rewrite_id and new_cwd is None and new_branch is None and fix is None:",
      "    if not rewrite_id:"),
 
     ("nothing is ever plain-copied, so an untouched copy is re-serialised",
-     "    if not rewrite_id and new_cwd is None and new_branch is None:",
+     "    if not rewrite_id and new_cwd is None and new_branch is None and fix is None:",
      "    if False:"),
 ]
 
@@ -6946,6 +6948,188 @@ MD_LINKS_MUTATIONS = [
      "          : '');"),
 ]
 
+# /move copies the whole session and can delete the original, or marks it
+# (tests/test_move_delete_original.py).
+MOVEWHOLE_COPY_MUTATIONS = [
+    ("the copy is the transcript alone, as it was",
+     "        if old_folder.is_dir():\n",
+     "        if False:\n"),
+
+    ("the original's name is copied, for the CLI to stamp back on the copy",
+     '                if path.is_dir() or rel == Path("custom-title.json"):\n',
+     "                if path.is_dir():\n"),
+
+    ("a subagent's transcript is copied untouched",
+     '                if path.suffix == ".jsonl":\n',
+     "                if False:\n"),
+
+    ("a subagent's transcript is rewritten as if it were the session's own",
+     "                    copy_session_file(path, dest, new_id, old_id=old_id, **rewrite)\n",
+     "                    copy_session_file(path, dest, new_id, **rewrite)\n"),
+
+    ("the rewind backups stay behind",
+     "        if old_hist.is_dir():\n",
+     "        if False:\n"),
+
+    ("half a copy is left behind",
+     "        for p in ours:\n",
+     "        for p in []:\n"),
+
+    ("a failed transcript copy leaves its temporary file",
+     "        tmp.unlink(missing_ok=True)\n        raise\n",
+     "        raise\n"),
+
+    ("paths into the original's folder are left pointing at it",
+     "                    if fix is not None and any(m in stripped for m in mentions):\n",
+     "                    if False:\n"),
+
+    ("the transcript beside the folder is not relocated",
+     '        + r"(?=[\\\\/]|\\.jsonl)",\n',
+     '        + r"(?=[\\\\/])",\n'),
+
+    ("only one separator is understood",
+     '    split = re.compile(r"[\\\\/]+")\n',
+     '    split = re.compile(r"[\\\\]+")\n'),
+
+    ("a path in another case is missed",
+     '        re.IGNORECASE if os.name == "nt" else 0)\n',
+     "        0)\n"),
+
+    ("a replacement drops the escaping of what it replaces",
+     "            lambda m: split.search(m.group(0)).group(0).join(new_parts), s)\n",
+     "            lambda m: str(new), s)\n"),
+
+    ("a record is counted with the blank lines",
+     "        return sum(1 for line in f if line.strip())\n",
+     "        return sum(1 for line in f)\n"),
+]
+
+MOVEWHOLE_TRASH_MUTATIONS = [
+    ("the folder stays behind",
+     '    for path in (jsonl.with_suffix(""), acct / "file-history" / sid):\n',
+     '    for path in (acct / "file-history" / sid,):\n'),
+
+    ("the hub's records of it stay behind",
+     "    for path in [acct / \"session-env\" / sid, *records]:\n",
+     "    for path in [acct / \"session-env\" / sid]:\n"),
+
+    ("a deletion that half fails says nothing",
+     '                left.append(f"{path}: {exc}")\n    records',
+     "                pass\n    records"),
+
+    ("the rest goes even when the transcript would not",
+     "    send2trash(str(jsonl))\n",
+     "    try:\n        send2trash(str(jsonl))\n    except OSError:\n        pass\n"),
+]
+
+MOVEWHOLE_SERVER_MUTATIONS = [
+    ("asking to delete is ignored",
+     "    if delete_original:\n        task = asyncio.create_task(\n",
+     "    if False:\n        task = asyncio.create_task(\n"),
+
+    ("anything a client sends deletes",
+     '    delete_original = msg.get("delete_original") is True\n',
+     '    delete_original = msg.get("delete_original") is not None\n'),
+
+    ("the original is not marked as moved",
+     "    await asyncio.to_thread(save_moved_record, sid, {\n",
+     "    await asyncio.to_thread(lambda *a: None, sid, {\n"),
+
+    ("the deletion does not wait for the copy",
+     '        if getattr(br, "client", None) is not None and not st.connecting:\n',
+     "        if True:\n"),
+
+    ("a copy that never comes up is waited for forever",
+     "        if time.monotonic() >= deadline:\n",
+     "        if False:\n"),
+
+    ("a copy that gave up is waited for",
+     "        if not st.connecting:\n            return \"the copy did not start\"\n",
+     ""),
+
+    ("a copy closed before it came up is waited for",
+     "        if runtimes.get(new_rt.rid) is not new_rt:\n",
+     "        if False:\n"),
+
+    ("an original opened again is deleted under it",
+     "    if _live_runtime_for(sid) is not None:\n        return \"it was opened again\"\n",
+     "    if False:\n        return \"it was opened again\"\n"),
+
+    ("an original another process has open is deleted under it",
+     "    if await asyncio.to_thread(proc_guard.find_foreign_claude_for_session, sid):\n",
+     "    if False:\n"),
+
+    ("a copy short of records does not stop the deletion",
+     "    if ours < theirs:\n",
+     "    if False:\n"),
+
+    ("a refused deletion is not said",
+     "    await new_rt.broadcast({\"type\": \"system_msg\",\n"
+     "                            \"subtype\": \"info\" if why is None else \"warning\",\n",
+     "    (lambda m: None)({\"type\": \"system_msg\",\n"
+     "                            \"subtype\": \"info\" if why is None else \"warning\",\n"),
+
+    ("a moved original is not marked in the list",
+     '            s["moved_to"] = _moved_to(s["session_id"], s["account"], out, live_titles)\n',
+     "            pass\n"),
+
+    ("a copy that is gone is still pointed at",
+     '    if to is None or find_session_dir(to["session_id"], to["account"]) is None:\n',
+     "    if to is None:\n"),
+
+    ("the copy's title is what the move named it, not what it is now",
+     "             or next((s.get(\"title\") for s in listed\n",
+     "             or next((None for s in listed\n"),
+
+    ("a running copy's title is not looked at",
+     '    title = (live_titles.get(to["session_id"])\n',
+     "    title = (None\n"),
+]
+
+MOVEWHOLE_LOBBY_MUTATIONS = [
+    ("a moved original opens itself, not its copy",
+     "    const opens = to || s;\n",
+     "    const opens = s;\n"),
+
+    ("a moved original is not marked",
+     "    if (to) {\n      const where",
+     "    if (false) {\n      const where"),
+
+    ("a moved original is not dimmed",
+     "    item.className = 'lobby-item' + (to ? ' lobby-item-moved' : '');\n",
+     "    item.className = 'lobby-item';\n"),
+
+    ("\"open the original\" opens the copy",
+     "        const item = e.target.closest('[data-sid]');\n",
+     "        const item = e.target.closest('.lobby-item');\n"),
+
+    ("the copy's account is never named",
+     "      if (to.account && _acctName(to.account) !== acct) where.push(_acctName(to.account));\n",
+     ""),
+
+    ("the copy's account is named even when it is the original's",
+     "      if (to.account && _acctName(to.account) !== acct) where.push(_acctName(to.account));\n",
+     "      if (to.account) where.push(_acctName(to.account));\n"),
+]
+
+MOVEWHOLE_UI_MUTATIONS = [
+    ("the checkbox is never sent",
+     "      delete_original: !!deleteOriginal,\n",
+     ""),
+
+    ("the checkbox is sent whatever it says",
+     "      delete_original: !!deleteOriginal,\n",
+     "      delete_original: true,\n"),
+
+    ("the checkbox is not remembered",
+     "    del.addEventListener('change', () => _rememberDelete(del.checked));\n",
+     ""),
+
+    ("the checkbox does not start as last left",
+     "    del.checked = _deleteWanted();\n",
+     ""),
+]
+
 COMPACTION_CMD_MUTATIONS = [
     ("/autocompact hides that the CLI has yet to take it",
      "    if cli is not None and compaction_env(*cli) != compaction_env(at, on):\n",
@@ -8152,6 +8336,16 @@ TARGETS = {
                    CWD_CONFIG_MUTATIONS, "pytest"),
     "cwd-server": ("server.py", "tests/test_cwd_arg.py",
                    CWD_SERVER_MUTATIONS, "pytest"),
+    "movewhole-copy": ("copy_session.py", "tests/test_move_delete_original.py",
+                       MOVEWHOLE_COPY_MUTATIONS, "pytest"),
+    "movewhole-trash": ("session.py", "tests/test_move_delete_original.py",
+                        MOVEWHOLE_TRASH_MUTATIONS, "pytest"),
+    "movewhole-server": ("server.py", "tests/test_move_delete_original.py",
+                         MOVEWHOLE_SERVER_MUTATIONS, "pytest"),
+    "movewhole-lobby": ("static/lobby.js", "tests/lobby_moved.test.js",
+                        MOVEWHOLE_LOBBY_MUTATIONS, "node"),
+    "movewhole-ui": ("static/move.js", "tests/move_overlay.test.js",
+                     MOVEWHOLE_UI_MUTATIONS, "node"),
     "account-server": ("server.py", "tests/test_session_account.py",
                        ACCOUNT_SERVER_MUTATIONS, "pytest"),
     "account-move": ("server.py", "tests/test_move_stops_original.py",

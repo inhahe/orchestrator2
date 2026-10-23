@@ -180,8 +180,10 @@ const Lobby = (() => {
     }
     if (elRecent) {
       elRecent.addEventListener('click', (e) => {
-        const item = e.target.closest('.lobby-item');
-        if (!item) return;
+        // The item names a session; so may a link inside it (a moved
+        // session's "open the original"), which then wins.
+        const item = e.target.closest('[data-sid]');
+        if (!item || !elRecent.contains(item)) return;
         if (_plainClick(e)) e.preventDefault(); else return;
         const sid = item.getAttribute('data-sid');
         const cwd = item.getAttribute('data-cwd') || '';
@@ -972,30 +974,51 @@ const Lobby = (() => {
     }
   }
 
+  // A session `/move` left behind (s.moved_to) opens its copy, where the work
+  // went on; the original is still a click away, and dimmed so the copy is
+  // what the eye finds.
   function _recentItem(s) {
     const item = document.createElement('div');
-    item.className = 'lobby-item';
-    item.setAttribute('data-sid', s.session_id || '');
-    if (s.cwd) item.setAttribute('data-cwd', s.cwd);
-    if (s.account) item.setAttribute('data-account', s.account);
+    const to = s.moved_to || null;
+    const opens = to || s;
+    item.className = 'lobby-item' + (to ? ' lobby-item-moved' : '');
+    item.setAttribute('data-sid', opens.session_id || '');
+    if (opens.cwd) item.setAttribute('data-cwd', opens.cwd);
+    if (opens.account) item.setAttribute('data-account', opens.account);
 
     const title = s.title || s.first_user_msg || (
       s.session_id ? s.session_id.substring(0, 8) : '(session)');
     // Short account tag for cross-account recent sessions.
-    const acct = s.account
-      ? s.account.replace(/\\/g, '/').split('/').pop() || ''
-      : '';
+    const acct = s.account ? _acctName(s.account) : '';
+    let moved = '';
+    if (to) {
+      const where = [to.title || (to.session_id || '').substring(0, 8)];
+      if (to.account && _acctName(to.account) !== acct) where.push(_acctName(to.account));
+      moved = `
+      <div class="lobby-item-moved-to">moved &rarr; ${_esc(where.join(' · '))}
+        <a class="lobby-item-original"
+           data-sid="${_esc(s.session_id || '')}" data-cwd="${_esc(s.cwd || '')}"
+           data-account="${_esc(s.account || '')}"
+           href="${_esc(_sessionHref(s.session_id || '', s.cwd || '', s.account || ''))}"
+           >open the original</a></div>`;
+    }
     item.innerHTML = `
       <div class="lobby-item-main">
         <a class="lobby-item-title"
-           href="${_esc(_sessionHref(s.session_id || '', s.cwd || '',
-                                     s.account || ''))}"
+           ${to ? 'title="Moved: opens the copy"' : ''}
+           href="${_esc(_sessionHref(opens.session_id || '', opens.cwd || '',
+                                     opens.account || ''))}"
            >${_esc(title)}</a>
         <span class="lobby-item-age">${_esc(s.age || '')}</span>
-      </div>
+      </div>${moved}
       <div class="lobby-item-cwd" title="${_esc(s.cwd || '')}">${_esc(s.cwd || '--')}</div>
       ${acct ? `<div class="lobby-item-acct">${_esc(acct)}</div>` : ''}`;
     return item;
+  }
+
+  // An account's name: its config dir's last part.
+  function _acctName(dir) {
+    return String(dir).replace(/\\/g, '/').split('/').pop() || '';
   }
 
   // --- Helpers ---------------------------------------------------------

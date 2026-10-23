@@ -112,8 +112,10 @@ from session import (
     find_session_dir,
     list_projects,
     list_sessions_for_project,
+    load_moved_record,
     load_persisted_queue,
     load_session_compaction,
+    moved_ids,
     normalize_path_for_compare,
     project_dir_for_cwd,
     read_human_title,
@@ -122,12 +124,14 @@ from session import (
     render_session_history,
     resolve_session_ref,
     resumable_sessions,
+    save_moved_record,
     save_persisted_bg_tasks,
     save_persisted_queue,
     save_session_compaction,
     save_session_cost,
     sessions_anywhere,
     sessions_titled,
+    trash_session,
     write_session_title,
 )
 from commands import (
@@ -659,10 +663,13 @@ def _recent_disk_sessions(limit: int = 40) -> list[dict[str, Any]]:
         if now - stamp < _DISK_CACHE_TTL:
             return cached
 
-    live_ids = {
-        getattr(rt.state, "session_id", None)
-        for rt in runtimes.values()
+    # Read once, from a copy: this runs in a worker thread, and the loop may
+    # open or close a session meanwhile.
+    live_titles = {
+        getattr(rt.state, "session_id", None): getattr(rt.state, "session_title", None)
+        for rt in list(runtimes.values())
     }
+    live_ids = set(live_titles)
     # Scan every Claude account/config dir on this machine — not just the hub's
     # own — so sessions launched under a different account still appear in the
     # lobby.  Each session is tagged with the ``account`` (config dir) it lives
@@ -697,6 +704,10 @@ def _recent_disk_sessions(limit: int = 40) -> list[dict[str, Any]]:
             log.warning("failed to scan disk sessions in %s", cdir, exc_info=True)
     out.sort(key=lambda s: s.get("mtime", 0), reverse=True)
     out = out[:limit]
+    moved = {cdir: moved_ids(cdir) for cdir in config_dirs}
+    for s in out:
+        if s["session_id"] in moved.get(s["account"], ()):
+            s["moved_to"] = _moved_to(s["session_id"], s["account"], out, live_titles)
     # Persist any newly-resolved titles so the next process start is fast.
     try:
         from session import flush_title_index
@@ -705,6 +716,31 @@ def _recent_disk_sessions(limit: int = 40) -> list[dict[str, Any]]:
         log.debug("title index flush failed", exc_info=True)
     _disk_sessions_cache = (now, out)
     return out
+
+
+def _moved_to(sid: str, account: str, listed: list[dict[str, Any]],
+              live_titles: dict[str | None, str | None]) -> dict[str, Any] | None:
+    """Where session *sid* of *account* was moved: the copy's ``session_id``,
+    ``title``, ``cwd`` and ``account`` -- or None, if it was not moved or the
+    copy is gone.  The title is the copy's own now, if it is running (in
+    *live_titles*, session id to title) or in *listed* (the session list being
+    built), else what the move named it."""
+    to = load_moved_record(sid, account)
+    if to is None or find_session_dir(to["session_id"], to["account"]) is None:
+        return None
+    title = (live_titles.get(to["session_id"])
+             or next((s.get("title") for s in listed
+                      if s.get("session_id") == to["session_id"]), None)
+             or to.get("title"))
+    return {"session_id": to["session_id"], "title": title,
+            "cwd": to.get("cwd"), "account": to["account"]}
+
+
+def _forget_disk_sessions() -> None:
+    """Have the next session list read the disk again, now, rather than when
+    the cache runs out -- after a change the user is waiting to see."""
+    global _disk_sessions_cache
+    _disk_sessions_cache = None
 
 
 #: Cache for the foreign-holder process scan.  A cold ``process_iter`` walk
@@ -5324,13 +5360,14 @@ async def _send_initial_state(ws: WebSocket) -> None:
 async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
     """Copy this tab's session to another account and/or directory, and attach.
 
-    The ``/move`` flow: copy the live session's JSONL into the chosen
-    account's projects tree under a *fresh* session id (so it never collides
-    with an existing one), set the entered name as its custom title, spin up a
+    The ``/move`` flow: copy the live session into the chosen account's
+    projects tree under a *fresh* session id (so it never collides with an
+    existing one), set the entered name as its custom title, spin up a
     runtime bound to that account resuming the copy, and attach THIS socket to
     it — so the conversation seamlessly continues in the current window.
-    Reuses ``copy_session.copy_session_file`` (which rewrites the ``sessionId``
-    fields so the copy resumes cleanly).
+    The copy is ``copy_session.copy_whole_session``: the transcript (its
+    ``sessionId`` fields rewritten so the copy resumes cleanly) and the files
+    the CLI keeps beside it.
 
     The destination is an **account and a directory**, either of which may be
     left as it is.  Moving directory is not just a matter of where the copy is
@@ -5338,9 +5375,14 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
     the cwd (and git branch) themselves, so both have to be rewritten or the
     copy would contradict the directory it lives in — see
     ``copy_session_file``.
+
+    The original is stopped, and then either kept -- marked in the session
+    list as moved, pointing at the copy -- or, when the message says
+    ``delete_original``, sent to the Recycle Bin once the copy is up
+    (``_trash_moved_original``).
     """
     import uuid
-    from copy_session import copy_session_file, git_branch_for, _sanitize_cwd
+    from copy_session import copy_whole_session, git_branch_for, _sanitize_cwd
 
     rt = _ws_runtime.get(ws) or _runtime_for_ws(ws)
     if rt is None or rt.state is None or rt.config is None \
@@ -5352,6 +5394,8 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
     target_cfg = (msg.get("config_dir") or "").strip()
     new_name = (msg.get("new_name") or "").strip()
     want_cwd = (msg.get("cwd") or "").strip()
+    # Only a real true deletes: anything else a client sends keeps it.
+    delete_original = msg.get("delete_original") is True
     if not target_cfg:
         await send_to(ws, {"type": "move_error",
                            "message": "No target account selected."})
@@ -5474,11 +5518,13 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
 
     # Copy (rewrites sessionId → new_id, and cwd/gitBranch on a move) off the
     # event loop — the JSONL can be hundreds of MB, which would otherwise
-    # freeze every tab and the ticker.
+    # freeze every tab and the ticker.  The whole session, its folder with it,
+    # so the copy stands on its own if the original is deleted.
     try:
         await loop.run_in_executor(
             None,
-            functools.partial(copy_session_file, src_jsonl, dest_jsonl, new_id,
+            functools.partial(copy_whole_session, src_jsonl, dest_jsonl, new_id,
+                              src_cfg=account_dir(src_cfg), dest_cfg=target_cfg,
                               new_cwd=dest_cwd if dir_changed else None,
                               new_branch=new_branch))
     except OSError as exc:
@@ -5565,11 +5611,29 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
     if new_rt.state is not None and not new_rt.state.session_title:
         new_rt.state.session_title = new_name
 
+    # The original says where the work went, whether it is to be deleted or
+    # not: a deletion that does not happen leaves it marked all the same, and
+    # one that does takes the record with it.
+    await asyncio.to_thread(save_moved_record, sid, {
+        "session_id": new_id, "title": new_name, "cwd": dest_cwd,
+        "account": target_cfg}, src_cfg)
+    _forget_disk_sessions()
+    await _push_session_list()
+    if delete_original:
+        task = asyncio.create_task(
+            _trash_moved_original(new_rt, src_jsonl, dest_jsonl, src_cfg),
+            name=f"move-trash-{sid[:8]}")
+        _move_trash_tasks.add(task)
+        task.add_done_callback(_move_trash_tasks.discard)
+
     await send_to(ws, {"type": "move_done", "rid": new_rt.rid})
     # Attach THIS socket to the new runtime → history + status flow into the
     # current window, continuing the conversation under the new account.
     await _attach_ws(ws, new_rt)
-    said = [f"Moved {where}. The original session was stopped."]
+    said = [f"Moved {where}. The original session was stopped"
+            + (", and goes to the Recycle Bin once this copy is up."
+               if delete_original else
+               "; the session list marks it as moved.")]
     if carry["queue"]:
         n = len(carry["queue"])
         said.append(f"{n} queued prompt{'s' if n != 1 else ''} came along.")
@@ -5577,6 +5641,87 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
         said.append("Its scheduled loop came along too.")
     await send_to(ws, {"type": "system_msg", "subtype": "info",
                        "data": {"message": " ".join(said)}})
+
+
+#: How long a move that deletes the original waits for the copy's CLI to come
+#: up first.  Generous, because resuming a large transcript is given minutes
+#: (sdk_bridge's connect budget), and running out only keeps the original.
+_MOVE_TRASH_WAIT_S = 900.0
+_MOVE_TRASH_POLL_S = 0.5
+#: The deletions waiting on a copy, held so none is collected mid-wait.
+_move_trash_tasks: set[asyncio.Task] = set()
+
+
+async def _trash_moved_original(new_rt: SessionRuntime, src_jsonl: Path,
+                                dest_jsonl: Path, src_cfg: str | None) -> None:
+    """Send the original of a move to the Recycle Bin, once its copy is up.
+
+    *new_rt* is the copy's runtime, *src_jsonl* and *dest_jsonl* the two
+    transcripts, *src_cfg* the original's account.  Deleting waits for the
+    copy's CLI to have resumed it -- proof the copy is a session and not only
+    a file -- and is refused if the original is running again, here or in
+    another process, or if the copy holds fewer records than it.  A refused or
+    failed deletion keeps the original, marked as moved (``_do_move`` saved
+    the record), and the copy's tabs are told why either way.
+    """
+    why = await _why_keep_moved_original(new_rt, src_jsonl, dest_jsonl)
+    left: list[str] = []
+    if why is None:
+        try:
+            left = await asyncio.to_thread(trash_session, src_jsonl, src_cfg)
+        except Exception as exc:
+            log.warning("move: could not trash the original %s", src_jsonl,
+                        exc_info=True)
+            why = f"it could not be sent to the Recycle Bin ({exc})"
+    if why is None:
+        log.info("move: the original %s went to the Recycle Bin", src_jsonl)
+        text = "The original session went to the Recycle Bin."
+        if left:
+            text += " Some of its files could not be removed:\n" + "\n".join(left)
+    else:
+        log.info("move: kept the original %s: %s", src_jsonl, why)
+        text = (f"The original session was kept: {why}. The session list "
+                f"marks it as moved.")
+    await new_rt.broadcast({"type": "system_msg",
+                            "subtype": "info" if why is None else "warning",
+                            "data": {"message": text}})
+    _forget_disk_sessions()
+    await _push_session_list()
+
+
+async def _why_keep_moved_original(new_rt: SessionRuntime, src_jsonl: Path,
+                                   dest_jsonl: Path) -> str | None:
+    """Why the original of a move must not be deleted, in words for the user;
+    None once it may be.  Waits for the copy's CLI to come up first."""
+    from copy_session import count_records
+    deadline = time.monotonic() + _MOVE_TRASH_WAIT_S
+    while True:
+        if runtimes.get(new_rt.rid) is not new_rt:
+            return "the copy was closed before it had started"
+        br, st = new_rt.bridge, new_rt.state
+        if getattr(br, "client", None) is not None and not st.connecting:
+            break
+        if not st.connecting:
+            return "the copy did not start"
+        if time.monotonic() >= deadline:
+            return (f"the copy had not started after "
+                    f"{_MOVE_TRASH_WAIT_S / 60:.0f} minutes")
+        await asyncio.sleep(_MOVE_TRASH_POLL_S)
+    sid = src_jsonl.stem
+    if await asyncio.to_thread(proc_guard.find_foreign_claude_for_session, sid):
+        return "another Claude process has it open"
+    try:
+        theirs, ours = await asyncio.to_thread(
+            lambda: (count_records(src_jsonl), count_records(dest_jsonl)))
+    except OSError as exc:
+        return f"the two could not be compared ({exc})"
+    if ours < theirs:
+        return f"the copy holds {ours} records and the original {theirs}"
+    # Last, and with no await after it before the deletion starts: the
+    # slower checks above give the user time to open it.
+    if _live_runtime_for(sid) is not None:
+        return "it was opened again"
+    return None
 
 
 def _move_where(dest_cwd: str | None, target_cfg: str | None) -> str:

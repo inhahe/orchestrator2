@@ -292,12 +292,16 @@ def scan_sessions(claude_dir: Path, progress=None) -> list[dict[str, Any]]:
 
 def copy_session_file(src_jsonl: Path, dest_jsonl: Path, new_id: str, *,
                       new_cwd: str | None = None,
-                      new_branch: str | None = None) -> None:
+                      new_branch: str | None = None,
+                      old_id: str | None = None,
+                      relocate: tuple[Path, Path] | None = None) -> None:
     """Copy *src_jsonl* to *dest_jsonl*, rewriting the metadata that has moved.
 
-    If *new_id* differs from the source's session id, every top-level
-    ``sessionId`` field equal to the old id is rewritten to *new_id* so the
-    copy resumes cleanly under the new name.
+    If *new_id* differs from the source's session id -- *old_id*, which is
+    the file's own name unless given (a subagent's transcript is named for the
+    subagent but records its session's id) -- every top-level ``sessionId``
+    field equal to the old id is rewritten to *new_id* so the copy resumes
+    cleanly under the new name.
 
     *new_cwd* moves the session to a different **working directory**: every
     top-level ``cwd`` is rewritten, and *new_branch* (pass ``""`` for "not a
@@ -317,37 +321,144 @@ def copy_session_file(src_jsonl: Path, dest_jsonl: Path, new_id: str, *,
     another (a session that used ``/cwd`` mid-flight has records from two
     directories, but the copy lands in exactly one project dir and must agree
     with it).
+
+    *relocate* -- ``(old, new)`` session folders, the copy having its own --
+    is the one exception to leaving paths in messages alone.  The folder is the
+    CLI's storage, not the user's: a tool result too large to keep inline is
+    saved there and the transcript says where, and a compaction summary names
+    the transcript beside it.  Those paths are rewritten to the copy's, so the
+    copy does not depend on files that go when the original does.
     """
-    old_id = src_jsonl.stem
+    old_id = old_id or src_jsonl.stem
     dest_jsonl.parent.mkdir(parents=True, exist_ok=True)
     rewrite_id = new_id != old_id
+    fix = _relocator(*relocate) if relocate is not None else None
+    # How the folder's name shows in a line of JSON that mentions a path into
+    # it: the id, then a separator (a backslash is escaped, but begins with
+    # one) or the transcript's extension.  Most lines do not, and skip the walk.
+    mentions = (old_id + "\\", old_id + "/", old_id + ".jsonl")
 
-    if not rewrite_id and new_cwd is None and new_branch is None:
+    if not rewrite_id and new_cwd is None and new_branch is None and fix is None:
         shutil.copy2(src_jsonl, dest_jsonl)
         return
 
     tmp = dest_jsonl.with_name(dest_jsonl.name + ".tmp")
-    with src_jsonl.open(encoding="utf-8", errors="replace") as fin, \
-            tmp.open("w", encoding="utf-8") as fout:
-        for line in fin:
-            stripped = line.strip()
-            if not stripped:
-                fout.write(line)
-                continue
-            try:
-                rec = json.loads(stripped)
-            except json.JSONDecodeError:
-                fout.write(line)
-                continue
-            if isinstance(rec, dict):
-                if rewrite_id and rec.get("sessionId") == old_id:
-                    rec["sessionId"] = new_id
-                if new_cwd is not None and "cwd" in rec:
-                    rec["cwd"] = new_cwd
-                if new_branch is not None and "gitBranch" in rec:
-                    rec["gitBranch"] = new_branch
-            fout.write(json.dumps(rec) + "\n")
-    os.replace(tmp, dest_jsonl)
+    try:
+        with src_jsonl.open(encoding="utf-8", errors="replace") as fin, \
+                tmp.open("w", encoding="utf-8") as fout:
+            for line in fin:
+                stripped = line.strip()
+                if not stripped:
+                    fout.write(line)
+                    continue
+                try:
+                    rec = json.loads(stripped)
+                except json.JSONDecodeError:
+                    fout.write(line)
+                    continue
+                if isinstance(rec, dict):
+                    if rewrite_id and rec.get("sessionId") == old_id:
+                        rec["sessionId"] = new_id
+                    if new_cwd is not None and "cwd" in rec:
+                        rec["cwd"] = new_cwd
+                    if new_branch is not None and "gitBranch" in rec:
+                        rec["gitBranch"] = new_branch
+                    if fix is not None and any(m in stripped for m in mentions):
+                        rec = _map_strings(rec, fix)
+                fout.write(json.dumps(rec) + "\n")
+        os.replace(tmp, dest_jsonl)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _relocator(old: Path, new: Path):
+    """A function of a string that points every path into folder *old* -- or
+    at the transcript named for it -- into *new* instead.
+
+    Matched with either separator, and on Windows in any case, since the path
+    was written by the CLI from its config dir as *it* was given it.  A
+    replacement keeps the separators of what it replaces: the path may sit in
+    text that escapes them (JSON a tool printed), and must stay escaped there.
+    """
+    split = re.compile(r"[\\/]+")
+    pattern = re.compile(
+        split.pattern.join(re.escape(p) for p in split.split(str(old)))
+        + r"(?=[\\/]|\.jsonl)",
+        re.IGNORECASE if os.name == "nt" else 0)
+    new_parts = split.split(str(new))
+
+    def fix(s: str) -> str:
+        return pattern.sub(
+            lambda m: split.search(m.group(0)).group(0).join(new_parts), s)
+    return fix
+
+
+def _map_strings(obj: Any, fn) -> Any:
+    """*obj*, a decoded JSON value, with *fn* applied to every string in it."""
+    if isinstance(obj, str):
+        return fn(obj)
+    if isinstance(obj, list):
+        return [_map_strings(v, fn) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _map_strings(v, fn) for k, v in obj.items()}
+    return obj
+
+
+def copy_whole_session(src_jsonl: Path, dest_jsonl: Path, new_id: str, *,
+                       src_cfg: str | Path, dest_cfg: str | Path,
+                       new_cwd: str | None = None,
+                       new_branch: str | None = None) -> None:
+    """Copy the session whose transcript is *src_jsonl*, in account *src_cfg*,
+    to *dest_jsonl* in account *dest_cfg* as session *new_id* -- all of it,
+    so the copy stands without the original.
+
+    A session is more than its transcript.  Beside it the CLI keeps a folder
+    of the same name (``subagents/`` -- the transcripts of the agents it ran
+    -- and ``tool-results/``), and in the account a ``file-history/<id>``
+    folder (the backups ``/rewind`` restores from).  Each is copied under the
+    new id; the transcripts in the folder are rewritten as the main one is
+    (``copy_session_file``).  The folder's ``custom-title.json`` is not: it
+    holds the original's name, which the CLI would stamp back on the copy.
+
+    If any part fails, what this wrote is removed and the error raised: half a
+    copy is not one.
+    """
+    old_id = src_jsonl.stem
+    old_folder, new_folder = src_jsonl.with_suffix(""), dest_jsonl.with_suffix("")
+    old_hist = Path(src_cfg) / "file-history" / old_id
+    new_hist = Path(dest_cfg) / "file-history" / new_id
+    ours = [p for p in (dest_jsonl, new_folder, new_hist) if not p.exists()]
+    rewrite = dict(new_cwd=new_cwd, new_branch=new_branch,
+                   relocate=(old_folder, new_folder))
+    try:
+        copy_session_file(src_jsonl, dest_jsonl, new_id, **rewrite)
+        if old_folder.is_dir():
+            for path in sorted(old_folder.rglob("*")):
+                rel = path.relative_to(old_folder)
+                if path.is_dir() or rel == Path("custom-title.json"):
+                    continue
+                dest = new_folder / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if path.suffix == ".jsonl":
+                    copy_session_file(path, dest, new_id, old_id=old_id, **rewrite)
+                else:
+                    shutil.copy2(path, dest)
+        if old_hist.is_dir():
+            shutil.copytree(old_hist, new_hist)
+    except BaseException:
+        for p in ours:
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                p.unlink(missing_ok=True)
+        raise
+
+
+def count_records(jsonl: Path) -> int:
+    """How many records transcript *jsonl* holds: its non-blank lines."""
+    with jsonl.open("rb") as f:
+        return sum(1 for line in f if line.strip())
 
 
 def git_branch_for(cwd: str) -> str:
