@@ -326,6 +326,22 @@ def test_what_will_not_go_is_said(sess, monkeypatch):
     assert len(left) == 2 and all("in use" in x for x in left)
 
 
+def test_a_copy_nobody_has_seen_is_deleted_whole(sess, recycle_bin):
+    """What a move discards when its copy will not start: everything, and
+    none of it to the Recycle Bin, where it would only puzzle."""
+    cfg = str(sess["src_cfg"])
+    session.save_session_cost(OLD, {"key_spent": 1.0}, cfg)
+    env = sess["src_cfg"] / "session-env" / OLD
+    env.mkdir(parents=True)
+
+    left = session.discard_session(sess["jsonl"], cfg)
+
+    assert left == [] and recycle_bin == []
+    for path in (sess["jsonl"], sess["folder"], sess["src_cfg"] / "file-history" / OLD, env):
+        assert not path.exists(), f"{path} is still there"
+    assert _hub_records(cfg, OLD) == []
+
+
 # --------------------------------------------------------------------------
 # The move
 # --------------------------------------------------------------------------
@@ -401,6 +417,38 @@ def test_and_leaves_no_mark_behind(mv):
     mv["run"](delete_original=True)
 
     assert load_moved_record(SID, mv["src_cfg"]) is None
+
+
+def test_the_deletion_is_recorded_before_it_starts(mv, monkeypatch):
+    """The hub stopping while the deletion waits for the copy must not forget
+    it: the record the move saves says the original is to go, for the next
+    start to finish."""
+    async def stopped_first(*_a, **_k):
+        pass
+    monkeypatch.setattr(server, "_trash_moved_original", stopped_first)
+
+    mv["run"](delete_original=True)
+
+    rec = load_moved_record(SID, mv["src_cfg"])
+    assert rec is not None and rec["delete"]
+    assert mv["src_jsonl"].exists()
+
+
+def test_files_left_behind_are_a_warning(mv, monkeypatch):
+    """The original went, but some of what came with it would not: the
+    user's to clear up, so said as a refusal is, not as news."""
+    def only_the_transcript(path):
+        if str(path) != str(mv["src_jsonl"]):
+            raise OSError("in use")
+        Path(path).unlink()
+    monkeypatch.setattr(send2trash, "send2trash", only_the_transcript)
+
+    mv["run"](delete_original=True)
+
+    told = [m for m in mv["copies"]["copy"].told
+            if "could not be removed" in (m.get("data") or {}).get("message", "")]
+    assert told, _told(mv)
+    assert told[0]["subtype"] == "warning", told[0]
 
 
 def test_not_asked_it_is_kept_and_marked(mv):
@@ -646,6 +694,42 @@ def test_a_deletion_cut_short_by_a_restart_is_finished(monkeypatch, tmp_path, re
     asyncio.run(server._finish_interrupted_deletions())
 
     assert str(a / "projects" / "D--work" / f"{OLD}.jsonl") in recycle_bin
+
+
+def test_the_hub_finishes_them_when_it_starts(monkeypatch):
+    """Driven through the hub's own startup, with what else it starts made
+    inert: the finishing is only any use if a start runs it."""
+    from config import parse_args
+    ran = []
+
+    async def finish():
+        ran.append("finished")
+
+    async def inert(*_a, **_k):
+        pass
+    monkeypatch.setattr(server, "_finish_interrupted_deletions", finish)
+    for name in ("_status_ticker", "_resurrect_scheduled_wakeups", "_restore_limit_resumes",
+                 "_model_cache_loop", "_deferred_bridge_startup", "_broadcast_shutdown"):
+        monkeypatch.setattr(server, name, inert)
+    monkeypatch.setattr(server, "_recent_disk_sessions", lambda: [])
+    monkeypatch.setattr(server, "_attach_queue_persistence", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_launch_compaction_to_state", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_seed_primary_session", lambda c: (c, None, None))
+    monkeypatch.setattr(proc_guard, "install_process_reaper", lambda: None)
+    for name in ("config", "state", "theme", "bridge", "_default_runtime", "_ticker_task",
+                 "_model_task", "_picker_mode", "_pending_resume_id"):
+        monkeypatch.setattr(server, name, getattr(server, name, None))
+    monkeypatch.setattr(server, "config", parse_args([]))
+    monkeypatch.setattr(server, "bridge", None)
+    monkeypatch.setattr(server, "runtimes", {})
+
+    async def go():
+        async with server.lifespan(server.app):
+            for _ in range(20):
+                await asyncio.sleep(0)
+    _drive(go())
+
+    assert ran == ["finished"]
 
 
 def test_but_kept_if_the_copy_falls_short_and_not_tried_again(monkeypatch, tmp_path, recycle_bin):
