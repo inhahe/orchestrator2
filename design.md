@@ -4708,13 +4708,23 @@ gaps made it undiagnosable:
   reason, cut to the 123 bytes a close frame holds (`_ws_close_reason`).
   Nothing is sent between accept and close, so accepting lets nobody in.
 - **The page retried a refusal.** It went through all twenty retries with the
-  same missing credential. `app.js` maps the three codes in `HUB_REFUSALS`
-  and on one calls `_refused`. That latches `_serverShutdown` as a server
-  shutdown does, so showing the window does not reverse it, and says in the
-  status bar, the chat and the lobby that only a reload signs the page in
-  again. A reload asks the browser for the password and gets the cookie.
-  `/connect` still tries. A test in `test_external_auth.py` reads
-  `HUB_REFUSALS` out of `app.js`, so the two sides cannot drift apart.
+  same missing credential. `app.js` maps the three codes in `HUB_REFUSALS`,
+  each with its status-bar label and its advice, and on one calls `_refused`.
+  A reload asks the browser for the password and gets the cookie, so the
+  advice is to reload. For a lockout it is to wait first, since a reload
+  during the lockout gets only the 429 page. A test in
+  `test_external_auth.py` reads `HUB_REFUSALS` out of `app.js`, so the two
+  sides cannot drift apart. A reload also discards the prompts queued while
+  disconnected (`_pendingSends`), so the message counts them and says to copy
+  them first. They are not carried across the reload: a hub restarted with a
+  new password numbers its sessions afresh, and the tab's `?rid=` could then
+  name another session.
+- **Three ways of stopping reconnecting, one sequence.** Giving up, a
+  refusal and a `server_shutdown` all go through `_stopReconnecting(label,
+  message, band, subtype)`: latch `_serverShutdown`, the status bar, the input
+  out of busy, the chat, the lobby band. They differ only in
+  `_retriesExhausted`, which the give-up branch alone sets. Only that latch
+  lets showing the window retry. `/connect` (`reconnect()`) reverses either.
 - **The lobby said "loading sessions" while there was nothing to load from.**
   `Lobby.showConnection` keeps a band above the lists whenever the socket is
   down: retrying with attempt *n* of 20 and **Retry now**, given up with
@@ -4740,11 +4750,17 @@ about 20 seconds on Windows, about two minutes on Android. With no close there
 is no retry and no band. `_connect` closes a socket still CONNECTING after
 `CONNECT_TIMEOUT_MS` (10s), which counts as a failed attempt. It does not
 touch an open socket that is slow to send its first message: attaching a large
-session can take longer than that. The band's Retry calls `App.retryNow`, which
-abandons a socket still handshaking before reconnecting. `reconnect()` leaves
-it alone, since its other callers (visibility, `/connect`) only want the socket
-back. The abandoned socket's close arrives after its replacement, so `own`
-ignores it.
+session can take longer than that. When someone asks for the socket back
+(`reconnect()`: the band's Retry, showing the window, `/connect`), a handshake
+under `HANDSHAKE_STUCK_MS` (3s) old is left to finish, since a second socket
+would orphan it. An older one is closed and replaced. Its close event arrives
+after its replacement, so `own` ignores it. The band's Retry goes through
+`App.retryNow`, which does nothing on an *open* socket: that is the hub on its
+way to answering, and `reconnect()` would take an open socket for `/connect`,
+restarting the session's CLI. The test harness's fake socket closes as a
+browser does, asynchronously and with 1006 for a socket that never opened, so
+the tests exercise `own` rather than a close that lands while the socket is
+still the tab's.
 
 **Refusals are logged** by `_RefusalLog` (`refused an outside socket from
 <ip>: <why>`), except a page request with no credential, which is just the

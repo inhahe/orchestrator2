@@ -308,12 +308,16 @@ live arrive over the page's WebSocket, so a page can load while that
 connection fails. The lobby then shows a band saying the hub isn't connected,
 which attempt it's on, and a **Retry now** button, in place of an endless
 "loading sessions". A connection attempt that hasn't opened after 10 seconds
-is given up and retried, and **Retry now** abandons one still trying. When
-the retries run out, or the hub shuts down, the button reads **Try again**.
+is given up and retried. **Retry now**, showing the window, and `/connect` all
+replace an attempt that has been trying for 3 seconds instead of waiting on it.
+When the retries run out, or the hub shuts down, the button reads **Try again**.
 A connection the hub *refused* (no valid sign-in, a lockout, or external access
-off) is not retried: the band and the chat give the hub's reason and a
-**Reload** button, since reloading the page is what signs it in again. A prompt
-typed while disconnected waits for a connection the hub actually answers on.
+off) is not retried: the band and the chat give the hub's reason, what would
+help, and a **Reload** button, since reloading the page is what signs it in
+again. During a lockout, wait it out before reloading. A prompt typed while
+disconnected waits for a connection the hub actually answers on. If the hub
+refuses instead, the message says how many such prompts a reload would
+discard, so you can copy them first.
 
 Every refused outside connection is written to the log (`--log-file`) with its
 address and the reason, except the browser's ordinary password prompt. Only

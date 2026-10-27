@@ -60,9 +60,10 @@ const Lobby = (() => {
 
   // The server drops this ws from `_lobby_watchers` when it disconnects, so a
   // reconnect must forget we were watching — otherwise _watch(true) would be a
-  // no-op and we'd never re-subscribe.  Called from app.js on ws (re)open.  If
-  // the overlay is still open, resubscribe on the fresh socket so live updates
-  // resume; otherwise just clear the flag.
+  // no-op and we'd never re-subscribe.  Called from app.js when the hub first
+  // answers on a socket -- not when it opens, since a refused one opens too.
+  // If the overlay is still open, resubscribe on the fresh socket so live
+  // updates resume; otherwise just clear the flag.
   function onReconnect() {
     _watching = false;
     if (_visible) _watch(true);

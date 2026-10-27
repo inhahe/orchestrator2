@@ -48,13 +48,20 @@ const App = (() => {
   // handshake takes well under a second on a LAN and a few over a slow
   // phone connection.
   const CONNECT_TIMEOUT_MS = 10000;
-  // Close codes the hub refuses an outside socket with (server.WS_CLOSE_*),
-  // and what the status bar says for each.  Retrying sends the same missing
-  // credential again, so none of them is retried.
+  // A handshake this old is taken for stuck when someone asks for the socket
+  // back (reconnect): replaced rather than waited on.
+  const HANDSHAKE_STUCK_MS = 3000;
+  let _handshakeStuck = false;     // the current socket has handshaken that long
+  // Close codes the hub refuses an outside socket with (server.WS_CLOSE_*):
+  // what the status bar says for each, and what would help.  Retrying sends
+  // the same missing credential again, so none of them is retried.
   const HUB_REFUSALS = {
-    4401: 'sign-in needed',
-    4403: 'outside access off',
-    4429: 'locked out',
+    4401: { label: 'sign-in needed',
+            advice: 'Reload the page to sign in again.' },
+    4403: { label: 'outside access off',
+            advice: 'Reload the page for how to turn it on.' },
+    4429: { label: 'locked out',
+            advice: 'Wait for the lockout to end, then reload the page to sign in again.' },
   };
   const PROMPT_WATCHDOG_MS = 8000; // ~how long a turn should take to start
   // Tab-unique so two tabs on one session can't collide on an id.
@@ -254,6 +261,10 @@ const App = (() => {
     setTimeout(() => {
       if (sock === ws && sock.readyState === WebSocket.CONNECTING) sock.close();
     }, CONNECT_TIMEOUT_MS);
+    _handshakeStuck = false;
+    setTimeout(() => {
+      if (sock === ws && sock.readyState === WebSocket.CONNECTING) _handshakeStuck = true;
+    }, HANDSHAKE_STUCK_MS);
 
     sock.onopen = own(() => {
       console.log('WebSocket connected');
@@ -275,7 +286,7 @@ const App = (() => {
       // The server drops this ws from its lobby-watcher set on disconnect, so
       // forget any prior subscription — the next render()/show() must re-send
       // lobby_watch to resume live updates on this fresh socket.
-      if (typeof Lobby !== 'undefined' && Lobby.onReconnect) Lobby.onReconnect();
+      Lobby.onReconnect();
       Lobby.showConnection(null);
       // Flush any prompts the user typed while the socket was down.
       _flushPending();
@@ -338,17 +349,11 @@ const App = (() => {
     reconnectAttempt++;
 
     if (reconnectAttempt > MAX_RECONNECT_ATTEMPTS) {
-      _serverShutdown = true;
       _retriesExhausted = true;
-      Status.update({ busy_label: 'disconnected', busy_class: 'shutdown', connection: true });
-      _nothingRunning();
-      Chat.handleMessage({
-        type: 'system_msg',
-        subtype: 'error',
-        data: { message: 'Lost connection to server (not running). '
-                         + 'Type /connect to retry once it\u2019s back up.' },
-      });
-      Lobby.showConnection({ state: 'gave-up', attempts: MAX_RECONNECT_ATTEMPTS });
+      _stopReconnecting('disconnected',
+                        'Lost connection to server (not running). '
+                        + 'Type /connect to retry once it\u2019s back up.',
+                        { state: 'gave-up', attempts: MAX_RECONNECT_ATTEMPTS });
       return;
     }
     Lobby.showConnection({ state: 'retrying', attempt: reconnectAttempt,
@@ -361,22 +366,39 @@ const App = (() => {
     }, reconnectDelay);
   }
 
+  /* Nothing will reconnect on its own any more: the hub went, refused this
+   * page, or we gave up on it.  The status bar shows *label*, the chat
+   * *message* (as *subtype*), and the lobby the band *band*.  The latch is
+   * reversed only by reconnect(); who else may reverse it depends on
+   * _retriesExhausted, which the caller sets. */
+  function _stopReconnecting(label, message, band, subtype = 'error') {
+    _serverShutdown = true;
+    Status.update({ busy_label: label, busy_class: 'shutdown', connection: true });
+    _nothingRunning();
+    Chat.handleMessage({ type: 'system_msg', subtype, data: { message } });
+    Lobby.showConnection(band);
+  }
+
   /* The hub refused this socket with *code*, one of HUB_REFUSALS: say why and
    * stop.  Only a reload signs the page in again -- it asks the browser for
-   * the password and gets the cookie a socket needs -- so the latch is the one
-   * a server shutdown sets, which showing the window does not reverse.
-   * /connect still tries. */
+   * the password and gets the cookie a socket needs -- so showing the window
+   * does not retry it.  /connect still tries.  A reload also discards the
+   * prompts queued meanwhile, so the message says so: re-sending them after
+   * it could reach another session, since a hub restarted with a new
+   * password numbers its sessions afresh. */
   function _refused(code, reason) {
-    _serverShutdown = true;
-    Status.update({ busy_label: HUB_REFUSALS[code], busy_class: 'shutdown', connection: true });
-    _nothingRunning();
-    let why = (reason || HUB_REFUSALS[code]).trim();
+    const refusal = HUB_REFUSALS[code];
+    let why = (reason || refusal.label).trim();
     if (!/[.!?]$/.test(why)) why += '.';
+    const n = _pendingSends.length;
+    const queued = !n ? ''
+      : n === 1 ? ' A prompt typed while disconnected was not sent, and '
+                  + 'reloading discards it: copy it first.'
+      : ` ${n} prompts typed while disconnected were not sent, and `
+        + 'reloading discards them: copy them first.';
     const message = 'The hub refused this page’s connection: ' + why + ' '
-      + (code === 4403 ? 'Reload the page for how to turn it on.'
-                       : 'Reload the page to sign in again.');
-    Chat.handleMessage({ type: 'system_msg', subtype: 'error', data: { message } });
-    Lobby.showConnection({ state: 'refused', message });
+      + refusal.advice + queued;
+    _stopReconnecting(refusal.label, message, { state: 'refused', message });
   }
 
   /* Nothing is running any more: the hub has gone, or we gave up on it.  The
@@ -435,9 +457,9 @@ const App = (() => {
         _armPromptWatchdog(promptId);
       }
     } else if (msg.type === 'message') {
-      // Socket is down — don't drop the user's prompt.  Queue it and flush on
-      // the next successful connect (ws.onopen → _flushPending), and kick a
-      // fresh reconnect in case auto-reconnect had latched off.
+      // Socket is down — don't drop the user's prompt.  Queue it and flush
+      // once a hub answers on a socket (hubAnswered → _flushPending), and kick
+      // a fresh reconnect in case auto-reconnect had latched off.
       _pendingSends.push(msg);
       Chat.handleMessage({
         type: 'system_msg',
@@ -481,19 +503,25 @@ const App = (() => {
     reconnectAttempt = 0;
     reconnectDelay = 1000;
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-    // A socket already handshaking will flush the queue on its own onopen;
-    // don't open a second one that would orphan the first.
-    if (ws && ws.readyState === WebSocket.CONNECTING) return;
+    // A socket already handshaking will flush the queue once the hub answers
+    // on it, so a fresh one is left to finish: a second would orphan it.  One
+    // handshaking for HANDSHAKE_STUCK_MS is replaced instead -- on a network
+    // that drops connection attempts it may never finish.  Its close event
+    // arrives once the new socket has replaced it, so it is not the tab's
+    // (`own`).
+    if (ws && ws.readyState === WebSocket.CONNECTING) {
+      if (!_handshakeStuck) return;
+      ws.close();
+    }
     Status.update({ busy_label: 'reconnecting', busy_class: 'reconnecting', connection: true });
     _connect();
   }
 
-  /* The lobby band's Retry: a fresh attempt now.  Unlike reconnect(), it
-   * abandons a socket still handshaking: on a network that drops some
-   * connection attempts, that one may never finish.  Its close event arrives
-   * once the new socket has replaced it, and so is not the tab's (`own`). */
+  /* The lobby band's Retry.  An open socket is the hub on its way to
+   * answering, so there is nothing to retry -- and reconnect() would take it
+   * for /connect, restarting the session's CLI. */
   function retryNow() {
-    if (ws && ws.readyState === WebSocket.CONNECTING) ws.close();
+    if (ws && ws.readyState === WebSocket.OPEN) return;
     reconnect();
   }
 
@@ -846,29 +874,14 @@ const App = (() => {
     if (type === 'server_restart') {
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       _serverShutdown = true;  // suppress the normal auto-reconnect
-      if (typeof Lobby !== 'undefined' && Lobby.showReloadingAndPoll) Lobby.showReloadingAndPoll();
+      Lobby.showReloadingAndPoll();
       return;
     }
 
     // Server is shutting down — show permanent status and stop reconnecting.
     if (type === 'server_shutdown') {
-      _serverShutdown = true;
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
-      Status.update({
-        busy_label: 'server stopped',
-        busy_class: 'shutdown',
-        connection: true,
-      });
-      _nothingRunning();
-      Chat.handleMessage({
-        type: 'system_msg',
-        subtype: 'info',
-        data: { message: msg.reason || 'Server shut down.' },
-      });
-      Lobby.showConnection({ state: 'stopped' });
+      _stopReconnecting('server stopped', msg.reason || 'Server shut down.',
+                        { state: 'stopped' }, 'info');
       return;
     }
 

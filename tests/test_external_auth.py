@@ -262,12 +262,14 @@ def test_the_page_knows_every_refusal_code():
     # have the page retry a refusal twenty times again.
     src = (pathlib.Path(server.__file__).parent / "static" / "app.js").read_text(
         encoding="utf-8")
-    block = re.search(r"const HUB_REFUSALS = \{(.*?)\};", src, re.S).group(1)
-    codes = {int(code) for code in re.findall(r"(\d+):", block)}
-    assert codes == {server.WS_CLOSE_SIGN_IN, server.WS_CLOSE_DISABLED,
-                     server.WS_CLOSE_LOCKED_OUT}
-    # _refused tells "off" apart: reloading shows how to turn it on.
-    assert f"code === {server.WS_CLOSE_DISABLED} ?" in src
+    block = re.search(r"const HUB_REFUSALS = \{(.*?)\n  \};", src, re.S).group(1)
+    entries = dict(re.findall(r"(\d+): \{ label: '([^']*)'", block))
+    assert {int(code) for code in entries} == {
+        server.WS_CLOSE_SIGN_IN, server.WS_CLOSE_DISABLED, server.WS_CLOSE_LOCKED_OUT}
+    # And each code means what the hub means by it.
+    assert entries[str(server.WS_CLOSE_SIGN_IN)] == "sign-in needed"
+    assert entries[str(server.WS_CLOSE_DISABLED)] == "outside access off"
+    assert entries[str(server.WS_CLOSE_LOCKED_OUT)] == "locked out"
 
 
 def _ws_untouched(sent):

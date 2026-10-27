@@ -120,10 +120,17 @@ function build(opts) {
       sockets.push(this);
     }
     send(data) { this.sent.push(data); }
+    // As a browser closes one: CLOSING at once, and the close event later, as
+    // a task of its own -- by when the page may have replaced the socket.  A
+    // socket that never opened reports an abnormal closure.
     close() {
-      if (this.readyState === FakeWebSocket.CLOSED) return;
-      this.readyState = FakeWebSocket.CLOSED;
-      if (this.onclose) this.onclose({ code: 1000, reason: 'test close' });
+      if (this.readyState >= FakeWebSocket.CLOSING) return;
+      const code = this.readyState === FakeWebSocket.CONNECTING ? 1006 : 1000;
+      this.readyState = FakeWebSocket.CLOSING;
+      win.setTimeout(() => {
+        this.readyState = FakeWebSocket.CLOSED;
+        if (this.onclose) this.onclose({ code, reason: '' });
+      }, 0);
     }
     // -- test controls
     accept() {
@@ -1014,17 +1021,49 @@ test('a socket that opens is not given up on for being slow to answer', (h) => {
   assert(h.sockets.length === 1, 'an open socket was closed by the connect timer');
 });
 
-test('Retry now replaces an attempt stuck connecting', (h) => {
+test('Retry now leaves a fresh handshake to finish', (h) => {
   h.live.drop();
-  h.advance(1500);                         // the retry is now handshaking
+  h.advance(1500);                         // the retry is handshaking, 0.5s old
+  const fresh = h.live;
+  connBand(h).button.click();
+  assert(h.live === fresh, 'a healthy handshake was thrown away');
+});
+
+test('Retry now replaces a handshake that is stuck', (h) => {
+  h.live.drop();
+  h.advance(1000);                         // the retry opens...
+  h.advance(3000);                         // ...and handshakes for 3s
   const stuck = h.live;
+  assert(stuck.readyState === h.win.WebSocket.CONNECTING, 'setup: not handshaking');
   connBand(h).button.click();
   assert(h.live !== stuck, 'Retry now waited on the stuck handshake');
-  assert(stuck.readyState === h.win.WebSocket.CLOSED, 'the stuck one was left open');
-  // Its close is not the tab's: no second socket is scheduled for it.
+  // Its close event comes after its replacement, so it is not the tab's: no
+  // band update, and no retry scheduled for it.
   const count = h.sockets.length;
   h.advance(5000);
+  assert(stuck.readyState === h.win.WebSocket.CLOSED, 'the stuck one was left open');
   assert(h.sockets.length === count, 'the abandoned attempt scheduled a retry');
+});
+
+test('showing the window replaces a handshake that is stuck', (h) => {
+  h.live.drop();
+  h.advance(1000);
+  h.advance(3000);
+  const stuck = h.live;
+  h.setHidden(true);
+  h.setHidden(false);
+  assert(h.live !== stuck, 'showing the window waited on a stuck handshake');
+});
+
+test('Retry on an open socket the hub has not answered yet sends no /connect', (h) => {
+  // /connect restarts the session's CLI: never the band's to send.
+  h.live.drop();
+  h.advance(1500);
+  h.live.accept();                         // open; the hub is still attaching
+  connBand(h).button.click();
+  assert(sentOfType(h.live, 'message').length === 0,
+         'Retry sent ' + JSON.stringify(sentOfType(h.live, 'message')));
+  assert(h.sockets.length === 2, 'Retry replaced an open socket');
 });
 
 test('a refused socket is not retried, and says to reload', (h) => {
@@ -1056,6 +1095,29 @@ test('a lockout and external access being off are refusals too', (h) => {
   refuse(h, 4403, 'External access is disabled on this server.');
   assert(stateText(h) === 'outside access off', stateText(h));
   assert(/disabled on this server\. Reload the page for how to turn it on\.$/
+         .test(connBand(h).text), connBand(h).text);
+});
+
+test('a lockout says to wait, not to reload at once', (h) => {
+  refuse(h, 4429, 'Too many failed password attempts. Try again in 3s.');
+  assert(connBand(h).text === 'The hub refused this page’s connection: Too '
+         + 'many failed password attempts. Try again in 3s. Wait for the lockout '
+         + 'to end, then reload the page to sign in again.', connBand(h).text);
+});
+
+test('a refusal says the queued prompts will not survive the reload', (h) => {
+  h.win.__mods.App.send({ type: 'message', text: 'one' });
+  h.win.__mods.App.send({ type: 'message', text: 'two' });
+  refuse(h, 4401, 'Authentication required.');
+  assert(/ 2 prompts typed while disconnected were not sent, and reloading discards them: copy them first\.$/
+         .test(connBand(h).text), connBand(h).text);
+  assert(chatText(h).includes('reloading discards them'), 'the chat was not told');
+});
+
+test('...and says it of one prompt in the singular', (h) => {
+  h.win.__mods.App.send({ type: 'message', text: 'one' });
+  refuse(h, 4401, 'Authentication required.');
+  assert(/ A prompt typed while disconnected was not sent, and reloading discards it: copy it first\.$/
          .test(connBand(h).text), connBand(h).text);
 });
 

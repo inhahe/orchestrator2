@@ -325,12 +325,12 @@ APP_MUTATIONS = [
      "      if (window.Move) Move.close();"),
 
     ("a reconnect stops telling the lobby to resubscribe",
-     "      if (typeof Lobby !== 'undefined' && Lobby.onReconnect) Lobby.onReconnect();",
-     "      if (window.Lobby && Lobby.onReconnect) Lobby.onReconnect();"),
+     "      Lobby.onReconnect();\n",
+     ""),
 
-    ("the restart UI is gated on a property that does not exist",
-     "      if (typeof Lobby !== 'undefined' && Lobby.showReloadingAndPoll) Lobby.showReloadingAndPoll();",
-     "      if (window.Lobby && Lobby.showReloadingAndPoll) Lobby.showReloadingAndPoll();"),
+    ("the restart UI never runs",
+     "      Lobby.showReloadingAndPoll();\n",
+     ""),
 
     ("no visibilitychange listener at all (the original bug)",
      "    document.addEventListener('visibilitychange', _onVisibilityChange);",
@@ -357,8 +357,9 @@ APP_MUTATIONS = [
      "    if (_serverShutdown) return;"),
 
     ("showing reconnects over a healthy socket, sending an untyped /connect",
+     "    if (document.hidden) { _hiddenAt = Date.now(); return; }\n"
      "    if (ws && ws.readyState === WebSocket.OPEN) return;\n",
-     ""),
+     "    if (document.hidden) { _hiddenAt = Date.now(); return; }\n"),
 
     ("the exhausted flag is never cleared, so it outlives its recovery",
      "    _serverShutdown = false;\n    _retriesExhausted = false;\n    reconnectAttempt = 0;",
@@ -5638,14 +5639,10 @@ SHUTSTATUS_APP_MUTATIONS = [
      "      if (_serverShutdown) return;\n      if (msg.status) {\n",
      "      if (msg.status) {\n"),
 
-    ("the notice leaves the stop button up",
-     "        connection: true,\n      });\n      _nothingRunning();\n",
-     "        connection: true,\n      });\n"),
-
-    ("giving up leaves the stop button up",
-     "      Status.update({ busy_label: 'disconnected', busy_class: 'shutdown', connection: true });\n"
-     "      _nothingRunning();\n",
-     "      Status.update({ busy_label: 'disconnected', busy_class: 'shutdown', connection: true });\n"),
+    ("the notice, giving up or a refusal leaves the stop button up",
+     "    Status.update({ busy_label: label, busy_class: 'shutdown', connection: true });\n"
+     "    _nothingRunning();\n",
+     "    Status.update({ busy_label: label, busy_class: 'shutdown', connection: true });\n"),
 
     ("nothing running still leaves the input busy",
      "    _isBusy = false;\n    Commands.setBusy(false);\n",
@@ -5676,22 +5673,33 @@ CONNBAND_APP_MUTATIONS = [
      "                           max: MAX_RECONNECT_ATTEMPTS });\n",
      ""),
 
-    ("the lobby is not told the retries ran out",
-     "      Lobby.showConnection({ state: 'gave-up', attempts: MAX_RECONNECT_ATTEMPTS });\n",
+    ("the lobby is not told reconnecting stopped",
+     "    Lobby.showConnection(band);\n",
      ""),
 
+    ("the lobby is told the retries ran out as if they had not",
+     "                        { state: 'gave-up', attempts: MAX_RECONNECT_ATTEMPTS });",
+     "                        { state: 'retrying', attempt: 20, max: 20 });"),
+
     ("showing the window overrules a refusal",
-     "  function _refused(code, reason) {\n    _serverShutdown = true;\n",
-     "  function _refused(code, reason) {\n    _serverShutdown = true;\n"
-     "    _retriesExhausted = true;\n"),
+     "  function _refused(code, reason) {\n",
+     "  function _refused(code, reason) {\n    _retriesExhausted = true;\n"),
 
     ("a reason without a full stop runs into the next sentence",
      "    if (!/[.!?]$/.test(why)) why += '.';\n",
      ""),
 
-    ("the chat is not told of a refusal",
-     "    Chat.handleMessage({ type: 'system_msg', subtype: 'error', data: { message } });\n",
+    ("the chat is not told when reconnecting stops",
+     "    Chat.handleMessage({ type: 'system_msg', subtype, data: { message } });\n",
      ""),
+
+    ("a lockout is told to reload at once",
+     "            advice: 'Wait for the lockout to end, then reload the page to sign in again.' },",
+     "            advice: 'Reload the page to sign in again.' },"),
+
+    ("a refusal is silent about the prompts a reload discards",
+     "      + refusal.advice + queued;",
+     "      + refusal.advice;"),
 
     ("a socket counts as connected on open, so a refused one swallows the queue",
      "      console.log('WebSocket connected');\n",
@@ -5709,13 +5717,25 @@ CONNBAND_APP_MUTATIONS = [
      "      if (sock === ws && sock.readyState === WebSocket.CONNECTING) sock.close();",
      "      if (sock === ws && sock.readyState !== WebSocket.CLOSED) sock.close();"),
 
-    ("Retry waits on a handshake that may never finish",
-     "    if (ws && ws.readyState === WebSocket.CONNECTING) ws.close();\n    reconnect();",
+    ("a stuck handshake is waited on",
+     "      if (!_handshakeStuck) return;\n      ws.close();\n",
+     "      return;\n"),
+
+    ("a fresh handshake is thrown away too",
+     "      if (!_handshakeStuck) return;\n",
+     ""),
+
+    ("a handshake is never taken for stuck",
+     "      if (sock === ws && sock.readyState === WebSocket.CONNECTING) _handshakeStuck = true;",
+     "      if (false) _handshakeStuck = true;"),
+
+    ("Retry on an open socket sends /connect, restarting the session's CLI",
+     "    if (ws && ws.readyState === WebSocket.OPEN) return;\n    reconnect();",
      "    reconnect();"),
 
     ("a hub that shut down leaves the lobby showing a live list",
-     "      Lobby.showConnection({ state: 'stopped' });\n",
-     ""),
+     "                        { state: 'stopped' }, 'info');",
+     "                        null, 'info');"),
 ]
 
 CONNBAND_LOBBY_MUTATIONS = [
@@ -5723,7 +5743,7 @@ CONNBAND_LOBBY_MUTATIONS = [
      "        else App.retryNow();",
      "        else location.reload();"),
 
-    ("Retry leaves a stuck handshake alone",
+    ("Retry on an open socket sends /connect",
      "        else App.retryNow();",
      "        else App.reconnect();"),
 
