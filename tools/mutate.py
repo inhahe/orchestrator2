@@ -588,8 +588,7 @@ EXTAUTH_MUTATIONS = [
      "                        self._record_failure()",
      "                    if auth or pw_param is not None:"),
 
-    # A refusal says why (2026-10-27: a phone's lobby sat on "loading
-    # sessions" with nothing anywhere to say what had happened).
+    # A refusal says why, to the page and to the log.
     ("a refused socket is closed before it is accepted -- 1006 and no reason",
      '            await send({"type": "websocket.accept"})\n',
      ""),
@@ -615,18 +614,42 @@ EXTAUTH_MUTATIONS = [
      '                    elif scope["type"] == "websocket":',
      "                    else:"),
 
-    ("the log is not capped",
-     "        if now < self._quiet_until:",
-     "        if False:"),
+    ("an address's repeats are written every time",
+     "        if ((last is not None and now - last < self.REPEAT_AFTER)",
+     "        if ((False)"),
 
-    ("what the cap held back is never counted",
-     "        if self._held:",
-     "        if False:"),
+    ("an address is never written again",
+     "        if ((last is not None and now - last < self.REPEAT_AFTER)",
+     "        if ((last is not None)"),
+
+    ("the log is not capped across addresses",
+     "                or len(self._written) >= self.PER_MINUTE):",
+     "                or False):"),
+
+    ("the minute never ends",
+     "        while self._written and now - self._written[0] >= 60.0:\n"
+     "            self._written.popleft()\n",
+     ""),
+
+    ("what was held back is never written",
+     "        if not self._held:\n            return\n",
+     "        return\n"),
+
+    ("the count of what was held back is never scheduled",
+     "                asyncio.get_running_loop().call_later(self.FLUSH_AFTER, self.flush)",
+     "                asyncio.get_running_loop()"),
+
+    ("the path is written raw, so a request can forge log lines",
+     '    path = quote(scope.get("path") or "/", safe="/")',
+     '    path = scope.get("path") or "/"'),
+
+    ("a long path is written whole",
+     "    if len(path) > 200:",
+     "    if False:"),
 
     ("the query string, and a ?password= in it, is logged",
-     """                else f"request for {scope.get('path') or '/'}")""",
-     """                else f"request for {scope.get('path') or '/'}?"
-                     f"{(scope.get('query_string') or b'').decode()}")"""),
+     '    return f"request for {path}"',
+     """    return f"request for {path}?{(scope.get('query_string') or b'').decode()}\""""),
 ]
 
 RESUMETURN_MUTATIONS = [
@@ -5669,12 +5692,44 @@ CONNBAND_APP_MUTATIONS = [
     ("the chat is not told of a refusal",
      "    Chat.handleMessage({ type: 'system_msg', subtype: 'error', data: { message } });\n",
      ""),
+
+    ("a socket counts as connected on open, so a refused one swallows the queue",
+     "      console.log('WebSocket connected');\n",
+     "      console.log('WebSocket connected');\n      hubAnswered();\n"),
+
+    ("every message is taken for the hub's first answer",
+     "      if (!answered) hubAnswered();",
+     "      hubAnswered();"),
+
+    ("a hanging handshake is kept until the OS gives up",
+     "      if (sock === ws && sock.readyState === WebSocket.CONNECTING) sock.close();",
+     "      if (false) sock.close();"),
+
+    ("the connect timer closes an open socket too",
+     "      if (sock === ws && sock.readyState === WebSocket.CONNECTING) sock.close();",
+     "      if (sock === ws && sock.readyState !== WebSocket.CLOSED) sock.close();"),
+
+    ("Retry waits on a handshake that may never finish",
+     "    if (ws && ws.readyState === WebSocket.CONNECTING) ws.close();\n    reconnect();",
+     "    reconnect();"),
+
+    ("a hub that shut down leaves the lobby showing a live list",
+     "      Lobby.showConnection({ state: 'stopped' });\n",
+     ""),
 ]
 
 CONNBAND_LOBBY_MUTATIONS = [
     ("Retry reloads the page instead",
-     "        else App.reconnect();",
+     "        else App.retryNow();",
      "        else location.reload();"),
+
+    ("Retry leaves a stuck handshake alone",
+     "        else App.retryNow();",
+     "        else App.reconnect();"),
+
+    ("a hub that shut down reads as retrying",
+     "    } else if (info.state === 'stopped') {",
+     "    } else if (false) {"),
 
     ("running out of retries reads as still retrying",
      "    } else if (info.state === 'gave-up') {",

@@ -418,11 +418,16 @@ test('a completed move closes the overlay', (h) => {
 
 test('a reconnect tells the lobby to resubscribe', (h) => {
   // Lobby.onReconnect re-sends `lobby_watch` on the fresh socket; without it a
-  // reconnected lobby silently stops receiving live updates.
+  // reconnected lobby silently stops receiving live updates.  It waits for
+  // the hub's first message, which a refused socket never sends.
   let calls = 0;
   h.win.__mods.Lobby.onReconnect = () => { calls++; };
   h.live.accept();
+  assert(calls === 0, 'told before the hub said anything');
+  h.live.deliver({ type: 'session_list', running: [], recent: [] });
   assert(calls === 1, 'the lobby was never told the socket is new');
+  h.live.deliver({ type: 'session_list', running: [], recent: [] });
+  assert(calls === 1, 'told again for a second message');
 });
 
 test('/help opens a real modal instead of falling back to inline text', (h) => {
@@ -940,8 +945,21 @@ function chatText(h) {
   return h.win.document.getElementById('messages').textContent;
 }
 
-function stateText(h) {
-  return h.win.document.getElementById('status-state').textContent;
+// What *sock* was sent, of type *type*.
+function sentOfType(sock, type) {
+  return sock.sent.map((d) => JSON.parse(d)).filter((m) => m.type === type);
+}
+
+// The hub's first message on a socket: what makes the tab count as connected.
+function hubSpeaks(h) {
+  h.live.deliver({ type: 'session_list', running: [], recent: [] });
+}
+
+// A refused socket, as a browser sees it since the hub accepts before
+// closing: it opens, then closes with the hub's code.
+function refuse(h, code, reason) {
+  h.live.accept();
+  h.live.drop(code, reason);
 }
 
 test('a lobby whose socket fails says so, with the attempt', (h) => {
@@ -956,15 +974,17 @@ test('a lobby whose socket fails says so, with the attempt', (h) => {
 
 test('the band counts the attempts as they fail', (h) => {
   h.live.drop();
-  h.advance(60000);
+  h.advance(1500);
   h.live.drop();
   assert(/attempt 2 of 20/.test(connBand(h).text), connBand(h).text);
 });
 
-test('the band goes once a socket opens', (h) => {
+test('the band goes once the hub answers, not merely once a socket opens', (h) => {
   h.live.drop();
-  h.advance(60000);
+  h.advance(1500);
   h.live.accept();
+  assert(connBand(h) !== null, 'gone before the hub said anything');
+  hubSpeaks(h);
   assert(connBand(h) === null, 'the band outlived the outage');
 });
 
@@ -975,8 +995,40 @@ test('Retry now opens a socket at once', (h) => {
   assert(h.sockets.length === before + 1, 'Retry now waited for the backoff');
 });
 
+test('a handshake that hangs is given up, and the band says so', (h) => {
+  // A network that drops the connection attempt leaves the socket CONNECTING
+  // until the OS gives up, which can be minutes.
+  const first = h.live;
+  h.advance(9000);
+  assert(first.readyState !== h.win.WebSocket.CLOSED, 'given up too soon');
+  h.advance(1000);
+  assert(first.readyState === h.win.WebSocket.CLOSED, 'the hanging attempt was kept');
+  assert(/attempt 1 of 20/.test(connBand(h).text), 'no band for a hanging attempt');
+  h.advance(1500);
+  assert(h.live !== first, 'no new attempt after giving one up');
+});
+
+test('a socket that opens is not given up on for being slow to answer', (h) => {
+  h.live.accept();
+  h.advance(60000);
+  assert(h.sockets.length === 1, 'an open socket was closed by the connect timer');
+});
+
+test('Retry now replaces an attempt stuck connecting', (h) => {
+  h.live.drop();
+  h.advance(1500);                         // the retry is now handshaking
+  const stuck = h.live;
+  connBand(h).button.click();
+  assert(h.live !== stuck, 'Retry now waited on the stuck handshake');
+  assert(stuck.readyState === h.win.WebSocket.CLOSED, 'the stuck one was left open');
+  // Its close is not the tab's: no second socket is scheduled for it.
+  const count = h.sockets.length;
+  h.advance(5000);
+  assert(h.sockets.length === count, 'the abandoned attempt scheduled a retry');
+});
+
 test('a refused socket is not retried, and says to reload', (h) => {
-  h.live.drop(4401, 'Authentication required.');
+  refuse(h, 4401, 'Authentication required.');
   const before = h.sockets.length;
   h.advance(600000);
   assert(h.sockets.length === before, 'a refusal was retried with the same credential');
@@ -990,7 +1042,7 @@ test('a refused socket is not retried, and says to reload', (h) => {
 });
 
 test('showing the window does not overrule a refusal', (h) => {
-  h.live.drop(4401, 'Authentication required.');
+  refuse(h, 4401, 'Authentication required.');
   const before = h.sockets.length;
   h.setHidden(true);
   h.setHidden(false);
@@ -998,19 +1050,59 @@ test('showing the window does not overrule a refusal', (h) => {
 });
 
 test('a lockout and external access being off are refusals too', (h) => {
-  h.live.drop(4429, 'Too many failed password attempts. Try again in 3s.');
+  refuse(h, 4429, 'Too many failed password attempts. Try again in 3s.');
   assert(stateText(h) === 'locked out', stateText(h));
   h.win.__mods.App.reconnect();      // /connect: the user asked
-  h.live.drop(4403, 'External access is disabled on this server.');
+  refuse(h, 4403, 'External access is disabled on this server.');
   assert(stateText(h) === 'outside access off', stateText(h));
   assert(/disabled on this server\. Reload the page for how to turn it on\.$/
          .test(connBand(h).text), connBand(h).text);
 });
 
 test('a refusal without a reason still reads as a sentence', (h) => {
-  h.live.drop(4401, '');
+  refuse(h, 4401, '');
   assert(connBand(h).text === 'The hub refused this page’s connection: '
          + 'sign-in needed. Reload the page to sign in again.', connBand(h).text);
+});
+
+test('a prompt queued while disconnected survives a refused socket', (h) => {
+  // The refused socket opens before it closes; sending the queue on open
+  // would put the prompt into a socket the hub never reads.
+  h.win.__mods.App.send({ type: 'message', text: 'hello' });
+  const refused = h.live;
+  refuse(h, 4401, 'Authentication required.');
+  assert(sentOfType(refused, 'message').length === 0,
+         'the queued prompt went into the refused socket');
+  h.win.__mods.App.reconnect();      // signed in elsewhere, then /connect
+  h.live.accept();
+  hubSpeaks(h);
+  const sent = sentOfType(h.live, 'message');
+  assert(sent.length === 1 && sent[0].text === 'hello', JSON.stringify(sent));
+});
+
+test('a ?new=1 tab refused at first still starts its session', (h) => {
+  const refused = h.live;
+  refuse(h, 4401, 'Authentication required.');
+  assert(sentOfType(refused, 'new').length === 0,
+         'the one launch request went into the refused socket');
+  h.win.__mods.App.reconnect();
+  h.live.accept();
+  hubSpeaks(h);
+  assert(sentOfType(h.live, 'new').length === 1, 'the launch request was spent');
+}, { url: 'http://localhost:8240/?new=1' });
+
+test('a hub that shuts down says so in the lobby, and Try again retries', (h) => {
+  h.live.accept();
+  hubSpeaks(h);
+  h.live.deliver({ type: 'server_shutdown', reason: 'bye' });
+  h.live.drop(1000);
+  const band = connBand(h);
+  assert(band && band.text === 'The hub has shut down, so this list is no '
+         + 'longer live.', band && band.text);
+  assert(band.button.textContent === 'Try again', band.button.textContent);
+  const before = h.sockets.length;
+  band.button.click();
+  assert(h.sockets.length === before + 1, 'Try again did nothing');
 });
 
 test('running out of retries says so in the lobby, and Try again retries', (h) => {
@@ -1435,7 +1527,7 @@ test('it reports the loss, not how a retry then failed', (h) => {
 test('and the latest loss, not an old one', (h) => {
   attachedAt(h, 'e1', 1);
   reconnects(h, 1006);
-  h.live.accept();                        // back: nothing left to report
+  attachedAt(h, 'e1', 1);                 // back, and heard: nothing left to report
   reconnects(h, 1001);
   assert(asked(h, 'why') === '1001', 'why=' + asked(h, 'why'));
 });

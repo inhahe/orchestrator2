@@ -4713,28 +4713,67 @@ gaps made it undiagnosable:
   shutdown does, so showing the window does not reverse it, and says in the
   status bar, the chat and the lobby that only a reload signs the page in
   again. A reload asks the browser for the password and gets the cookie.
-  `/connect` still tries.
+  `/connect` still tries. A test in `test_external_auth.py` reads
+  `HUB_REFUSALS` out of `app.js`, so the two sides cannot drift apart.
 - **The lobby said "loading sessions" while there was nothing to load from.**
   `Lobby.showConnection` keeps a band above the lists whenever the socket is
   down: retrying with attempt *n* of 20 and **Retry now**, given up with
-  **Try again**, or refused with the hub's reason and **Reload**. `app.js`
-  drives it from `_scheduleReconnect` and `_refused`, and clears it on open.
-  The band is updated in place, like the halt rows, so a click is not lost to
-  a rebuild.
+  **Try again**, refused with the hub's reason and **Reload**, or, after a
+  `server_shutdown`, stopped with **Try again**. `app.js` drives it from
+  `_scheduleReconnect`, `_refused` and the `server_shutdown` handler. The
+  band is updated in place, like the halt rows, so a click is not lost to a
+  rebuild.
+
+**Connected means the hub has spoken.** A refused socket now *opens* before it
+closes, and everything `onopen` used to do would then go into a socket the hub
+never reads: the prompts queued while disconnected (`_flushPending`) and the
+one-shot `?open=` / `?new=` request, both lost for good. So `onopen` only
+logs. What assumes a listening hub runs in `hubAnswered`, on the socket's first
+message: every accepted tab gets `attached` or `session_list` at once, and a
+refused one gets nothing. That also covers resetting the retry count, the
+lobby's resubscription and clearing the band. A loss is reported (`why=`)
+until a socket is *answered*, not merely opened.
+
+**A handshake that hangs is given up.** A network that drops a connection
+attempt (the hairpin case) leaves the socket CONNECTING until the OS gives up:
+about 20 seconds on Windows, about two minutes on Android. With no close there
+is no retry and no band. `_connect` closes a socket still CONNECTING after
+`CONNECT_TIMEOUT_MS` (10s), which counts as a failed attempt. It does not
+touch an open socket that is slow to send its first message: attaching a large
+session can take longer than that. The band's Retry calls `App.retryNow`, which
+abandons a socket still handshaking before reconnecting. `reconnect()` leaves
+it alone, since its other callers (visibility, `/connect`) only want the socket
+back. The abandoned socket's close arrives after its replacement, so `own`
+ignores it.
 
 **Refusals are logged** by `_RefusalLog` (`refused an outside socket from
 <ip>: <why>`), except a page request with no credential, which is just the
 password challenge. A socket with no credential *is* logged: it is a page that
-signed in but whose socket cannot. The cap is one line a minute, global for
-the throttle's reason, with the refusals held back counted into the next line.
-The query string is never written, since it can carry `?password=`. So a
-phone that loaded the page and never got its list either left a line, and was
-refused, or left none, and its socket never reached the hub.
+signed in but whose socket cannot. Each address's first refusal is written,
+and that address again only after `REPEAT_AFTER` (10 min). A single global
+cap of one line a minute could have hidden the very refusal being looked for
+behind a bot's. Across addresses the cap is `PER_MINUTE` (10), global for the
+throttle's reason. What is held back is counted, and `flush` writes the count
+`FLUSH_AFTER` (60s) after the first of it, on a `call_later` timer, so the
+count does not wait for a refusal that may never come.
+`_refused_what` quotes the path and cuts it at 200 characters. ASGI hands the
+path over percent-decoded, so written raw, `%0A` and `%1B` from anyone on the
+internet would forge lines and escape codes in the log. The query string is
+never written, since it can carry `?password=`. So a phone that loaded the
+page and never got its list either left a line, and was refused, or left none,
+and its socket never reached the hub.
 
-Pinned by `test_external_auth.py` (the codes, the reasons, what is and is not
-logged, the cap), `reconnect_on_show.test.js` (the band, Retry and Reload, no
-retry after a refusal, showing the window), and mutation targets `extauth`,
-`connband-app` and `connband-lobby`.
+uvicorn's own console line for a refused socket now reads `[accepted]`, since
+it was. That line is not ours and not in `--log-file`; `_RefusalLog`'s line
+is the authority on what was refused.
+
+Pinned by `test_external_auth.py` (the codes and reasons, the codes' parity
+with `app.js`, what is and is not logged, per-address and global caps, the held
+count and its timer, forged and long paths), `reconnect_on_show.test.js` (the
+band in each state, Retry and Reload, no retry after a refusal, showing the
+window, the queue and the launch request surviving an open-then-refused socket,
+the connect timeout, Retry replacing a stuck handshake, a hub that shut
+down), and mutation targets `extauth`, `connband-app` and `connband-lobby`.
 
 ---
 

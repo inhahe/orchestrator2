@@ -307,15 +307,20 @@ secret can't be recovered by response-timing analysis.
 live arrive over the page's WebSocket, so a page can load while that
 connection fails. The lobby then shows a band saying the hub isn't connected,
 which attempt it's on, and a **Retry now** button, in place of an endless
-"loading sessions". When the retries run out, the button reads **Try again**.
+"loading sessions". A connection attempt that hasn't opened after 10 seconds
+is given up and retried, and **Retry now** abandons one still trying. When
+the retries run out, or the hub shuts down, the button reads **Try again**.
 A connection the hub *refused* (no valid sign-in, a lockout, or external access
 off) is not retried: the band and the chat give the hub's reason and a
-**Reload** button, since reloading the page is what signs it in again.
+**Reload** button, since reloading the page is what signs it in again. A prompt
+typed while disconnected waits for a connection the hub actually answers on.
 
 Every refused outside connection is written to the log (`--log-file`) with its
-address and the reason, except the browser's ordinary password prompt. At most
-one line a minute is written, however many refusals arrive, so a scan of the
-port can't flood the log. The next line counts the ones held back. A phone that
+address and the reason, except the browser's ordinary password prompt. Only
+the first refusal from each address is written, and repeats again after 10
+minutes. Across all addresses, at most 10 lines a minute are written, so a scan
+of the port can't flood the log. What is held back is counted in a line written
+a minute later. A phone that
 loads the page but never gets its session list leaves a line here if the hub
 refused it. If nothing appears, its connection never reached the hub at all.
 For example, a router with unreliable *hairpin NAT* passes some connections

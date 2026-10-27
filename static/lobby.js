@@ -640,13 +640,13 @@ const Lobby = (() => {
 
   // The hub's connection, while it is not up: a band above the session lists.
   //
-  // The lists arrive over the socket, so with it down "loading sessions" was
-  // all the lobby said, for as long as it stayed down -- whether the hub was
-  // unreachable, had refused the socket, or the page had stopped retrying.
-  // *info* is null once the socket is open, else one of
+  // The lists arrive over the socket, so without this the lobby can only go
+  // on saying "loading sessions", or go on showing a list that is no longer
+  // live.  *info* is null once the hub answers on a socket, else one of
   //   {state: 'retrying', attempt, max}  -- a retry is scheduled
   //   {state: 'gave-up', attempts}       -- app.js stopped retrying
   //   {state: 'refused', message}        -- the hub refused it (app.js _refused)
+  //   {state: 'stopped'}                 -- the hub said it was shutting down
   // The band is updated in place: a button replaced between mousedown and
   // mouseup loses the click.
   function showConnection(info) {
@@ -663,7 +663,7 @@ const Lobby = (() => {
         + '<button type="button" class="lobby-conn-act"></button>';
       box.querySelector('.lobby-conn-act').addEventListener('click', (e) => {
         if (e.currentTarget.dataset.act === 'reload') location.reload();
-        else App.reconnect();
+        else App.retryNow();
       });
     }
     let text, label, act;
@@ -674,6 +674,10 @@ const Lobby = (() => {
     } else if (info.state === 'gave-up') {
       text = 'Couldn’t reach the hub after ' + info.attempts
         + ' tries, so the session list can’t load.';
+      label = 'Try again';
+      act = 'retry';
+    } else if (info.state === 'stopped') {
+      text = 'The hub has shut down, so this list is no longer live.';
       label = 'Try again';
       act = 'retry';
     } else {

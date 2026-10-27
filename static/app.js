@@ -44,6 +44,10 @@ const App = (() => {
   let _hubHears = [];
   const MAX_RECONNECT_DELAY = 30000;
   const MAX_RECONNECT_ATTEMPTS = 20;
+  // Longest a socket may take to open before the attempt is given up.  A
+  // handshake takes well under a second on a LAN and a few over a slow
+  // phone connection.
+  const CONNECT_TIMEOUT_MS = 10000;
   // Close codes the hub refuses an outside socket with (server.WS_CLOSE_*),
   // and what the status bar says for each.  Retrying sends the same missing
   // credential again, so none of them is retried.
@@ -244,8 +248,26 @@ const App = (() => {
     // resume sends again -- is not the session's.
     const own = (handler) => (e) => { if (sock === ws) handler(e); };
 
+    // A handshake that never finishes is abandoned, and counts as a failed
+    // attempt: a network that drops a connection attempt leaves the socket
+    // CONNECTING until the OS gives up, which can be minutes.
+    setTimeout(() => {
+      if (sock === ws && sock.readyState === WebSocket.CONNECTING) sock.close();
+    }, CONNECT_TIMEOUT_MS);
+
     sock.onopen = own(() => {
       console.log('WebSocket connected');
+    });
+
+    // Connected means the hub has spoken on this socket, not merely that it
+    // opened: a refused socket is opened and then closed without a word
+    // (server._reject), and every accepted one gets `attached` or
+    // `session_list` at once.  So what assumes a hub is listening waits for
+    // its first message -- above all the prompts queued while disconnected,
+    // and the one launch request, which a refused socket would swallow.
+    let answered = false;
+    const hubAnswered = () => {
+      answered = true;
       reconnectDelay = 1000;
       reconnectAttempt = 0;
       _lastClose = null;
@@ -270,7 +292,7 @@ const App = (() => {
           send(cwd ? { type: 'new', cwd } : { type: 'new' });
         }
       }
-    });
+    };
 
     sock.onclose = own((e) => {
       console.log('WebSocket closed:', e.code, e.reason);
@@ -297,6 +319,7 @@ const App = (() => {
     });
 
     sock.onmessage = own((e) => {
+      if (!answered) hubAnswered();
       let msg;
       try {
         msg = JSON.parse(e.data);
@@ -463,6 +486,15 @@ const App = (() => {
     if (ws && ws.readyState === WebSocket.CONNECTING) return;
     Status.update({ busy_label: 'reconnecting', busy_class: 'reconnecting', connection: true });
     _connect();
+  }
+
+  /* The lobby band's Retry: a fresh attempt now.  Unlike reconnect(), it
+   * abandons a socket still handshaking: on a network that drops some
+   * connection attempts, that one may never finish.  Its close event arrives
+   * once the new socket has replaced it, and so is not the tab's (`own`). */
+  function retryNow() {
+    if (ws && ws.readyState === WebSocket.CONNECTING) ws.close();
+    reconnect();
   }
 
   /* Reconnect the moment the window is shown, rather than on the backoff's
@@ -836,6 +868,7 @@ const App = (() => {
         subtype: 'info',
         data: { message: msg.reason || 'Server shut down.' },
       });
+      Lobby.showConnection({ state: 'stopped' });
       return;
     }
 
@@ -952,5 +985,5 @@ const App = (() => {
 
   document.addEventListener('DOMContentLoaded', init);
 
-  return { send, reconnect, showToolDetail, showBgDetail, openModal, closeModal };
+  return { send, reconnect, retryNow, showToolDetail, showBgDetail, openModal, closeModal };
 })();

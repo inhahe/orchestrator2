@@ -40,7 +40,7 @@ import re
 import socket as _socket
 import sys
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from html import escape as html_escape
 from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
@@ -48,7 +48,7 @@ from typing import Any, NamedTuple, NoReturn
 import bg_stall
 import limit_resume
 import wakeup_store
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import dataclasses
 import webbrowser
@@ -2996,41 +2996,84 @@ def _ws_close_reason(text: str) -> str:
     return first.encode("utf-8")[:123].decode("utf-8", "ignore")
 
 
-class _RefusalLog:
-    """Writes refused outside connections to the log, a line a minute at most.
+def _refused_what(scope: dict) -> str:
+    """What *scope* was, for a log line: "socket", or "request for <path>".
 
-    Without it a refusal left no trace anywhere, so a page that loaded while
-    its socket was refused could not be told apart, afterwards, from one
-    whose socket never reached the hub.  The cap is global, not per address,
-    for the throttle's reason: a scan from many addresses must not flood the
-    log.  What it holds back is counted into the next line it writes.
+    The path is quoted and cut short: ASGI hands it over percent-decoded, so
+    written raw, a request from anyone could put line breaks and terminal
+    escapes into the log, forging lines in it.  The query string is never
+    written: it can carry ``?password=``.
+    """
+    if scope.get("type") == "websocket":
+        return "socket"
+    path = quote(scope.get("path") or "/", safe="/")
+    if len(path) > 200:
+        path = path[:200] + "..."
+    return f"request for {path}"
+
+
+class _RefusalLog:
+    """Writes refused outside connections to the log, without letting a flood
+    of them flood it.
+
+    The first refusal from each address is written, so the one connection
+    being looked for is there; that address's repeats are not, for
+    ``REPEAT_AFTER`` seconds.  Lines are also capped at ``PER_MINUTE`` across
+    all addresses, for the throttle's reason: a scan from many addresses must
+    not flood the log.  What is held back is counted, and the count written
+    ``FLUSH_AFTER`` seconds after the first of it.
     """
 
-    INTERVAL = 60.0
+    PER_MINUTE = 10
+    REPEAT_AFTER = 600.0
+    FLUSH_AFTER = 60.0
+    _MAX_ADDRESSES = 4096     # remembered for REPEAT_AFTER; the oldest go first
 
     def __init__(self) -> None:
-        self._quiet_until = 0.0          # time.monotonic() deadline
+        self._written: deque[float] = deque()      # when lines went out, last minute
+        self._last_from: dict[str, float] = {}     # address -> its last line
         self._held = 0
         self._held_from: set[str] = set()
+        self._flush_armed = False
 
     def note(self, scope: dict, ip: str, why: str) -> None:
         """Record that the request or socket *scope*, from *ip*, was refused
-        because *why*.  The query string is never written: it can carry
-        ``?password=``."""
+        because *why*."""
         now = time.monotonic()
-        if now < self._quiet_until:
-            self._held += 1
-            if len(self._held_from) < 1000:
-                self._held_from.add(ip)
+        while self._written and now - self._written[0] >= 60.0:
+            self._written.popleft()
+        last = self._last_from.get(ip)
+        if ((last is not None and now - last < self.REPEAT_AFTER)
+                or len(self._written) >= self.PER_MINUTE):
+            self._hold(ip)
             return
-        what = ("socket" if scope.get("type") == "websocket"
-                else f"request for {scope.get('path') or '/'}")
-        held = ""
-        if self._held:
-            held = (f" (and {self._held} more in the minute after the previous "
-                    f"such line, from {len(self._held_from)} address(es))")
-        log.info("refused an outside %s from %s: %s%s", what, ip, why, held)
-        self._quiet_until = now + self.INTERVAL
+        log.info("refused an outside %s from %s: %s", _refused_what(scope), ip, why)
+        self._written.append(now)
+        self._last_from.pop(ip, None)              # re-inserted as the newest
+        self._last_from[ip] = now
+        if len(self._last_from) > self._MAX_ADDRESSES:
+            del self._last_from[next(iter(self._last_from))]
+
+    def _hold(self, ip: str) -> None:
+        self._held += 1
+        if len(self._held_from) < 1000:
+            self._held_from.add(ip)
+        if not self._flush_armed:
+            try:
+                asyncio.get_running_loop().call_later(self.FLUSH_AFTER, self.flush)
+                self._flush_armed = True
+            except RuntimeError:
+                pass                    # no loop: whoever calls flush() writes it
+
+    def flush(self) -> None:
+        """Write how many refusals were held back since the last such line."""
+        self._flush_armed = False
+        if not self._held:
+            return
+        n = len(self._held_from)
+        log.info("refused %d more outside connection(s) from %s address(es) "
+                 "without a line each: repeats, or past %d lines a minute",
+                 self._held, f"{n}+" if n >= 1000 else n, self.PER_MINUTE)
         self._held = 0
         self._held_from = set()
 
@@ -3091,6 +3134,8 @@ class _ExternalAuthMiddleware:
         # and gets a wall of "no" is told, on the spot, how to say yes.
         self.disabled_message = disabled_message or (
             "External access is disabled on this server.\n\n" + EXTERNAL_HOWTO)
+        # Its first paragraph: what the log says, and a refused socket is told.
+        self._disabled_reason = _ws_close_reason(self.disabled_message)
         # Deterministic token derived from the password: lets the cookie
         # authenticate without carrying the literal secret.
         self.token = (
@@ -3114,8 +3159,7 @@ class _ExternalAuthMiddleware:
                     # default, or "on" with no password, which is refused).
                     # Don't send a Basic-Auth challenge: it would prompt for a
                     # password that can never work.
-                    self._refusals.note(scope, client_ip,
-                                        _ws_close_reason(self.disabled_message))
+                    self._refusals.note(scope, client_ip, self._disabled_reason)
                     await self._reject(scope, receive, send,
                                        self.disabled_message, challenge=False,
                                        ws_code=WS_CLOSE_DISABLED)

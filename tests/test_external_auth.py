@@ -15,7 +15,9 @@ tests drive the ASGI middleware directly (no real HTTP stack) to verify:
 * Password/token comparisons use ``hmac.compare_digest`` (constant time).
 * A refused socket is accepted and then closed with a ``WS_CLOSE_*`` code and a
   short reason, so the page can say why rather than wait for ever.
-* Refusals are logged, a line a minute at most, never with the query string.
+* Refusals are logged: each address's first, within a cap across addresses,
+  with what was held back counted; never the query string, and never a path
+  that could forge a line.
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ import base64
 import hashlib
 import logging
 import os
+import pathlib
+import re
 import sys
 
 import pytest
@@ -42,10 +46,11 @@ async def _inner_app(scope, receive, send):
     await send({"type": "http.response.body", "body": b"ok"})
 
 
-def _drive(mw, *, ip="8.8.8.8", headers=None, query=b"", scheme="http"):
+def _drive(mw, *, ip="8.8.8.8", headers=None, query=b"", scheme="http", path="/"):
     """Run one HTTP request through *mw*; return (status, headers-dict, ran)."""
     scope = {
         "type": "http",
+        "path": path,
         "client": (ip, 12345),
         "headers": headers or [],
         "query_string": query,
@@ -252,6 +257,19 @@ def test_close_reason_is_cut_to_what_a_close_frame_holds():
     assert reason == "é" * 61                          # no half character
 
 
+def test_the_page_knows_every_refusal_code():
+    # app.js cannot import them: a code renumbered on one side only would
+    # have the page retry a refusal twenty times again.
+    src = (pathlib.Path(server.__file__).parent / "static" / "app.js").read_text(
+        encoding="utf-8")
+    block = re.search(r"const HUB_REFUSALS = \{(.*?)\};", src, re.S).group(1)
+    codes = {int(code) for code in re.findall(r"(\d+):", block)}
+    assert codes == {server.WS_CLOSE_SIGN_IN, server.WS_CLOSE_DISABLED,
+                     server.WS_CLOSE_LOCKED_OUT}
+    # _refused tells "off" apart: reloading shows how to turn it on.
+    assert f"code === {server.WS_CLOSE_DISABLED} ?" in src
+
+
 def _ws_untouched(sent):
     """Nothing socket-level was sent: the middleware let the socket through."""
     return not any(m["type"].startswith("websocket.") for m in sent)
@@ -268,14 +286,14 @@ def test_cookie_authenticated_socket_is_let_in(mw):
     assert ran and _ws_untouched(sent)
 
 
-# --- Refusals are logged, a line a minute at most ------------------------------
+# --- Refusals are logged, without a flood flooding the log ---------------------
 
 @pytest.fixture
 def refusals(caplog):
     """The lines the middleware logs about refusals."""
     caplog.set_level(logging.INFO, logger="orchestrator2")
     return lambda: [r.getMessage() for r in caplog.records
-                    if r.getMessage().startswith("refused an outside")]
+                    if r.getMessage().startswith("refused ")]
 
 
 def test_a_refused_socket_is_logged_with_its_address_and_why(mw, refusals):
@@ -303,19 +321,82 @@ def test_lan_is_never_logged(mw, refusals):
     assert refusals() == []
 
 
-def test_refusals_within_the_minute_are_counted_into_the_next_line(mw, refusals):
-    _drive_ws(mw, ip="203.0.113.1")
-    _drive_ws(mw, ip="203.0.113.2")
-    _drive_ws(mw, ip="203.0.113.2")
-    _drive_ws(mw, ip="203.0.113.3")
-    assert len(refusals()) == 1, "the cap let a second line through"
-    mw._refusals._quiet_until = 0.0                 # the minute is up
-    _drive_ws(mw, ip="203.0.113.4")
+def test_a_path_cannot_forge_lines_in_the_log(mw, refusals):
+    # ASGI hands the path over percent-decoded: written raw, %0A would end
+    # the line and start a forged one.
+    forged = "/x\n2026-10-27 12:00:00,000 [orchestrator2] INFO: all is well\x1b[2J"
+    _drive(mw, path=forged, query=b"password=nope")
+    (line,) = refusals()
+    assert "\n" not in line and "\x1b" not in line, repr(line)
+    assert line.startswith("refused an outside request for /x%0A2026"), line
+
+
+def test_a_long_path_is_cut_short(mw, refusals):
+    _drive(mw, path="/" + "a" * 5000, query=b"password=nope")
+    (line,) = refusals()
+    assert len(line) < 300, len(line)
+
+
+def test_each_address_gets_its_first_refusal_written(mw, refusals):
+    # A bot's refusal a moment earlier must not hide the phone's.
+    _drive(mw, ip="198.51.100.9", query=b"password=guess")
+    _drive_ws(mw, ip="203.0.113.7")
+    assert [line.split(" from ")[1].split(":")[0] for line in refusals()] == [
+        "198.51.100.9", "203.0.113.7"]
+
+
+def test_an_address_repeating_itself_is_written_once(mw, refusals):
+    for _ in range(5):
+        _drive_ws(mw, ip="203.0.113.7")
+    assert len(refusals()) == 1
+
+
+def test_an_address_is_written_again_after_a_while(mw, refusals):
+    _drive_ws(mw, ip="203.0.113.7")
+    mw._refusals._last_from["203.0.113.7"] -= mw._refusals.REPEAT_AFTER
+    _drive_ws(mw, ip="203.0.113.7")
+    assert len(refusals()) == 2
+
+
+def test_lines_are_capped_across_addresses(mw, refusals):
+    cap = mw._refusals.PER_MINUTE
+    for i in range(cap + 5):
+        _drive_ws(mw, ip=f"203.0.113.{i}")
+    assert len(refusals()) == cap, "a scan from many addresses flooded the log"
+    # A minute on, there is room again.
+    mw._refusals._written = type(mw._refusals._written)(
+        t - 60.0 for t in mw._refusals._written)
+    _drive_ws(mw, ip="198.51.100.1")
+    assert len(refusals()) == cap + 1
+
+
+def test_what_was_held_back_is_counted(mw, caplog, refusals):
+    for _ in range(3):
+        _drive_ws(mw, ip="203.0.113.7")         # one line, two held
+    _drive_ws(mw, ip="203.0.113.8")             # a line of its own
+    _drive_ws(mw, ip="203.0.113.8")             # held
+    mw._refusals.flush()
+    assert refusals()[-1] == ("refused 3 more outside connection(s) from 2 "
+                              "address(es) without a line each: repeats, or "
+                              "past 10 lines a minute")
+    # Counted once: a second flush with nothing new held writes nothing.
+    n = len(refusals())
+    mw._refusals.flush()
+    assert len(refusals()) == n
+
+
+def test_the_count_is_written_by_itself_later(refusals):
+    # In the running hub nobody calls flush(): holding schedules it, once.
+    import asyncio
+
+    async def run():
+        log = server._RefusalLog()
+        log.FLUSH_AFTER = 0.05
+        for _ in range(4):                      # one line, three held
+            log.note({"type": "websocket"}, "203.0.113.7", "why")
+        await asyncio.sleep(0.2)
+
+    asyncio.run(run())
     lines = refusals()
-    assert len(lines) == 2
-    assert lines[1].endswith("(and 3 more in the minute after the previous such "
-                             "line, from 2 address(es))"), lines[1]
-    # And the count starts again.
-    mw._refusals._quiet_until = 0.0
-    _drive_ws(mw, ip="203.0.113.5")
-    assert "more in the minute" not in refusals()[2]
+    assert lines[1:] == ["refused 3 more outside connection(s) from 1 address(es) "
+                         "without a line each: repeats, or past 10 lines a minute"], lines
