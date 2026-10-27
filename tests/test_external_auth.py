@@ -13,12 +13,16 @@ tests drive the ASGI middleware directly (no real HTTP stack) to verify:
   can't get a fresh budget per address.
 * A successful auth clears the failure counter.
 * Password/token comparisons use ``hmac.compare_digest`` (constant time).
+* A refused socket is accepted and then closed with a ``WS_CLOSE_*`` code and a
+  short reason, so the page can say why rather than wait for ever.
+* Refusals are logged, a line a minute at most, never with the query string.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
 import sys
 
@@ -26,7 +30,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from server import _ExternalAuthMiddleware
+import server                                            # noqa: E402
+from server import _ExternalAuthMiddleware               # noqa: E402
 
 
 async def _inner_app(scope, receive, send):
@@ -177,3 +182,140 @@ def test_valid_cookie_authenticates(mw):
     assert status == 200 and ran
     # Already authed by cookie → no need to re-plant one.
     assert b"set-cookie" not in resp_hdrs
+
+
+# --- A refused socket is told why --------------------------------------------
+#
+# Closing a socket before accepting it reaches the browser as a failed
+# handshake, code 1006 and no reason, so the page could not tell a refusal from
+# a network fault and showed "loading sessions" for ever.  Accepted, then
+# closed with a code of the hub's own, it can say what would help.
+
+def _drive_ws(mw, *, ip="8.8.8.8", headers=None, query=b""):
+    """Run one WebSocket upgrade through *mw*; return (sent messages, ran)."""
+    scope = {"type": "websocket", "client": (ip, 12345), "scheme": "ws",
+             "path": "/ws", "headers": headers or [], "query_string": query}
+    sent = []
+
+    async def receive():
+        return {"type": "websocket.connect"}
+
+    async def send(message):
+        sent.append(message)
+
+    import asyncio
+    asyncio.run(mw(scope, receive, send))
+    return sent, scope.get("_ran", [])
+
+
+def _closed_with(sent):
+    """The (code, reason) *sent* closed with, after accepting."""
+    assert [m["type"] for m in sent] == ["websocket.accept", "websocket.close"], sent
+    return sent[1]["code"], sent[1]["reason"]
+
+
+def test_socket_without_credentials_is_told_to_sign_in(mw):
+    sent, ran = _drive_ws(mw)
+    assert not ran
+    assert _closed_with(sent) == (server.WS_CLOSE_SIGN_IN, "Authentication required.")
+
+
+def test_socket_with_a_wrong_password_is_told_to_sign_in(mw):
+    sent, ran = _drive_ws(mw, query=b"password=nope")
+    assert not ran
+    assert _closed_with(sent)[0] == server.WS_CLOSE_SIGN_IN
+
+
+def test_socket_during_a_lockout_is_told_so(mw):
+    for _ in range(mw._FREE_ATTEMPTS + 1):
+        _drive(mw, headers=_basic("nope"))
+    sent, ran = _drive_ws(mw)
+    code, reason = _closed_with(sent)
+    assert not ran
+    assert code == server.WS_CLOSE_LOCKED_OUT
+    assert reason.startswith("Too many failed password attempts. Try again in ")
+
+
+def test_socket_when_external_access_is_off_gets_a_short_reason():
+    long = "External access is disabled on this server.\n\n" + "how to " * 100
+    mw = _ExternalAuthMiddleware(_inner_app, password=None, disabled_message=long)
+    code, reason = _closed_with(_drive_ws(mw)[0])
+    assert code == server.WS_CLOSE_DISABLED
+    # The first paragraph only: a close frame's reason holds 123 bytes, and a
+    # longer one makes the close itself fail.
+    assert reason == "External access is disabled on this server."
+
+
+def test_close_reason_is_cut_to_what_a_close_frame_holds():
+    reason = server._ws_close_reason("é" * 100)       # 200 bytes of UTF-8
+    assert len(reason.encode("utf-8")) <= 123
+    assert reason == "é" * 61                          # no half character
+
+
+def _ws_untouched(sent):
+    """Nothing socket-level was sent: the middleware let the socket through."""
+    return not any(m["type"].startswith("websocket.") for m in sent)
+
+
+def test_lan_socket_is_not_refused(mw):
+    sent, ran = _drive_ws(mw, ip="192.168.1.5")
+    assert ran and _ws_untouched(sent)
+
+
+def test_cookie_authenticated_socket_is_let_in(mw):
+    token = hashlib.sha256(b"orch2-auth:secret").hexdigest()
+    sent, ran = _drive_ws(mw, headers=[(b"cookie", ("orch2_auth=" + token).encode())])
+    assert ran and _ws_untouched(sent)
+
+
+# --- Refusals are logged, a line a minute at most ------------------------------
+
+@pytest.fixture
+def refusals(caplog):
+    """The lines the middleware logs about refusals."""
+    caplog.set_level(logging.INFO, logger="orchestrator2")
+    return lambda: [r.getMessage() for r in caplog.records
+                    if r.getMessage().startswith("refused an outside")]
+
+
+def test_a_refused_socket_is_logged_with_its_address_and_why(mw, refusals):
+    _drive_ws(mw, ip="203.0.113.7")
+    assert refusals() == ["refused an outside socket from 203.0.113.7: no password "
+                          "and no valid sign-in cookie"]
+
+
+def test_the_password_challenge_itself_is_not_logged(mw, refusals):
+    # A page request with no credential is the browser being asked for the
+    # password: every first visit makes several.
+    _drive(mw)
+    assert refusals() == []
+
+
+def test_a_wrong_password_is_logged_without_the_query_string(mw, refusals):
+    _drive(mw, query=b"password=hunter2")
+    lines = refusals()
+    assert lines == ["refused an outside request for / from 8.8.8.8: wrong password"]
+    assert "hunter2" not in " ".join(lines)
+
+
+def test_lan_is_never_logged(mw, refusals):
+    _drive_ws(mw, ip="192.168.1.5")
+    assert refusals() == []
+
+
+def test_refusals_within_the_minute_are_counted_into_the_next_line(mw, refusals):
+    _drive_ws(mw, ip="203.0.113.1")
+    _drive_ws(mw, ip="203.0.113.2")
+    _drive_ws(mw, ip="203.0.113.2")
+    _drive_ws(mw, ip="203.0.113.3")
+    assert len(refusals()) == 1, "the cap let a second line through"
+    mw._refusals._quiet_until = 0.0                 # the minute is up
+    _drive_ws(mw, ip="203.0.113.4")
+    lines = refusals()
+    assert len(lines) == 2
+    assert lines[1].endswith("(and 3 more in the minute after the previous such "
+                             "line, from 2 address(es))"), lines[1]
+    # And the count starts again.
+    mw._refusals._quiet_until = 0.0
+    _drive_ws(mw, ip="203.0.113.5")
+    assert "more in the minute" not in refusals()[2]

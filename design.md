@@ -4632,10 +4632,11 @@ is opt-in; without it the tool prints the plan and touches nothing.
 
 ## 9. Auth & networking
 
-The server binds `0.0.0.0`, so any device on the LAN can reach it. `auth.py`
-classifies each connection as LAN or external; external clients require a
-password (HTTP Basic, which sets a cookie the WebSocket then presents; a
-`?password=` query param also works). LAN clients pass without credentials.
+The server binds `0.0.0.0`, so any device on the LAN can reach it.
+`_ExternalAuthMiddleware` in `server.py` classifies each connection as LAN or
+external; external clients require a password (HTTP Basic, which sets a cookie
+the WebSocket then presents; a `?password=` query param also works). LAN
+clients pass without credentials.
 
 ### External access is off until you turn it on, with a password
 
@@ -4689,6 +4690,51 @@ rather than a guess, so accepting it gives an attacker nothing, and it removes
 the one real bite of a global counter: a stranger guessing from anywhere could
 otherwise lock the owner out of their own remote session for up to five
 minutes.
+
+### A refusal says why, to the page and to the log
+
+The session list, and everything live, arrive over the page's WebSocket, so a
+page can load while its socket fails. Reported 2026-10-27: a phone's lobby
+sat on "loading sessions" for good, and nothing anywhere said why. The cause
+was a router whose hairpin NAT dropped some connections at random. Three
+gaps made it undiagnosable:
+
+- **The page could not tell a refusal from a network fault.** `_reject`
+  closed a refused socket *before* accepting it, and per ASGI that is an HTTP
+  403 on the upgrade. The browser reports a failed handshake, code 1006 and no
+  reason, whatever code the hub sent. Now it accepts and then closes with one
+  of `WS_CLOSE_SIGN_IN` (4401), `WS_CLOSE_DISABLED` (4403) or
+  `WS_CLOSE_LOCKED_OUT` (4429), with the message's first paragraph as the
+  reason, cut to the 123 bytes a close frame holds (`_ws_close_reason`).
+  Nothing is sent between accept and close, so accepting lets nobody in.
+- **The page retried a refusal.** It went through all twenty retries with the
+  same missing credential. `app.js` maps the three codes in `HUB_REFUSALS`
+  and on one calls `_refused`. That latches `_serverShutdown` as a server
+  shutdown does, so showing the window does not reverse it, and says in the
+  status bar, the chat and the lobby that only a reload signs the page in
+  again. A reload asks the browser for the password and gets the cookie.
+  `/connect` still tries.
+- **The lobby said "loading sessions" while there was nothing to load from.**
+  `Lobby.showConnection` keeps a band above the lists whenever the socket is
+  down: retrying with attempt *n* of 20 and **Retry now**, given up with
+  **Try again**, or refused with the hub's reason and **Reload**. `app.js`
+  drives it from `_scheduleReconnect` and `_refused`, and clears it on open.
+  The band is updated in place, like the halt rows, so a click is not lost to
+  a rebuild.
+
+**Refusals are logged** by `_RefusalLog` (`refused an outside socket from
+<ip>: <why>`), except a page request with no credential, which is just the
+password challenge. A socket with no credential *is* logged: it is a page that
+signed in but whose socket cannot. The cap is one line a minute, global for
+the throttle's reason, with the refusals held back counted into the next line.
+The query string is never written, since it can carry `?password=`. So a
+phone that loaded the page and never got its list either left a line, and was
+refused, or left none, and its socket never reached the hub.
+
+Pinned by `test_external_auth.py` (the codes, the reasons, what is and is not
+logged, the cap), `reconnect_on_show.test.js` (the band, Retry and Reload, no
+retry after a refusal, showing the window), and mutation targets `extauth`,
+`connband-app` and `connband-lobby`.
 
 ---
 

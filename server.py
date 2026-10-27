@@ -2981,6 +2981,59 @@ def _is_private_ip(ip_str: str) -> bool:
 
 _AUTH_COOKIE = "orch2_auth"
 
+#: Close codes a refused outside socket is closed with, so the page can tell a
+#: refusal from a network fault and say what would help (``HUB_REFUSALS`` in
+#: app.js).  Retrying cannot get past any of them.
+WS_CLOSE_SIGN_IN = 4401      # neither a password nor a valid sign-in cookie
+WS_CLOSE_DISABLED = 4403     # external access is off, or on with no password
+WS_CLOSE_LOCKED_OUT = 4429   # the brute-force throttle's lockout
+
+
+def _ws_close_reason(text: str) -> str:
+    """*text*'s first paragraph, cut to the 123 bytes a close frame's reason
+    can hold (a longer one makes the close itself fail)."""
+    first = text.split("\n\n", 1)[0].strip()
+    return first.encode("utf-8")[:123].decode("utf-8", "ignore")
+
+
+class _RefusalLog:
+    """Writes refused outside connections to the log, a line a minute at most.
+
+    Without it a refusal left no trace anywhere, so a page that loaded while
+    its socket was refused could not be told apart, afterwards, from one
+    whose socket never reached the hub.  The cap is global, not per address,
+    for the throttle's reason: a scan from many addresses must not flood the
+    log.  What it holds back is counted into the next line it writes.
+    """
+
+    INTERVAL = 60.0
+
+    def __init__(self) -> None:
+        self._quiet_until = 0.0          # time.monotonic() deadline
+        self._held = 0
+        self._held_from: set[str] = set()
+
+    def note(self, scope: dict, ip: str, why: str) -> None:
+        """Record that the request or socket *scope*, from *ip*, was refused
+        because *why*.  The query string is never written: it can carry
+        ``?password=``."""
+        now = time.monotonic()
+        if now < self._quiet_until:
+            self._held += 1
+            if len(self._held_from) < 1000:
+                self._held_from.add(ip)
+            return
+        what = ("socket" if scope.get("type") == "websocket"
+                else f"request for {scope.get('path') or '/'}")
+        held = ""
+        if self._held:
+            held = (f" (and {self._held} more in the minute after the previous "
+                    f"such line, from {len(self._held_from)} address(es))")
+        log.info("refused an outside %s from %s: %s%s", what, ip, why, held)
+        self._quiet_until = now + self.INTERVAL
+        self._held = 0
+        self._held_from = set()
+
 
 class _ExternalAuthMiddleware:
     """ASGI middleware: require Basic Auth for non-LAN clients.
@@ -2995,7 +3048,7 @@ class _ExternalAuthMiddleware:
     outside the LAN: browsers cache HTTP Basic-Auth credentials but do **not**
     replay the ``Authorization`` header on a ``new WebSocket()`` upgrade
     (iOS Safari never does), so a password-protected hub would authenticate the
-    page yet silently reject its socket (close 1008), leaving the app stuck
+    page yet silently reject its socket, leaving the app stuck
     "reconnecting" — which looks exactly like a rejected password.  Cookies, by
     contrast, *are* sent on same-origin WS upgrades, so once the page load sets
     the cookie the socket authenticates automatically.  A token (not the raw
@@ -3016,6 +3069,11 @@ class _ExternalAuthMiddleware:
     always bypasses the throttle, and the cap keeps any single lockout ≤5 min.)
     Password / token comparisons use ``hmac.compare_digest`` so a network
     attacker can't recover the secret via response-timing analysis.
+
+    **A refusal says why, to the page and to the log.**  A refused socket is
+    closed with one of the ``WS_CLOSE_*`` codes and a reason (``_reject``),
+    and refusals are logged through :class:`_RefusalLog` -- except a page
+    request carrying no credential, which is the ordinary password challenge.
     """
 
     # Throttle tuning.  Small at first (a fat-fingered password shouldn't lock
@@ -3043,6 +3101,7 @@ class _ExternalAuthMiddleware:
         # brute-force note above).  In-process only; a restart forgives.
         self._fails = 0
         self._locked_until = 0.0    # time.monotonic() deadline
+        self._refusals = _RefusalLog()
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
         if scope["type"] in ("http", "websocket"):
@@ -3055,8 +3114,11 @@ class _ExternalAuthMiddleware:
                     # default, or "on" with no password, which is refused).
                     # Don't send a Basic-Auth challenge: it would prompt for a
                     # password that can never work.
+                    self._refusals.note(scope, client_ip,
+                                        _ws_close_reason(self.disabled_message))
                     await self._reject(scope, receive, send,
-                                       self.disabled_message, challenge=False)
+                                       self.disabled_message, challenge=False,
+                                       ws_code=WS_CLOSE_DISABLED)
                     return
                 headers = dict(scope.get("headers", []))
                 auth = headers.get(b"authorization", b"").decode("utf-8", "replace")
@@ -3083,11 +3145,14 @@ class _ExternalAuthMiddleware:
                 # gets nothing (not even a timing signal) during the window.
                 retry_after = self._lockout_remaining()
                 if retry_after > 0:
+                    self._refusals.note(scope, client_ip, "locked out after "
+                                        "too many wrong passwords")
                     await self._reject(
                         scope, receive, send,
                         f"Too many failed password attempts. Try again in "
                         f"{int(retry_after) + 1}s.",
-                        challenge=False, status=429, retry_after=retry_after)
+                        challenge=False, status=429, retry_after=retry_after,
+                        ws_code=WS_CLOSE_LOCKED_OUT)
                     return
 
                 header_ok = self._check_basic_auth(auth)
@@ -3106,6 +3171,13 @@ class _ExternalAuthMiddleware:
                     # it only because by then the cookie existed.
                     if auth or pw_param is not None:
                         self._record_failure()
+                        self._refusals.note(scope, client_ip, "wrong password")
+                    elif scope["type"] == "websocket":
+                        # A page asking for the password is the challenge
+                        # working; a socket with none is a page that signed in
+                        # but whose socket cannot.
+                        self._refusals.note(scope, client_ip, "no password "
+                                            "and no valid sign-in cookie")
                     await self._reject(scope, receive, send,
                                        "Authentication required.")
                     return
@@ -3181,7 +3253,8 @@ class _ExternalAuthMiddleware:
     @staticmethod
     async def _reject(scope: dict, receive: Any, send: Any, message: str,
                       *, challenge: bool = True, status: int = 401,
-                      retry_after: float | None = None) -> None:
+                      retry_after: float | None = None,
+                      ws_code: int = WS_CLOSE_SIGN_IN) -> None:
         """Reject an unauthenticated external connection.
 
         *challenge* controls whether a ``WWW-Authenticate: Basic`` header is
@@ -3189,6 +3262,8 @@ class _ExternalAuthMiddleware:
         when external access is disabled outright, so users aren't asked for a
         password that can never be accepted.  *status* / *retry_after* let the
         throttle emit a ``429`` with a ``Retry-After`` hint during a lockout.
+        *ws_code* is the close code a socket gets instead, with *message*'s
+        first paragraph as the reason.
         """
         if scope["type"] == "http":
             body = message.encode("utf-8")
@@ -3209,11 +3284,14 @@ class _ExternalAuthMiddleware:
             })
             await send({"type": "http.response.body", "body": body})
         else:
-            # WebSocket: accept then immediately close with a reason code.
-            # (ASGI doesn't let us send an HTTP 401 on a WS scope.)
+            # Accepted, then closed: a socket closed before it is accepted
+            # reaches the page as a failed handshake -- code 1006, no reason --
+            # which it cannot tell from a network fault.  Nothing is sent in
+            # between, so accepting lets nobody in.
             await receive()  # websocket.connect
-            await send({"type": "websocket.close", "code": 1008,
-                        "reason": message})
+            await send({"type": "websocket.accept"})
+            await send({"type": "websocket.close", "code": ws_code,
+                        "reason": _ws_close_reason(message)})
 
 
 def build_app() -> Any:

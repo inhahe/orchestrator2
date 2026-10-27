@@ -638,6 +638,56 @@ const Lobby = (() => {
       + 're-read per request — those only need a browser refresh.';
   }
 
+  // The hub's connection, while it is not up: a band above the session lists.
+  //
+  // The lists arrive over the socket, so with it down "loading sessions" was
+  // all the lobby said, for as long as it stayed down -- whether the hub was
+  // unreachable, had refused the socket, or the page had stopped retrying.
+  // *info* is null once the socket is open, else one of
+  //   {state: 'retrying', attempt, max}  -- a retry is scheduled
+  //   {state: 'gave-up', attempts}       -- app.js stopped retrying
+  //   {state: 'refused', message}        -- the hub refused it (app.js _refused)
+  // The band is updated in place: a button replaced between mousedown and
+  // mouseup loses the click.
+  function showConnection(info) {
+    if (!info) {
+      const old = document.getElementById('lobby-conn');
+      if (old) old.remove();
+      return;
+    }
+    let box = document.getElementById('lobby-conn');
+    if (!box) {
+      box = _bannerBox('lobby-conn', 'lobby-conn');
+      box.setAttribute('role', 'status');
+      box.innerHTML = '<span class="lobby-conn-text"></span>'
+        + '<button type="button" class="lobby-conn-act"></button>';
+      box.querySelector('.lobby-conn-act').addEventListener('click', (e) => {
+        if (e.currentTarget.dataset.act === 'reload') location.reload();
+        else App.reconnect();
+      });
+    }
+    let text, label, act;
+    if (info.state === 'refused') {
+      text = info.message;
+      label = 'Reload';
+      act = 'reload';
+    } else if (info.state === 'gave-up') {
+      text = 'Couldn’t reach the hub after ' + info.attempts
+        + ' tries, so the session list can’t load.';
+      label = 'Try again';
+      act = 'retry';
+    } else {
+      text = 'Not connected to the hub, so the session list can’t load. '
+        + 'Retrying (attempt ' + info.attempt + ' of ' + info.max + ').';
+      label = 'Retry now';
+      act = 'retry';
+    }
+    _setText(box.querySelector('.lobby-conn-text'), text);
+    const btn = box.querySelector('.lobby-conn-act');
+    _setText(btn, label);
+    btn.dataset.act = act;
+  }
+
   // The element *id* of a banner above the session lists, created with
   // *className* on first use.  It goes before the lobby notice bar, so it sits
   // outside the card lists.
@@ -1185,6 +1235,6 @@ const Lobby = (() => {
 
   return { init, open, openHub, show, hide, isVisible,
            onAttached, onSessionClosed, render, expectSession, showNotice,
-           onSessionElsewhere,
+           onSessionElsewhere, showConnection,
            onReconnect, showReloadingAndPoll: _showReloadingAndPoll };
 })();

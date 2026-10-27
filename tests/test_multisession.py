@@ -790,9 +790,8 @@ def test_auth_external_http_basic_sets_cookie_and_ws_accepts_it():
     """The crux of external access: an HTTP page authenticates via Basic Auth
     and receives an ``orch2_auth`` cookie; the follow-up WebSocket upgrade —
     which browsers do NOT send Basic credentials on — then authenticates purely
-    via that cookie.  Regression: without the cookie the WS was rejected (close
-    1008) even though the password was correct, so external sign-in looked
-    broken.
+    via that cookie.  Regression: without the cookie the WS was rejected even
+    though the password was correct, so external sign-in looked broken.
     """
     import asyncio as _a
     import base64 as _b64
@@ -823,8 +822,9 @@ def test_auth_external_ws_without_credentials_rejected():
     mw = server._ExternalAuthMiddleware(None, password="pw")
     ran, sent = _a.run(_drive_auth(mw, _ws_scope("8.8.8.8")))
     assert ran is False
-    closes = [m for m in sent if m.get("type") == "websocket.close"]
-    assert closes and closes[0]["code"] == 1008
+    # Accepted first, so the close code reaches the page (test_external_auth).
+    assert [m["type"] for m in sent] == ["websocket.accept", "websocket.close"]
+    assert sent[1]["code"] == server.WS_CLOSE_SIGN_IN
 
 
 def test_auth_external_ws_password_query_param_accepted():

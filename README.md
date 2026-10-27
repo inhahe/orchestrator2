@@ -303,6 +303,25 @@ out of their own remote session. Password and
 cookie-token comparisons run in constant time (`hmac.compare_digest`) so the
 secret can't be recovered by response-timing analysis.
 
+**When the page can't connect, it says so.** The session list and everything
+live arrive over the page's WebSocket, so a page can load while that
+connection fails. The lobby then shows a band saying the hub isn't connected,
+which attempt it's on, and a **Retry now** button, in place of an endless
+"loading sessions". When the retries run out, the button reads **Try again**.
+A connection the hub *refused* (no valid sign-in, a lockout, or external access
+off) is not retried: the band and the chat give the hub's reason and a
+**Reload** button, since reloading the page is what signs it in again.
+
+Every refused outside connection is written to the log (`--log-file`) with its
+address and the reason, except the browser's ordinary password prompt. At most
+one line a minute is written, however many refusals arrive, so a scan of the
+port can't flood the log. The next line counts the ones held back. A phone that
+loads the page but never gets its session list leaves a line here if the hub
+refused it. If nothing appears, its connection never reached the hub at all.
+For example, a router with unreliable *hairpin NAT* passes some connections
+from inside your network to your own public address and drops others. On your
+own Wi-Fi, use the hub's LAN address instead.
+
 ### Choosing a Claude account
 
 orchestrator2 uses the config dir given by `CLAUDE_CONFIG_DIR` (or `~/.claude` when that's unset), the same as the `claude` CLI. Sessions live under `<config-dir>/projects/<cwd>/`, so `claude --continue` / `--resume` only share a conversation with orchestrator2 when both are pointed at the **same** config dir. To pin a specific account regardless of the environment, pass `--config-dir` (with `--resume`, a session on another account is still followed to it: a session can be resumed only on its own account):

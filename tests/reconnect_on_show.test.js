@@ -130,9 +130,9 @@ function build(opts) {
       this.readyState = FakeWebSocket.OPEN;
       if (this.onopen) this.onopen({});
     }
-    drop(code = 1006) {
+    drop(code = 1006, reason = 'test drop') {
       this.readyState = FakeWebSocket.CLOSED;
-      if (this.onclose) this.onclose({ code, reason: 'test drop' });
+      if (this.onclose) this.onclose({ code, reason });
     }
     // Gone, as far as readyState says, but the page has not been told: the
     // close event waits behind whatever runs first.  That is how Chrome wakes
@@ -918,6 +918,118 @@ test('a server_restart drives the lobby reload poll', (h) => {
   h.win.__mods.Lobby.showReloadingAndPoll = () => { polls++; };
   h.live.deliver({ type: 'server_restart' });
   assert(polls === 1, 'the restart UI never ran');
+});
+
+/* ---- the lobby says when its connection is down ------------------------ *
+ *
+ * The session lists arrive over the socket.  With it down, "loading
+ * sessions" was all the lobby said, for ever: on a phone whose router
+ * dropped some connections at random the page loaded and the list never
+ * did, and nothing on screen said why.  A refused socket was worse: it was
+ * retried twenty times with the same missing credential.
+ */
+
+function connBand(h) {
+  const el = h.win.document.getElementById('lobby-conn');
+  if (!el) return null;
+  return { text: el.querySelector('.lobby-conn-text').textContent,
+           button: el.querySelector('.lobby-conn-act') };
+}
+
+function chatText(h) {
+  return h.win.document.getElementById('messages').textContent;
+}
+
+function stateText(h) {
+  return h.win.document.getElementById('status-state').textContent;
+}
+
+test('a lobby whose socket fails says so, with the attempt', (h) => {
+  assert(connBand(h) === null, 'a band before anything failed');
+  h.live.drop();                     // the first socket never opened
+  const band = connBand(h);
+  assert(band, 'the lobby said nothing about its connection');
+  assert(band.text === 'Not connected to the hub, so the session list can’t '
+         + 'load. Retrying (attempt 1 of 20).', band.text);
+  assert(band.button.textContent === 'Retry now', band.button.textContent);
+});
+
+test('the band counts the attempts as they fail', (h) => {
+  h.live.drop();
+  h.advance(60000);
+  h.live.drop();
+  assert(/attempt 2 of 20/.test(connBand(h).text), connBand(h).text);
+});
+
+test('the band goes once a socket opens', (h) => {
+  h.live.drop();
+  h.advance(60000);
+  h.live.accept();
+  assert(connBand(h) === null, 'the band outlived the outage');
+});
+
+test('Retry now opens a socket at once', (h) => {
+  h.live.drop();
+  const before = h.sockets.length;
+  connBand(h).button.click();
+  assert(h.sockets.length === before + 1, 'Retry now waited for the backoff');
+});
+
+test('a refused socket is not retried, and says to reload', (h) => {
+  h.live.drop(4401, 'Authentication required.');
+  const before = h.sockets.length;
+  h.advance(600000);
+  assert(h.sockets.length === before, 'a refusal was retried with the same credential');
+  const band = connBand(h);
+  const said = 'The hub refused this page’s connection: Authentication '
+    + 'required. Reload the page to sign in again.';
+  assert(band.text === said, band.text);
+  assert(band.button.textContent === 'Reload', band.button.textContent);
+  assert(chatText(h).includes(said), 'the chat was not told');
+  assert(stateText(h) === 'sign-in needed', stateText(h));
+});
+
+test('showing the window does not overrule a refusal', (h) => {
+  h.live.drop(4401, 'Authentication required.');
+  const before = h.sockets.length;
+  h.setHidden(true);
+  h.setHidden(false);
+  assert(h.sockets.length === before, 'showing the window retried a refusal');
+});
+
+test('a lockout and external access being off are refusals too', (h) => {
+  h.live.drop(4429, 'Too many failed password attempts. Try again in 3s.');
+  assert(stateText(h) === 'locked out', stateText(h));
+  h.win.__mods.App.reconnect();      // /connect: the user asked
+  h.live.drop(4403, 'External access is disabled on this server.');
+  assert(stateText(h) === 'outside access off', stateText(h));
+  assert(/disabled on this server\. Reload the page for how to turn it on\.$/
+         .test(connBand(h).text), connBand(h).text);
+});
+
+test('a refusal without a reason still reads as a sentence', (h) => {
+  h.live.drop(4401, '');
+  assert(connBand(h).text === 'The hub refused this page’s connection: '
+         + 'sign-in needed. Reload the page to sign in again.', connBand(h).text);
+});
+
+test('running out of retries says so in the lobby, and Try again retries', (h) => {
+  h.exhaustRetries();
+  const band = connBand(h);
+  assert(band.text === 'Couldn’t reach the hub after 20 tries, so the session '
+         + 'list can’t load.', band.text);
+  assert(band.button.textContent === 'Try again', band.button.textContent);
+  const before = h.sockets.length;
+  band.button.click();
+  assert(h.sockets.length === before + 1, 'Try again did nothing');
+});
+
+test('an ordinary drop is still retried', (h) => {
+  h.live.accept();
+  h.live.drop(1006);
+  const before = h.sockets.length;
+  h.advance(1500);
+  assert(h.sockets.length === before + 1, 'a network drop was taken for a refusal');
 });
 
 /* ---- opening a session in its own tab --------------------------------- *

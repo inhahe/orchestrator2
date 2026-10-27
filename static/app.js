@@ -44,6 +44,14 @@ const App = (() => {
   let _hubHears = [];
   const MAX_RECONNECT_DELAY = 30000;
   const MAX_RECONNECT_ATTEMPTS = 20;
+  // Close codes the hub refuses an outside socket with (server.WS_CLOSE_*),
+  // and what the status bar says for each.  Retrying sends the same missing
+  // credential again, so none of them is retried.
+  const HUB_REFUSALS = {
+    4401: 'sign-in needed',
+    4403: 'outside access off',
+    4429: 'locked out',
+  };
   const PROMPT_WATCHDOG_MS = 8000; // ~how long a turn should take to start
   // Tab-unique so two tabs on one session can't collide on an id.
   const TAB_ID = Math.random().toString(36).slice(2, 10);
@@ -246,6 +254,7 @@ const App = (() => {
       // forget any prior subscription — the next render()/show() must re-send
       // lobby_watch to resume live updates on this fresh socket.
       if (typeof Lobby !== 'undefined' && Lobby.onReconnect) Lobby.onReconnect();
+      Lobby.showConnection(null);
       // Flush any prompts the user typed while the socket was down.
       _flushPending();
       // Drive an open/new request once (only on the first connect, not on
@@ -275,6 +284,10 @@ const App = (() => {
       // Leaving it armed would also have it close an already-closed socket.
       _clearPromptWatchdog();
       _endCatchUp();
+      if (HUB_REFUSALS[e.code]) {
+        _refused(e.code, e.reason);
+        return;
+      }
       _showConnectionStatus('disconnected');
       _scheduleReconnect();
     });
@@ -312,14 +325,35 @@ const App = (() => {
         data: { message: 'Lost connection to server (not running). '
                          + 'Type /connect to retry once it\u2019s back up.' },
       });
+      Lobby.showConnection({ state: 'gave-up', attempts: MAX_RECONNECT_ATTEMPTS });
       return;
     }
+    Lobby.showConnection({ state: 'retrying', attempt: reconnectAttempt,
+                           max: MAX_RECONNECT_ATTEMPTS });
 
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       _connect();
       reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
     }, reconnectDelay);
+  }
+
+  /* The hub refused this socket with *code*, one of HUB_REFUSALS: say why and
+   * stop.  Only a reload signs the page in again -- it asks the browser for
+   * the password and gets the cookie a socket needs -- so the latch is the one
+   * a server shutdown sets, which showing the window does not reverse.
+   * /connect still tries. */
+  function _refused(code, reason) {
+    _serverShutdown = true;
+    Status.update({ busy_label: HUB_REFUSALS[code], busy_class: 'shutdown', connection: true });
+    _nothingRunning();
+    let why = (reason || HUB_REFUSALS[code]).trim();
+    if (!/[.!?]$/.test(why)) why += '.';
+    const message = 'The hub refused this page’s connection: ' + why + ' '
+      + (code === 4403 ? 'Reload the page for how to turn it on.'
+                       : 'Reload the page to sign in again.');
+    Chat.handleMessage({ type: 'system_msg', subtype: 'error', data: { message } });
+    Lobby.showConnection({ state: 'refused', message });
   }
 
   /* Nothing is running any more: the hub has gone, or we gave up on it.  The

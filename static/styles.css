@@ -1890,7 +1890,8 @@ html, body {
    looking at may not be what is on disk. */
 /* The warning bands above the session lists: stale code, and each halt. */
 .lobby-stale,
-.lobby-halt {
+.lobby-halt,
+.lobby-conn {
   margin: 0 0 14px;
   padding: 10px 14px;
   border: 1px solid var(--system-warning, #e0af68);
@@ -1912,20 +1913,24 @@ html, body {
   word-break: break-word;
 }
 
-/* A halt in force, with its Lift button (lobby.js, _renderHalts). */
-.lobby-halt {
+/* A halt in force, with its Lift button (lobby.js, _renderHalts), and the
+   hub's connection while it is down, with Retry or Reload (showConnection). */
+.lobby-halt,
+.lobby-conn {
   display: flex;
   align-items: flex-start;
   gap: 12px;
 }
-.lobby-halt-text { flex: 1 1 auto; min-width: 0; }
+.lobby-halt-text,
+.lobby-conn-text { flex: 1 1 auto; min-width: 0; }
 .lobby-halt-reason {
   display: block;
   margin-top: 4px;
   color: var(--text-muted);
   word-break: break-word;
 }
-.lobby-halt-lift {
+.lobby-halt-lift,
+.lobby-conn-act {
   flex: 0 0 auto;
   font-family: var(--font-mono);
   font-size: 12px;
@@ -1940,7 +1945,8 @@ html, body {
   transition: background 0.12s, color 0.12s;
 }
 /* Dark on the amber: white on it is about 1.9:1. */
-.lobby-halt-lift:hover:not(:disabled) {
+.lobby-halt-lift:hover:not(:disabled),
+.lobby-conn-act:hover {
   background: var(--system-warning, #e0af68);
   color: var(--bg, #1a1a2e);
 }

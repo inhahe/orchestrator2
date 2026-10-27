@@ -21,8 +21,12 @@ Targets:
    server    whose queued prompts a starting session may adopt
   extauth    server.py       x test_external_access_policy.py +    (pytest)
                                test_external_auth.py
-             who may reach the hub from outside the LAN, and what counts
-             as a failed password attempt
+             who may reach the hub from outside the LAN, what counts
+             as a failed password attempt, and what a refusal tells
+             the page and the log
+  connband-  static/app.js, static/lobby.js x reconnect_on_show.test.js
+   app/lobby the lobby says when its connection is down, and a
+             socket the hub refused is not retried
   foreign    server.py       x test_foreign_running_sessions.py    (pytest)
              a session running in *another* hub is running, not "recent"
   stale      server.py       x tests/test_stale_sources.py      (pytest)
@@ -535,7 +539,8 @@ EXTAUTH_MUTATIONS = [
     ("a credential-less request counts as a failed attempt (the original bug)",
      "                    if auth or pw_param is not None:\n"
      "                        self._record_failure()",
-     "                    self._record_failure()"),
+     "                    self._record_failure()\n"
+     "                    if auth or pw_param is not None:"),
 
     ("external access defaults back to on",
      '    enabled = cfg_access in ("on", "1", "true", "yes")',
@@ -581,7 +586,47 @@ EXTAUTH_MUTATIONS = [
     ("wrong passwords stop being counted at all",
      "                    if auth or pw_param is not None:\n"
      "                        self._record_failure()",
-     "                    pass"),
+     "                    if auth or pw_param is not None:"),
+
+    # A refusal says why (2026-10-27: a phone's lobby sat on "loading
+    # sessions" with nothing anywhere to say what had happened).
+    ("a refused socket is closed before it is accepted -- 1006 and no reason",
+     '            await send({"type": "websocket.accept"})\n',
+     ""),
+
+    ("every refusal closes with the same code",
+     '            await send({"type": "websocket.close", "code": ws_code,',
+     '            await send({"type": "websocket.close", "code": WS_CLOSE_SIGN_IN,'),
+
+    ("the whole message goes into the close frame, past its 123 bytes",
+     '                        "reason": _ws_close_reason(message)})',
+     '                        "reason": message})'),
+
+    ("a reason is cut mid-character",
+     '    return first.encode("utf-8")[:123].decode("utf-8", "ignore")',
+     '    return first[:123]'),
+
+    ("a socket refused for want of a cookie is not logged",
+     '                        self._refusals.note(scope, client_ip, "no password "\n'
+     '                                            "and no valid sign-in cookie")',
+     "                        pass"),
+
+    ("the password challenge itself is logged",
+     '                    elif scope["type"] == "websocket":',
+     "                    else:"),
+
+    ("the log is not capped",
+     "        if now < self._quiet_until:",
+     "        if False:"),
+
+    ("what the cap held back is never counted",
+     "        if self._held:",
+     "        if False:"),
+
+    ("the query string, and a ?password= in it, is logged",
+     """                else f"request for {scope.get('path') or '/'}")""",
+     """                else f"request for {scope.get('path') or '/'}?"
+                     f"{(scope.get('query_string') or b'').decode()}")"""),
 ]
 
 RESUMETURN_MUTATIONS = [
@@ -5588,6 +5633,62 @@ SHUTSTATUS_APP_MUTATIONS = [
      "    _retriesExhausted = false;\n    reconnectAttempt = 0;\n"),
 ]
 
+# The lobby says when its connection is down, and a socket the hub refused is
+# not retried with the same missing credential.  tests/reconnect_on_show.test.js,
+# "the lobby says when its connection is down".
+CONNBAND_APP_MUTATIONS = [
+    ("a refused socket is retried like a dropped one",
+     "      if (HUB_REFUSALS[e.code]) {\n"
+     "        _refused(e.code, e.reason);\n"
+     "        return;\n"
+     "      }\n",
+     ""),
+
+    ("the band outlives the outage",
+     "      Lobby.showConnection(null);\n",
+     ""),
+
+    ("the lobby is not told a retry is coming",
+     "    Lobby.showConnection({ state: 'retrying', attempt: reconnectAttempt,\n"
+     "                           max: MAX_RECONNECT_ATTEMPTS });\n",
+     ""),
+
+    ("the lobby is not told the retries ran out",
+     "      Lobby.showConnection({ state: 'gave-up', attempts: MAX_RECONNECT_ATTEMPTS });\n",
+     ""),
+
+    ("showing the window overrules a refusal",
+     "  function _refused(code, reason) {\n    _serverShutdown = true;\n",
+     "  function _refused(code, reason) {\n    _serverShutdown = true;\n"
+     "    _retriesExhausted = true;\n"),
+
+    ("a reason without a full stop runs into the next sentence",
+     "    if (!/[.!?]$/.test(why)) why += '.';\n",
+     ""),
+
+    ("the chat is not told of a refusal",
+     "    Chat.handleMessage({ type: 'system_msg', subtype: 'error', data: { message } });\n",
+     ""),
+]
+
+CONNBAND_LOBBY_MUTATIONS = [
+    ("Retry reloads the page instead",
+     "        else App.reconnect();",
+     "        else location.reload();"),
+
+    ("running out of retries reads as still retrying",
+     "    } else if (info.state === 'gave-up') {",
+     "    } else if (false) {"),
+
+    ("a refusal offers to retry",
+     "      label = 'Reload';",
+     "      label = 'Retry now';"),
+
+    ("the band never goes",
+     "      if (old) old.remove();",
+     "      if (old) {}"),
+]
+
 # One socket per tab, and a numbered message drawn at most once (2026-10-02:
 # a session "is showing a lot of things twice").  tests/reconnect_on_show.test.js,
 # "one socket per tab".  There is no mutation for the guard on `onopen`: a
@@ -8751,6 +8852,10 @@ TARGETS = {
                        SHUTSTATUS_APP_MUTATIONS, "node"),
     "onesocket-app": ("static/app.js", "tests/reconnect_on_show.test.js",
                       ONESOCKET_APP_MUTATIONS, "node"),
+    "connband-app": ("static/app.js", "tests/reconnect_on_show.test.js",
+                     CONNBAND_APP_MUTATIONS, "node"),
+    "connband-lobby": ("static/lobby.js", "tests/reconnect_on_show.test.js",
+                       CONNBAND_LOBBY_MUTATIONS, "node"),
     "mutate-tool": ("tools/mutate.py", "tests/test_mutate_tool.py",
                     MUTATE_TOOL_MUTATIONS, "pytest"),
     "offloop": ("commands.py", "tests/test_off_loop_commands.py",
