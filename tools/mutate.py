@@ -4034,6 +4034,54 @@ LEAVEGUARD_STATE_MUTATIONS = [
      ""),
 ]
 
+# Ctrl+Up recalls the session's own prompts.  tests/reconnect_on_show.test.js.
+HISTORY_MUTATIONS = [
+    ("a tab that switches session keeps the other's history",
+     "    if (!carry) _promptHistory = [];\n",
+     ""),
+
+    ("a /move's copy starts with no history",
+     "    if (!carry) _promptHistory = [];\n",
+     "    _promptHistory = [];\n"),
+
+    ("a session's stored history is never brought back",
+     "    _promptHistory = _loadHistory(sid);\n",
+     "    _promptHistory = [];\n"),
+
+    ("what the tab held when the id came is lost",
+     "    for (const t of held) _append(t);\n",
+     ""),
+
+    ("nothing is kept",
+     "          localStorage.setItem(HISTORY_KEY(_sid), JSON.stringify(_promptHistory));\n",
+     ""),
+
+    ("histories pile up without bound",
+     "      while (order.length >= MAX_SESSIONS) localStorage.removeItem(HISTORY_KEY(order.shift()));\n",
+     ""),
+
+    ("the most recently used goes first",
+     "      order.push(_sid);\n",
+     "      order.unshift(_sid);\n"),
+
+]
+
+HISTORY_STATUS_MUTATIONS = [
+    ("the history is not told which session it is",
+     "    if (typeof Commands !== 'undefined') Commands.setSessionId(status.session_id);\n",
+     ""),
+]
+
+HISTORY_APP_MUTATIONS = [
+    ("the history is not told the tab switched session",
+     "      Commands.setRuntime(s.rid || null);\n",
+     ""),
+
+    ("a /move drops the history",
+     "      Commands.setRuntime(msg.rid || null, { carry: true });\n",
+     ""),
+]
+
 # A session's path is shown whole in the session list.
 # tests/lobby_running_card.test.js.
 LOBBYPATH_MUTATIONS = [
@@ -6931,7 +6979,7 @@ APIKEY_CMD_MUTATIONS = [
 # out of the prompt history" and the two after it.
 APIKEY_HISTORY_MUTATIONS = [
     ("a line that may hold a key goes into the history -- the gap",
-     "    if (_mayHoldKey(text)) return;\n",
+     "    if (_mayHoldKey(text)) return false;\n",
      ""),
 
     ("/apikey with something not shaped like a key goes into the history",
@@ -6946,13 +6994,13 @@ APIKEY_HISTORY_MUTATIONS = [
      "    return /^\\/apikey\\s+(?!off$)/i.test(text) || /sk-ant-/i.test(text);\n",
      "    return /^\\/apikey\\s+/i.test(text) || /sk-ant-/i.test(text);\n"),
 
-    ("a key stored before the filter is still recalled",
-     "        _promptHistory = all.filter(x => !_mayHoldKey(x));\n",
-     "        _promptHistory = all;\n"),
+    ("a key in a stored history is brought back",
+     "        ? all.filter((x) => typeof x === 'string' && !_mayHoldKey(x)).slice(-MAX_HISTORY)\n",
+     "        ? all.filter((x) => typeof x === 'string').slice(-MAX_HISTORY)\n"),
 
-    ("a key stored before the filter stays on disk",
-     "        if (_promptHistory.length !== all.length) {\n",
-     "        if (false) {\n"),
+    ("the history every session shared stays, a pasted key and all",
+     "    try { localStorage.removeItem('prompt-history'); } catch (_) {}\n",
+     ""),
 ]
 
 APIKEY_SERVER_MUTATIONS = [
@@ -8945,6 +8993,12 @@ TARGETS = {
                       FAVICON_LOBBY_MUTATIONS, "node"),
     "statecolour": ("static/util.js", "tests/reconnect_on_show.test.js",
                     STATE_COLOUR_TEXT_MUTATIONS, "node"),
+    "history": ("static/commands.js", "tests/reconnect_on_show.test.js",
+                HISTORY_MUTATIONS, "node"),
+    "history-status": ("static/status.js", "tests/reconnect_on_show.test.js",
+                       HISTORY_STATUS_MUTATIONS, "node"),
+    "history-app": ("static/app.js", "tests/reconnect_on_show.test.js",
+                    HISTORY_APP_MUTATIONS, "node"),
     "lobbypath": ("static/lobby.js", "tests/lobby_running_card.test.js",
                   LOBBYPATH_MUTATIONS, "node"),
     "leaveguard": ("static/leave_guard.js", "tests/leave_guard.test.js",

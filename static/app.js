@@ -785,6 +785,8 @@ const App = (() => {
         } catch (_) {}
       }
       Lobby.onAttached(msg.session);
+      // Ctrl+Up's history is the session's: another runtime, another history.
+      Commands.setRuntime(s.rid || null);
       // A /move that finished lands here (server re-attached this socket to
       // the copied session's runtime) — close the move overlay.
       if (typeof Move !== 'undefined') Move.close();
@@ -804,8 +806,10 @@ const App = (() => {
     }
 
     // /move: server accepted the copy; `attached` will follow and close the
-    // overlay.  No action needed here (kept for protocol clarity).
+    // overlay.  The conversation goes on in the copy, and so does Ctrl+Up's
+    // history: this tab's, kept under the copy's id when it comes.
     if (type === 'move_done') {
+      Commands.setRuntime(msg.rid || null, { carry: true });
       return;
     }
 

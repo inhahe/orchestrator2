@@ -626,14 +626,33 @@ function typeCommand(h, text) {
 
 /* ---- prompt history ----------------------------------------------------- */
 
-function savedHistory(h) {
-  return JSON.parse(h.win.localStorage.getItem('prompt-history') || '[]');
+// Ctrl+Up recalls the session's own prompts.  Asked 2026-10-27: "make ctrl+up
+// history specific to that session/window, not global to all sessions".
+
+function savedHistory(h, sid) {
+  return JSON.parse(h.win.localStorage.getItem('prompt-history:' + (sid || 'S1')) || '[]');
+}
+
+/* The tab on runtime *rid*, whose session has id *sid*. */
+function onSession(h, rid, sid) {
+  h.live.deliver({ type: 'attached', session: { rid, cwd: 'D:/x' } });
+  statusOf(h, { busy_class: 'idle', session_id: sid });
+}
+
+function recall(h, times) {
+  const input = h.win.document.getElementById('input-box');
+  for (let i = 0; i < (times || 1); i++) {
+    input.dispatchEvent(new h.win.KeyboardEvent(
+      'keydown', { key: 'ArrowUp', ctrlKey: true, bubbles: true, cancelable: true }));
+  }
+  return input.value;
 }
 
 const PASTED = 'sk-ant-api03-pasted-in-hope';
 
 test('a line that may hold an API key is kept out of the prompt history', (h) => {
   h.live.accept();
+  onSession(h, 'r1', 'S1');
   typeCommand(h, '/apikey ' + PASTED);
   typeCommand(h, '/apikey not-shaped-like-one');
   typeCommand(h, '/login ' + PASTED);
@@ -650,15 +669,18 @@ test('...but is still sent, for the hub to refuse', (h) => {
   assert(sent.length === 1 && sent[0].text === '/apikey ' + PASTED, JSON.stringify(sent));
 });
 
-test('a key already in the stored history is taken out of it', (h) => {
+test('a key already in a stored history is not brought back', (h) => {
+  h.live.accept();
+  onSession(h, 'r1', 'S1');
   const saved = savedHistory(h);
   assert(!saved.some(x => x.includes(PASTED)), JSON.stringify(saved));
   assert(saved.includes('an older prompt'), JSON.stringify(saved));
-}, { local: { 'prompt-history': JSON.stringify(
+}, { local: { 'prompt-history:S1': JSON.stringify(
   ['an older prompt', '/apikey ' + PASTED, 'my key is ' + PASTED]) } });
 
 test('...and the rest is kept, /apikey off included', (h) => {
   h.live.accept();
+  onSession(h, 'r1', 'S1');
   typeCommand(h, '/apikey off');
   typeCommand(h, '/apikey');
   typeCommand(h, 'an ordinary prompt');
@@ -666,6 +688,77 @@ test('...and the rest is kept, /apikey off included', (h) => {
   assert(['/apikey off', '/apikey', 'an ordinary prompt'].every(x => saved.includes(x)),
          JSON.stringify(saved));
 });
+
+test('Ctrl+Up recalls this session\'s prompts, not another\'s', (h) => {
+  h.live.accept();
+  onSession(h, 'r1', 'S1');
+  assert(recall(h) === 'asked in S1', recall(h));
+}, { local: { 'prompt-history:S1': JSON.stringify(['asked in S1']),
+              'prompt-history:S2': JSON.stringify(['asked in S2']) } });
+
+test('what is typed in a session is kept as that session\'s', (h) => {
+  h.live.accept();
+  onSession(h, 'r1', 'S1');
+  typeCommand(h, 'hello S1');
+  assert(JSON.stringify(savedHistory(h)) === '["hello S1"]', JSON.stringify(savedHistory(h)));
+  assert(h.win.localStorage.getItem('prompt-history:S2') === null, 'another session got it');
+});
+
+test('a tab that switches session switches history with it', (h) => {
+  // A phone switches session in place.
+  h.live.accept();
+  onSession(h, 'r1', 'S1');
+  typeCommand(h, 'hello S1');
+  onSession(h, 'r2', 'S2');
+  assert(recall(h) === 'asked in S2', 'S2 recalled ' + JSON.stringify(recall(h)));
+  assert(recall(h, 3) === 'asked in S2', 'S1\'s prompt came up in S2');
+}, { local: { 'prompt-history:S2': JSON.stringify(['asked in S2']) } });
+
+test('a prompt typed before the session has its id joins its history', (h) => {
+  // A new session's id comes with its first turn.
+  h.live.accept();
+  h.live.deliver({ type: 'attached', session: { rid: 'r1', cwd: 'D:/x' } });
+  typeCommand(h, 'the first prompt');
+  statusOf(h, { busy_class: 'working', session_id: 'S1' });
+  assert(JSON.stringify(savedHistory(h)) === '["earlier","the first prompt"]',
+         JSON.stringify(savedHistory(h)));
+}, { local: { 'prompt-history:S1': JSON.stringify(['earlier']) } });
+
+test('the same conversation under a new id keeps its history', (h) => {
+  // A context trim gives the session a new id; so does /clear in this tab.
+  h.live.accept();
+  onSession(h, 'r1', 'S1');
+  typeCommand(h, 'before the trim');
+  statusOf(h, { busy_class: 'idle', session_id: 'S1b' });
+  assert(recall(h) === 'before the trim', recall(h));
+  assert(savedHistory(h, 'S1b').includes('before the trim'), JSON.stringify(savedHistory(h, 'S1b')));
+});
+
+test('so does a /move\'s copy', (h) => {
+  h.live.accept();
+  onSession(h, 'r1', 'S1');
+  typeCommand(h, 'before the move');
+  h.live.deliver({ type: 'move_done', rid: 'r9' });
+  onSession(h, 'r9', 'COPY');
+  assert(recall(h) === 'before the move', recall(h));
+});
+
+test('the histories kept are bounded, the least recently used going first', (h) => {
+  h.live.accept();
+  onSession(h, 'r1', 'NEW');
+  typeCommand(h, 'x');
+  const order = JSON.parse(h.win.localStorage.getItem('prompt-history-sessions'));
+  assert(order.length === 100 && order[order.length - 1] === 'NEW', JSON.stringify(order.slice(-3)));
+  assert(h.win.localStorage.getItem('prompt-history:old0') === null, 'the oldest was kept');
+  assert(h.win.localStorage.getItem('prompt-history:old1') !== null, 'more than one went');
+}, { local: Object.fromEntries([
+  ['prompt-history-sessions', JSON.stringify(Array.from({ length: 100 }, (_, i) => 'old' + i))],
+  ...Array.from({ length: 100 }, (_, i) => ['prompt-history:old' + i, '["p"]'])]) });
+
+test('the history every session once shared is gone', (h) => {
+  // It may hold a pasted key, and nothing reads it now.
+  assert(h.win.localStorage.getItem('prompt-history') === null, 'still there');
+}, { local: { 'prompt-history': JSON.stringify(['my key is ' + PASTED]) } });
 
 test('/move opens the move overlay', (h) => {
   h.live.accept();

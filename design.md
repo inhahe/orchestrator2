@@ -2638,8 +2638,9 @@ every account, so:
   key pasted in hope. The browser keeps such a line out of its prompt
   history, which `localStorage` writes to disk, and any line holding text
   shaped like an Anthropic key (`commands.js`, `_mayHoldKey`); the line is
-  still sent, for the hub to refuse. Such lines already in the stored history
-  are dropped from it when the page loads.
+  still sent, for the hub to refuse. Such lines already in a stored history
+  are not brought back from it, and the history every session once shared,
+  which may hold one, is removed when the page loads.
 
 An account's own key wins over a session's: the CLI applies `settings.json`'s
 `env` over the environment it was started with. Measured by pointing the CLI
@@ -3336,6 +3337,29 @@ Pinned by `tests/leave_guard.test.js`, four tests in
 mutation targets `leaveguard`, `leaveguard-util`, `leaveguard-status`,
 `leaveguard-lobby`, `leaveguard-app`, `leaveguard-server` and
 `leaveguard-state`.
+
+### Ctrl+Up recalls the session's own prompts
+
+Asked for on 2026-10-27: "make ctrl+up history specific to that
+session/window, not global to all sessions". `commands.js` keeps a history per
+session, in `localStorage` under `prompt-history:<session id>`, so it outlives
+the tab and a reload. `prompt-history-sessions` orders the histories by use,
+and only the 100 most recently used are kept, fewer while the storage is full.
+The tab learns its runtime from `attached` (`Commands.setRuntime`) and its
+session's id from each status snapshot (`Commands.setSessionId`):
+
+- **Another runtime, another history.** A tab that switches session in place
+  (a phone) leaves the old one's history behind.
+- **A new id in the same runtime keeps it.** That covers a context trim (the
+  same conversation under a new id), a `/clear` in the tab, and a `/move`'s
+  copy, which `move_done` marks as carrying the history over. What the tab
+  holds joins the new id's stored history. So does a prompt typed before a
+  new session had its id.
+- **The one history every session used to share** (`prompt-history`) is
+  removed, since nothing reads it and it may hold a pasted key.
+
+Pinned by the prompt history tests in `reconnect_on_show.test.js`; mutation
+targets `history`, `history-status`, `history-app` and `apikey-history`.
 
 ### A sent prompt is tracked by id, not by "did anything come back"
 

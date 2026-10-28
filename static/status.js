@@ -149,6 +149,8 @@ const Status = (() => {
     if (typeof Favicon !== 'undefined') Favicon.update(status);
     // And whether closing the tab asks first (--confirm-close).
     if (typeof LeaveGuard !== 'undefined') LeaveGuard.update(status);
+    // Ctrl+Up recalls this session's prompts: which session it is.
+    if (typeof Commands !== 'undefined') Commands.setSessionId(status.session_id);
 
     // Indicator dot + state text.
     const cls = status.busy_class || 'idle';
