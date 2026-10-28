@@ -3255,7 +3255,7 @@ bar's text and the dot so the two cannot disagree:
 | yellow | `compacting`, `connecting`, `reconnecting` |
 | green | `working` |
 | purple | `bg-wait` |
-| grey | `idle`, but purple while background tasks run (`bg_count`) or a loop is scheduled (`wakeup_at`), which the status bar shows in fields of their own |
+| grey | `idle`, but purple while background tasks run (`bg_count`), a loop is scheduled (`wakeup_at`), or a resume after a usage limit is (`limit_resume_at`): work to come, which the status bar shows in fields of its own |
 
 The status bar shows one state, and the hub chooses it (`state_to_status_dict`),
 so the dot needs no precedence of its own: a turn with background tasks
@@ -3307,20 +3307,26 @@ that's in any state other than idle (and maybe waiting for a loop)". With
 idle**: the grey dot above. `Util.restsIdle` is that rule, and `Favicon` and
 `LeaveGuard` (`static/leave_guard.js`) both use it, so they cannot disagree. So
 it asks while the session is working, connecting or compacting, runs
-background tasks, waits on a scheduled loop, or shows an error, and while the
-hub cannot be reached, since the session may be busy. It does not ask once the
-hub has shut down, when there is nothing left to watch, nor in a tab with no
-session. Closing the tab stops none of this, because the hub carries on without
-it (see the idle teardown); what is lost is the user's view of it.
+background tasks, waits on a scheduled loop or a resume after a usage limit,
+or shows an error, and while the hub cannot be reached, since the session may
+be busy. It does not ask once the hub has shut down, when there is nothing left
+to watch, nor in a tab with no session. Closing one tab of several stops none
+of this. Closing the last can: with auto-shutdown (on under `--open` and
+`--detach`) the hub shuts down 30 s later, and its turns and background tasks
+with it, and a session no tab is left on is closed by the idle teardown once
+nothing keeps it busy.
 
 - **The browser asks, in its own words.** A page can only ask for the question,
-  by cancelling `beforeunload`, and cannot word it. Mobile browsers may not ask
-  at all.
+  by cancelling `beforeunload` (both `preventDefault` and `returnValue`, which
+  different browsers read), and cannot word it. Browsers ask only once the user
+  has clicked or typed in the page, so a tab opened and only watched closes
+  without a question; mobile browsers may not ask at all.
 - **`beforeunload` cannot tell closing from navigating**, so the page marks its
-  own navigations as on purpose (`LeaveGuard.leavingOnPurpose`, for 3 s): a
-  server's `navigate`, the reload after a hub restart, the Reload button of a
-  refused connection, the "go to the window that has it" redirect, and a popup
-  blocked into an in-place open (`lobby.js`'s `_navigate`). Opening another
+  own navigations as on purpose (`LeaveGuard.leavingOnPurpose`, for 3 s from
+  the latest): a server's `navigate`, the reload after a hub restart, the
+  Reload button of a refused connection, the "go to the window that has it"
+  redirect, a popup blocked into an in-place open, and a window name that is
+  this tab's own (`lobby.js`'s `_navigate`, `_openInTab`). Opening another
   session or the lobby normally leaves this tab where it is.
 - **What the page says of its own connection** (`connection: true`:
   reconnecting, shut down) carries only that, so the guard lays it over the
@@ -3329,10 +3335,12 @@ it (see the idle teardown); what is lost is the user's view of it.
   (`confirm_close`, from the session's `Config`). A launch that joins a running
   hub hands it over (`_hub_launch_kwargs`), and the hub turns it on for itself
   and every session it has open (`_turn_on_confirm_close`), since it is a
-  preference about tabs rather than about one session. A launch without the
-  flag never turns it off.
+  preference about tabs rather than about one session -- after the launch's
+  refusal checks, so that a refused launch changes nothing. A launch without
+  the flag never turns it off, and a Restart passes it on to the hub that
+  replaces this one (`api_restart`).
 
-Pinned by `tests/leave_guard.test.js`, four tests in
+Pinned by `tests/leave_guard.test.js`, five tests in
 `reconnect_on_show.test.js` on the real page, and `tests/test_confirm_close.py`;
 mutation targets `leaveguard`, `leaveguard-util`, `leaveguard-status`,
 `leaveguard-lobby`, `leaveguard-app`, `leaveguard-server` and
@@ -3350,13 +3358,22 @@ session's id from each status snapshot (`Commands.setSessionId`):
 
 - **Another runtime, another history.** A tab that switches session in place
   (a phone) leaves the old one's history behind.
+- **Another session, another history**, in the same runtime too: `/resume`
+  and `/cwd` open one there, and `attached` says which.
 - **A new id in the same runtime keeps it.** That covers a context trim (the
   same conversation under a new id), a `/clear` in the tab, and a `/move`'s
   copy, which `move_done` marks as carrying the history over. What the tab
-  holds joins the new id's stored history. So does a prompt typed before a
-  new session had its id.
-- **The one history every session used to share** (`prompt-history`) is
-  removed, since nothing reads it and it may hold a pasted key.
+  holds joins the new id's stored history, less what is there already
+  (another tab on the session may have carried it over first). So does a
+  prompt typed before a new session had its id.
+- **Two tabs on one session share it.** The stored history is read again
+  before a prompt is added to it and when recalling starts, and what the tab
+  holds that the storage lacks (a line there was no room for) is kept.
+- **A full storage** gives up at most five other histories for one save: full
+  of something else, it would otherwise be emptied of all of them for nothing.
+- **The one history every session used to share** (`prompt-history`) is left
+  as it was and not read. It has no line that may hold a key, which that
+  history kept out too.
 
 Pinned by the prompt history tests in `reconnect_on_show.test.js`; mutation
 targets `history`, `history-status`, `history-app` and `apikey-history`.

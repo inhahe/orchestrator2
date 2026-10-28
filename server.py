@@ -533,12 +533,13 @@ def _turn_on_confirm_close() -> None:
     off by a launch without it: one that leaves a flag out has not asked for
     anything."""
     global config
-    if config is not None and not config.confirm_close:
-        log.info("hub: --confirm-close turned on by a launch")
-        config = dataclasses.replace(config, confirm_close=True)
+    # The default runtime's Config is the hub's (_replace_runtime_config).
     for rt in list(runtimes.values()):
         if rt.config is not None and not rt.config.confirm_close:
             _replace_runtime_config(rt, confirm_close=True)
+    if config is not None and not config.confirm_close:
+        log.info("hub: --confirm-close turned on by a launch")
+        config = dataclasses.replace(config, confirm_close=True)
 
 
 def _replace_runtime_config(rt: "SessionRuntime", **changes: Any) -> None:
@@ -3876,6 +3877,10 @@ async def api_restart() -> dict[str, Any]:
             continue
         child.append(a)
         i += 1
+    # On by a launch that joined, rather than by this one's own flags: kept
+    # (_turn_on_confirm_close never turns it off).
+    if config is not None and config.confirm_close and "--confirm-close" not in child:
+        child.append("--confirm-close")
     child.extend(["--port", str(port), "--skip-auto-login", "--wait-port"])
     # Resume exactly the current primary session on the fresh process.
     if sid:
@@ -4145,10 +4150,7 @@ async def _session_launch(body: dict[str, Any]) -> dict[str, Any]:
     resume_after_limit = body.get("resume_after_limit")
     if not isinstance(resume_after_limit, bool):
         resume_after_limit = None
-    # A preference about tabs, not this session: on for the hub, before the
-    # session is opened so that it has it too.
-    if body.get("confirm_close") is True:
-        _turn_on_confirm_close()
+    confirm_close = body.get("confirm_close") is True
     # The launch's ANTHROPIC_API_KEY, for this session alone (see
     # HANDOVER_KEYS_ENV).
     api_key = body.get("api_key")
@@ -4198,6 +4200,10 @@ async def _session_launch(body: dict[str, Any]) -> dict[str, Any]:
         if refusal:
             log.warning("hub launch (%s): refused: %s", asked, refusal)
             return {"ok": False, "error": refusal, "refused": True}
+    # A preference about tabs, not this session: on for the hub, before the
+    # session is opened so that it has it too.
+    if confirm_close:
+        _turn_on_confirm_close()
     # The launch says what its session is billed to: without a key, that is
     # the account's login, whatever key the session ran with before.
     if target_sid and not api_key:

@@ -1148,6 +1148,9 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         # status pushes.  None when nothing is armed.
         "wakeup_at": state.wakeup_at,
         "wakeup_defers": state.wakeup_defers,
+        # A resume after a usage limit, when one is scheduled: work to come, as
+        # a loop's wakeup is (static/util.js restsIdle).
+        "limit_resume_at": state.limit_resume_at,
         "collapse_tools": state.collapse_tools,
         "collapse_threshold": state.collapse_threshold,
         "max_dom_messages": state.max_dom_messages,

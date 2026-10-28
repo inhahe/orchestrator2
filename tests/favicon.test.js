@@ -129,6 +129,10 @@ test('waiting to loop is purple, the loop field\'s colour', () => {
   is({ busy_class: 'idle', wakeup_at: LOOP }, PURPLE, 'waiting to loop');
 });
 
+test('so is waiting to resume after a usage limit: work to come', () => {
+  is({ busy_class: 'idle', limit_resume_at: LOOP }, PURPLE, 'waiting to resume');
+});
+
 test('idle is grey', () => {
   is({ busy_class: 'idle' }, GREY, 'idle');
 });

@@ -16,12 +16,17 @@ const Commands = (() => {
   // The session's own: what was typed in it, from any tab, kept in
   // localStorage under its session id (HISTORY_KEY), so it outlives the tab
   // and a reload.  A tab that switches session switches history with it.
+  // Read again before it is added to or recalled from, so two tabs on one
+  // session each have what the other typed.
   // Asked 2026-10-27: "make ctrl+up history specific to that session/window,
   // not global to all sessions".
   const MAX_HISTORY = 200;
   // Histories kept, the least recently used dropped past it -- or sooner, when
-  // the browser's storage is full.  SESSIONS_KEY orders them.
+  // the browser's storage is full, but never more than MAX_EVICTIONS for one
+  // save: storage full of something else is no reason to empty it of these.
+  // SESSIONS_KEY orders them.
   const MAX_SESSIONS = 100;
+  const MAX_EVICTIONS = 5;
   const HISTORY_KEY = (sid) => 'prompt-history:' + sid;
   const SESSIONS_KEY = 'prompt-history-sessions';
   let _promptHistory = [];   // oldest first
@@ -45,10 +50,6 @@ const Commands = (() => {
     acDropdown.className = 'hidden';
     elInputWrap.style.position = 'relative';
     elInputWrap.appendChild(acDropdown);
-
-    // The one history every session shared, before each had its own: read by
-    // nothing now, and it may hold a pasted key (_mayHoldKey).
-    try { localStorage.removeItem('prompt-history'); } catch (_) {}
 
     // Event listeners.
     elInput.addEventListener('keydown', _onKeyDown);
@@ -209,6 +210,7 @@ const Commands = (() => {
   // ----- Prompt history -----
 
   function _navigateHistory(dir) {
+    if (_historyIndex === -1) _refreshHistory();
     if (_promptHistory.length === 0) return;
 
     if (_historyIndex === -1) {
@@ -248,7 +250,24 @@ const Commands = (() => {
   }
 
   function _pushHistory(text) {
+    _refreshHistory();
     if (_append(text)) _saveHistory();
+  }
+
+  // The stored history, which another tab on this session may have added to.
+  function _refreshHistory() {
+    if (!_sid) return;
+    const stored = _loadHistory(_sid);
+    if (stored) _promptHistory = _merged(stored, _promptHistory);
+  }
+
+  // *stored*, then what of *held* it does not have: a line this tab could not
+  // save (the storage full), or carried from the id before -- unless another
+  // tab on the session carried it over first.
+  function _merged(stored, held) {
+    const out = stored.slice();
+    for (const t of held) if (!out.includes(t)) out.push(t);
+    return out.slice(-MAX_HISTORY);
   }
 
   // Add *text* to the history in memory; whether it was added.
@@ -263,7 +282,8 @@ const Commands = (() => {
     return true;
   }
 
-  // Session *sid*'s stored history, less any line that may hold a key.
+  // Session *sid*'s stored history, less any line that may hold a key; null
+  // if the storage cannot be read.
   function _loadHistory(sid) {
     try {
       const all = JSON.parse(localStorage.getItem(HISTORY_KEY(sid)) || '[]');
@@ -271,7 +291,7 @@ const Commands = (() => {
         ? all.filter((x) => typeof x === 'string' && !_mayHoldKey(x)).slice(-MAX_HISTORY)
         : [];
     } catch (_) {
-      return [];
+      return null;
     }
   }
 
@@ -285,12 +305,12 @@ const Commands = (() => {
       if (!Array.isArray(order)) order = [];
       order = order.filter((s) => s !== _sid);
       while (order.length >= MAX_SESSIONS) localStorage.removeItem(HISTORY_KEY(order.shift()));
-      for (;;) {
+      for (let evicted = 0; ; evicted++) {
         try {
           localStorage.setItem(HISTORY_KEY(_sid), JSON.stringify(_promptHistory));
           break;
         } catch (e) {
-          if (!order.length) throw e;
+          if (!order.length || evicted >= MAX_EVICTIONS) throw e;
           localStorage.removeItem(HISTORY_KEY(order.shift()));
         }
       }
@@ -299,12 +319,14 @@ const Commands = (() => {
     } catch (_) { /* in memory, then, for this tab */ }
   }
 
-  /** The tab shows runtime *rid* now (app.js, on `attached`): another one's
-   *  history is not its.  Its own comes with its session id (setSessionId).
-   *  *carry*: the conversation goes on there -- a /move's copy -- so this
-   *  tab's history goes with it. */
-  function setRuntime(rid, { carry = false } = {}) {
-    if (rid === _rid) return;
+  /** The tab shows runtime *rid*, on session *sessionId* if it has one yet
+   *  (app.js, on `attached`): another runtime's history is not its, nor
+   *  another session's -- /resume and /cwd open one in the same runtime.
+   *  Its own comes with its session id (setSessionId).  *carry*: the
+   *  conversation goes on there -- a /move's copy -- so this tab's history
+   *  goes with it. */
+  function setRuntime(rid, { carry = false, sessionId = null } = {}) {
+    if (rid === _rid && !(sessionId && _sid && sessionId !== _sid)) return;
     _rid = rid;
     _sid = null;
     if (!carry) _promptHistory = [];
@@ -318,9 +340,7 @@ const Commands = (() => {
   function setSessionId(sid) {
     if (!sid || sid === _sid) return;
     _sid = sid;
-    const held = _promptHistory;
-    _promptHistory = _loadHistory(sid);
-    for (const t of held) _append(t);
+    _promptHistory = _merged(_loadHistory(sid) || [], _promptHistory);
     _historyIndex = -1;
     _saveHistory();
   }

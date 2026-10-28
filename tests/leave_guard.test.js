@@ -42,6 +42,7 @@ function page() {
   const win = dom.window;
   const timers = [];
   win.setTimeout = (fn) => { timers.push(fn); return timers.length; };
+  win.clearTimeout = (id) => { if (id) timers[id - 1] = null; };
   win.eval(GUARD_JS + '\n;window.LeaveGuard = LeaveGuard;');
   // Asking takes both: preventDefault, which Firefox and today's Chrome read,
   // and returnValue, which older Chrome and Edge read.  Either alone cancels
@@ -58,7 +59,8 @@ function page() {
     }
     return prevented;
   };
-  return { guard: win.LeaveGuard, asks, runTimers: () => timers.splice(0).forEach((f) => f()) };
+  return { guard: win.LeaveGuard, asks, timers,
+           runTimers: () => timers.splice(0).forEach((f) => f && f()) };
 }
 
 const ON = { confirm_close: true };
@@ -76,7 +78,8 @@ test('so does any state but resting idle', () => {
                    { busy_class: 'bg-wait' }, { busy_class: 'error' },
                    { busy_class: 'reconnecting' },
                    { busy_class: 'idle', bg_count: 2 },
-                   { busy_class: 'idle', wakeup_at: 1893456000 }]) {
+                   { busy_class: 'idle', wakeup_at: 1893456000 },
+                   { busy_class: 'idle', limit_resume_at: 1893456000 }]) {
     const { guard, asks } = page();
     guard.update({ ...ON, ...s });
     assert(asks(), JSON.stringify(s));
@@ -128,6 +131,16 @@ test('it asks still while the hub cannot be reached', () => {
   assert(asks(), 'the reconnecting tab forgot --confirm-close');
   guard.update({ busy_class: 'shutdown', busy_label: 'server shut down', connection: true });
   assert(!asks(), 'asked with the hub shut down');
+});
+
+test('a second navigation on purpose is covered for its own full time', () => {
+  const { guard, asks, timers } = page();
+  guard.update({ ...ON, busy_class: 'working' });
+  guard.leavingOnPurpose();
+  guard.leavingOnPurpose();
+  const first = timers[0];
+  if (first) first();            // the first one's time is up
+  assert(!asks(), 'the first mark ended the second early');
 });
 
 test('the latest state counts', () => {

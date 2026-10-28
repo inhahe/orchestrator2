@@ -336,6 +336,9 @@ const Lobby = (() => {
   // *name*.  This gives "new tab, or activate the existing one" for free.
   // Falls back to same-tab navigation only if the popup was blocked.
   function _openInTab(url, name) {
+    // This tab's own name (one opened in place, keeping it): the tab goes
+    // there itself.
+    if (name && name === window.name) { _navigate(url); return; }
     let w = null;
     try { w = window.open(url, name); } catch (e) { w = null; }
     if (w) { try { w.focus(); } catch (e) {} return; }

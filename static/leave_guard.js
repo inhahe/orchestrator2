@@ -5,19 +5,25 @@
  * that's in any state other than idle (and maybe waiting for a loop)".
  * Resting idle is what the tab's grey dot shows (Util.restsIdle): any other
  * colour -- working, connecting, compacting, background tasks running, a loop
- * scheduled, an error -- asks.  Closing the tab stops none of those (the hub
- * carries on without it); what it loses is the user's view of them.
+ * or a resume after a usage limit scheduled, an error -- asks.  Closing one
+ * tab of several stops none of those, but closing the last can: a hub that
+ * shuts down when its tabs are gone (auto-shutdown, which --open and --detach
+ * turn on) stops its turns with it, and a session whose last tab closes is
+ * closed after the idle timeout once nothing keeps it.
  *
  * The browser draws the question itself, in its own words ("Leave site?"):
- * a page may only ask for it, from ``beforeunload``.  So it is asked as well
- * when the page navigates away -- which it does on purpose now and then: a
- * server's ``navigate``, the reload after a hub restart.  Those call
- * ``leavingOnPurpose`` first.  A phone's browser may not ask at all.
+ * a page may only ask for it, from ``beforeunload``, and is heard only once
+ * the user has clicked or typed in it -- a tab opened and only watched is
+ * closed without a question, as it is on a phone, whose browser may not ask
+ * at all.  It is asked as well when the page navigates away, which it does
+ * on purpose now and then -- a server's ``navigate``, the reload after a hub
+ * restart -- so those call ``leavingOnPurpose`` first.
  */
 
 const LeaveGuard = (() => {
   let _status = null;      // the session's latest status snapshot; null: none
   let _onPurpose = false;  // the page is navigating itself
+  let _onPurposeTimer = null;
 
   /** Whether closing now should ask: the hub was started (or joined) with
    *  --confirm-close, and the session is not resting idle -- nor gone, with
@@ -45,7 +51,9 @@ const LeaveGuard = (() => {
    *  after a moment, should the navigation not happen. */
   function leavingOnPurpose() {
     _onPurpose = true;
-    setTimeout(() => { _onPurpose = false; }, 3000);
+    // From the latest: an earlier one's would end the mark early.
+    clearTimeout(_onPurposeTimer);
+    _onPurposeTimer = setTimeout(() => { _onPurpose = false; }, 3000);
   }
 
   window.addEventListener('beforeunload', (e) => {

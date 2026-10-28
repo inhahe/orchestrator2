@@ -755,10 +755,68 @@ test('the histories kept are bounded, the least recently used going first', (h) 
   ['prompt-history-sessions', JSON.stringify(Array.from({ length: 100 }, (_, i) => 'old' + i))],
   ...Array.from({ length: 100 }, (_, i) => ['prompt-history:old' + i, '["p"]'])]) });
 
-test('the history every session once shared is gone', (h) => {
-  // It may hold a pasted key, and nothing reads it now.
-  assert(h.win.localStorage.getItem('prompt-history') === null, 'still there');
-}, { local: { 'prompt-history': JSON.stringify(['my key is ' + PASTED]) } });
+test('the history every session once shared is left as it was, unread', (h) => {
+  h.live.accept();
+  onSession(h, 'r1', 'S1');
+  assert(recall(h) === '', 'it was recalled: ' + recall(h));
+  assert(h.win.localStorage.getItem('prompt-history') === '["from before"]', 'it was touched');
+}, { local: { 'prompt-history': JSON.stringify(['from before']) } });
+
+test('/resume of another session in the same runtime brings that one\'s history', (h) => {
+  // /resume and /cwd open another session in the tab's runtime.
+  h.live.accept();
+  onSession(h, 'r1', 'S1');
+  typeCommand(h, 'asked in S1');
+  h.live.deliver({ type: 'attached', session: { rid: 'r1', session_id: 'S2', cwd: 'D:/x' } });
+  statusOf(h, { busy_class: 'idle', session_id: 'S2' });
+  assert(recall(h, 3) === 'asked in S2', recall(h, 3));
+  assert(!savedHistory(h, 'S2').includes('asked in S1'), JSON.stringify(savedHistory(h, 'S2')));
+}, { local: { 'prompt-history:S2': JSON.stringify(['asked in S2']) } });
+
+test('a prompt typed in another tab on the session is recalled here, and kept', (h) => {
+  h.live.accept();
+  onSession(h, 'r1', 'S1');
+  // The other tab saves after this one loaded.
+  h.win.localStorage.setItem('prompt-history:S1', JSON.stringify(['from the other tab']));
+  assert(recall(h) === 'from the other tab', recall(h));
+});
+
+test('and a prompt typed here keeps the one typed there', (h) => {
+  h.live.accept();
+  onSession(h, 'r1', 'S1');
+  h.win.localStorage.setItem('prompt-history:S1', JSON.stringify(['from the other tab']));
+  typeCommand(h, 'mine');
+  assert(JSON.stringify(savedHistory(h)) === '["from the other tab","mine"]',
+         JSON.stringify(savedHistory(h)));
+});
+
+test('two tabs carrying a history to a new id do not double it', (h) => {
+  h.live.accept();
+  onSession(h, 'r1', 'S1');
+  typeCommand(h, 'p1');
+  // The other tab carried it to the new id first.
+  h.win.localStorage.setItem('prompt-history:S2', JSON.stringify(['p1']));
+  statusOf(h, { busy_class: 'idle', session_id: 'S2' });
+  assert(JSON.stringify(savedHistory(h, 'S2')) === '["p1"]', JSON.stringify(savedHistory(h, 'S2')));
+});
+
+test('storage full of something else does not empty it of every history', (h) => {
+  h.live.accept();
+  const Storage = h.win.Storage.prototype;
+  const setItem = Storage.setItem;
+  Storage.setItem = function (k, v) {
+    if (k === 'prompt-history:FULL') throw new h.win.DOMException('full', 'QuotaExceededError');
+    return setItem.call(this, k, v);
+  };
+  onSession(h, 'r1', 'FULL');
+  typeCommand(h, 'x');
+  const left = Array.from({ length: 20 }, (_, i) => 'old' + i)
+    .filter((sid) => h.win.localStorage.getItem('prompt-history:' + sid) !== null);
+  assert(left.length >= 15, `${20 - left.length} other histories dropped for nothing`);
+  assert(recall(h) === 'x', 'not kept in the tab either');
+}, { local: Object.fromEntries([
+  ['prompt-history-sessions', JSON.stringify(Array.from({ length: 20 }, (_, i) => 'old' + i))],
+  ...Array.from({ length: 20 }, (_, i) => ['prompt-history:old' + i, '["p"]'])]) });
 
 test('/move opens the move overlay', (h) => {
   h.live.accept();
@@ -1575,6 +1633,19 @@ test('the tab icon\'s dot is the colour of the state the status bar shows', (h) 
   assert(iconOf(h) === '#bc3fbc', 'waiting to loop: ' + iconOf(h));
   statusOf(h, { busy_class: 'idle' });
   assert(iconOf(h) === '#666666', 'idle: ' + iconOf(h));
+});
+
+test('nor when the tab is itself the one the page opens something in', (h) => {
+  // A tab opened in place keeps its name, and window.open of that name
+  // would take this very tab away.
+  attached(h);
+  statusOf(h, { busy_class: 'working', busy_label: 'working', confirm_close: true });
+  h.win.name = 'orch2-lobby';
+  const opened = [];
+  h.win.open = (url, name) => { opened.push(name); return { focus() {} }; };
+  try { h.win.document.getElementById('sessions-btn').click(); } catch (e) { /* jsdom */ }
+  assert(opened.length === 0, 'opened by name: ' + opened.join());
+  assert(!closeAsks(h), 'the page’s own navigation asked');
 });
 
 test('the status bar writes each state in its own colour', (h) => {

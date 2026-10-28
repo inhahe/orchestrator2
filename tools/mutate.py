@@ -3913,14 +3913,24 @@ FAVICON_UTIL_MUTATIONS = [
      "    compacting:   '--indicator-compacting',",
      "    compacting:   '--indicator-working',"),
 
-    ("background tasks while idle show nothing",
-     "      && !(s.bg_count > 0) && typeof s.wakeup_at !== 'number';\n",
-     "      && typeof s.wakeup_at !== 'number';\n"),
-
-    ("a scheduled loop is never shown",
-     "      && !(s.bg_count > 0) && typeof s.wakeup_at !== 'number';\n",
-     "      && !(s.bg_count > 0);\n"),
 ]
+
+# Util.restsIdle, which the tab's dot and the guard on closing it share:
+# run against each one's tests (favicon-util, leaveguard-util).
+RESTS_IDLE_MUTATIONS = [
+    ("background tasks running rest idle",
+     "      && !(s.bg_count > 0) && typeof s.wakeup_at !== 'number'\n",
+     "      && typeof s.wakeup_at !== 'number'\n"),
+
+    ("a loop scheduled rests idle",
+     "      && !(s.bg_count > 0) && typeof s.wakeup_at !== 'number'\n",
+     "      && !(s.bg_count > 0)\n"),
+
+    ("a resume after a usage limit scheduled rests idle",
+     "      && typeof s.limit_resume_at !== 'number';\n",
+     "      ;\n"),
+]
+FAVICON_UTIL_MUTATIONS += RESTS_IDLE_MUTATIONS
 
 # The status bar writes each state in its colour.  The tab's dot shows
 # bg-wait purple with or without the table's entry (Util.restsIdle), so the
@@ -3960,8 +3970,12 @@ LEAVEGUARD_MUTATIONS = [
      "    if (_onPurpose || !wouldAsk()) return;\n",
      "    if (!wouldAsk()) return;\n"),
 
+    ("an earlier navigation's mark ends a later one's early",
+     "    clearTimeout(_onPurposeTimer);\n",
+     ""),
+
     ("a navigation that did not happen leaves closing unguarded for good",
-     "    setTimeout(() => { _onPurpose = false; }, 3000);\n",
+     "    _onPurposeTimer = setTimeout(() => { _onPurpose = false; }, 3000);\n",
      ""),
 
     ("a lobby tab asks for the session it had",
@@ -3977,15 +3991,7 @@ LEAVEGUARD_UTIL_MUTATIONS = [
     ("any state rests idle",
      "    return (s.busy_class || 'idle') === 'idle'\n",
      "    return true\n"),
-
-    ("background tasks running rest idle",
-     "      && !(s.bg_count > 0) && typeof s.wakeup_at !== 'number';\n",
-     "      && typeof s.wakeup_at !== 'number';\n"),
-
-    ("a loop scheduled rests idle",
-     "      && !(s.bg_count > 0) && typeof s.wakeup_at !== 'number';\n",
-     "      && !(s.bg_count > 0);\n"),
-]
+] + RESTS_IDLE_MUTATIONS
 
 LEAVEGUARD_PAGE_STATUS_MUTATIONS = [
     ("the status bar does not tell it the session's state",
@@ -3996,6 +4002,10 @@ LEAVEGUARD_PAGE_STATUS_MUTATIONS = [
 LEAVEGUARD_PAGE_LOBBY_MUTATIONS = [
     ("a tab that has no session any more is not told",
      "    if (typeof LeaveGuard !== 'undefined') LeaveGuard.setLanding(on);\n",
+     ""),
+
+    ("the page opening something in this very tab, by its name, asks",
+     "    if (name && name === window.name) { _navigate(url); return; }\n",
      ""),
 
     ("the page opening something in its own tab asks",
@@ -4016,8 +4026,17 @@ LEAVEGUARD_SERVER_MUTATIONS = [
      ""),
 
     ("the hub does not act on it",
-     "    if body.get(\"confirm_close\") is True:\n        _turn_on_confirm_close()\n",
-     ""),
+     "    confirm_close = body.get(\"confirm_close\") is True\n",
+     "    confirm_close = False\n"),
+
+    ("a Restart drops it when a joining launch turned it on",
+     "    if config is not None and config.confirm_close and \"--confirm-close\" not in child:\n",
+     "    if False:\n"),
+
+    ("a launch the hub refuses turns it on all the same",
+     "    confirm_close = body.get(\"confirm_close\") is True\n",
+     "    confirm_close = body.get(\"confirm_close\") is True\n"
+     "    if confirm_close:\n        _turn_on_confirm_close()\n"),
 
     ("only sessions opened from now get it",
      "            _replace_runtime_config(rt, confirm_close=True)\n",
@@ -4032,6 +4051,10 @@ LEAVEGUARD_STATE_MUTATIONS = [
     ("the tab is never told",
      "        \"confirm_close\": bool(getattr(config, \"confirm_close\", False)),\n",
      ""),
+
+    ("nor of a resume after a usage limit",
+     "        \"limit_resume_at\": state.limit_resume_at,\n",
+     ""),
 ]
 
 # Ctrl+Up recalls the session's own prompts.  tests/reconnect_on_show.test.js.
@@ -4045,16 +4068,40 @@ HISTORY_MUTATIONS = [
      "    _promptHistory = [];\n"),
 
     ("a session's stored history is never brought back",
-     "    _promptHistory = _loadHistory(sid);\n",
-     "    _promptHistory = [];\n"),
+     "    _promptHistory = _merged(_loadHistory(sid) || [], _promptHistory);\n",
+     "    _promptHistory = _merged([], _promptHistory);\n"),
 
     ("what the tab held when the id came is lost",
-     "    for (const t of held) _append(t);\n",
-     ""),
+     "    _promptHistory = _merged(_loadHistory(sid) || [], _promptHistory);\n",
+     "    _promptHistory = _merged(_loadHistory(sid) || [], []);\n"),
 
     ("nothing is kept",
      "          localStorage.setItem(HISTORY_KEY(_sid), JSON.stringify(_promptHistory));\n",
      ""),
+
+    ("another session opened in the same runtime keeps the last one's history",
+     "    if (rid === _rid && !(sessionId && _sid && sessionId !== _sid)) return;\n",
+     "    if (rid === _rid) return;\n"),
+
+    ("a prompt another tab typed is not recalled here",
+     "    if (_historyIndex === -1) _refreshHistory();\n",
+     ""),
+
+    ("a prompt typed here drops one another tab typed",
+     "    _refreshHistory();\n    if (_append(text)) _saveHistory();\n",
+     "    if (_append(text)) _saveHistory();\n"),
+
+    ("a line the storage had no room for is lost on the next look",
+     "    if (stored) _promptHistory = _merged(stored, _promptHistory);\n",
+     "    if (stored) _promptHistory = stored;\n"),
+
+    ("two tabs carrying a history over double it",
+     "    for (const t of held) if (!out.includes(t)) out.push(t);\n",
+     "    for (const t of held) out.push(t);\n"),
+
+    ("storage full of something else is emptied of every history",
+     "          if (!order.length || evicted >= MAX_EVICTIONS) throw e;\n",
+     "          if (!order.length) throw e;\n"),
 
     ("histories pile up without bound",
      "      while (order.length >= MAX_SESSIONS) localStorage.removeItem(HISTORY_KEY(order.shift()));\n",
@@ -4074,8 +4121,12 @@ HISTORY_STATUS_MUTATIONS = [
 
 HISTORY_APP_MUTATIONS = [
     ("the history is not told the tab switched session",
-     "      Commands.setRuntime(s.rid || null);\n",
+     "      Commands.setRuntime(s.rid || null, { sessionId: s.session_id || null });\n",
      ""),
+
+    ("nor which session the runtime holds now",
+     "      Commands.setRuntime(s.rid || null, { sessionId: s.session_id || null });\n",
+     "      Commands.setRuntime(s.rid || null);\n"),
 
     ("a /move drops the history",
      "      Commands.setRuntime(msg.rid || null, { carry: true });\n",
@@ -6512,14 +6563,6 @@ DEADCLI_RECOVERY_MUTATIONS = [
 ]
 
 
-# A tab Chrome had frozen "replays the recent history fairly slowly" when it is
-# shown again (2026-10-10): its backlog was drawn a message at a time, with a
-# repaint and a layout or more between, and a view following the bottom
-# stopped following partway.  tests/history_backfill.test.js, "following
-# through a burst".  No mutation for endCatchUp's `if (!_catchingUp) return;`
-# or for clear() emptying _thinkingToFit: one spares a flush that would draw
-# nothing, the other frees the summaries of a view already gone, and no test
-# can tell either from its absence.
 # A run of tools collapsing leaves something on screen.
 # tests/collapse_view.test.js.
 COLLAPSE_VIEW_MUTATIONS = [
@@ -6536,6 +6579,14 @@ COLLAPSE_VIEW_MUTATIONS = [
      "    const _wasPinned = _autoScroll && !_replayInProgress && !_drawingInBulk;\n"),
 ]
 
+# A tab Chrome had frozen "replays the recent history fairly slowly" when it is
+# shown again (2026-10-10): its backlog was drawn a message at a time, with a
+# repaint and a layout or more between, and a view following the bottom
+# stopped following partway.  tests/history_backfill.test.js, "following
+# through a burst".  No mutation for endCatchUp's `if (!_catchingUp) return;`
+# or for clear() emptying _thinkingToFit: one spares a flush that would draw
+# nothing, the other frees the summaries of a view already gone, and no test
+# can tell either from its absence.
 CATCHUP_CHAT_MUTATIONS = [
     ("a burst stops a following view following -- the report",
      "        } else if (elMessages.scrollTop < _followedTop - 2) {\n",
@@ -6998,9 +7049,6 @@ APIKEY_HISTORY_MUTATIONS = [
      "        ? all.filter((x) => typeof x === 'string' && !_mayHoldKey(x)).slice(-MAX_HISTORY)\n",
      "        ? all.filter((x) => typeof x === 'string').slice(-MAX_HISTORY)\n"),
 
-    ("the history every session shared stays, a pasted key and all",
-     "    try { localStorage.removeItem('prompt-history'); } catch (_) {}\n",
-     ""),
 ]
 
 APIKEY_SERVER_MUTATIONS = [

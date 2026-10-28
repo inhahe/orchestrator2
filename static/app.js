@@ -785,8 +785,9 @@ const App = (() => {
         } catch (_) {}
       }
       Lobby.onAttached(msg.session);
-      // Ctrl+Up's history is the session's: another runtime, another history.
-      Commands.setRuntime(s.rid || null);
+      // Ctrl+Up's history is the session's: another runtime, or another
+      // session in this one (/resume, /cwd), another history.
+      Commands.setRuntime(s.rid || null, { sessionId: s.session_id || null });
       // A /move that finished lands here (server re-attached this socket to
       // the copied session's runtime) — close the move overlay.
       if (typeof Move !== 'undefined') Move.close();

@@ -85,3 +85,63 @@ def test_and_one_without_it_leaves_it_as_it_was(monkeypatch, tmp_path):
     assert server.config.confirm_close is True
     assert created["confirm_close"] is True
     assert open_rt.config.confirm_close is False, "a launch turned on what it did not ask for"
+
+
+def _restart_argv(monkeypatch, argv, cfg):
+    """The command line a Restart gives the hub that replaces this one."""
+    import subprocess
+    from state import State
+    seen = {}
+
+    def fake_popen(args, **kw):
+        seen["argv"] = list(args)
+        raise OSError("not really")
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(server, "config", cfg)
+    st = State()
+    st.session_id = "sid-1"
+    monkeypatch.setattr(server, "state", st)
+    asyncio.run(server.api_restart())
+    return seen["argv"]
+
+
+def test_a_restart_keeps_it_when_a_joining_launch_turned_it_on(monkeypatch):
+    """The hub's own command line does not have it: a launch that joined
+    gave it, and nothing takes it back."""
+    argv = _restart_argv(monkeypatch, ["server.py"], parse_args(["--confirm-close"]))
+
+    assert argv.count("--confirm-close") == 1, argv
+
+
+def test_and_does_not_say_it_twice(monkeypatch):
+    argv = _restart_argv(monkeypatch, ["server.py", "--confirm-close"],
+                         parse_args(["--confirm-close"]))
+
+    assert argv.count("--confirm-close") == 1, argv
+
+
+def test_a_launch_the_hub_refuses_changes_nothing(monkeypatch, tmp_path):
+    """Refused for the name it asked to give a session it did not choose."""
+    created, open_rt = _hub(monkeypatch, tmp_path)
+    monkeypatch.setattr(server, "_session_to_open", lambda *a, **k: "sid-x")
+    monkeypatch.setattr(server, "_disk_names", lambda *a, **k: ("Old name", None))
+    monkeypatch.setattr(server, "_rename_refusal", lambda *a, **k: "refused")
+
+    got = asyncio.run(server.api_session_launch({
+        "cwd": str(tmp_path), "agent_name": "New name", "confirm_close": True}))
+
+    assert got.get("refused") is True, got
+    assert server.config.confirm_close is False
+    assert open_rt.config.confirm_close is False
+
+
+def test_the_tab_is_told_of_a_resume_after_a_usage_limit():
+    """Work to come, as a loop's wakeup is: the tab's dot, and the guard on
+    closing it, count it (static/util.js restsIdle)."""
+    cfg = parse_args([])
+    st = init_state_from_config(cfg)
+    st.limit_resume_at = 1893456000.0
+
+    assert state_to_status_dict(st, cfg)["limit_resume_at"] == 1893456000.0
