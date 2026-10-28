@@ -3298,6 +3298,45 @@ over purple, a dropped socket, an exhausted reconnect, a closed session.
 Mutation targets are `favicon` (`favicon.js` × 16), `favicon-util` (the shared
 table × 7), `favicon-status` and `favicon-lobby` (the two wiring lines).
 
+### Closing a tab can ask first (`--confirm-close`)
+
+Asked for on 2026-10-27: "confirm with a popup before the user can close a tab
+that's in any state other than idle (and maybe waiting for a loop)". With
+`--confirm-close`, a tab asks before it closes unless its session is **resting
+idle**: the grey dot above. `Util.restsIdle` is that rule, and `Favicon` and
+`LeaveGuard` (`static/leave_guard.js`) both use it, so they cannot disagree. So
+it asks while the session is working, connecting or compacting, runs
+background tasks, waits on a scheduled loop, or shows an error, and while the
+hub cannot be reached, since the session may be busy. It does not ask once the
+hub has shut down, when there is nothing left to watch, nor in a tab with no
+session. Closing the tab stops none of this, because the hub carries on without
+it (see the idle teardown); what is lost is the user's view of it.
+
+- **The browser asks, in its own words.** A page can only ask for the question,
+  by cancelling `beforeunload`, and cannot word it. Mobile browsers may not ask
+  at all.
+- **`beforeunload` cannot tell closing from navigating**, so the page marks its
+  own navigations as on purpose (`LeaveGuard.leavingOnPurpose`, for 3 s): a
+  server's `navigate`, the reload after a hub restart, the Reload button of a
+  refused connection, the "go to the window that has it" redirect, and a popup
+  blocked into an in-place open (`lobby.js`'s `_navigate`). Opening another
+  session or the lobby normally leaves this tab where it is.
+- **What the page says of its own connection** (`connection: true`:
+  reconnecting, shut down) carries only that, so the guard lays it over the
+  last snapshot the hub sent, keeping `confirm_close`.
+- **For the whole hub.** The flag reaches the tab in every status snapshot
+  (`confirm_close`, from the session's `Config`). A launch that joins a running
+  hub hands it over (`_hub_launch_kwargs`), and the hub turns it on for itself
+  and every session it has open (`_turn_on_confirm_close`), since it is a
+  preference about tabs rather than about one session. A launch without the
+  flag never turns it off.
+
+Pinned by `tests/leave_guard.test.js`, four tests in
+`reconnect_on_show.test.js` on the real page, and `tests/test_confirm_close.py`;
+mutation targets `leaveguard`, `leaveguard-util`, `leaveguard-status`,
+`leaveguard-lobby`, `leaveguard-app`, `leaveguard-server` and
+`leaveguard-state`.
+
 ### A sent prompt is tracked by id, not by "did anything come back"
 
 Each prompt the tab echoes optimistically carries a `prompt_id`, and the server

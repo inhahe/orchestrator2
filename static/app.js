@@ -865,6 +865,8 @@ const App = (() => {
 
     // Server-initiated page navigation (e.g. /resume opening the picker).
     if (type === 'navigate') {
+      // On purpose: no "leave site?" for it (leave_guard.js).
+      if (typeof LeaveGuard !== 'undefined') LeaveGuard.leavingOnPurpose();
       window.location.href = msg.url;
       return;
     }

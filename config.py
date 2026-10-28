@@ -599,6 +599,8 @@ class Config:
     collapse_tools: bool = True        # auto-collapse consecutive tool/thinking blocks
     collapse_threshold: int = 3        # tools shown before collapsing
     max_dom_messages: int = 2000       # 0 = never trim old messages from the DOM
+    # Closing a tab whose session is not resting idle asks first (--confirm-close).
+    confirm_close: bool = False
 
     # Panels
     panel_delay: float = 0.0
@@ -957,6 +959,15 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--max-dom-messages",
         type=int, default=2000, metavar="N",
         help="Max DOM elements in the chat backscroll before trimming old ones. 0 = never trim. Default: 2000.",
+    )
+    ap.add_argument(
+        "--confirm-close",
+        action="store_true",
+        help="Ask before a tab closes while its session is not resting idle: "
+             "working, connecting or compacting, running background tasks, "
+             "waiting on a scheduled loop, or showing an error -- whatever "
+             "gives the tab a coloured dot. For the whole hub: a launch that "
+             "joins a running hub turns it on there too.",
     )
 
     # -- Bell --
@@ -1338,6 +1349,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         collapse_tools=args.collapse_tools,
         collapse_threshold=max(1, args.collapse_threshold),
         max_dom_messages=max(0, args.max_dom_messages),
+        confirm_close=bool(args.confirm_close),
         bell_on=(
             " ".join(args.bell_on)
             if isinstance(args.bell_on, list)

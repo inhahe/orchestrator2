@@ -46,5 +46,17 @@ const Util = (() => {
     compacting:   '--indicator-compacting',
   };
 
-  return { formatDuration, STATE_COLOUR_VARS };
+  /**
+   * Whether the session of a status snapshot is resting idle -- the grey dot:
+   * idle, with no background task running and no loop scheduled.  The tab's
+   * icon (favicon.js) and the guard on closing it (leave_guard.js) agree on
+   * it through here.
+   */
+  function restsIdle(status) {
+    const s = status || {};
+    return (s.busy_class || 'idle') === 'idle'
+      && !(s.bg_count > 0) && typeof s.wakeup_at !== 'number';
+  }
+
+  return { formatDuration, STATE_COLOUR_VARS, restsIdle };
 })();

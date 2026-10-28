@@ -3832,21 +3832,14 @@ FAVICON_MUTATIONS = [
 
     ("purple takes precedence over green",
      "    if (stateVar) return stateVar;\n"
-     "    if (s.bg_count > 0 || typeof s.wakeup_at === 'number') return '--indicator-bg-wait';\n",
-     "    if (s.bg_count > 0 || typeof s.wakeup_at === 'number') return '--indicator-bg-wait';\n"
-     "    if (stateVar) return stateVar;\n"),
-
-    ("background tasks while idle show nothing",
-     "    if (s.bg_count > 0 || typeof s.wakeup_at === 'number') return '--indicator-bg-wait';",
-     "    if (typeof s.wakeup_at === 'number') return '--indicator-bg-wait';"),
-
-    ("a scheduled loop is never shown",
-     "    if (s.bg_count > 0 || typeof s.wakeup_at === 'number') return '--indicator-bg-wait';",
-     "    if (s.bg_count > 0) return '--indicator-bg-wait';"),
+     "    return Util.restsIdle(s) ? '--indicator-idle' : '--indicator-bg-wait';\n",
+     "    if (!Util.restsIdle(s)) return '--indicator-bg-wait';\n"
+     "    if (stateVar) return stateVar;\n"
+     "    return '--indicator-idle';\n"),
 
     ("idle is not grey",
-     "    return '--indicator-idle';",
-     "    return '--indicator-working';"),
+     "    return Util.restsIdle(s) ? '--indicator-idle' : '--indicator-bg-wait';\n",
+     "    return Util.restsIdle(s) ? '--indicator-working' : '--indicator-bg-wait';\n"),
 
     ("compacting has no colour when the theme gives none",
      "    '--indicator-compacting': '#e5e510',\n",
@@ -3920,6 +3913,19 @@ FAVICON_UTIL_MUTATIONS = [
      "    compacting:   '--indicator-compacting',",
      "    compacting:   '--indicator-working',"),
 
+    ("background tasks while idle show nothing",
+     "      && !(s.bg_count > 0) && typeof s.wakeup_at !== 'number';\n",
+     "      && typeof s.wakeup_at !== 'number';\n"),
+
+    ("a scheduled loop is never shown",
+     "      && !(s.bg_count > 0) && typeof s.wakeup_at !== 'number';\n",
+     "      && !(s.bg_count > 0);\n"),
+]
+
+# The status bar writes each state in its colour.  The tab's dot shows
+# bg-wait purple with or without the table's entry (Util.restsIdle), so the
+# status bar's text is what needs it.  tests/reconnect_on_show.test.js.
+STATE_COLOUR_TEXT_MUTATIONS = [
     ("an older hub's bg-wait reads as idle",
      "    'bg-wait':    '--indicator-bg-wait',\n",
      ""),
@@ -3928,6 +3934,103 @@ FAVICON_UTIL_MUTATIONS = [
 FAVICON_STATUS_MUTATIONS = [
     ("the status bar never tells the icon",
      "    if (typeof Favicon !== 'undefined') Favicon.update(status);\n",
+     ""),
+]
+
+# --confirm-close: a tab asks before it closes on a session not resting idle.
+# tests/leave_guard.test.js, reconnect_on_show.test.js, test_confirm_close.py.
+LEAVEGUARD_MUTATIONS = [
+    ("it asks without --confirm-close",
+     "    if (!s || !s.confirm_close || s.busy_class === 'shutdown') return false;\n",
+     "    if (!s || s.busy_class === 'shutdown') return false;\n"),
+
+    ("it asks with the hub shut down, nothing left to watch",
+     "    if (!s || !s.confirm_close || s.busy_class === 'shutdown') return false;\n",
+     "    if (!s || !s.confirm_close) return false;\n"),
+
+    ("it asks only browsers that read preventDefault",
+     "    e.preventDefault();\n",
+     ""),
+
+    ("it asks only browsers that read returnValue",
+     "    e.returnValue = '';\n",
+     ""),
+
+    ("the page's own navigation asks",
+     "    if (_onPurpose || !wouldAsk()) return;\n",
+     "    if (!wouldAsk()) return;\n"),
+
+    ("a navigation that did not happen leaves closing unguarded for good",
+     "    setTimeout(() => { _onPurpose = false; }, 3000);\n",
+     ""),
+
+    ("a lobby tab asks for the session it had",
+     "    if (on) _status = null;\n",
+     ""),
+
+    ("a tab the hub cannot reach forgets --confirm-close",
+     "    _status = status.connection && _status ? { ..._status, ...status } : status;\n",
+     "    _status = status;\n"),
+]
+
+LEAVEGUARD_UTIL_MUTATIONS = [
+    ("any state rests idle",
+     "    return (s.busy_class || 'idle') === 'idle'\n",
+     "    return true\n"),
+
+    ("background tasks running rest idle",
+     "      && !(s.bg_count > 0) && typeof s.wakeup_at !== 'number';\n",
+     "      && typeof s.wakeup_at !== 'number';\n"),
+
+    ("a loop scheduled rests idle",
+     "      && !(s.bg_count > 0) && typeof s.wakeup_at !== 'number';\n",
+     "      && !(s.bg_count > 0);\n"),
+]
+
+LEAVEGUARD_PAGE_STATUS_MUTATIONS = [
+    ("the status bar does not tell it the session's state",
+     "    if (typeof LeaveGuard !== 'undefined') LeaveGuard.update(status);\n",
+     ""),
+]
+
+LEAVEGUARD_PAGE_LOBBY_MUTATIONS = [
+    ("a tab that has no session any more is not told",
+     "    if (typeof LeaveGuard !== 'undefined') LeaveGuard.setLanding(on);\n",
+     ""),
+
+    ("the page opening something in its own tab asks",
+     "    if (typeof LeaveGuard !== 'undefined') LeaveGuard.leavingOnPurpose();\n"
+     "    if (url === null) location.reload();\n",
+     "    if (url === null) location.reload();\n"),
+]
+
+LEAVEGUARD_PAGE_APP_MUTATIONS = [
+    ("the hub sending the tab elsewhere asks",
+     "      if (typeof LeaveGuard !== 'undefined') LeaveGuard.leavingOnPurpose();\n",
+     ""),
+]
+
+LEAVEGUARD_SERVER_MUTATIONS = [
+    ("a joining launch's flag is dropped",
+     "        \"confirm_close\": cfg.confirm_close,\n",
+     ""),
+
+    ("the hub does not act on it",
+     "    if body.get(\"confirm_close\") is True:\n        _turn_on_confirm_close()\n",
+     ""),
+
+    ("only sessions opened from now get it",
+     "            _replace_runtime_config(rt, confirm_close=True)\n",
+     "            pass\n"),
+
+    ("the open sessions get it, not those opened from now",
+     "        config = dataclasses.replace(config, confirm_close=True)\n",
+     "        pass\n"),
+]
+
+LEAVEGUARD_STATE_MUTATIONS = [
+    ("the tab is never told",
+     "        \"confirm_close\": bool(getattr(config, \"confirm_close\", False)),\n",
      ""),
 ]
 
@@ -8840,8 +8943,24 @@ TARGETS = {
                        FAVICON_STATUS_MUTATIONS, "node"),
     "favicon-lobby": ("static/lobby.js", "tests/reconnect_on_show.test.js",
                       FAVICON_LOBBY_MUTATIONS, "node"),
+    "statecolour": ("static/util.js", "tests/reconnect_on_show.test.js",
+                    STATE_COLOUR_TEXT_MUTATIONS, "node"),
     "lobbypath": ("static/lobby.js", "tests/lobby_running_card.test.js",
                   LOBBYPATH_MUTATIONS, "node"),
+    "leaveguard": ("static/leave_guard.js", "tests/leave_guard.test.js",
+                   LEAVEGUARD_MUTATIONS, "node"),
+    "leaveguard-util": ("static/util.js", "tests/leave_guard.test.js",
+                        LEAVEGUARD_UTIL_MUTATIONS, "node"),
+    "leaveguard-status": ("static/status.js", "tests/reconnect_on_show.test.js",
+                          LEAVEGUARD_PAGE_STATUS_MUTATIONS, "node"),
+    "leaveguard-lobby": ("static/lobby.js", "tests/reconnect_on_show.test.js",
+                         LEAVEGUARD_PAGE_LOBBY_MUTATIONS, "node"),
+    "leaveguard-app": ("static/app.js", "tests/reconnect_on_show.test.js",
+                       LEAVEGUARD_PAGE_APP_MUTATIONS, "node"),
+    "leaveguard-server": ("server.py", "tests/test_confirm_close.py",
+                          LEAVEGUARD_SERVER_MUTATIONS, "pytest"),
+    "leaveguard-state": ("state.py", "tests/test_confirm_close.py",
+                         LEAVEGUARD_STATE_MUTATIONS, "pytest"),
     "loopkeep-bridge": ("sdk_bridge.py", "tests/test_loops_survive_restart.py",
                         LOOPKEEP_BRIDGE_MUTATIONS, "pytest"),
     "loopkeep-server": ("server.py", "tests/test_loops_survive_restart.py",

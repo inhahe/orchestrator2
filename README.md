@@ -479,6 +479,7 @@ You can see which a session uses. The status bar's plan field reads **`API $1.23
 | `--show-edits` | `compact` | Edit tool display: `off`, `compact`, `full` |
 | `--ascii-only` | off | Use ASCII markers instead of Unicode |
 | `--collapse-tools` / `--no-collapse-tools` | on | Auto-collapse activity between messages |
+| `--confirm-close` | off | Ask before a tab closes while its session is not resting idle: working, connecting or compacting, running background tasks, waiting on a scheduled loop, or showing an error — whatever gives the tab a coloured dot rather than a grey one. The browser asks in its own words ("Leave site?"); a phone's browser may not ask at all. Closing the tab never stops the session: the hub carries on with it. For the whole hub: a launch that joins a running hub turns it on there too |
 
 ### Bell Notifications
 

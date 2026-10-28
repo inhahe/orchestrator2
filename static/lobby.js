@@ -323,6 +323,14 @@ const Lobby = (() => {
     App.send(m);
   }
 
+  // This tab goes to *url*, or reloads (null), on purpose: no "leave site?"
+  // for it, which --confirm-close asks only of the user closing the tab.
+  function _navigate(url) {
+    if (typeof LeaveGuard !== 'undefined') LeaveGuard.leavingOnPurpose();
+    if (url === null) location.reload();
+    else window.location.href = url;
+  }
+
   // window.open(url, name): if a tab with *name* exists the browser focuses
   // (and navigates) it; otherwise it opens a new tab and stamps it with
   // *name*.  This gives "new tab, or activate the existing one" for free.
@@ -332,7 +340,7 @@ const Lobby = (() => {
     try { w = window.open(url, name); } catch (e) { w = null; }
     if (w) { try { w.focus(); } catch (e) {} return; }
     // Popup blocked (rare for a user-gesture click) — navigate in place.
-    window.location.href = url;
+    _navigate(url);
   }
 
   // Focus an existing per-session tab WITHOUT reloading it; only navigate if we
@@ -345,7 +353,7 @@ const Lobby = (() => {
   function _focusOrOpen(url, name) {
     let w = null;
     try { w = window.open('', name); } catch (e) { w = null; }
-    if (!w) { window.location.href = url; return; }   // popup blocked
+    if (!w) { _navigate(url); return; }   // popup blocked
     // **The tab we were asked to focus can be this one.**  Browsing-context
     // lookup by name checks the *current* context first, so a tab still
     // carrying `orch2-sess-<sid>` gets itself back -- and then the code below
@@ -357,7 +365,7 @@ const Lobby = (() => {
     // the lobby, still named for that session; clicking it in Recents was a
     // no-op every time.  Navigating here is also the *right* answer -- "focus
     // the tab showing this session" when that tab is this one means show it.
-    if (w === window) { window.location.href = url; return; }
+    if (w === window) { _navigate(url); return; }
     let blank = false;
     try { blank = !w.location.href || w.location.href === 'about:blank'; }
     catch (e) { blank = false; }   // cross-origin read blocked -> assume live
@@ -473,10 +481,10 @@ const Lobby = (() => {
       tries++;
       try {
         const r = await fetch('/api/ready', { cache: 'no-store' });
-        if (r.ok) { location.reload(); return; }
+        if (r.ok) { _navigate(null); return; }
       } catch (e) { /* server still down / restarting */ }
       // Give up after ~60s and reload anyway so the user isn't stuck.
-      if (tries > 150) { location.reload(); return; }
+      if (tries > 150) { _navigate(null); return; }
       setTimeout(poll, 400);
     }
     // Small initial delay so the old process has a moment to exit.
@@ -540,6 +548,7 @@ const Lobby = (() => {
     // No session, no state: the app's own icon, and it stays -- a lobby tab
     // gets no status updates, so a coloured dot would be a stale one.
     if (typeof Favicon !== 'undefined') Favicon.setLanding(on);
+    if (typeof LeaveGuard !== 'undefined') LeaveGuard.setLanding(on);
   }
 
   // Called from app.js when an `attached` message arrives — the tab is now
@@ -663,7 +672,7 @@ const Lobby = (() => {
       box.innerHTML = '<span class="lobby-conn-text"></span>'
         + '<button type="button" class="lobby-conn-act"></button>';
       box.querySelector('.lobby-conn-act').addEventListener('click', (e) => {
-        if (e.currentTarget.dataset.act === 'reload') location.reload();
+        if (e.currentTarget.dataset.act === 'reload') _navigate(null);
         else App.retryNow();
       });
     }
@@ -1218,7 +1227,7 @@ const Lobby = (() => {
         'That session is already open in another orchestrator2 window' + since
         + '.\n\nTwo windows can’t drive one session at once. Go to the '
         + 'window that already has it?');
-      if (go) { window.location.href = url; return; }
+      if (go) { _navigate(url); return; }
     } else if (msg.port) {
       window.alert(
         'That session is already open in another orchestrator2 window' + since

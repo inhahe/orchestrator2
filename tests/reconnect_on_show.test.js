@@ -19,7 +19,7 @@ const { JSDOM } = require('jsdom');
 
 const ROOT = path.join(__dirname, '..');
 const STATIC = path.join(ROOT, 'static');
-const SCRIPTS = ['util.js', 'favicon.js', 'diff.js', 'status.js', 'panels.js',
+const SCRIPTS = ['util.js', 'favicon.js', 'leave_guard.js', 'diff.js', 'status.js', 'panels.js',
                  'commands.js', 'usage.js', 'vendor/markdown-it.min.js', 'chat.js',
                  'lobby.js', 'move.js', 'app.js'];
 
@@ -1405,6 +1405,47 @@ test('an older hub without busy_since still shows its own bg-wait label', (h) =>
   assert(stateText(h) === 'bg wait (2) (0:3:00)', stateText(h));
 });
 
+/* ---- closing the tab (static/leave_guard.js) --------------------------- */
+
+// Whether closing the page now would ask (leave_guard.test.js checks the
+// rule; these check that the page feeds it).
+function closeAsks(h) {
+  const e = new h.win.Event('beforeunload', { cancelable: true });
+  h.win.dispatchEvent(e);
+  return e.defaultPrevented;
+}
+
+test('with --confirm-close, closing a tab on a working session asks', (h) => {
+  attached(h);
+  statusOf(h, { busy_class: 'working', busy_label: 'working', confirm_close: true });
+  assert(closeAsks(h), 'it did not ask');
+  statusOf(h, { busy_class: 'idle', confirm_close: true });
+  assert(!closeAsks(h), 'it asked of a session resting idle');
+});
+
+test('and not once the tab has no session', (h) => {
+  attached(h);
+  statusOf(h, { busy_class: 'working', busy_label: 'working', confirm_close: true });
+  h.live.deliver({ type: 'session_closed', rid: 's1', message: 'closed' });
+  assert(!closeAsks(h), 'a lobby tab asked');
+});
+
+test('nor when the hub sends the tab somewhere itself', (h) => {
+  attached(h);
+  statusOf(h, { busy_class: 'working', busy_label: 'working', confirm_close: true });
+  try { h.live.deliver({ type: 'navigate', url: '/static/resume.html' }); } catch (e) { /* jsdom */ }
+  assert(!closeAsks(h), "the page's own navigation asked");
+});
+
+test('nor when the page opens something in its own tab itself', (h) => {
+  // The lobby opens in a tab of its own; with the popup blocked (jsdom has
+  // no window.open) it opens in this one, on purpose.
+  attached(h);
+  statusOf(h, { busy_class: 'working', busy_label: 'working', confirm_close: true });
+  try { h.win.document.getElementById('sessions-btn').click(); } catch (e) { /* jsdom */ }
+  assert(!closeAsks(h), 'the page’s own navigation asked');
+});
+
 /* ---- the tab's icon (static/favicon.js) --------------------------------- */
 
 // The colour of the tab icon's dot, or "plain" for the app's own icon.
@@ -1441,6 +1482,18 @@ test('the tab icon\'s dot is the colour of the state the status bar shows', (h) 
   assert(iconOf(h) === '#bc3fbc', 'waiting to loop: ' + iconOf(h));
   statusOf(h, { busy_class: 'idle' });
   assert(iconOf(h) === '#666666', 'idle: ' + iconOf(h));
+});
+
+test('the status bar writes each state in its own colour', (h) => {
+  attached(h);
+  const colour = () => h.win.document.getElementById('status-state').style.color;
+  for (const [cls, v] of [['working', '--indicator-working'], ['bg-wait', '--indicator-bg-wait'],
+                          ['compacting', '--indicator-compacting'], ['error', '--system-error']]) {
+    statusOf(h, { busy_class: cls, busy_label: cls });
+    assert(colour() === `var(${v})`, `${cls}: ${colour()}`);
+  }
+  statusOf(h, { busy_class: 'idle', busy_label: 'idle' });
+  assert(colour() === '', 'idle: ' + colour());
 });
 
 test('a turn with background tasks running is green, not purple', (h) => {

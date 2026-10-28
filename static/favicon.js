@@ -42,8 +42,7 @@ const Favicon = (() => {
     const s = status || {};
     const stateVar = Util.STATE_COLOUR_VARS[s.busy_class || 'idle'];
     if (stateVar) return stateVar;
-    if (s.bg_count > 0 || typeof s.wakeup_at === 'number') return '--indicator-bg-wait';
-    return '--indicator-idle';
+    return Util.restsIdle(s) ? '--indicator-idle' : '--indicator-bg-wait';
   }
 
   // Only plain colour syntax reaches the SVG.  The value comes from a theme

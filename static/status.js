@@ -147,6 +147,8 @@ const Status = (() => {
     // `typeof`, not `window.Favicon`: a top-level const is not a property of
     // window, so that check would be false in a real browser.
     if (typeof Favicon !== 'undefined') Favicon.update(status);
+    // And whether closing the tab asks first (--confirm-close).
+    if (typeof LeaveGuard !== 'undefined') LeaveGuard.update(status);
 
     // Indicator dot + state text.
     const cls = status.busy_class || 'idle';

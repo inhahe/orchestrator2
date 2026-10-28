@@ -527,6 +527,20 @@ def _session_keys_to_hand_over() -> dict[str, str]:
     return keys
 
 
+def _turn_on_confirm_close() -> None:
+    """A launch asked for --confirm-close: on for the hub, so for every
+    session it opens from now, and for every one it has open.  Never turned
+    off by a launch without it: one that leaves a flag out has not asked for
+    anything."""
+    global config
+    if config is not None and not config.confirm_close:
+        log.info("hub: --confirm-close turned on by a launch")
+        config = dataclasses.replace(config, confirm_close=True)
+    for rt in list(runtimes.values()):
+        if rt.config is not None and not rt.config.confirm_close:
+            _replace_runtime_config(rt, confirm_close=True)
+
+
 def _replace_runtime_config(rt: "SessionRuntime", **changes: Any) -> None:
     """Give a live session a changed Config.
 
@@ -4131,6 +4145,10 @@ async def _session_launch(body: dict[str, Any]) -> dict[str, Any]:
     resume_after_limit = body.get("resume_after_limit")
     if not isinstance(resume_after_limit, bool):
         resume_after_limit = None
+    # A preference about tabs, not this session: on for the hub, before the
+    # session is opened so that it has it too.
+    if body.get("confirm_close") is True:
+        _turn_on_confirm_close()
     # The launch's ANTHROPIC_API_KEY, for this session alone (see
     # HANDOVER_KEYS_ENV).
     api_key = body.get("api_key")
@@ -7334,6 +7352,7 @@ def _hub_launch_kwargs(cfg: Config, config_dir: str | None) -> dict[str, Any]:
         # default is not this session's to impose.
         "compact_at": cfg.compact_at if cfg.compact_at_given else None,
         "auto_compact": cfg.auto_compact if cfg.auto_compact_given else None,
+        "confirm_close": cfg.confirm_close,
     }
 
 
@@ -7440,6 +7459,7 @@ def _launch_into_hub(
     api_key: str | None = None,
     compact_at: int | None = None,
     auto_compact: bool | None = None,
+    confirm_close: bool = False,
 ) -> str | None:
     """Ask a running hub to open a session; return its ``rid``.
 
@@ -7471,6 +7491,8 @@ def _launch_into_hub(
     And ``resume_after_limit``, the launch's ``--resume-after-limit`` (True)
     or ``--no-resume-after-limit`` (False), or None for neither, which leaves
     the hub's; True also turns it on for a session the hub already has open.
+    And ``confirm_close``, which a launch can only turn on, for the whole hub
+    (_turn_on_confirm_close).
     """
     import urllib.request
 
@@ -7491,6 +7513,7 @@ def _launch_into_hub(
         "api_key": api_key,
         "compact_at": compact_at,
         "auto_compact": auto_compact,
+        "confirm_close": bool(confirm_close),
     }).encode("utf-8")
     try:
         req = urllib.request.Request(
