@@ -70,6 +70,7 @@
   --indicator-error: var(--red);
   --indicator-connecting: var(--yellow);
   --indicator-bg-wait: var(--purple);  /* TUI: bg-wait-label = magenta */
+  --indicator-compacting: var(--yellow);
   --modal-backdrop: rgba(0,0,0,0.6);
   --scrollbar-thumb: var(--border);
   --scrollbar-hover: var(--border-light);

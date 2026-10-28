@@ -334,8 +334,7 @@ test('a known zero viewer count is shown, not mistaken for unknown', () => {
 });
 
 // The dot is the tab's dot: the state the session's status bar shows, in its
-// colour.  Reported 2026-10-27: "the status circle in sessions view shows grey
-// when it's in bg-wait mode instead of purple".
+// colour -- bg-wait purple, not idle's grey.
 function dotOf(card) {
   const dot = card.querySelector('.lobby-dot');
   return { colour: dot.style.background, title: dot.getAttribute('title'), cls: dot.className };
@@ -343,7 +342,7 @@ function dotOf(card) {
 
 test('a session waiting on background tasks has the purple dot', () => {
   const p = makePage().render([Object.assign({}, OURS, {
-    state: 'bg-wait', state_label: 'bg wait (2) (0:3:00)', bg_count: 2 })]);
+    busy_class: 'bg-wait', busy_label: 'bg wait (2) (0:3:00)', bg_count: 2 })]);
   const d = dotOf(p.card(0));
   assert(d.colour === 'var(--indicator-bg-wait)', d.colour);
   assert(d.title === 'bg wait (2) (0:3:00)', d.title);
@@ -352,21 +351,32 @@ test('a session waiting on background tasks has the purple dot', () => {
 
 test('every state is in its own colour, as the tab\'s dot is', () => {
   for (const [m, colour] of [
-    [{ busy: true, state: 'working' }, 'var(--indicator-working)'],
-    [{ busy: true, state: 'compacting' }, 'var(--indicator-compacting)'],
-    [{ state: 'connecting' }, 'var(--indicator-connecting)'],
-    [{ state: 'error', state_label: 'not authed' }, 'var(--system-error)'],
-    [{ state: 'idle', wakeup_at: Date.now() / 1000 + 600 }, 'var(--indicator-bg-wait)'],
-    [{ state: 'idle', limit_resume_at: Date.now() / 1000 + 600 }, 'var(--indicator-bg-wait)'],
-    [{ state: 'idle' }, 'var(--indicator-idle)']]) {
+    [{ busy: true, busy_class: 'working' }, 'var(--indicator-working)'],
+    [{ busy: true, busy_class: 'working', bg_count: 1 }, 'var(--indicator-working)'],
+    [{ busy: true, busy_class: 'compacting' }, 'var(--indicator-compacting)'],
+    [{ busy_class: 'connecting' }, 'var(--indicator-connecting)'],
+    [{ busy_class: 'error', busy_label: 'not authed' }, 'var(--system-error)'],
+    [{ busy_class: 'idle', wakeup_at: Date.now() / 1000 + 600 }, 'var(--indicator-bg-wait)'],
+    [{ busy_class: 'idle', limit_resume_at: Date.now() / 1000 + 600 }, 'var(--indicator-bg-wait)'],
+    [{ busy_class: 'idle' }, 'var(--indicator-idle)']]) {
     const d = dotOf(makePage().render([Object.assign({}, OURS, m)]).card(0));
     assert(d.colour === colour, `${JSON.stringify(m)}: ${d.colour}`);
   }
 });
 
+test('the dot is named for the state it shows', () => {
+  for (const [m, cls] of [[{ busy: true, busy_class: 'working' }, 'busy'],
+                          [{ busy_class: 'bg-wait', bg_count: 1 }, 'bg-wait'],
+                          [{ busy_class: 'idle', wakeup_at: Date.now() / 1000 + 60 }, 'waiting'],
+                          [{ busy_class: 'idle' }, 'idle']]) {
+    const d = dotOf(makePage().render([Object.assign({}, OURS, m)]).card(0));
+    assert(d.cls === 'lobby-dot ' + cls, `${JSON.stringify(m)}: ${d.cls}`);
+  }
+});
+
 test('so is another hub\'s session, when that hub says its state', () => {
   const known = Object.assign({}, FOREIGN, { busy: false, viewers: 1, live_known: true,
-                                             state: 'bg-wait', bg_count: 1 });
+                                             busy_class: 'bg-wait', bg_count: 1 });
   const d = dotOf(makePage().render([known]).card(0));
   assert(d.colour === 'var(--indicator-bg-wait)', d.colour);
 });
@@ -374,6 +384,49 @@ test('so is another hub\'s session, when that hub says its state', () => {
 test('the unknown dot stays a ring, in no state\'s colour', () => {
   const d = dotOf(makePage().render([FOREIGN]).card(0));
   assert(d.colour === '', d.colour);
+});
+
+test('a state this page does not know is told by busy alone', () => {
+  // A newer hub's, or a name every object has.
+  for (const cls of ['paused', 'constructor', '__proto__']) {
+    const busy = dotOf(makePage().render([Object.assign({}, OURS,
+      { busy: true, busy_class: cls })]).card(0));
+    assert(busy.colour === 'var(--indicator-working)', `${cls}, busy: ${busy.colour}`);
+    const idle = dotOf(makePage().render([Object.assign({}, OURS,
+      { busy: false, busy_class: cls })]).card(0));
+    assert(idle.colour === 'var(--indicator-idle)', `${cls}, idle: ${idle.colour}`);
+  }
+});
+
+test('closing a card says what it cuts off, whatever its dot shows', () => {
+  // Compacting is a turn too; and its tasks and loop go with it.
+  const p = makePage().render([Object.assign({}, OURS, {
+    busy: true, busy_class: 'compacting', bg_count: 2, wakeup_at: Date.now() / 1000 + 60 })]);
+  const asked = [];
+  p.win.confirm = (msg) => { asked.push(msg); return false; };
+  p.card(0).querySelector('.lobby-card-close').click();
+  assert(asked.length === 1, 'not asked');
+  assert(asked[0].includes('in-flight turn will be lost'), asked[0]);
+  assert(asked[0].includes('2 background tasks are stopped'), asked[0]);
+  assert(asked[0].includes('scheduled loop ends'), asked[0]);
+});
+
+test('and a resume after a usage limit', () => {
+  const p = makePage().render([Object.assign({}, OURS, {
+    busy_class: 'idle', limit_resume_at: Date.now() / 1000 + 600 })]);
+  const asked = [];
+  p.win.confirm = (msg) => { asked.push(msg); return false; };
+  p.card(0).querySelector('.lobby-card-close').click();
+  assert(asked.length === 1 && asked[0].includes('will not resume when the usage limit resets'),
+         asked[0]);
+});
+
+test('an idle one, nothing of the kind', () => {
+  const p = makePage().render([OURS]);
+  const asked = [];
+  p.win.confirm = (msg) => { asked.push(msg); return false; };
+  p.card(0).querySelector('.lobby-card-close').click();
+  assert(asked.length === 1 && !/in-flight|background|loop|resume/.test(asked[0]), asked[0]);
 });
 
 test('our own cards still use the two-state dot', () => {

@@ -392,13 +392,23 @@ const Lobby = (() => {
   function _closeSession(card, rid) {
     const titleEl = card.querySelector('.lobby-card-title');
     const name = titleEl ? titleEl.textContent.trim() : rid;
-    const busy = !!card.querySelector('.lobby-dot.busy');
     let msg = `Close "${name}"?\n\n`
       + 'This stops the session\u2019s Claude process. Its history is kept on '
       + 'disk \u2014 you can reopen it later from Recent.';
-    if (busy) {
+    if (card.dataset.busy) {
       msg += '\n\nThis session is working right now; the in-flight turn will '
            + 'be lost.';
+    }
+    const bg = Number(card.dataset.bg || 0);
+    if (bg > 0) {
+      msg += `\n\nIts ${bg === 1 ? 'background task is' : `${bg} background tasks are`} `
+           + 'stopped with it.';
+    }
+    if (card.dataset.loop) {
+      msg += '\n\nIts scheduled loop ends.';
+    }
+    if (card.dataset.resume) {
+      msg += '\n\nIt will not resume when the usage limit resets.';
     }
     if (rid === _currentRid) {
       msg += '\n\nThis is the session this tab is viewing, so the tab will '
@@ -937,6 +947,12 @@ const Lobby = (() => {
     if (m.session_id) card.setAttribute('data-sid', m.session_id);
     if (m.cwd) card.setAttribute('data-cwd', m.cwd);
     if (m.account) card.setAttribute('data-account', m.account);
+    // What closing it would cut off (_closeSession), whatever the dot shows: a
+    // turn compacting is still a turn.
+    if (m.busy === true) card.setAttribute('data-busy', '1');
+    if (m.bg_count > 0) card.setAttribute('data-bg', String(m.bg_count));
+    if (typeof m.wakeup_at === 'number') card.setAttribute('data-loop', '1');
+    if (typeof m.limit_resume_at === 'number') card.setAttribute('data-resume', '1');
 
     const title = m.title || (m.session_id ? m.session_id.substring(0, 8)
                                            : '(new session)');
@@ -947,19 +963,22 @@ const Lobby = (() => {
     const known = m.busy === true || m.busy === false;
     // Known, it is the tab's dot: the state the session's status bar shows, in
     // its colour (Util.stateColourVar) -- bg-wait purple, compacting yellow.
-    // A hub too old to say its state says only busy or not.
-    const state = m.state || (m.busy === true ? 'working' : 'idle');
-    const colourVar = known ? Util.stateColourVar({
-      busy_class: state, bg_count: m.bg_count, wakeup_at: m.wakeup_at,
-      limit_resume_at: m.limit_resume_at }) : null;
+    // A hub too old to say its state, or one saying a state this page does
+    // not know, is told by busy alone.
+    const s = Util.knowsState(m.busy_class) ? m
+      : Object.assign({}, m, { busy_class: m.busy === true ? 'working' : 'idle' });
+    const colourVar = known ? Util.stateColourVar(s) : null;
+    // Named for the state: "busy" working, "idle" resting idle, "waiting" idle
+    // with work to come, else the state itself (bg-wait, compacting, error...).
     const dotCls = !known ? 'unknown'
-      : state === 'working' ? 'busy'
-      : colourVar === '--indicator-idle' ? 'idle' : 'waiting';
+      : s.busy_class === 'working' ? 'busy'
+      : s.busy_class !== 'idle' ? s.busy_class
+      : Util.restsIdle(s) ? 'idle' : 'waiting';
     const dotStyle = colourVar ? ` style="background: var(${colourVar})"` : '';
     // The two ways of not knowing are worth telling apart when you are trying
     // to work out why: a hub that did not answer is a hub you can go look at,
     // while a bare `claude --resume` in a terminal has no API to answer with.
-    const dotTitle = known ? (m.state_label || (m.busy === true ? 'working' : 'idle'))
+    const dotTitle = known ? (m.busy_label || (m.busy === true ? 'working' : 'idle'))
       : (m.port
            ? `Owned by the hub on port ${m.port}, which didn't answer `
              + '— whether it is working right now is unknown'

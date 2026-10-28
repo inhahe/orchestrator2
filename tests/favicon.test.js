@@ -129,6 +129,12 @@ test('waiting to loop is purple, the loop field\'s colour', () => {
   is({ busy_class: 'idle', wakeup_at: LOOP }, PURPLE, 'waiting to loop');
 });
 
+test('a state the page does not know is taken for idle', () => {
+  is({ busy_class: 'paused' }, GREY, 'an unknown state');
+  is({ busy_class: 'constructor' }, GREY, 'a name every object has');
+  is({ busy_class: 'paused', bg_count: 1 }, PURPLE, 'an unknown state, tasks running');
+});
+
 test('so is waiting to resume after a usage limit: work to come', () => {
   is({ busy_class: 'idle', limit_resume_at: LOOP }, PURPLE, 'waiting to resume');
 });

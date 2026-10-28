@@ -613,7 +613,7 @@ _picker_mode: bool = False
 # ``_ws_runtime`` maps a socket to the runtime it's currently attached to.
 # ``lobby_clients`` holds tabs sitting at the lobby, not attached to any
 # session.
-from session_runtime import SessionRuntime  # noqa: E402
+from session_runtime import LIVE_STATE_KEYS, SessionRuntime  # noqa: E402
 import proc_guard  # noqa: E402
 import ws_channel  # noqa: E402
 
@@ -988,11 +988,7 @@ def _foreign_running_entry(sess: dict[str, Any], holder: Any,
         # None means "we could not ask", NOT "no". See the docstring.
         "busy": live.get("busy") if live else None,
         # Its state as its own hub shows it, when that hub is one that says.
-        "state": live.get("state"),
-        "state_label": live.get("state_label"),
-        "bg_count": live.get("bg_count"),
-        "wakeup_at": live.get("wakeup_at"),
-        "limit_resume_at": live.get("limit_resume_at"),
+        **{k: live.get(k) for k in LIVE_STATE_KEYS},
         "viewers": live.get("viewers") if live else None,
         "created_at": live.get("created_at"),
         "last_activity": live.get("last_activity") or sess.get("mtime", 0),

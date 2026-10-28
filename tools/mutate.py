@@ -3925,21 +3925,35 @@ FAVICON_UTIL_MUTATIONS += RESTS_IDLE_MUTATIONS
 # the session list (favicon-util; lobbydot).
 STATE_COLOUR_VAR_MUTATIONS = [
     ("the status bar's state is ignored",
-     "    if (stateVar) return stateVar;\n",
+     "    if (cls !== 'idle' && knowsState(cls)) return STATE_COLOUR_VARS[cls];\n",
      ""),
 
     ("purple takes precedence over green",
-     "    if (stateVar) return stateVar;\n"
-     "    return restsIdle(s) ? '--indicator-idle' : '--indicator-bg-wait';\n",
-     "    if (!restsIdle(s)) return '--indicator-bg-wait';\n"
-     "    if (stateVar) return stateVar;\n"
+     "    if (cls !== 'idle' && knowsState(cls)) return STATE_COLOUR_VARS[cls];\n"
+     "    return restsIdle({ ...s, busy_class: 'idle' }) ? '--indicator-idle' : '--indicator-bg-wait';\n",
+     "    if (!restsIdle({ ...s, busy_class: 'idle' })) return '--indicator-bg-wait';\n"
+     "    if (cls !== 'idle' && knowsState(cls)) return STATE_COLOUR_VARS[cls];\n"
      "    return '--indicator-idle';\n"),
 
     ("idle is not grey",
-     "    return restsIdle(s) ? '--indicator-idle' : '--indicator-bg-wait';\n",
-     "    return restsIdle(s) ? '--indicator-working' : '--indicator-bg-wait';\n"),
+     "? '--indicator-idle' : '--indicator-bg-wait';\n",
+     "? '--indicator-working' : '--indicator-bg-wait';\n"),
+
+    ("a name every object has is a state it knows",
+     "    return cls === 'idle' || Object.prototype.hasOwnProperty.call(STATE_COLOUR_VARS, cls);\n",
+     "    return cls === 'idle' || cls in STATE_COLOUR_VARS;\n"),
 ]
-FAVICON_UTIL_MUTATIONS += STATE_COLOUR_VAR_MUTATIONS
+FAVICON_UTIL_MUTATIONS += STATE_COLOUR_VAR_MUTATIONS + [
+    # The tab's icon only: the session list hands stateColourVar no state it
+    # does not know, having told it by busy first (lobby.js).
+    ("a state it does not know is drawn in no colour",
+     "    if (cls !== 'idle' && knowsState(cls)) return STATE_COLOUR_VARS[cls];\n",
+     "    if (cls !== 'idle') return STATE_COLOUR_VARS[cls];\n"),
+
+    ("a state it does not know is taken for work to come",
+     "    return restsIdle({ ...s, busy_class: 'idle' }) ?",
+     "    return restsIdle(s) ?"),
+]
 
 # The session list's dot is the tab's.  tests/lobby_running_card.test.js.
 LOBBYDOT_MUTATIONS = [
@@ -3948,48 +3962,75 @@ LOBBYDOT_MUTATIONS = [
      "    const dotStyle = '';\n"),
 
     ("a card's state is not read, only whether it is busy",
-     "    const state = m.state || (m.busy === true ? 'working' : 'idle');\n",
-     "    const state = m.busy === true ? 'working' : 'idle';\n"),
+     "    const s = Util.knowsState(m.busy_class) ? m\n",
+     "    const s = false ? m\n"),
 
-    ("a card's background tasks and loop are not read",
-     "      busy_class: state, bg_count: m.bg_count, wakeup_at: m.wakeup_at,\n",
-     "      busy_class: state,\n"),
+    ("a state this page does not know is drawn as if known",
+     "    const s = Util.knowsState(m.busy_class) ? m\n",
+     "    const s = m.busy_class ? m\n"),
 
-    ("nor its resume after a usage limit",
-     "      limit_resume_at: m.limit_resume_at }) : null;\n",
-     "      }) : null;\n"),
+    ("a card whose state is not known reads as idle even working",
+     "      : Object.assign({}, m, { busy_class: m.busy === true ? 'working' : 'idle' });\n",
+     "      : Object.assign({}, m, { busy_class: 'idle' });\n"),
 
     ("the dot's tooltip says only working or idle",
-     "    const dotTitle = known ? (m.state_label || (m.busy === true ? 'working' : 'idle'))\n",
+     "    const dotTitle = known ? (m.busy_label || (m.busy === true ? 'working' : 'idle'))\n",
      "    const dotTitle = known ? (m.busy === true ? 'working' : 'idle')\n"),
 
-    ("a dot in a colour is called idle",
-     "      : colourVar === '--indicator-idle' ? 'idle' : 'waiting';\n",
+    ("a dot in a state is named as if idle",
+     "      : s.busy_class !== 'idle' ? s.busy_class\n",
+     ""),
+
+    ("a dot with work to come is called idle",
+     "      : Util.restsIdle(s) ? 'idle' : 'waiting';\n",
      "      : 'idle';\n"),
 
     ("the unknown ring is filled with a state's colour",
-     "    const colourVar = known ? Util.stateColourVar({\n",
-     "    const colourVar = true ? Util.stateColourVar({\n"),
+     "    const colourVar = known ? Util.stateColourVar(s) : null;\n",
+     "    const colourVar = Util.stateColourVar(s);\n"),
+
+    ("closing a compacting card does not say its turn is lost",
+     "    if (m.busy === true) card.setAttribute('data-busy', '1');\n",
+     "    if (m.busy_class === 'working') card.setAttribute('data-busy', '1');\n"),
+
+    ("nor that its background tasks stop",
+     "    if (m.bg_count > 0) card.setAttribute('data-bg', String(m.bg_count));\n",
+     ""),
+
+    ("nor that its loop ends",
+     "    if (typeof m.wakeup_at === 'number') card.setAttribute('data-loop', '1');\n",
+     ""),
+
+    ("nor that it will not resume after the usage limit",
+     "    if (typeof m.limit_resume_at === 'number') card.setAttribute('data-resume', '1');\n",
+     ""),
 ]
 
 LOBBYDOT_RUNTIME_MUTATIONS = [
     ("a card does not say its state",
-     "            \"state\": cls,\n",
+     "            live[\"busy_label\"], live[\"busy_class\"] = busy_state(st)[:2]\n",
      ""),
 
     ("nor its background tasks",
-     "            \"bg_count\": len(getattr(st, \"background_tasks\", None) or {}),\n",
+     "            live[\"bg_count\"] = len(st.background_tasks)\n",
      ""),
 
-    ("nor what is to come",
-     "            \"wakeup_at\": getattr(st, \"wakeup_at\", None),\n"
-     "            \"limit_resume_at\": getattr(st, \"limit_resume_at\", None),\n",
+    ("nor its loop's wakeup",
+     "            live[\"wakeup_at\"] = st.wakeup_at\n",
      ""),
+
+    ("nor its resume after a usage limit",
+     "            live[\"limit_resume_at\"] = st.limit_resume_at\n",
+     ""),
+
+    ("another hub's card is not asked for one of them",
+     "LIVE_STATE_KEYS = (\"busy_class\", \"busy_label\", \"bg_count\", \"wakeup_at\", \"limit_resume_at\")\n",
+     "LIVE_STATE_KEYS = (\"busy_class\", \"busy_label\", \"bg_count\", \"wakeup_at\")\n"),
 ]
 
 LOBBYDOT_SERVER_MUTATIONS = [
     ("another hub's card drops the state that hub said",
-     "        \"state\": live.get(\"state\"),\n",
+     "        **{k: live.get(k) for k in LIVE_STATE_KEYS},\n",
      ""),
 ]
 

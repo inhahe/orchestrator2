@@ -3856,15 +3856,20 @@ started under a different `CLAUDE_CONFIG_DIR` still reopens correctly.
 
 A running card's dot is the tab's icon's dot: the state its status bar shows,
 in that state's colour (`Util.stateColourVar`, which `favicon.js` draws in
-too), so a session in bg-wait is purple, not the grey of idle. The card says
-the state (`SessionRuntime.meta`'s `state` and `state_label`, from
-`state.busy_state`, the part of `state_to_status_dict` that chooses it) and
-what the dot reads besides: `bg_count`, `wakeup_at`, `limit_resume_at`. A
-session another hub runs carries what that hub says (`_foreign_running_entry`);
-a hub too old to say its state says only whether it is busy, and gets green
-or grey. Pinned by `tests/lobby_running_card.test.js` and
-`tests/test_lobby_state.py`; mutation targets `lobbydot`, `lobbydot-util`,
-`lobbydot-runtime` and `lobbydot-server`.
+too), so a session in bg-wait is purple, not the grey of idle. The card
+carries the status snapshot's own fields, under its own names
+(`session_runtime.LIVE_STATE_KEYS`): the state, `busy_class` and `busy_label`
+(from `state.busy_state`, the part of `state_to_status_dict` that chooses
+them), and what the dot reads besides, `bg_count`, `wakeup_at` and
+`limit_resume_at`. A session another hub runs carries the same keys as that
+hub said them (`_foreign_running_entry`). A hub too old to say its state, or
+one saying a state this page does not know (`Util.knowsState`, which ignores
+names every object inherits), is told by `busy` alone: green or grey. The
+same fields tell the close button's confirmation what closing cuts off: a
+turn in flight (`busy`, so a compacting turn counts), background tasks, a
+loop, a resume after a usage limit. Pinned by
+`tests/lobby_running_card.test.js` and `tests/test_lobby_state.py`; mutation
+targets `lobbydot`, `lobbydot-util`, `lobbydot-runtime` and `lobbydot-server`.
 
 **Wire protocol** — client → server: `list`, `lobby_watch {on}`, `detach`,
 `attach {rid}`, `open {session_id, cwd, account}`, `new {cwd}`, `close {rid}`,

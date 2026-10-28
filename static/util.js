@@ -60,18 +60,27 @@ const Util = (() => {
       && typeof s.limit_resume_at !== 'number';
   }
 
+  /** Whether *cls* is a state (``busy_class``) this page knows: idle, or one
+   *  of STATE_COLOUR_VARS' own -- not a name it merely inherits, such as
+   *  "constructor", which a newer or broken hub's card could carry. */
+  function knowsState(cls) {
+    return cls === 'idle' || Object.prototype.hasOwnProperty.call(STATE_COLOUR_VARS, cls);
+  }
+
   /**
-   * The CSS variable a session's dot is drawn in, for a status snapshot (or
-   * a session-list card, which carries the same fields): its state's colour,
-   * else grey resting idle and purple idle with work to come.  The tab's icon
-   * (favicon.js) and the session list's dot (lobby.js) are drawn in it.
+   * The CSS variable a session's dot is drawn in, for a status snapshot or a
+   * session-list card (which carries the same fields, SessionRuntime.meta):
+   * its state's colour, else grey resting idle and purple idle with work to
+   * come.  The tab's icon (favicon.js) and the session list's dot (lobby.js)
+   * are drawn in it.  A state it does not know is taken for idle: the caller
+   * that may meet one says what it knows instead (lobby.js).
    */
   function stateColourVar(status) {
     const s = status || {};
-    const stateVar = STATE_COLOUR_VARS[s.busy_class || 'idle'];
-    if (stateVar) return stateVar;
-    return restsIdle(s) ? '--indicator-idle' : '--indicator-bg-wait';
+    const cls = s.busy_class || 'idle';
+    if (cls !== 'idle' && knowsState(cls)) return STATE_COLOUR_VARS[cls];
+    return restsIdle({ ...s, busy_class: 'idle' }) ? '--indicator-idle' : '--indicator-bg-wait';
   }
 
-  return { formatDuration, STATE_COLOUR_VARS, restsIdle, stateColourVar };
+  return { formatDuration, STATE_COLOUR_VARS, restsIdle, stateColourVar, knowsState };
 })();

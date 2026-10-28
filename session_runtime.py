@@ -23,6 +23,11 @@ from typing import Any
 import ws_channel
 from state import busy_state
 
+#: What a session-list card says of its session's state, under the status
+#: snapshot's names: what the dot is drawn from.  A card for a session another
+#: hub runs carries that hub's (server._foreign_running_entry).
+LIVE_STATE_KEYS = ("busy_class", "busy_label", "bg_count", "wakeup_at", "limit_resume_at")
+
 # --- A tab that loses its socket resumes; it does not reload ----------------
 #
 # Reported 2026-09-27: "often, a tab randomly changes its name from the session
@@ -201,20 +206,22 @@ class SessionRuntime:
         """A small dict describing this session for the lobby list."""
         st = self.state
         cfg = self.config
-        # The state the status bar shows, and what else the tab's dot reads
-        # (static/util.js stateColourVar), so the list's dot is that dot.
-        label, cls = busy_state(st)[:2] if st is not None else ("idle", "idle")
+        # The state the status bar shows, and what else the tab's dot reads,
+        # under a status snapshot's own names (LIVE_STATE_KEYS): the list's
+        # dot is drawn as the tab's is (static/util.js stateColourVar).
+        live = dict.fromkeys(LIVE_STATE_KEYS)
+        if st is not None:
+            live["busy_label"], live["busy_class"] = busy_state(st)[:2]
+            live["bg_count"] = len(st.background_tasks)
+            live["wakeup_at"] = st.wakeup_at
+            live["limit_resume_at"] = st.limit_resume_at
         return {
             "rid": self.rid,
             "session_id": getattr(st, "session_id", None),
             "title": getattr(st, "session_title", None),
             "cwd": getattr(cfg, "cwd", None),
             "busy": bool(getattr(st, "busy", False)),
-            "state": cls,
-            "state_label": label,
-            "bg_count": len(getattr(st, "background_tasks", None) or {}),
-            "wakeup_at": getattr(st, "wakeup_at", None),
-            "limit_resume_at": getattr(st, "limit_resume_at", None),
+            **live,
             "viewers": len(self.clients),
             "created_at": self.created_at,
             "last_activity": self.last_activity,

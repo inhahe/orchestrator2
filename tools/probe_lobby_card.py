@@ -76,8 +76,8 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 </div></div>
 <script>
   window.App = { send: function(){}, isConnected: function(){ return true; } };
-  window.Util = { formatDuration: function(s){ return s + 's'; } };
 </script>
+<script>%(util)s</script>
 <script>%(lobby)s</script>
 <script>
   Lobby.init();
@@ -129,6 +129,8 @@ def main() -> int:
 
     html = PAGE % {
         "css": css,
+        # The real Util: the card's dot is drawn in its state colours.
+        "util": (ROOT / "static" / "util.js").read_text(encoding="utf-8"),
         "lobby": lobby,
         "cards": json.dumps(CARDS),
     }
