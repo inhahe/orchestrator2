@@ -21,6 +21,7 @@ import uuid
 from typing import Any
 
 import ws_channel
+from state import busy_state
 
 # --- A tab that loses its socket resumes; it does not reload ----------------
 #
@@ -200,12 +201,20 @@ class SessionRuntime:
         """A small dict describing this session for the lobby list."""
         st = self.state
         cfg = self.config
+        # The state the status bar shows, and what else the tab's dot reads
+        # (static/util.js stateColourVar), so the list's dot is that dot.
+        label, cls = busy_state(st)[:2] if st is not None else ("idle", "idle")
         return {
             "rid": self.rid,
             "session_id": getattr(st, "session_id", None),
             "title": getattr(st, "session_title", None),
             "cwd": getattr(cfg, "cwd", None),
             "busy": bool(getattr(st, "busy", False)),
+            "state": cls,
+            "state_label": label,
+            "bg_count": len(getattr(st, "background_tasks", None) or {}),
+            "wakeup_at": getattr(st, "wakeup_at", None),
+            "limit_resume_at": getattr(st, "limit_resume_at", None),
             "viewers": len(self.clients),
             "created_at": self.created_at,
             "last_activity": self.last_activity,

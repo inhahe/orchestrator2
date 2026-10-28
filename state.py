@@ -912,14 +912,14 @@ def init_state_from_config(config: Config) -> State:
 # Status serialisation (for the frontend status bar)
 # ---------------------------------------------------------------------------
 
-def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
-    """Produce the JSON-serialisable blob that drives the frontend status bar.
-
-    Mirrors the logic of _panel_session() in the original orchestrator.
-    """
-    now_ts = int(time.time())
-
-    # --- Busy label + class ---
+def busy_state(state: "State", now_ts: int | None = None
+               ) -> tuple[str, str, str | None, float | None]:
+    """The state the status bar shows for *state*, and the session list's dot:
+    (label, class -- a key of the page's state colours, or "idle" -- the label
+    without its clock, and when the timed state began, by time.monotonic(),
+    or None).  *now_ts* is the time, in whole seconds, it is read at."""
+    if now_ts is None:
+        now_ts = int(time.time())
     # For the timed states, also *when* the state began (``busy_since``, epoch
     # seconds) and the label without its clock (``busy_prefix``), so the status
     # bar can compute the elapsed time itself.  Reported 2026-09-26: "once i
@@ -1006,6 +1006,18 @@ def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
         # The minute between a limit's reset and the resume that follows it.
         busy_label = "idle" + resumes
         busy_class = "idle"
+    return busy_label, busy_class, busy_prefix, since_mono
+
+
+def state_to_status_dict(state: State, config: Config) -> dict[str, Any]:
+    """Produce the JSON-serialisable blob that drives the frontend status bar.
+
+    Mirrors the logic of _panel_session() in the original orchestrator.
+    """
+    now_ts = int(time.time())
+
+    # --- Busy label + class ---
+    busy_label, busy_class, busy_prefix, since_mono = busy_state(state, now_ts)
     busy_since = (round(time.time() - (time.monotonic() - since_mono))
                   if since_mono is not None else None)
 

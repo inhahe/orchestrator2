@@ -60,5 +60,18 @@ const Util = (() => {
       && typeof s.limit_resume_at !== 'number';
   }
 
-  return { formatDuration, STATE_COLOUR_VARS, restsIdle };
+  /**
+   * The CSS variable a session's dot is drawn in, for a status snapshot (or
+   * a session-list card, which carries the same fields): its state's colour,
+   * else grey resting idle and purple idle with work to come.  The tab's icon
+   * (favicon.js) and the session list's dot (lobby.js) are drawn in it.
+   */
+  function stateColourVar(status) {
+    const s = status || {};
+    const stateVar = STATE_COLOUR_VARS[s.busy_class || 'idle'];
+    if (stateVar) return stateVar;
+    return restsIdle(s) ? '--indicator-idle' : '--indicator-bg-wait';
+  }
+
+  return { formatDuration, STATE_COLOUR_VARS, restsIdle, stateColourVar };
 })();

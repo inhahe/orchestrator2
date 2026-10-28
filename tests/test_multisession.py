@@ -74,10 +74,10 @@ class FakeBridge:
 
 def make_runtime(rid=None, *, cwd="C:/proj", session_id="sid-1",
                  title=None, busy=False) -> SessionRuntime:
-    state = SimpleNamespace(
-        session_id=session_id, session_title=title, busy=busy,
-        queued_prompts=[],
-    )
+    # A real State: the card reads the state the status bar shows from it.
+    from state import State
+    state = State()
+    state.session_id, state.session_title, state.busy = session_id, title, busy
     cfg = SimpleNamespace(cwd=cwd, session_idle_timeout=300)
     rt = SessionRuntime(config=cfg, state=state, rid=rid)
     rt.bridge = FakeBridge()

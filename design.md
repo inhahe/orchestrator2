@@ -3850,9 +3850,21 @@ resume.
 ## 8. The lobby
 
 The `☰ Sessions` overlay browses every session on the hub: those running live
-(cwd, viewer count, busy dot) and recent on-disk ones, scanned across **all**
+(cwd, viewer count, state dot) and recent on-disk ones, scanned across **all**
 Claude accounts on the machine and tagged with their account so a session
 started under a different `CLAUDE_CONFIG_DIR` still reopens correctly.
+
+A running card's dot is the tab's icon's dot: the state its status bar shows,
+in that state's colour (`Util.stateColourVar`, which `favicon.js` draws in
+too), so a session in bg-wait is purple, not the grey of idle. The card says
+the state (`SessionRuntime.meta`'s `state` and `state_label`, from
+`state.busy_state`, the part of `state_to_status_dict` that chooses it) and
+what the dot reads besides: `bg_count`, `wakeup_at`, `limit_resume_at`. A
+session another hub runs carries what that hub says (`_foreign_running_entry`);
+a hub too old to say its state says only whether it is busy, and gets green
+or grey. Pinned by `tests/lobby_running_card.test.js` and
+`tests/test_lobby_state.py`; mutation targets `lobbydot`, `lobbydot-util`,
+`lobbydot-runtime` and `lobbydot-server`.
 
 **Wire protocol** — client → server: `list`, `lobby_watch {on}`, `detach`,
 `attach {rid}`, `open {session_id, cwd, account}`, `new {cwd}`, `close {rid}`,

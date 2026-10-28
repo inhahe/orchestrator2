@@ -12,6 +12,8 @@ const fs = require('fs');
 const path = require('path');
 const { JSDOM } = require('jsdom');
 
+const UTIL_JS = fs.readFileSync(
+  path.join(__dirname, '..', 'static', 'util.js'), 'utf8');
 const LOBBY_JS = fs.readFileSync(
   path.join(__dirname, '..', 'static', 'lobby.js'), 'utf8');
 
@@ -50,7 +52,10 @@ function page(recent) {
                           runScripts: 'outside-only', pretendToBeVisual: false });
   const win = dom.window;
   win.App = { send: () => {}, isConnected: () => true };
-  win.Util = { formatDuration: (s) => `${s}s` };
+  // The real Util -- its state colours draw the dot -- with a duration
+  // short enough to read in a test.
+  win.eval('window.__Util = (function () {' + UTIL_JS + ';return Util; })();');
+  win.Util = Object.assign({}, win.__Util, { formatDuration: (s) => `${s}s` });
   const opened = [];
   win.open = (_url, name) => {
     const tab = { name, location: { href: 'about:blank' }, focus() {} };

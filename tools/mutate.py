@@ -3826,20 +3826,9 @@ CLIQUEUE_CHAT_MUTATIONS = [
 
 # The tab's icon shows the session's state.  tests/favicon.test.js.
 FAVICON_MUTATIONS = [
-    ("the status bar's state is ignored",
-     "    if (stateVar) return stateVar;\n",
-     ""),
-
-    ("purple takes precedence over green",
-     "    if (stateVar) return stateVar;\n"
-     "    return Util.restsIdle(s) ? '--indicator-idle' : '--indicator-bg-wait';\n",
-     "    if (!Util.restsIdle(s)) return '--indicator-bg-wait';\n"
-     "    if (stateVar) return stateVar;\n"
-     "    return '--indicator-idle';\n"),
-
-    ("idle is not grey",
-     "    return Util.restsIdle(s) ? '--indicator-idle' : '--indicator-bg-wait';\n",
-     "    return Util.restsIdle(s) ? '--indicator-working' : '--indicator-bg-wait';\n"),
+    ("the dot is not the state's",
+     "    const colour = _resolve(Util.stateColourVar(status));\n",
+     "    const colour = _resolve('--indicator-idle');\n"),
 
     ("compacting has no colour when the theme gives none",
      "    '--indicator-compacting': '#e5e510',\n",
@@ -3931,6 +3920,78 @@ RESTS_IDLE_MUTATIONS = [
      "      ;\n"),
 ]
 FAVICON_UTIL_MUTATIONS += RESTS_IDLE_MUTATIONS
+
+# Util.stateColourVar: the colour of a session's dot, in the tab's icon and in
+# the session list (favicon-util; lobbydot).
+STATE_COLOUR_VAR_MUTATIONS = [
+    ("the status bar's state is ignored",
+     "    if (stateVar) return stateVar;\n",
+     ""),
+
+    ("purple takes precedence over green",
+     "    if (stateVar) return stateVar;\n"
+     "    return restsIdle(s) ? '--indicator-idle' : '--indicator-bg-wait';\n",
+     "    if (!restsIdle(s)) return '--indicator-bg-wait';\n"
+     "    if (stateVar) return stateVar;\n"
+     "    return '--indicator-idle';\n"),
+
+    ("idle is not grey",
+     "    return restsIdle(s) ? '--indicator-idle' : '--indicator-bg-wait';\n",
+     "    return restsIdle(s) ? '--indicator-working' : '--indicator-bg-wait';\n"),
+]
+FAVICON_UTIL_MUTATIONS += STATE_COLOUR_VAR_MUTATIONS
+
+# The session list's dot is the tab's.  tests/lobby_running_card.test.js.
+LOBBYDOT_MUTATIONS = [
+    ("a card's dot is grey whatever its state -- the report",
+     "    const dotStyle = colourVar ? ` style=\"background: var(${colourVar})\"` : '';\n",
+     "    const dotStyle = '';\n"),
+
+    ("a card's state is not read, only whether it is busy",
+     "    const state = m.state || (m.busy === true ? 'working' : 'idle');\n",
+     "    const state = m.busy === true ? 'working' : 'idle';\n"),
+
+    ("a card's background tasks and loop are not read",
+     "      busy_class: state, bg_count: m.bg_count, wakeup_at: m.wakeup_at,\n",
+     "      busy_class: state,\n"),
+
+    ("nor its resume after a usage limit",
+     "      limit_resume_at: m.limit_resume_at }) : null;\n",
+     "      }) : null;\n"),
+
+    ("the dot's tooltip says only working or idle",
+     "    const dotTitle = known ? (m.state_label || (m.busy === true ? 'working' : 'idle'))\n",
+     "    const dotTitle = known ? (m.busy === true ? 'working' : 'idle')\n"),
+
+    ("a dot in a colour is called idle",
+     "      : colourVar === '--indicator-idle' ? 'idle' : 'waiting';\n",
+     "      : 'idle';\n"),
+
+    ("the unknown ring is filled with a state's colour",
+     "    const colourVar = known ? Util.stateColourVar({\n",
+     "    const colourVar = true ? Util.stateColourVar({\n"),
+]
+
+LOBBYDOT_RUNTIME_MUTATIONS = [
+    ("a card does not say its state",
+     "            \"state\": cls,\n",
+     ""),
+
+    ("nor its background tasks",
+     "            \"bg_count\": len(getattr(st, \"background_tasks\", None) or {}),\n",
+     ""),
+
+    ("nor what is to come",
+     "            \"wakeup_at\": getattr(st, \"wakeup_at\", None),\n"
+     "            \"limit_resume_at\": getattr(st, \"limit_resume_at\", None),\n",
+     ""),
+]
+
+LOBBYDOT_SERVER_MUTATIONS = [
+    ("another hub's card drops the state that hub said",
+     "        \"state\": live.get(\"state\"),\n",
+     ""),
+]
 
 # The status bar writes each state in its colour.  The tab's dot shows
 # bg-wait purple with or without the table's entry (Util.restsIdle), so the
@@ -9049,6 +9110,14 @@ TARGETS = {
                     HISTORY_APP_MUTATIONS, "node"),
     "lobbypath": ("static/lobby.js", "tests/lobby_running_card.test.js",
                   LOBBYPATH_MUTATIONS, "node"),
+    "lobbydot": ("static/lobby.js", "tests/lobby_running_card.test.js",
+                 LOBBYDOT_MUTATIONS, "node"),
+    "lobbydot-util": ("static/util.js", "tests/lobby_running_card.test.js",
+                      STATE_COLOUR_VAR_MUTATIONS, "node"),
+    "lobbydot-runtime": ("session_runtime.py", "tests/test_lobby_state.py",
+                         LOBBYDOT_RUNTIME_MUTATIONS, "pytest"),
+    "lobbydot-server": ("server.py", "tests/test_lobby_state.py",
+                        LOBBYDOT_SERVER_MUTATIONS, "pytest"),
     "leaveguard": ("static/leave_guard.js", "tests/leave_guard.test.js",
                    LEAVEGUARD_MUTATIONS, "node"),
     "leaveguard-util": ("static/util.js", "tests/leave_guard.test.js",

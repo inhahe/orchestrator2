@@ -79,7 +79,7 @@ Joined running orchestrator2 hub on port 8420 (session s2).
 
 Click **☰ Sessions** in the status bar to open the **lobby** — a browser for
 every session on the hub. It lists the sessions running live (with their
-working directory, viewer count and a busy dot) plus recent on-disk sessions
+working directory, viewer count and a dot in the colours of the tab's icon: green working, purple waiting on background tasks or a scheduled loop, yellow connecting or compacting, red for an error, grey idle; hover it for the state) plus recent on-disk sessions
 you can reopen, and has a **New session** button (optionally pointed at a
 different working directory). Picking a running session attaches this tab to
 it; opening a recent one spins up a fresh live session for it. The lobby
@@ -93,7 +93,7 @@ A session running in **another orchestrator2 window** (the hub reuses one
 server per account/port, so a machine driving several accounts has several)
 is listed as running too, on a dashed card tagged `other window :<port>`. This
 window can't drive or close it, so it has no **×**; clicking it offers to go to
-the window that does. Its busy dot and viewer count come from *that* hub —
+the window that does. Its dot and viewer count come from *that* hub —
 orchestrator2 asks it directly — so a session working away in another window
 looks busy here. When the owning hub can't be asked (it didn't answer, or the
 session is held by a bare `claude --resume` in a terminal, which has no API),

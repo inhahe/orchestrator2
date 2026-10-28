@@ -31,6 +31,8 @@ const fs = require('fs');
 const path = require('path');
 const { JSDOM } = require('jsdom');
 
+const UTIL_JS = fs.readFileSync(
+  path.join(__dirname, '..', 'static', 'util.js'), 'utf8');
 const LOBBY_JS = fs.readFileSync(
   path.join(__dirname, '..', 'static', 'lobby.js'), 'utf8');
 
@@ -72,7 +74,10 @@ function makePage() {
                           runScripts: 'outside-only', pretendToBeVisual: false });
   const win = dom.window;
   win.App = { send: () => {}, isConnected: () => true };
-  win.Util = { formatDuration: (s) => `${s}s` };
+  // The real Util -- its state colours draw the dot -- with a duration
+  // short enough to read in a test.
+  win.eval('window.__Util = (function () {' + UTIL_JS + ';return Util; })();');
+  win.Util = Object.assign({}, win.__Util, { formatDuration: (s) => `${s}s` });
   // jsdom's window.open returns null, which sends the desktop path into its
   // `window.location.href = url` fallback and a "Not implemented: navigation"
   // warning.  A stub keeps the click tests about the click.
@@ -326,6 +331,49 @@ test('a known zero viewer count is shown, not mistaken for unknown', () => {
                               { busy: false, viewers: 0, live_known: true });
   const p = makePage().render([known]);
   assert(textOf(p.card(0)).includes('0 viewers'), textOf(p.card(0)));
+});
+
+// The dot is the tab's dot: the state the session's status bar shows, in its
+// colour.  Reported 2026-10-27: "the status circle in sessions view shows grey
+// when it's in bg-wait mode instead of purple".
+function dotOf(card) {
+  const dot = card.querySelector('.lobby-dot');
+  return { colour: dot.style.background, title: dot.getAttribute('title'), cls: dot.className };
+}
+
+test('a session waiting on background tasks has the purple dot', () => {
+  const p = makePage().render([Object.assign({}, OURS, {
+    state: 'bg-wait', state_label: 'bg wait (2) (0:3:00)', bg_count: 2 })]);
+  const d = dotOf(p.card(0));
+  assert(d.colour === 'var(--indicator-bg-wait)', d.colour);
+  assert(d.title === 'bg wait (2) (0:3:00)', d.title);
+  assert(!/\bidle\b/.test(d.cls), 'called idle: ' + d.cls);
+});
+
+test('every state is in its own colour, as the tab\'s dot is', () => {
+  for (const [m, colour] of [
+    [{ busy: true, state: 'working' }, 'var(--indicator-working)'],
+    [{ busy: true, state: 'compacting' }, 'var(--indicator-compacting)'],
+    [{ state: 'connecting' }, 'var(--indicator-connecting)'],
+    [{ state: 'error', state_label: 'not authed' }, 'var(--system-error)'],
+    [{ state: 'idle', wakeup_at: Date.now() / 1000 + 600 }, 'var(--indicator-bg-wait)'],
+    [{ state: 'idle', limit_resume_at: Date.now() / 1000 + 600 }, 'var(--indicator-bg-wait)'],
+    [{ state: 'idle' }, 'var(--indicator-idle)']]) {
+    const d = dotOf(makePage().render([Object.assign({}, OURS, m)]).card(0));
+    assert(d.colour === colour, `${JSON.stringify(m)}: ${d.colour}`);
+  }
+});
+
+test('so is another hub\'s session, when that hub says its state', () => {
+  const known = Object.assign({}, FOREIGN, { busy: false, viewers: 1, live_known: true,
+                                             state: 'bg-wait', bg_count: 1 });
+  const d = dotOf(makePage().render([known]).card(0));
+  assert(d.colour === 'var(--indicator-bg-wait)', d.colour);
+});
+
+test('the unknown dot stays a ring, in no state\'s colour', () => {
+  const d = dotOf(makePage().render([FOREIGN]).card(0));
+  assert(d.colour === '', d.colour);
 });
 
 test('our own cards still use the two-state dot', () => {

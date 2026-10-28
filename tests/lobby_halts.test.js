@@ -11,6 +11,8 @@ const fs = require('fs');
 const path = require('path');
 const { JSDOM } = require('jsdom');
 
+const UTIL_JS = fs.readFileSync(
+  path.join(__dirname, '..', 'static', 'util.js'), 'utf8');
 const LOBBY_JS = fs.readFileSync(
   path.join(__dirname, '..', 'static', 'lobby.js'), 'utf8');
 
@@ -48,7 +50,10 @@ function makePage() {
   const win = dom.window;
   const sent = [];
   win.App = { send: (m) => sent.push(m), isConnected: () => true };
-  win.Util = { formatDuration: (s) => `${s}s` };
+  // The real Util -- its state colours draw the dot -- with a duration
+  // short enough to read in a test.
+  win.eval('window.__Util = (function () {' + UTIL_JS + ';return Util; })();');
+  win.Util = Object.assign({}, win.__Util, { formatDuration: (s) => `${s}s` });
   win.open = () => ({ focus() {}, location: { href: 'about:blank' } });
   win.confirm = () => true;
   win.eval(LOBBY_JS + '\n;globalThis.__Lobby = Lobby;');

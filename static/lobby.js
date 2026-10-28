@@ -945,18 +945,27 @@ const Lobby = (() => {
     // the idle dot asserted "not working" about a session that might well be
     // mid-turn.  "I don't know" is a real answer and gets its own dot.
     const known = m.busy === true || m.busy === false;
-    const dotCls = m.busy === true ? 'busy' : (known ? 'idle' : 'unknown');
+    // Known, it is the tab's dot: the state the session's status bar shows, in
+    // its colour (Util.stateColourVar) -- bg-wait purple, compacting yellow.
+    // A hub too old to say its state says only busy or not.
+    const state = m.state || (m.busy === true ? 'working' : 'idle');
+    const colourVar = known ? Util.stateColourVar({
+      busy_class: state, bg_count: m.bg_count, wakeup_at: m.wakeup_at,
+      limit_resume_at: m.limit_resume_at }) : null;
+    const dotCls = !known ? 'unknown'
+      : state === 'working' ? 'busy'
+      : colourVar === '--indicator-idle' ? 'idle' : 'waiting';
+    const dotStyle = colourVar ? ` style="background: var(${colourVar})"` : '';
     // The two ways of not knowing are worth telling apart when you are trying
     // to work out why: a hub that did not answer is a hub you can go look at,
     // while a bare `claude --resume` in a terminal has no API to answer with.
-    const dotTitle = m.busy === true ? 'working'
-      : (known ? 'idle'
-               : (m.port
-                    ? `Owned by the hub on port ${m.port}, which didn't answer `
-                      + '— whether it is working right now is unknown'
-                    : 'Held by a process that is not an orchestrator2 hub '
-                      + '(e.g. `claude --resume` in a terminal), so its state '
-                      + 'cannot be queried'));
+    const dotTitle = known ? (m.state_label || (m.busy === true ? 'working' : 'idle'))
+      : (m.port
+           ? `Owned by the hub on port ${m.port}, which didn't answer `
+             + '— whether it is working right now is unknown'
+           : 'Held by a process that is not an orchestrator2 hub '
+             + '(e.g. `claude --resume` in a terminal), so its state '
+             + 'cannot be queried');
     const activity = _fmtAgo(m.last_activity);
     const viewers = typeof m.viewers === 'number' ? m.viewers : null;
     const viewerLabel = viewers === 1 ? '1 viewer' : `${viewers} viewers`;
@@ -1007,7 +1016,7 @@ const Lobby = (() => {
 
     card.innerHTML = `
       <div class="lobby-card-top">
-        <span class="lobby-dot ${dotCls}" title="${_esc(dotTitle)}"></span>
+        <span class="lobby-dot ${dotCls}"${dotStyle} title="${_esc(dotTitle)}"></span>
         <a class="lobby-card-title" title="${_esc(title)}"
            href="${_esc(m.rid ? '/?rid=' + encodeURIComponent(m.rid)
                               : _sessionHref(m.session_id || '', m.cwd || '',

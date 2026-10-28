@@ -987,6 +987,12 @@ def _foreign_running_entry(sess: dict[str, Any], holder: Any,
         "account": sess.get("account"),
         # None means "we could not ask", NOT "no". See the docstring.
         "busy": live.get("busy") if live else None,
+        # Its state as its own hub shows it, when that hub is one that says.
+        "state": live.get("state"),
+        "state_label": live.get("state_label"),
+        "bg_count": live.get("bg_count"),
+        "wakeup_at": live.get("wakeup_at"),
+        "limit_resume_at": live.get("limit_resume_at"),
         "viewers": live.get("viewers") if live else None,
         "created_at": live.get("created_at"),
         "last_activity": live.get("last_activity") or sess.get("mtime", 0),

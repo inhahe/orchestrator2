@@ -37,14 +37,6 @@ const Favicon = (() => {
   let _key = null;        // the colour shown now; null = the app's icon
   let _landing = false;   // no session in this tab
 
-  /** The CSS variable whose colour the dot shows for a status snapshot. */
-  function _colourFor(status) {
-    const s = status || {};
-    const stateVar = Util.STATE_COLOUR_VARS[s.busy_class || 'idle'];
-    if (stateVar) return stateVar;
-    return Util.restsIdle(s) ? '--indicator-idle' : '--indicator-bg-wait';
-  }
-
   // Only plain colour syntax reaches the SVG.  The value comes from a theme
   // file, and anything else would at best make the icon invalid.
   const COLOUR = /^(#[0-9a-f]{3,8}|(rgba?|hsla?)\([0-9.,%\s]+\)|[a-z]+)$/i;
@@ -76,7 +68,7 @@ const Favicon = (() => {
    *  couple of seconds: the icon is built only when its colour changes). */
   function update(status) {
     if (_landing) return;
-    const colour = _resolve(_colourFor(status));
+    const colour = _resolve(Util.stateColourVar(status));
     if (colour === _key) return;
     _show(colour, 'data:image/svg+xml,' + encodeURIComponent(_svg(colour)));
   }
