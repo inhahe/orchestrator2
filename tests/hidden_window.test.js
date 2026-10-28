@@ -118,6 +118,16 @@ function makePage({ hidden = false } = {}) {
     get: () => { layoutReads++; return 0; },
     set: () => { scrollWrites++; },
   });
+  // Where each row is in the view, the list never scrolled: a collapse holds
+  // the view still only when the text above its run is on screen.
+  el.getBoundingClientRect = () => ({ top: 0, bottom: 500, height: 500 });
+  const realRect = win.HTMLElement.prototype.getBoundingClientRect;
+  win.HTMLElement.prototype.getBoundingClientRect = function () {
+    if (this.parentElement !== el) return realRect.call(this);
+    layoutReads++;
+    const top = ROW_H * [...el.children].indexOf(this);
+    return { top, bottom: top + ROW_H, height: ROW_H };
+  };
 
   // A message shape chat.js does not recognise is dropped with a warning, and
   // a dropped message appends nothing -- which would let every cap assertion

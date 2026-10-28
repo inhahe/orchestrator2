@@ -3416,7 +3416,19 @@ The rule, and how `chat.js` holds it:
   (`_cancelGap`/`_cancelShortGap`). Those exist to hold a *visible* reading
   position steady, and `_maybeTrimOldMessages` returns early while either is
   open — a gap left open across a hide is the unbounded-growth bug by another
-  route.
+  route. For the same reason a collapse in a hidden window opens none, and so
+  reads no layout for one.
+- **A collapse holds still only text that is on screen.** The gap keeps the
+  text above a collapsing run of tools where it was, by holding the space the
+  run gave up open at the bottom. When the run started at or above the top
+  edge of the view (`_textAboveShown`), none of that text was showing and
+  there is nothing to keep still. Before 2026-10-27 the gap then held the view
+  on the space the run had left, and a run that had filled the screen left it
+  blank ("the tool list fills the view and then when they all collapse, the
+  view is blank"), until enough new text came to fill it. Now following goes
+  on, and the view shows the bottom: the collapsed line and what came after.
+  Pinned by `tests/collapse_view.test.js`, with a small layout model; mutation
+  target `collapse-view`.
 - **`_reclaimStrandedTrim()`**, also on the hide side, closes the *other* door
   into the same bug: `_onNextFrame` only helps when the cap is crossed while
   already hidden. Cross it while **visible** and the trim is correctly parked on

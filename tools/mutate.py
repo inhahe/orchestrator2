@@ -6345,6 +6345,22 @@ DEADCLI_RECOVERY_MUTATIONS = [
 # or for clear() emptying _thinkingToFit: one spares a flush that would draw
 # nothing, the other frees the summaries of a view already gone, and no test
 # can tell either from its absence.
+# A run of tools collapsing leaves something on screen.
+# tests/collapse_view.test.js.
+COLLAPSE_VIEW_MUTATIONS = [
+    ("a run that filled the view is held still on the space it left -- blank",
+     "    if (_wasPinned && _textAboveShown) {\n",
+     "    if (_wasPinned) {\n"),
+
+    ("no collapse holds the text above it still",
+     "    if (_wasPinned && _textAboveShown) {\n",
+     "    if (false) {\n"),
+
+    ("a hidden window measures what nobody sees",
+     "    const _wasPinned = _autoScroll && !_replayInProgress && !_drawingInBulk && !_hidden();\n",
+     "    const _wasPinned = _autoScroll && !_replayInProgress && !_drawingInBulk;\n"),
+]
+
 CATCHUP_CHAT_MUTATIONS = [
     ("a burst stops a following view following -- the report",
      "        } else if (elMessages.scrollTop < _followedTop - 2) {\n",
@@ -6380,8 +6396,8 @@ CATCHUP_CHAT_MUTATIONS = [
      "      {\n        _dispatchMessage(m);\n      } if (false) {\n"),
 
     ("a catch-up reads the layout for every run it collapses",
-     "    const _wasPinned = _autoScroll && !_replayInProgress && !_drawingInBulk;\n",
-     "    const _wasPinned = _autoScroll && !_replayInProgress;\n"),
+     "    const _wasPinned = _autoScroll && !_replayInProgress && !_drawingInBulk && !_hidden();\n",
+     "    const _wasPinned = _autoScroll && !_replayInProgress && !_hidden();\n"),
 
     ("a collapse reads the view's top when nothing will use it",
      "    const _beforeTop = _wasPinned ? elMessages.scrollTop : 0;\n",
@@ -8969,6 +8985,8 @@ TARGETS = {
                 EXTAUTH_MUTATIONS, "pytest"),
     "catchup-chat": ("static/chat.js", "tests/history_backfill.test.js",
                      CATCHUP_CHAT_MUTATIONS, "node"),
+    "collapse-view": ("static/chat.js", "tests/collapse_view.test.js",
+                      COLLAPSE_VIEW_MUTATIONS, "node"),
     "catchup-app": ("static/app.js", "tests/reconnect_on_show.test.js",
                     CATCHUP_APP_MUTATIONS, "node"),
     "apikey-state": ("state.py", "tests/test_api_key_billing.py",

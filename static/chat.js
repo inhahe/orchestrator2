@@ -160,13 +160,21 @@ const Chat = (() => {
 
     // Snapshot scroll state *before* the DOM shrinks so we can anchor it.
     // Only engage the gap when the user is following at the bottom and we're
-    // not bulk-replaying history (where a live gap would just churn).
-    const _wasPinned = _autoScroll && !_replayInProgress && !_drawingInBulk;
+    // not bulk-replaying history (where a live gap would just churn) -- and
+    // only in a window that is shown: a gap holds a reading position steady,
+    // a hidden window shows none, and hiding closes the gaps anyway.
+    const _wasPinned = _autoScroll && !_replayInProgress && !_drawingInBulk && !_hidden();
     // Read only for that gap: each read forces a layout of the whole list, and
     // a catch-up or a history collapses hundreds of times in a row.
     const _beforeTop = _wasPinned ? elMessages.scrollTop : 0;
     const _beforeH = _wasPinned ? elMessages.scrollHeight : 0;
     const _beforeContentH = _wasPinned ? _contentHeight() : 0;
+    // Where the run starts in the view.  At or above its top edge, none of the
+    // text above the run is on screen: there is nothing to hold still, and a
+    // gap would hold the view on the space the run left -- blank, if the run
+    // filled the screen.
+    const _textAboveShown = _wasPinned
+      && activityEls[0].getBoundingClientRect().top > elMessages.getBoundingClientRect().top;
 
     // Create collapsible group.
     const group = document.createElement('div');
@@ -200,8 +208,9 @@ const Chat = (() => {
     });
 
     // If we were following at the bottom, anchor the collapse so the text
-    // above the collapsed run stays put instead of lurching.
-    if (_wasPinned) {
+    // above the collapsed run stays put instead of lurching.  With none of it
+    // on screen, following goes on: the view shows the bottom.
+    if (_wasPinned && _textAboveShown) {
       const freedScroll = _beforeH - elMessages.scrollHeight;
       if (freedScroll > 2) {
         // Overflowing scroller: freeze scrollTop and hold the reclaimed space
