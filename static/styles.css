@@ -1383,6 +1383,8 @@ html, body {
   display: none;              /* hidden on desktop */
   align-items: center;
   gap: 4px;
+  /* A button does not inherit the page's font: set as the sessions link's. */
+  font-family: var(--font-mono);
   font-size: 14px;
   color: var(--text-dim);
   background: var(--bg-panel);
@@ -1414,6 +1416,35 @@ html, body {
 .sidebar-toggle-count[hidden] { display: none; }
 
 .sidebar-toggle:hover {
+  color: var(--text-bright);
+  background: var(--bg-tool-hover);
+  border-color: var(--accent-dim);
+}
+
+/* ===================================================================
+   Sessions button (in status bar)
+   =================================================================== */
+
+.sessions-btn {
+  /* An anchor, not a button, so the browser's own "open in new tab" works on
+     it -- the only way to get a second orchestrator2 tab on a phone, where
+     the page cannot focus or raise one itself.  Laid out as the panels
+     toggle beside it is, so their labels line up. */
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.sessions-btn:hover {
   color: var(--text-bright);
   background: var(--bg-tool-hover);
   border-color: var(--accent-dim);
@@ -1544,33 +1575,6 @@ html, body {
     font-size: 12px;
     min-height: 32px;
   }
-}
-
-/* ===================================================================
-   Sessions button (in status bar)
-   =================================================================== */
-
-.sessions-btn {
-  /* An anchor, not a button, so the browser's own "open in new tab" works on
-     it -- the only way to get a second orchestrator2 tab on a phone, where
-     the page cannot focus or raise one itself. */
-  display: inline-block;
-  text-decoration: none;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-dim);
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 2px 8px;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
-}
-.sessions-btn:hover {
-  color: var(--text-bright);
-  background: var(--bg-tool-hover);
-  border-color: var(--accent-dim);
 }
 
 /* ===================================================================
