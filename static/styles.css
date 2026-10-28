@@ -2016,13 +2016,13 @@ html, body {
   pointer-events: none;
 }
 
+/* Shown whole: a long path wraps, at its spaces or after its separators
+   (lobby.js _pathHtml), or inside a name too long for a line of its own. */
 .lobby-card-cwd {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-dim);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
   margin-bottom: 6px;
 }
 .lobby-card-meta {
@@ -2095,9 +2095,7 @@ html, body {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-dim);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
   margin-top: 2px;
 }
 .lobby-item-acct {

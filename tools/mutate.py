@@ -3931,6 +3931,30 @@ FAVICON_STATUS_MUTATIONS = [
      ""),
 ]
 
+# A session's path is shown whole in the session list.
+# tests/lobby_running_card.test.js.
+LOBBYPATH_MUTATIONS = [
+    ("a path has nowhere to wrap but its spaces",
+     "    return _esc(path).replace(/[\\\\/]/g, '$&<wbr>');\n",
+     "    return _esc(path);\n"),
+
+    ("a path written with / does not wrap after it",
+     "    return _esc(path).replace(/[\\\\/]/g, '$&<wbr>');\n",
+     "    return _esc(path).replace(/[\\\\]/g, '$&<wbr>');\n"),
+
+    ("a path is markup",
+     "    return _esc(path).replace(/[\\\\/]/g, '$&<wbr>');\n",
+     "    return String(path).replace(/[\\\\/]/g, '$&<wbr>');\n"),
+
+    ("a running session's path is not given its places to wrap",
+     "      <div class=\"lobby-card-cwd\">${_pathHtml(m.cwd || '--')}</div>\n",
+     "      <div class=\"lobby-card-cwd\">${_esc(m.cwd || '--')}</div>\n"),
+
+    ("nor a recent session's",
+     "      <div class=\"lobby-item-cwd\">${_pathHtml(s.cwd || '--')}</div>\n",
+     "      <div class=\"lobby-item-cwd\">${_esc(s.cwd || '--')}</div>\n"),
+]
+
 FAVICON_LOBBY_MUTATIONS = [
     ("a tab whose session closed keeps its last light",
      "    if (typeof Favicon !== 'undefined') Favicon.setLanding(on);\n",
@@ -8816,6 +8840,8 @@ TARGETS = {
                        FAVICON_STATUS_MUTATIONS, "node"),
     "favicon-lobby": ("static/lobby.js", "tests/reconnect_on_show.test.js",
                       FAVICON_LOBBY_MUTATIONS, "node"),
+    "lobbypath": ("static/lobby.js", "tests/lobby_running_card.test.js",
+                  LOBBYPATH_MUTATIONS, "node"),
     "loopkeep-bridge": ("sdk_bridge.py", "tests/test_loops_survive_restart.py",
                         LOOPKEEP_BRIDGE_MUTATIONS, "pytest"),
     "loopkeep-server": ("server.py", "tests/test_loops_survive_restart.py",

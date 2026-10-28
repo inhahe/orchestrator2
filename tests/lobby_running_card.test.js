@@ -183,6 +183,25 @@ test('the full title is rendered, not shortened by the markup', () => {
   assert(textOf(t) === 'Good Photons', `title was ${JSON.stringify(textOf(t))}`);
 });
 
+test('the path is shown whole, free to wrap after each separator', () => {
+  // Asked 2026-10-27: "make it so that long paths in the sessions shown in the
+  // sessions view aren't cut off".
+  const p = makePage().render([FOREIGN]);
+  const cwd = p.card(0).querySelector('.lobby-card-cwd');
+  assert(cwd.textContent === FOREIGN.cwd, cwd.textContent);
+  assert(cwd.querySelectorAll('wbr').length === 2, cwd.innerHTML);
+  assert(cwd.innerHTML.startsWith('D:\\<wbr>visual studio projects\\<wbr>'), cwd.innerHTML);
+});
+
+test('and so is a recent session\'s, with either separator', () => {
+  const p = makePage();
+  p.Lobby.render({ running: [], recent_pending: false,
+                   recent: [{ session_id: 'r', title: 't', cwd: 'D:/a b/c<d>', age: '1h' }] });
+  const cwd = p.win.document.querySelector('#lobby-recent .lobby-item-cwd');
+  assert(cwd.textContent === 'D:/a b/c<d>', cwd.textContent);
+  assert(cwd.innerHTML === 'D:/<wbr>a b/<wbr>c&lt;d&gt;', cwd.innerHTML);
+});
+
 test('the title carries a tooltip, so an elided one is still readable', () => {
   const p = makePage().render([FOREIGN]);
   const t = p.card(0).querySelector('.lobby-card-title');

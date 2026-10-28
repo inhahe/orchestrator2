@@ -1007,7 +1007,7 @@ const Lobby = (() => {
                 title="Close this session (stops its Claude process; history is kept)"
                 >&times;</button>`}
       </div>
-      <div class="lobby-card-cwd" title="${_esc(m.cwd || '')}">${_esc(m.cwd || '--')}</div>
+      <div class="lobby-card-cwd">${_pathHtml(m.cwd || '--')}</div>
       ${foreignTag ? `<div class="lobby-card-tags">${foreignTag}</div>` : ''}
       <div class="lobby-card-meta">
         ${metaParts.join('<span class="lobby-card-sep">·</span>')}
@@ -1065,9 +1065,15 @@ const Lobby = (() => {
            >${_esc(title)}</a>
         <span class="lobby-item-age">${_esc(s.age || '')}</span>
       </div>${moved}
-      <div class="lobby-item-cwd" title="${_esc(s.cwd || '')}">${_esc(s.cwd || '--')}</div>
+      <div class="lobby-item-cwd">${_pathHtml(s.cwd || '--')}</div>
       ${acct ? `<div class="lobby-item-acct">${_esc(acct)}</div>` : ''}`;
     return item;
+  }
+
+  // A path as HTML, shown whole: free to wrap after each separator, as well
+  // as at its spaces, so that a line can end where a folder does.
+  function _pathHtml(path) {
+    return _esc(path).replace(/[\\/]/g, '$&<wbr>');
   }
 
   // An account's name: its config dir's last part.
