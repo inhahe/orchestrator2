@@ -938,27 +938,6 @@ const App = (() => {
 
   // --- Modal ---
 
-  // A panel's item shows its block in the chat: opened, out of any group it
-  // was collapsed into (a `display:none` element scrolls to nothing), and
-  // counted as opened by the user, so its run is not collapsed under them.
-  function showToolDetail(toolUseId) {
-    const el = document.querySelector(`[data-tool-use-id="${toolUseId}"]`);
-    if (el) {
-      Chat.reveal(el);
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
-  }
-
-  function showBgDetail(taskId) {
-    // Find the bg task element in chat (prefer bg_complete over bg_started).
-    const all = document.querySelectorAll(`[data-bg-task-id="${taskId}"]`);
-    const el = all.length > 0 ? all[all.length - 1] : null;
-    if (el) {
-      Chat.reveal(el);
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
-  }
-
   function openModal(title, content) {
     document.getElementById('modal-title').textContent = title;
     document.getElementById('modal-body').textContent = content;
@@ -981,5 +960,5 @@ const App = (() => {
 
   document.addEventListener('DOMContentLoaded', init);
 
-  return { send, reconnect, retryNow, showToolDetail, showBgDetail, openModal, closeModal };
+  return { send, reconnect, retryNow, openModal, closeModal };
 })();

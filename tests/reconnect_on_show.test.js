@@ -2264,7 +2264,7 @@ test('the plan field says on hover what the session is billed to', (h) => {
   assert(el.title === s.status.plan_title, JSON.stringify(el.title));
 });
 
-test('a group opened to show a tool fits the thinking it hid', (h) => {
+test('a group opened at its header fits the thinking it hid', (h) => {
   // A backlog's one-line thinking is measured once it is all in, but not
   // inside a collapsed group, where nothing can be measured.
   const proto = h.win.HTMLElement.prototype;
@@ -2281,22 +2281,8 @@ test('a group opened to show a tool fits the thinking it hid', (h) => {
   h.live.deliver({ type: 'assistant_text', content: 'done', delta: false, seq: 9 });
   const summary = () => h.win.document.querySelector('.thinking-summary').textContent;
   assert(summary() === '(15 chars)', 'measured while shut: ' + summary());
-  h.win.__mods.App.showToolDetail('t1');
+  h.win.document.querySelector('.activity-group-toggle').click();
   assert(summary() === 'short and sweet', summary());
-});
-
-test('a background task shown from its panel is shown open, out of its group', (h) => {
-  h.win.Element.prototype.scrollIntoView = () => {};   // jsdom has none
-  resumedAt(h, 5, 8);
-  h.live.deliver({ type: 'bg_complete', task_id: 'bg1', name: 'build', status: 'completed',
-                   command: 'make', output: 'built', seq: 6 });
-  h.live.deliver({ type: 'tool_use', tool_use_id: 't1', name: 'Read', input: {}, seq: 7 });
-  h.live.deliver({ type: 'assistant_text', content: 'done', delta: false, seq: 8 });
-  const bg = h.win.document.querySelector('[data-bg-task-id="bg1"]');
-  assert(bg.closest('.activity-group.collapsed'), 'precondition: collapsed');
-  h.win.__mods.App.showBgDetail('bg1');
-  assert(!bg.closest('.activity-group.collapsed'), 'still in its collapsed group');
-  assert(bg.querySelector('.tool-detail').classList.contains('open'), 'its output is shut');
 });
 
 console.log(`\n${passes}/${passes + failures} passed`);

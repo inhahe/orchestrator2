@@ -140,7 +140,9 @@ def awaits_reply(text: str, is_error: bool) -> bool:
     *text* and *is_error* are the result as the CLI records it.  True means
     the question is asked and waits for the user's reply -- not a tool that
     failed -- and the chat draws it so (``awaiting_reply``, chat.js).  Known
-    by its opening words, so a session from before a rewording still is.
+    by its opening words, so a session from before a rewording still is.  The
+    history has no tool name to hand, so the chat heeds it only on a
+    question's block.
     """
     return bool(is_error) and (text or "").lstrip().startswith(ASK_DENIAL_LEAD)
 

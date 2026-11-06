@@ -6815,41 +6815,11 @@ CATCHUP_APP_MUTATIONS = [
     ("a backlog whose end never comes is held for good",
      "        _catchUpTimer = setTimeout(_endCatchUp, CATCH_UP_MAX_MS);\n",
      ""),
-
-    ("a panel's tool is not shown out of its group",
-     "    const el = document.querySelector(`[data-tool-use-id=\"${toolUseId}\"]`);\n"
-     "    if (el) {\n"
-     "      Chat.reveal(el);\n",
-     "    const el = document.querySelector(`[data-tool-use-id=\"${toolUseId}\"]`);\n"
-     "    if (el) {\n"),
-
-    ("nor a panel's background task",
-     "    const el = all.length > 0 ? all[all.length - 1] : null;\n"
-     "    if (el) {\n"
-     "      Chat.reveal(el);\n",
-     "    const el = all.length > 0 ? all[all.length - 1] : null;\n"
-     "    if (el) {\n"),
 ]
 
-# Chat.reveal, which a panel's item shows its block by (app.js).
-# tests/reconnect_on_show.test.js.
-REVEAL_CHAT_MUTATIONS = [
-    ("a group opened to show a tool leaves the thinking it hid unfitted",
-     "      fitThinking(group);\n",
-     ""),
-
-    ("a group opened to show a block stays shut",
-     "      _setGroupOpen(group, true);\n",
-     ""),
-
-    ("the block shown from a panel stays shut",
-     "    if (el._expand) _setOpen(el, true);\n",
-     ""),
-]
-
-# A run of activity collapses, but not what the user is reading; a question is
-# never collapsed, and reads as waiting for its reply.
-# tests/activity_collapse.test.js.
+# A run of activity collapses, but not what the user is reading; what the
+# user asked for or must answer stands apart; a question reads as waiting for
+# its reply until it has one.  tests/activity_collapse.test.js.
 ACTIVITY_COLLAPSE_MUTATIONS = [
     ("a run holding a block the user opened collapses anyway -- the report",
      "    const open = activityEls.some((el) => el.dataset.userOpen);\n",
@@ -6869,10 +6839,6 @@ ACTIVITY_COLLAPSE_MUTATIONS = [
      "    _expandable(el, el.querySelector('.thinking-header'), body, icon);\n"
      "    if (_showThinking) el.dataset.userOpen = '1';\n"),
 
-    ("a block shown from a panel does not count as opened",
-     "    if (el._expand) _setOpen(el, true);\n",
-     "    if (el._expand) el._expand.body.classList.add('open');\n"),
-
     ("a group left open says it is shut",
      "    toggle.textContent = (open ? '\\u25BC ' : '\\u25B6 ') + toggle.dataset.summary;\n",
      "    toggle.textContent = '\\u25B6 ' + toggle.dataset.summary;\n"),
@@ -6881,25 +6847,101 @@ ACTIVITY_COLLAPSE_MUTATIONS = [
      "      const opening = group.classList.contains('collapsed');\n",
      "      const opening = true;\n"),
 
-    ("what ran before a question is left out of every group",
-     "    if (isAsk) _collapseActivity();\n",
+    ("a group held open stays open once nothing in it is",
+     "      _setGroupOpen(held, false);\n",
+     ""),
+
+    ("it folds while something in it is still open",
+     "    if (held && !held.querySelector('[data-user-open]')) {\n",
+     "    if (held) {\n"),
+
+    ("a group held open is not marked so",
+     "    if (open) group.dataset.heldOpen = '1';\n",
+     ""),
+
+    ("a group the user opened at its header folds under them",
+     "      delete group.dataset.heldOpen;\n",
+     ""),
+
+    ("nothing the user asked for stands apart",
+     "    _collapseActivity();\n"
+     "    el.classList.add('activity-boundary');\n",
+     "    _collapseActivity();\n"),
+
+    ("what ran before it is left out of every group",
+     "    _collapseActivity();\n"
+     "    el.classList.add('activity-boundary');\n",
+     "    el.classList.add('activity-boundary');\n"),
+
+    ("a question is collapsed with the rest",
+     "    if (isAsk) _standApart(el);\n",
+     ""),
+
+    ("a /btw exchange is collapsed with the rest",
+     "    _standApart(el);\n"
+     "    elMessages.appendChild(el);\n"
+     "    _btwEls.set(",
+     "    elMessages.appendChild(el);\n"
+     "    _btwEls.set("),
+
+    ("a command's output is collapsed with the rest",
+     "    el.className = 'msg msg-command';\n"
+     "    _standApart(el);\n",
+     "    el.className = 'msg msg-command';\n"),
+
+    ("the warning that a tool call was written as text is collapsed with the tools",
+     "    _standApart(warn);\n",
      ""),
 
     ("a question waiting for its reply reads as a failed tool",
-     "    if (el && msg.awaiting_reply) {\n",
+     "    if (el && msg.awaiting_reply && el.classList.contains('msg-ask')) {\n",
      "    if (false) {\n"),
 
+    ("any block a result says waits reads as a question",
+     "    if (el && msg.awaiting_reply && el.classList.contains('msg-ask')) {\n",
+     "    if (el && msg.awaiting_reply) {\n"),
+
     ("it is marked as failed",
-     "        iconEl.className = 'tool-status-icon asking';\n",
-     "        iconEl.className = 'tool-status-icon error';\n"),
+     "      iconEl.className = 'tool-status-icon asking';\n",
+     "      iconEl.className = 'tool-status-icon error';\n"),
 
     ("nothing says where to answer it",
-     "        detail.appendChild(hint);\n",
+     "      el.querySelector('.tool-detail').appendChild(hint);\n",
      ""),
 
-    ("a question is collapsed with the rest",
-     "    el.className = 'msg msg-tool' + (isAsk ? ' msg-ask activity-boundary' : '');\n",
-     "    el.className = 'msg msg-tool' + (isAsk ? ' msg-ask' : '');\n"),
+    ("the same result again says it twice",
+     "      if (_awaitingAsks.includes(el)) return;   // the same result again\n",
+     ""),
+
+    ("a question answered still waits",
+     "    _collapseActivity();\n"
+     "    _answerAsks();\n",
+     "    _collapseActivity();\n"),
+
+    ("a question waiting is never noted",
+     "      _awaitingAsks.push(el);\n",
+     ""),
+
+    ("a question answered still says where to answer it",
+     "      el.querySelector('.ask-reply-hint').remove();\n",
+     ""),
+
+    ("older history answers the question waiting now",
+     "    const awaiting = _awaitingAsks;\n"
+     "    _awaitingAsks = [];\n",
+     "    const awaiting = [];\n"),
+
+    ("a question at the end of older history waits, though answered below",
+     "      if (real.querySelector('.msg-user')) _answerAsks();\n",
+     ""),
+
+    ("every question at the end of older history counts as answered",
+     "      if (real.querySelector('.msg-user')) _answerAsks();\n",
+     "      _answerAsks();\n"),
+
+    ("the questions waiting are forgotten by a backfill",
+     "      _awaitingAsks = awaiting.concat(_awaitingAsks);\n",
+     ""),
 ]
 
 # The hub shows a question once, by its own block, and marks its denial.
@@ -9457,8 +9499,6 @@ TARGETS = {
                       COLLAPSE_VIEW_MUTATIONS, "node"),
     "catchup-app": ("static/app.js", "tests/reconnect_on_show.test.js",
                     CATCHUP_APP_MUTATIONS, "node"),
-    "reveal-chat": ("static/chat.js", "tests/reconnect_on_show.test.js",
-                    REVEAL_CHAT_MUTATIONS, "node"),
     "activity-collapse": ("static/chat.js", "tests/activity_collapse.test.js",
                           ACTIVITY_COLLAPSE_MUTATIONS, "node"),
     "ask-bridge": ("sdk_bridge.py", "tests/test_ask_user_question.py",

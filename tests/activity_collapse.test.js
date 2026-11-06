@@ -183,28 +183,46 @@ test('so does a background task\'s output the user opened', () => {
   assert(shown(bg), 'the output being read was collapsed away');
 });
 
-test('a block shown from a panel is shown out of its group, open', () => {
+test('a group held open for what was being read folds once that is closed', () => {
   const p = makePage();
   p.text('Working.');
   const a = p.tool();
+  const b = p.tool();
   p.tool();
-  p.text('Done.');
-  assert(!shown(a), 'precondition: collapsed');
-  p.Chat.reveal(a);
-  assert(shown(a), 'still in a collapsed group');
-  assert(a.querySelector('.tool-detail').classList.contains('open'), 'its detail is shut');
-  assert(p.groups()[0].querySelector('.activity-group-toggle').textContent === '▼ 2 tools',
-         p.groups()[0].querySelector('.activity-group-toggle').textContent);
+  p.click(a, '.tool-header');
+  p.click(b, '.tool-header');
+  p.text('Done reading.');
+  p.click(a, '.tool-header');
+  assert(shown(b), 'folded while another of its blocks was still open');
+  p.click(b, '.tool-header');
+  assert(!shown(b), 'left open with nothing open in it');
+  assert(p.groups()[0].querySelector('.activity-group-toggle').textContent === '▶ 3 tools');
 });
 
-test('and counts as opened by the user, so its run is not collapsed under them', () => {
+test('but a group opened at its header stays as the user left it', () => {
   const p = makePage();
   p.text('Working.');
   const a = p.tool();
   p.tool();
-  p.Chat.reveal(a);
   p.text('Done.');
-  assert(shown(a), 'collapsed while being read');
+  p.groups()[0].querySelector('.activity-group-toggle').click();
+  p.click(a, '.tool-header');
+  p.click(a, '.tool-header');
+  assert(shown(a), 'the group the user opened folded under them');
+});
+
+test('so does one held open, once the user has folded and opened it again', () => {
+  const p = makePage();
+  p.text('Working.');
+  const a = p.tool();
+  p.tool();
+  p.click(a, '.tool-header');
+  p.text('Done.');
+  const toggle = p.groups()[0].querySelector('.activity-group-toggle');
+  toggle.click();
+  toggle.click();
+  p.click(a, '.tool-header');
+  assert(shown(a), 'the group the user opened folded under them');
 });
 
 // ---- a question --------------------------------------------------------------
@@ -242,6 +260,125 @@ test('a question that really failed still reads as failed', () => {
   assert(q.querySelector('.tool-status-icon').classList.contains('error'));
   assert(q.textContent.includes("isn't supported"), 'the error is hidden');
   assert(!q.querySelector('.ask-reply-hint'));
+});
+
+test('a question answered reads as answered', () => {
+  const p = makePage();
+  const q = ask(p);
+  p.send({ type: 'user_message', content: 'B', local: true });
+  const icon = q.querySelector('.tool-status-icon');
+  assert(icon.classList.contains('complete') && icon.textContent === '✓',
+         `${icon.className} ${icon.textContent}`);
+  assert(!q.querySelector('.ask-reply-hint'), 'it still says to answer it');
+});
+
+test('in history too, while the last one unanswered still waits', () => {
+  const p = makePage();
+  const turn = (id) => [
+    { type: 'tool_use', tool_use_id: id, name: 'AskUserQuestion', input: QUESTIONS },
+    { type: 'tool_result', tool_use_id: id, is_error: true, content: DENIAL,
+      awaiting_reply: true }];
+  p.send({ type: 'history', messages: [...turn('q1'), { type: 'user', content: 'A' },
+                                        ...turn('q2')] });
+  assert(p.block('q1').querySelector('.tool-status-icon').classList.contains('complete'),
+         'an answered question still waits');
+  assert(p.block('q2').querySelector('.tool-status-icon').classList.contains('asking'),
+         'the open question reads as answered');
+});
+
+test('one in older history was answered, if a prompt is shown below it', () => {
+  const p = makePage();
+  p.send({ type: 'history', more_above: 2, messages: [{ type: 'user', content: 'A' }] });
+  p.send({ type: 'history_prepend', messages: [
+    { type: 'tool_use', tool_use_id: 'q1', name: 'AskUserQuestion', input: QUESTIONS },
+    { type: 'tool_result', tool_use_id: 'q1', is_error: true, content: DENIAL,
+      awaiting_reply: true }] });
+  assert(p.block('q1').querySelector('.tool-status-icon').classList.contains('complete'),
+         'answered below, and still waiting');
+});
+
+test('and older history does not answer the question waiting now', () => {
+  const p = makePage();
+  p.send({ type: 'history', more_above: 2, messages: [
+    { type: 'tool_use', tool_use_id: 'q2', name: 'AskUserQuestion', input: QUESTIONS },
+    { type: 'tool_result', tool_use_id: 'q2', is_error: true, content: DENIAL,
+      awaiting_reply: true }] });
+  p.send({ type: 'history_prepend', messages: [{ type: 'user', content: 'older' }] });
+  assert(p.block('q2').querySelector('.tool-status-icon').classList.contains('asking'),
+         'a prompt from before it was taken for its answer');
+  p.send({ type: 'user_message', content: 'B', local: true });
+  assert(p.block('q2').querySelector('.tool-status-icon').classList.contains('complete'),
+         'the backfill lost it: the reply does not answer it');
+});
+
+test('one at the end of older history, with no prompt since, still waits', () => {
+  const p = makePage();
+  p.send({ type: 'history', more_above: 2, messages: [{ type: 'assistant', content: 'Over to you.' }] });
+  p.send({ type: 'history_prepend', messages: [
+    { type: 'tool_use', tool_use_id: 'q1', name: 'AskUserQuestion', input: QUESTIONS },
+    { type: 'tool_result', tool_use_id: 'q1', is_error: true, content: DENIAL,
+      awaiting_reply: true }] });
+  assert(p.block('q1').querySelector('.tool-status-icon').classList.contains('asking'),
+         'taken for answered with nothing said since');
+});
+
+test('the same result twice says where to answer once', () => {
+  const p = makePage();
+  const q = ask(p);
+  p.send({ type: 'tool_result', tool_use_id: 'q1', is_error: true, content: DENIAL,
+           awaiting_reply: true });
+  assert(q.querySelectorAll('.ask-reply-hint').length === 1,
+         `${q.querySelectorAll('.ask-reply-hint').length} hints`);
+});
+
+test('only a question\'s block reads as waiting, whatever a result says', () => {
+  const p = makePage();
+  p.send({ type: 'tool_use', tool_use_id: 'b1', name: 'Bash', status: 'running',
+           input: { command: 'x' } });
+  p.send({ type: 'tool_result', tool_use_id: 'b1', is_error: true, content: DENIAL + ' boom',
+           awaiting_reply: true });
+  const b = p.block('b1');
+  assert(b.querySelector('.tool-status-icon').classList.contains('error'), 'not a failure');
+  assert(b.textContent.includes('boom'), 'its error is hidden');
+});
+
+// ---- what the user asked for -------------------------------------------------
+
+test('a /btw exchange is never collapsed, and what ran before it is', () => {
+  const p = makePage();
+  p.text('Working.');
+  const before = p.tool();
+  p.tool();
+  p.send({ type: 'btw_start', id: 'w1', question: 'what is X?' });
+  p.send({ type: 'btw_delta', id: 'w1', text: 'X is' });
+  p.tool();
+  p.tool();
+  p.text('Done.');
+  const btw = p.doc.querySelector('.msg-btw');
+  assert(!btw.closest('.activity-group'), 'the answer being read was collapsed away');
+  assert(!shown(before), 'the tools before it were left out of every group');
+});
+
+test('nor is a command\'s output', () => {
+  const p = makePage();
+  p.text('Working.');
+  p.tool();
+  p.send({ type: 'command_data', label: 'status', data: 'all well' });
+  p.tool();
+  p.tool();
+  p.text('Done.');
+  const out = p.doc.querySelector('.msg-command');
+  assert(!out.closest('.activity-group'), 'what the user asked for was collapsed away');
+});
+
+test('the warning that Claude wrote a tool call as text stays with that text', () => {
+  const p = makePage();
+  p.text('Here: <invoke name="Bash">');
+  p.tool();
+  p.tool();
+  p.text('Done.');
+  const warn = p.doc.querySelector('.msg-system.warning');
+  assert(warn && !warn.closest('.activity-group'), 'the warning was collapsed away');
 });
 
 test('a question from history reads the same', () => {

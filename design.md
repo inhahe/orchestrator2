@@ -3778,8 +3778,7 @@ throughout.
   together afterwards (`_fitThinking`): a couple of layouts in all, not one
   each. A history replay fits its summaries the same way. A summary inside a
   collapsed group cannot be measured, so it keeps its hint until the group is
-  opened, by its toggle or when `app.js` reveals a tool inside it
-  (`Chat.fitThinking`). Then the view follows to the bottom at once, not on
+  opened at its header (`fitThinking`). Then the view follows to the bottom at once, not on
   the next frame, so a scroll check due before that frame cannot find it out
   of place.
 - **A burst is not the user scrolling away.** "A bit scrolled up" was the
@@ -3833,29 +3832,34 @@ an older one.
   background task's output, an injected prompt) is built by `_expandable`, and
   `_setOpen` marks one the user has open with `data-user-open`. A run holding
   such a block becomes a group with its header showing ▼, so nothing being
-  read folds away; the header still collapses it. A block *drawn* open
+  read folds away; the header still collapses it. Held open only for that
+  (`data-held-open`), the group folds once nothing in it is open; folded or
+  opened at its header, it stays as the user left it. A block *drawn* open
   (`--show-thinking`, a question) is not one the user opened, and does not
-  count. A block a panel's item shows (`App.showToolDetail`/`showBgDetail`)
-  goes through `Chat.reveal`, which opens the group it was collapsed into and
-  the block itself, as the user's doing.
-- **A question is never collapsed, and shown once.** The hub cannot run
-  AskUserQuestion, so `_handle_tool_permission` denies it with
+  count.
+- **What the user asked for, or must answer, stands apart** (`_standApart`):
+  a question, a `/btw` exchange, a command's output, the warning that Claude
+  wrote a tool call as text. Each is marked `activity-boundary`, so no group
+  takes it, and the activity before it collapses as it is drawn, since no
+  later collapse reaches back past a boundary.
+- **A question is shown once, and reads as waiting for its reply.** The hub
+  cannot run AskUserQuestion, so `_handle_tool_permission` denies it with
   `tool_manager.ASK_DENIAL` and Claude goes on in plain text. The questions are
-  shown from the tool call itself: `_addToolUse` draws an AskUserQuestion open
-  and marks it `activity-boundary`, collapsing what ran before it first, since
-  no later collapse reaches back past a boundary. They are shown only there:
-  a copy as a notice would be ordinary activity, and fold away with the
-  thinking after it. The denial's result carries
+  shown from the tool call itself, which `_addToolUse` draws open. They are
+  shown only there: a copy as a notice would be ordinary activity, and fold
+  away with the thinking after it. The denial's result carries
   `awaiting_reply` (`tool_manager.awaits_reply`, recognised by the denial's
   opening words, live in `format_tool_result_msg` and from history in
-  `session.render_session_history`), and the block draws it as waiting for a
-  reply: a **?**, and where to answer, in place of a red failure and the text
-  meant for Claude.
+  `session.render_session_history`), and a question's block draws it as
+  waiting: a **?**, and where to answer, in place of a red failure and the
+  text meant for Claude. The next prompt the user sends is the reply, and
+  marks every question waiting answered (`_answerAsks`), in history too; a
+  backfill of older history counts one at its end answered when a prompt is
+  shown below it.
 
-Pinned by `tests/activity_collapse.test.js`, `tests/test_ask_user_question.py`
-and two tests in `reconnect_on_show.test.js` (a panel's reveal); mutation
-targets `activity-collapse`, `reveal-chat`, `catchup-app`, `ask-bridge`,
-`ask-tools`, `ask-history`.
+Pinned by `tests/activity_collapse.test.js` and
+`tests/test_ask_user_question.py`; mutation targets `activity-collapse`,
+`ask-bridge`, `ask-tools`, `ask-history`.
 
 ### Display options are backend state, not frontend state
 

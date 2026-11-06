@@ -112,7 +112,9 @@ const Chat = (() => {
     });
   }
 
-  /** Open or close *el*, an _expandable block, as the user's doing. */
+  /** Open or close *el*, an _expandable block, as the user's doing.  A group
+   *  held open only for what the user had open in it folds once nothing in
+   *  it is (data-held-open, _collapseActivity). */
   function _setOpen(el, open) {
     const x = el._expand;
     x.body.classList.toggle('open', open);
@@ -120,17 +122,35 @@ const Chat = (() => {
     if (open) el.dataset.userOpen = '1';
     else delete el.dataset.userOpen;
     if (open && x.onOpen) x.onOpen();
+    const held = !open && el.closest('.activity-group[data-held-open]');
+    if (held && !held.querySelector('[data-user-open]')) {
+      delete held.dataset.heldOpen;
+      _setGroupOpen(held, false);
+    }
   }
 
-  /** Show *el*, a block the user asked to see from elsewhere (a panel's
-   *  item): the group it was collapsed into opens, and so does the block. */
-  function reveal(el) {
-    const group = el.closest('.activity-group.collapsed');
-    if (group) {
-      _setGroupOpen(group, true);
-      fitThinking(group);
+  /** *el*, about to be drawn, is something the user asked for or must act on
+   *  (a question, a /btw exchange, a command's output, the warning that a tool
+   *  call was written as text): no group takes it.
+   *  What ran before it collapses now, as before any boundary -- no later
+   *  collapse reaches back past one. */
+  function _standApart(el) {
+    _collapseActivity();
+    el.classList.add('activity-boundary');
+  }
+
+  // Questions drawn waiting for the user's reply (_addToolResult); the next
+  // prompt the user sends is the reply (_addUserMessage).
+  let _awaitingAsks = [];
+
+  function _answerAsks() {
+    for (const el of _awaitingAsks) {
+      const icon = el.querySelector('.tool-status-icon');
+      icon.textContent = '\u2713';
+      icon.className = 'tool-status-icon complete';
+      el.querySelector('.ask-reply-hint').remove();
     }
-    if (el._expand) _setOpen(el, true);
+    _awaitingAsks = [];
   }
 
   function _setGroupOpen(group, open) {
@@ -247,9 +267,12 @@ const Chat = (() => {
     group.appendChild(toggle);
     group.appendChild(content);
     _setGroupOpen(group, open);
+    if (open) group.dataset.heldOpen = '1';
 
     toggle.addEventListener('click', () => {
       const opening = group.classList.contains('collapsed');
+      // Folded or opened at its header, it stays as the user left it.
+      delete group.dataset.heldOpen;
       _setGroupOpen(group, opening);
       if (opening) {
         fitThinking(content);
@@ -405,6 +428,7 @@ const Chat = (() => {
     _catchingUp = false;
     _thinkingToFit = [];
     _toolBlocks.clear();
+    _awaitingAsks = [];
     _cancelGap();
     _cancelShortGap();
   }
@@ -760,8 +784,7 @@ const Chat = (() => {
   }
 
   // Fit the summaries inside *root* that were hidden when the rest were
-  // fitted: a collapsed group, on being opened (at its header, or by reveal
-  // to show a block a panel was asked for).
+  // fitted: a collapsed group, on being opened at its header.
   function fitThinking(root) {
     _fitThinking(Array.from(root.querySelectorAll('.thinking-summary[data-fit]')));
   }
@@ -810,6 +833,7 @@ const Chat = (() => {
   function _addUserMessage(content, local, midTurn) {
     _flushStreaming();
     _collapseActivity();
+    _answerAsks();
     const el = document.createElement('div');
     el.className = 'msg msg-user';
     // *midTurn*: history of a prompt the session was handed during a turn
@@ -930,6 +954,7 @@ const Chat = (() => {
     const warn = document.createElement('div');
     warn.className = 'msg msg-system warning';
     warn.textContent = '\u26A0 Claude emitted a tool call as text \u2014 it didn\u2019t actually run. Nudge it to retry.';
+    _standApart(warn);
     elMessages.appendChild(warn);
   }
 
@@ -1012,16 +1037,13 @@ const Chat = (() => {
     _flushStreaming();
     const h = msg.header || {};
     const name = msg.name || h.name || '?';
-    // AskUserQuestion needs the user's attention: render it expanded and keep
-    // it out of the collapsed activity group (mark it an activity boundary so
-    // _collapseActivity never sweeps it in with the other tools).  As before
-    // any boundary, what ran before it collapses first: no later collapse
-    // reaches back past it.
+    // AskUserQuestion needs the user's attention: rendered expanded, and no
+    // group takes it.
     const isAsk = name === 'AskUserQuestion';
-    if (isAsk) _collapseActivity();
 
     const el = document.createElement('div');
-    el.className = 'msg msg-tool' + (isAsk ? ' msg-ask activity-boundary' : '');
+    el.className = 'msg msg-tool' + (isAsk ? ' msg-ask' : '');
+    if (isAsk) _standApart(el);
     el.dataset.toolUseId = msg.tool_use_id;
 
     const summary = _toolHeaderSummary(h, msg.input);
@@ -1059,22 +1081,20 @@ const Chat = (() => {
   function _addToolResult(msg) {
     const isErr = msg.is_error || msg.status === 'error';
     const el = _toolBlocks.get(msg.tool_use_id);
-    if (el && msg.awaiting_reply) {
+    if (el && msg.awaiting_reply && el.classList.contains('msg-ask')) {
       // The hub's answer to Claude for a question it cannot run (tool_manager
-      // .awaits_reply): not a failure, the question asked and waiting.
+      // .awaits_reply): not a failure, the question asked and waiting.  Known
+      // by its text, so only a question's block is taken for one.
+      if (_awaitingAsks.includes(el)) return;   // the same result again
       const iconEl = el.querySelector('.tool-status-icon');
-      if (iconEl) {
-        iconEl.textContent = '?';
-        iconEl.className = 'tool-status-icon asking';
-      }
-      const detail = el.querySelector('.tool-detail');
-      if (detail) {
-        const hint = document.createElement('div');
-        hint.className = 'ask-reply-hint';
-        hint.textContent = 'Answer in the message box: name an option, or say it '
-                         + 'in your own words.';
-        detail.appendChild(hint);
-      }
+      iconEl.textContent = '?';
+      iconEl.className = 'tool-status-icon asking';
+      const hint = document.createElement('div');
+      hint.className = 'ask-reply-hint';
+      hint.textContent = 'Answer in the message box: name an option, or say it '
+                       + 'in your own words.';
+      el.querySelector('.tool-detail').appendChild(hint);
+      _awaitingAsks.push(el);
     } else if (el) {
       // Update status icon (▶ → ✓ or ✗).
       const iconEl = el.querySelector('.tool-status-icon');
@@ -1370,6 +1390,7 @@ const Chat = (() => {
        </div>
        <div class="btw-question">${_esc(msg.question || '')}</div>
        <div class="btw-answer"></div>`;
+    _standApart(el);
     elMessages.appendChild(el);
     _btwEls.set(id, el.querySelector('.btw-answer'));
     _scrollToBottom();
@@ -1428,6 +1449,7 @@ const Chat = (() => {
 
     const el = document.createElement('div');
     el.className = 'msg msg-command';
+    _standApart(el);
 
     const data = msg.data;
     const label = msg.label;
@@ -1629,6 +1651,10 @@ const Chat = (() => {
     const real = elMessages;
     const scratch = document.createElement('div');
     elMessages = scratch;
+    // The questions waiting already are newer than any in these messages: a
+    // prompt among them answers only theirs.
+    const awaiting = _awaitingAsks;
+    _awaitingAsks = [];
     try {
       const sep = document.createElement('div');
       sep.className = 'msg msg-system activity-boundary';
@@ -1638,6 +1664,9 @@ const Chat = (() => {
     } finally {
       elMessages = real;
       _moreAbove = 0;
+      // One still waiting at their end was answered by a prompt shown below.
+      if (real.querySelector('.msg-user')) _answerAsks();
+      _awaitingAsks = awaiting.concat(_awaitingAsks);
     }
 
     // Anchor the viewport: inserting content above shifts everything down by
@@ -2202,5 +2231,5 @@ const Chat = (() => {
 
   return { init, clear, handleMessage, setCollapseTools, getCollapseTools,
            setShowThinking, getShowThinking, setMaxDomMessages, forceScrollToBottom,
-           beginCatchUp, endCatchUp, reveal };
+           beginCatchUp, endCatchUp };
 })();

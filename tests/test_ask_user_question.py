@@ -34,7 +34,8 @@ QUESTIONS = {"questions": [{
     "options": [{"label": "A", "description": "a"}, {"label": "B", "description": "b"}],
 }]}
 
-# As the CLI records the denial, in a session from before this change.
+# The denial as the CLI recorded it, copied from a session's transcript
+# (2026-11-02): the message itself, unwrapped, with is_error set.
 RECORDED = ("AskUserQuestion isn't supported in this interface, so it was not run. "
             "Your questions have already been shown to the user in the chat. Do not "
             "repeat them — end your turn and wait for the user's plain-text reply, "
