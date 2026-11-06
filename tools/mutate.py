@@ -856,12 +856,12 @@ STALE_MUTATIONS = [
 STALETAB_MUTATIONS = [
     ("a tab still carrying a session's name focuses itself and does nothing "
      "(the original report)",
-     "    if (w === window) { window.location.href = url; return; }\n",
+     "    if (w === window) { _navigate(url); return; }\n",
      ""),
 
     ("every target is treated as self, so no other tab is ever focused",
-     "    if (w === window) { window.location.href = url; return; }",
-     "    { window.location.href = url; return; }"),
+     "    if (w === window) { _navigate(url); return; }",
+     "    { _navigate(url); return; }"),
 
     ("a notice leaves the tab wearing the name of a session it is not showing",
      "    if (!_hasSession) _setLanding(true);\n"
@@ -999,12 +999,12 @@ LOBBYCARD_MUTATIONS = [
      "    const viewers = m.viewers || null;"),
 
     ("unknown is rendered as the idle dot again (the original bug)",
-     "    const dotCls = m.busy === true ? 'busy' : (known ? 'idle' : 'unknown');",
-     "    const dotCls = m.busy ? 'busy' : 'idle';"),
+     "    const dotCls = !known ? 'unknown'\n",
+     "    const dotCls = !known ? 'idle'\n"),
 
     ("unknown is rendered as the busy dot, crying wolf instead",
-     "    const dotCls = m.busy === true ? 'busy' : (known ? 'idle' : 'unknown');",
-     "    const dotCls = m.busy === false ? 'idle' : 'busy';"),
+     "    const dotCls = !known ? 'unknown'\n",
+     "    const dotCls = !known ? 'busy'\n"),
 
     ("a null busy counts as known, so nothing is ever unknown",
      "    const known = m.busy === true || m.busy === false;",
@@ -1015,12 +1015,12 @@ LOBBYCARD_MUTATIONS = [
      "    const known = false;"),
 
     ("the dot tooltip goes back to the two-state text",
-     "        <span class=\"lobby-dot ${dotCls}\" title=\"${_esc(dotTitle)}\"></span>",
-     "        <span class=\"lobby-dot ${dotCls}\" title=\"${m.busy ? 'working' : 'idle'}\"></span>"),
+     "        <span class=\"lobby-dot ${dotCls}\"${dotStyle} title=\"${_esc(dotTitle)}\"></span>",
+     "        <span class=\"lobby-dot ${dotCls}\"${dotStyle} title=\"${m.busy ? 'working' : 'idle'}\"></span>"),
 
     ("the two kinds of not-knowing are described identically",
-     "               : (m.port",
-     "               : (false"),
+     "      : (m.port\n",
+     "      : (false\n"),
 
     ("an empty rid is emitted anyway, leaving a dangling separator",
      "    if (m.rid) metaParts.push(`<span class=\"lobby-card-rid\">${_esc(m.rid)}</span>`);",
