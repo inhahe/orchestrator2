@@ -4847,24 +4847,26 @@ correct password clears them.
 
 **The count wears off, one failure per `_MAX_LOCKOUT`.** It used to fall only
 on a correct password or a restart, so a scan that ran it up left the owner's
-next typo, however much later, the full five-minute lockout. `_record_failure`
-now forgets one failure for each `_MAX_LOCKOUT` that has passed, before
-counting the new one:
+next typo, however much later, the full five-minute lockout. The count is now
+a level, `_level`, that drains continuously at one failure per `_MAX_LOCKOUT`
+and cannot drain below empty. `_fails` reads it whole, rounding a
+part-forgotten failure up, which gives exactly the counts of forgetting whole
+windows while carrying the part of a window that has passed into the next with
+no bookkeeping:
 
 - After a scan stops, the owner's first typo is free once ten windows have
   passed (50 minutes), and all five free attempts are back after fourteen
   (70 minutes). A typo sooner than that can still cost up to the full
   lockout.
 - Guesses that average slower than one per window cannot build the count up
-  over time. Only whole windows are forgotten, so `_forget_from`, the moment
-  forgetting is counted from, moves on by just the windows forgotten, and the
-  part of a window that has passed counts toward the next. Moving it to the
-  time of each failure would throw that part away every time. Gaps of 150s
-  then 460s, averaging slower than a window, would then climb to the cap.
-  Gaps that average only barely slower are a random walk with almost no
-  drift, and wander a few failures up and back down under any rule.
-- An empty count banks nothing: forgetting starts afresh from its next
-  failure. Otherwise a long silence would buy that many free tries.
+  over time, since the part of a window that has passed always counts toward
+  the next. A version that forgot whole windows since the last failure, and
+  threw the rest away at each one, let gaps of 150s then 460s, averaging
+  slower than a window, climb to the cap. Gaps that average only barely
+  slower are a random walk with almost no drift, and wander a few failures up
+  and back down under any rule.
+- An empty count banks nothing, since the level stops at zero. Otherwise a
+  long silence would buy that many free tries.
 - A guesser at the cap stays there. Each try comes a full window after the
   last, forgets one, and adds one.
 - No way of guessing averages more than one try per window, the rate the cap
@@ -4898,9 +4900,16 @@ and where it sits.
 refuses a `str` with any non-ASCII character by raising `TypeError`. A
 request carrying one, which anyone can send, then got a server error and a
 traceback instead of a refusal, outside both the throttle and the refusal
-log's cap. A non-ASCII password could never be used at all. The password, the
-`?password=` value and the cookie are each encoded as UTF-8 first, and a
-non-ASCII one is then simply a wrong credential.
+log's cap. A non-ASCII password could never be used at all. What a request
+carries is encoded as UTF-8 and compared with the password's and the token's
+bytes. Those are encoded once, in `__init__`, so a password that is not text
+fails at startup with a clear error rather than on every outside request. A
+non-ASCII credential is then simply a wrong one. The Basic challenge says
+`charset="UTF-8"` (RFC 7617), so a client knows how to encode a non-ASCII
+password. One that ignores it sends ISO-8859-1, which is not valid UTF-8 once
+the password has a non-ASCII character, and `_check_basic_auth` then reads
+the bytes as Latin-1. Without that, the owner's correct password would count
+as a wrong guess, and five of them would lock the owner out.
 
 ### A refusal says why, to the page and to the log
 

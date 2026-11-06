@@ -277,6 +277,18 @@ def test_the_count_stops_at_the_cap(clock):
     assert mw._lockout_remaining() == mw._MAX_LOCKOUT
 
 
+def test_a_part_forgotten_failure_still_counts(clock):
+    # The count drains continuously; until a failure has drained away
+    # entirely it still counts, as it would with whole windows.
+    mw = _ExternalAuthMiddleware(_inner_app, password="secret")
+    for _ in range(mw._FREE_ATTEMPTS):
+        mw._record_failure()
+    clock[0] += mw._MAX_LOCKOUT * 0.99
+    mw._record_failure()
+    assert mw._fails == mw._FREE_ATTEMPTS + 1
+    assert mw._lockout_remaining() > 0, "a part-forgotten failure was let off"
+
+
 def test_the_count_cap_is_where_the_window_reaches_its_own(clock):
     # Any lower, and the lockout would stop escalating short of its cap.
     mw = _ExternalAuthMiddleware(_inner_app, password="secret")
@@ -341,14 +353,44 @@ def test_a_non_ascii_query_password_is_a_wrong_one(mw):
 
 
 def test_a_non_ascii_password_can_be_used():
-    mw = _ExternalAuthMiddleware(_inner_app, password="Passwört")
-    status, hdrs, ran = _drive(mw, headers=_basic("Passwört"))
+    mw = _ExternalAuthMiddleware(_inner_app, password="Passw\u00f6rt")
+    status, hdrs, ran = _drive(mw, headers=_basic("Passw\u00f6rt"))
     assert status == 200 and ran
     status, _, ran = _drive(mw, query=b"password=Passw%C3%B6rt")
     assert status == 200 and ran
     cookie = hdrs[b"set-cookie"].split(b";")[0]
     status, _, ran = _drive(mw, headers=[(b"cookie", cookie)])
     assert status == 200 and ran
+
+
+def test_the_challenge_asks_for_utf_8(mw):
+    # RFC 7617: without it, how a client encodes a non-ASCII password is up
+    # to the client.
+    _, hdrs, _ = _drive(mw)
+    assert hdrs[b"www-authenticate"] == b'Basic realm="orchestrator2", charset="UTF-8"'
+
+
+def test_a_client_that_sends_latin_1_is_understood():
+    # One that ignores the charset: its correct password must not count as a
+    # wrong guess, five of which would lock the owner out.
+    mw = _ExternalAuthMiddleware(_inner_app, password="Passw\u00f6rt")
+    tok = base64.b64encode("u:Passw\u00f6rt".encode("latin-1"))
+    status, _, ran = _drive(mw, headers=[(b"authorization", b"Basic " + tok)])
+    assert status == 200 and ran
+    assert mw._fails == 0
+
+
+def test_bytes_that_are_not_utf_8_are_a_wrong_password(mw):
+    tok = base64.b64encode(b"u:\xff\xfe\xfd")
+    status, _, ran = _drive(mw, headers=[(b"authorization", b"Basic " + tok)])
+    assert status == 401 and not ran
+    assert mw._fails == 1
+
+
+def test_a_password_that_is_not_text_fails_at_startup():
+    # Not on every request from outside, as an error the throttle never sees.
+    with pytest.raises(ValueError, match="not valid text"):
+        _ExternalAuthMiddleware(_inner_app, password="bad\udcff")
 
 
 # --- A refused socket is told why --------------------------------------------

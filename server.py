@@ -3007,15 +3007,18 @@ WS_CLOSE_DISABLED = 4403     # external access is off, or on with no password
 WS_CLOSE_LOCKED_OUT = 4429   # the brute-force throttle's lockout
 
 
-def _secret_matches(given: str, secret: str) -> bool:
-    """Whether *given*, from a request, is *secret*, in constant time.
+def _secret_matches(given: str, secret: bytes) -> bool:
+    """Whether *given*, decoded from a request, is *secret* (its UTF-8 bytes),
+    in constant time.
 
-    Compared as UTF-8 bytes: ``hmac.compare_digest`` refuses a ``str`` with
-    any non-ASCII character, with a TypeError that would turn a request
-    carrying one -- which anyone can send -- into a server error that skips
-    the throttle, and would make a non-ASCII password unusable.
+    Compared as bytes: ``hmac.compare_digest`` refuses a ``str`` with any
+    non-ASCII character, with a TypeError that would turn a request carrying
+    one -- which anyone can send -- into a server error that skips the
+    throttle, and would make a non-ASCII password unusable.  A lone surrogate
+    in *given* encodes to bytes no valid UTF-8 secret contains, so it can
+    only fail to match, never fail.
     """
-    return hmac.compare_digest(given.encode("utf-8"), secret.encode("utf-8"))
+    return hmac.compare_digest(given.encode("utf-8", "surrogatepass"), secret)
 
 
 def _ws_close_reason(text: str) -> str:
@@ -3172,17 +3175,26 @@ class _ExternalAuthMiddleware:
             "External access is disabled on this server.\n\n" + EXTERNAL_HOWTO)
         # Its first paragraph: what the log says, and a refused socket is told.
         self._disabled_reason = _ws_close_reason(self.disabled_message)
+        # Encoded once, so a password that is not text fails here, at
+        # startup, rather than as an error on every request from outside.
+        try:
+            self._password_bytes = (password.encode("utf-8")
+                                    if password is not None else None)
+        except UnicodeEncodeError as exc:
+            raise ValueError("the external-access password is not valid "
+                             "text: it cannot be encoded as UTF-8") from exc
         # Deterministic token derived from the password: lets the cookie
         # authenticate without carrying the literal secret.
         self.token = (
-            hashlib.sha256(("orch2-auth:" + password).encode()).hexdigest()
-            if password is not None else None
+            hashlib.sha256(b"orch2-auth:" + self._password_bytes).hexdigest()
+            if self._password_bytes is not None else None
         )
+        self._token_bytes = self.token.encode("ascii") if self.token else None
         # Global failure tracking (shared across all source IPs — see the
         # brute-force note above).  In-process only; a restart forgives.
-        self._fails = 0
+        self._level = 0.0           # failures not yet forgotten, draining
         self._locked_until = 0.0    # time.monotonic() deadline
-        self._forget_from = 0.0     # time.monotonic() forgetting is counted from
+        self._last_failure = 0.0    # time.monotonic() of the latest failure
         self._refusals = _RefusalLog()
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
@@ -3240,7 +3252,7 @@ class _ExternalAuthMiddleware:
 
                 header_ok = self._check_basic_auth(auth)
                 param_ok = pw_param is not None and _secret_matches(
-                    pw_param, self.password)
+                    pw_param, self._password_bytes)
                 if not (header_ok or param_ok):
                     # **Only a wrong credential counts as an attempt.**  A
                     # request that carried none is not a guess — it is a browser
@@ -3279,36 +3291,30 @@ class _ExternalAuthMiddleware:
         remaining = self._locked_until - time.monotonic()
         return remaining if remaining > 0 else 0.0
 
+    @property
+    def _fails(self) -> int:
+        """The failures not yet forgotten, a part-forgotten one counting whole."""
+        return math.ceil(self._level)
+
     def _record_failure(self) -> None:
         """Count a failed attempt and (past the threshold) arm the lockout.
 
-        One failure is forgotten for each ``_MAX_LOCKOUT`` that passes, so the
-        count wears off however it was run up: a scan that stopped stops
-        costing the owner, and guesses that average slower than one per
-        window never build it up.  A guesser can therefore never average more
-        than one try per ``_MAX_LOCKOUT``, which the cap allows anyway:
-        waiting gains nothing.
-
-        Only whole windows are forgotten, and ``_forget_from`` moves on by
-        just those, so the part of a window that has passed counts towards
-        the next.  Moving it to *now* would throw that part away at every
-        failure, and uneven gaps -- 150s, then 460s -- would build the count
-        up while averaging slower than one per window.  An empty count banks
-        nothing: forgetting starts afresh from its next failure.
+        The count drains continuously, one failure per ``_MAX_LOCKOUT``, so it
+        wears off however it was run up: a scan that stopped stops costing
+        the owner, and guesses that average slower than one per window cannot
+        build it up -- the part of a window that has passed counts towards
+        the next.  It cannot drain below empty, so a silence banks nothing.
+        A guesser can therefore never average more than one try per
+        ``_MAX_LOCKOUT``, which the cap allows anyway: waiting gains nothing.
 
         On the request path the count cannot pass ``_MAX_FAILS``: there the
         lockout is the cap, so the next counted failure comes a full window
-        later and forgets one.  The ``min`` makes that hold for any caller.
+        later and drains one.  The ``min`` makes that hold for any caller.
         """
         now = time.monotonic()
-        forgotten = int((now - self._forget_from) // self._MAX_LOCKOUT)
-        level = self._fails - forgotten
-        if level > 0:
-            self._forget_from += forgotten * self._MAX_LOCKOUT
-        else:
-            level = 0
-            self._forget_from = now
-        self._fails = min(level + 1, self._MAX_FAILS)
+        drained = max(0.0, now - self._last_failure) / self._MAX_LOCKOUT
+        self._level = min(max(0.0, self._level - drained) + 1, self._MAX_FAILS)
+        self._last_failure = now
         over = self._fails - self._FREE_ATTEMPTS
         if over > 0:
             window = min(self._BASE_LOCKOUT * (2 ** (over - 1)), self._MAX_LOCKOUT)
@@ -3316,7 +3322,7 @@ class _ExternalAuthMiddleware:
 
     def _record_success(self) -> None:
         """Clear the failure history after a valid credential."""
-        self._fails = 0
+        self._level = 0.0
         self._locked_until = 0.0
 
     def _check_basic_auth(self, auth_header: str) -> bool:
@@ -3324,21 +3330,28 @@ class _ExternalAuthMiddleware:
         if not auth_header.startswith("Basic "):
             return False
         try:
-            decoded = base64.b64decode(auth_header[6:]).decode("utf-8", "replace")
+            raw = base64.b64decode(auth_header[6:])
         except Exception:
             return False
+        # UTF-8, which the challenge asks for (RFC 7617's charset).  A client
+        # that ignores it sends ISO-8859-1, which is not valid UTF-8 once the
+        # password has a non-ASCII character, and decodes from any bytes.
+        try:
+            decoded = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            decoded = raw.decode("latin-1")
         # Accept any username; only the password matters.
         parts = decoded.split(":", 1)
-        return len(parts) == 2 and _secret_matches(parts[1], self.password)
+        return len(parts) == 2 and _secret_matches(parts[1], self._password_bytes)
 
     def _cookie_ok(self, cookie_header: bytes) -> bool:
         """True when the request carries a valid ``orch2_auth`` cookie."""
-        if not cookie_header or self.token is None:
+        if not cookie_header or self._token_bytes is None:
             return False
         raw = cookie_header.decode("utf-8", "replace")
         for part in raw.split(";"):
             name, _, value = part.strip().partition("=")
-            if name == _AUTH_COOKIE and _secret_matches(value, self.token):
+            if name == _AUTH_COOKIE and _secret_matches(value, self._token_bytes):
                 return True
         return False
 
@@ -3383,7 +3396,8 @@ class _ExternalAuthMiddleware:
             ]
             if challenge:
                 resp_headers.append(
-                    [b"www-authenticate", b'Basic realm="orchestrator2"'])
+                    [b"www-authenticate",
+                     b'Basic realm="orchestrator2", charset="UTF-8"'])
             if retry_after is not None:
                 resp_headers.append(
                     [b"retry-after", str(int(retry_after) + 1).encode()])

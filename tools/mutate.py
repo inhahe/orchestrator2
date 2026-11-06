@@ -592,12 +592,28 @@ EXTAUTH_MUTATIONS = [
      ""),
 
     ("the count is not capped, and overflows",
-     "        self._fails = min(level + 1, self._MAX_FAILS)",
-     "        self._fails = level + 1"),
+     "        self._level = min(max(0.0, self._level - drained) + 1, self._MAX_FAILS)",
+     "        self._level = max(0.0, self._level - drained) + 1"),
+
+    ("a part-forgotten failure counts as gone",
+     "        return math.ceil(self._level)",
+     "        return math.floor(self._level)"),
 
     ("a non-ASCII credential crashes the check",
-     '    return hmac.compare_digest(given.encode("utf-8"), secret.encode("utf-8"))',
-     "    return hmac.compare_digest(given, secret)"),
+     '    return hmac.compare_digest(given.encode("utf-8", "surrogatepass"), secret)',
+     '    return hmac.compare_digest(given, secret.decode("utf-8"))'),
+
+    ("the challenge leaves the password's encoding to the client",
+     """b'Basic realm="orchestrator2", charset="UTF-8"'""",
+     """b'Basic realm="orchestrator2"'"""),
+
+    ("a Latin-1 client's correct password is a wrong guess",
+     '            decoded = raw.decode("latin-1")',
+     '            decoded = raw.decode("utf-8", "replace")'),
+
+    ("a password that is not text fails on every request, not at startup",
+     '            self._password_bytes = (password.encode("utf-8")',
+     '            self._password_bytes = (password.encode("utf-8", "surrogatepass")'),
 
     ("the count is capped before the window reaches its own cap",
      "    _MAX_FAILS = _FREE_ATTEMPTS + 1 + math.ceil(",
@@ -608,24 +624,20 @@ EXTAUTH_MUTATIONS = [
      "                cookie_ok = bool(headers.get(b\"cookie\"))"),
 
     ("failures are never forgotten",
-     "        forgotten = int((now - self._forget_from) // self._MAX_LOCKOUT)",
-     "        forgotten = 0"),
+     "        drained = max(0.0, now - self._last_failure) / self._MAX_LOCKOUT",
+     "        drained = 0.0"),
 
-    ("the part of a window that passed is thrown away at every failure",
-     "            self._forget_from += forgotten * self._MAX_LOCKOUT",
-     "            self._forget_from = now"),
+    ("forgetting counts from before the latest failure",
+     "        self._last_failure = now\n",
+     ""),
 
     ("failures are forgotten faster than the cap lets a guesser try",
-     "        forgotten = int((now - self._forget_from) // self._MAX_LOCKOUT)",
-     "        forgotten = int((now - self._forget_from) // (self._MAX_LOCKOUT / 5))"),
+     "        drained = max(0.0, now - self._last_failure) / self._MAX_LOCKOUT",
+     "        drained = max(0.0, now - self._last_failure) / (self._MAX_LOCKOUT / 5)"),
 
-    ("an empty count banks the time it was empty",
-     "            level = 0\n            self._forget_from = now\n",
-     "            level = 0\n"),
-
-    ("a count forgotten below zero banks free tries",
-     "            level = 0\n            self._forget_from = now\n",
-     "            self._forget_from = now\n"),
+    ("a silence banks free tries: the count drains below empty",
+     "min(max(0.0, self._level - drained) + 1,",
+     "min((self._level - drained) + 1,"),
 
     ("wrong passwords stop being counted at all",
      "                    if auth or pw_param is not None:\n"
