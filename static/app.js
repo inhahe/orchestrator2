@@ -938,32 +938,13 @@ const App = (() => {
 
   // --- Modal ---
 
-  // If `el` lives inside a collapsed activity group, expand that group so
-  // the element is actually visible before we scroll to it.  Without this,
-  // clicking a panel item whose scroll block was folded into an activity
-  // group would scroll to a `display:none` element and show nothing.
-  function _revealInScroll(el) {
-    const group = el.closest('.activity-group.collapsed');
-    if (group) {
-      group.classList.remove('collapsed');
-      // Thinking summaries cannot be measured while their group is shut.
-      Chat.fitThinking(group);
-      const toggle = group.querySelector('.activity-group-toggle');
-      if (toggle) toggle.textContent = toggle.textContent.replace(/^\u25B6/, '\u25BC');
-    }
-  }
-
+  // A panel's item shows its block in the chat: opened, out of any group it
+  // was collapsed into (a `display:none` element scrolls to nothing), and
+  // counted as opened by the user, so its run is not collapsed under them.
   function showToolDetail(toolUseId) {
-    // For now, show the tool block's detail view.
-    // In the future, could fetch via /api/show.
     const el = document.querySelector(`[data-tool-use-id="${toolUseId}"]`);
     if (el) {
-      _revealInScroll(el);
-      const detail = el.querySelector('.tool-detail');
-      if (detail) {
-        detail.classList.add('open');
-        el.querySelector('.tool-expand-icon')?.classList.add('open');
-      }
+      Chat.reveal(el);
       el.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
   }
@@ -973,12 +954,7 @@ const App = (() => {
     const all = document.querySelectorAll(`[data-bg-task-id="${taskId}"]`);
     const el = all.length > 0 ? all[all.length - 1] : null;
     if (el) {
-      _revealInScroll(el);
-      const detail = el.querySelector('.tool-detail');
-      if (detail) {
-        detail.classList.add('open');
-        el.querySelector('.tool-expand-icon')?.classList.add('open');
-      }
+      Chat.reveal(el);
       el.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
   }

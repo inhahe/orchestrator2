@@ -123,6 +123,28 @@ def format_tool_use_msg(
     }
 
 
+# What Claude is told when it calls AskUserQuestion, which the hub cannot run
+# (SDKBridge._handle_tool_permission): the chat shows the questions from the
+# tool call itself, and the user answers them as an ordinary prompt.
+ASK_DENIAL_LEAD = "AskUserQuestion isn't supported in this interface"
+ASK_DENIAL = (
+    ASK_DENIAL_LEAD + ", so it was not run. Your questions have already been "
+    "shown to the user in the chat. Do not repeat them — end your turn and "
+    "wait for the user's plain-text reply, then continue with their answer."
+)
+
+
+def awaits_reply(text: str, is_error: bool) -> bool:
+    """Whether a tool result is the hub's AskUserQuestion denial.
+
+    *text* and *is_error* are the result as the CLI records it.  True means
+    the question is asked and waits for the user's reply -- not a tool that
+    failed -- and the chat draws it so (``awaiting_reply``, chat.js).  Known
+    by its opening words, so a session from before a rewording still is.
+    """
+    return bool(is_error) and (text or "").lstrip().startswith(ASK_DENIAL_LEAD)
+
+
 def format_tool_result_msg(
     tool_use_id: str,
     seq: int | None,
@@ -140,6 +162,7 @@ def format_tool_result_msg(
         "content": text,
         "size_hint": humanize_size(text),
         "status": "error" if is_error else "complete",
+        "awaiting_reply": awaits_reply(text, is_error),
     }
 
 

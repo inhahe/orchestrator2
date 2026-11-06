@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from account import account_dir
-from tool_manager import format_tool_header
+from tool_manager import awaits_reply, format_tool_header
 
 log = logging.getLogger(__name__)
 
@@ -2983,12 +2983,14 @@ def render_session_history(
                             else _extract_text(inner)
                         )
                         text = (text or "").strip()
+                        is_error = bool(block.get("is_error"))
                         messages.append({
                             "type": "tool_result",
                             "tool_use_id": block["tool_use_id"],
                             "content": text,
-                            "is_error": bool(block.get("is_error")),
+                            "is_error": is_error,
                             "size_hint": _humanize_size(text),
+                            "awaiting_reply": awaits_reply(text, is_error),
                             "is_history": True,
                         })
 

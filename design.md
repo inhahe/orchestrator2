@@ -3819,6 +3819,44 @@ Tests: `tests/test_resume_stream.py` (the stream, `_resume_ws`, and the real
 close report, and the name kept through a drop and a reload). Mutation
 targets: `resume-runtime`, `resume-server`, `resume-app`, `resume-status`.
 
+### A run of activity collapses, but not what you are reading
+
+Tools, thinking blocks and notices are drawn one by one as they stream in.
+When the next **boundary** arrives (Claude's text, a user or peer message, an
+injected prompt, the turn's end), `_collapseActivity` wraps everything since
+the previous boundary into one group, collapsed to a summary line ("3 tools,
+1 thinking"). A group is itself a boundary, so no collapse reaches back into
+an older one.
+
+- **A run holding a block the user has open is grouped open.** Every block
+  that opens at a click on its header (a tool's detail, a thinking block, a
+  background task's output, an injected prompt) is built by `_expandable`, and
+  `_setOpen` marks one the user has open with `data-user-open`. A run holding
+  such a block becomes a group with its header showing ▼, so nothing being
+  read folds away; the header still collapses it. A block *drawn* open
+  (`--show-thinking`, a question) is not one the user opened, and does not
+  count. A block a panel's item shows (`App.showToolDetail`/`showBgDetail`)
+  goes through `Chat.reveal`, which opens the group it was collapsed into and
+  the block itself, as the user's doing.
+- **A question is never collapsed, and shown once.** The hub cannot run
+  AskUserQuestion, so `_handle_tool_permission` denies it with
+  `tool_manager.ASK_DENIAL` and Claude goes on in plain text. The questions are
+  shown from the tool call itself: `_addToolUse` draws an AskUserQuestion open
+  and marks it `activity-boundary`, collapsing what ran before it first, since
+  no later collapse reaches back past a boundary. They are shown only there:
+  a copy as a notice would be ordinary activity, and fold away with the
+  thinking after it. The denial's result carries
+  `awaiting_reply` (`tool_manager.awaits_reply`, recognised by the denial's
+  opening words, live in `format_tool_result_msg` and from history in
+  `session.render_session_history`), and the block draws it as waiting for a
+  reply: a **?**, and where to answer, in place of a red failure and the text
+  meant for Claude.
+
+Pinned by `tests/activity_collapse.test.js`, `tests/test_ask_user_question.py`
+and two tests in `reconnect_on_show.test.js` (a panel's reveal); mutation
+targets `activity-collapse`, `reveal-chat`, `catchup-app`, `ask-bridge`,
+`ask-tools`, `ask-history`.
+
 ### Display options are backend state, not frontend state
 
 Anything that changes how the stream *looks* (`collapse_tools`,

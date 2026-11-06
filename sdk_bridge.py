@@ -189,6 +189,7 @@ from session import (
     project_dir_for_cwd,
 )
 from tool_manager import (
+    ASK_DENIAL,
     complete_bg_task,
     complete_tool,
     format_tool_result_msg,
@@ -5594,22 +5595,14 @@ class SDKBridge:
         pipeline step 1e).  orchestrator2's chat UI has no picker widget, and
         answering the tool requires returning the selections via
         ``updated_input`` (which we don't collect), so letting it run just
-        yields empty answers — that's how it "always failed".  Instead we
-        surface the questions in the chat and deny with guidance so Claude
-        continues the exchange in plain text, which the chat handles
-        naturally.  Every other tool keeps the prior behavior.
+        yields empty answers.  Instead it is denied with guidance, so Claude
+        continues the exchange in plain text.  The chat shows the questions
+        from the tool call itself, in a block that never collapses, and draws
+        this denial as the question waiting for a reply (``awaiting_reply``).
+        Every other tool keeps the prior behavior.
         """
         if tool_name == "AskUserQuestion":
-            await self._surface_ask_user_question(tool_input)
-            return PermissionResultDeny(
-                message=(
-                    "AskUserQuestion isn't supported in this interface, so it "
-                    "was not run. Your questions have already been shown to the "
-                    "user in the chat. Do not repeat them — end your turn and "
-                    "wait for the user's plain-text reply, then continue with "
-                    "their answer."
-                ),
-            )
+            return PermissionResultDeny(message=ASK_DENIAL)
 
         # Ordinary tools only reach here under a real permission mode; bypass
         # auto-allows them before calling us.  Preserve that: auto-allow under
@@ -5629,52 +5622,6 @@ class SDKBridge:
         if allowed:
             return PermissionResultAllow()
         return PermissionResultDeny(message="User denied")
-
-    async def _surface_ask_user_question(self, tool_input: dict) -> None:
-        """Render an AskUserQuestion tool call as a readable chat message.
-
-        The tool input carries 1-4 questions, each with 2-4 labelled options
-        (an "Other"/free-text choice is always implied).  We format them as a
-        system message so the user sees exactly what Claude wanted to ask and
-        can answer in their own words.
-        """
-        questions = []
-        if isinstance(tool_input, dict) and isinstance(tool_input.get("questions"), list):
-            questions = tool_input["questions"]
-
-        lines: list[str] = []
-        lines.append(
-            "Claude has a question:" if len(questions) == 1
-            else "Claude has some questions:"
-        )
-        for qi, q in enumerate(questions, 1):
-            if not isinstance(q, dict):
-                continue
-            qtext = str(q.get("question") or "").strip()
-            multi = bool(q.get("multiSelect"))
-            prefix = f"{qi}. " if len(questions) > 1 else ""
-            lines.append("")
-            lines.append(
-                f"{prefix}{qtext}" + ("  (choose all that apply)" if multi else "")
-            )
-            opts = q.get("options")
-            if isinstance(opts, list):
-                for opt in opts:
-                    if not isinstance(opt, dict):
-                        continue
-                    label = str(opt.get("label") or "").strip()
-                    desc = str(opt.get("description") or "").strip()
-                    lines.append(f"    - {label}" + (f" \u2014 {desc}" if desc else ""))
-            lines.append("    - (or answer in your own words)")
-
-        text = "\n".join(lines).rstrip()
-        if not text:
-            text = "Claude tried to ask a question, but it had no content."
-        await self.broadcast({
-            "type": "system_msg",
-            "subtype": "info",
-            "data": {"message": text},
-        })
 
     async def _surface_api_error_loop(self, err_code: str | None) -> None:
         """Break out of a repeating API-error loop and warn the user.

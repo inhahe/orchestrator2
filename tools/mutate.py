@@ -6677,8 +6677,8 @@ COLLAPSE_VIEW_MUTATIONS = [
      "    if (false) {\n"),
 
     ("a hidden window measures what nobody sees",
-     "    const _wasPinned = _autoScroll && !_replayInProgress && !_drawingInBulk && !_hidden();\n",
-     "    const _wasPinned = _autoScroll && !_replayInProgress && !_drawingInBulk;\n"),
+     "      && !_hidden();\n",
+     "      ;\n"),
 ]
 
 # A tab Chrome had frozen "replays the recent history fairly slowly" when it is
@@ -6724,8 +6724,8 @@ CATCHUP_CHAT_MUTATIONS = [
      "      {\n        _dispatchMessage(m);\n      } if (false) {\n"),
 
     ("a catch-up reads the layout for every run it collapses",
-     "    const _wasPinned = _autoScroll && !_replayInProgress && !_drawingInBulk && !_hidden();\n",
-     "    const _wasPinned = _autoScroll && !_replayInProgress && !_hidden();\n"),
+     "    const _wasPinned = !open && _autoScroll && !_replayInProgress && !_drawingInBulk\n",
+     "    const _wasPinned = !open && _autoScroll && !_replayInProgress\n"),
 
     ("a collapse reads the view's top when nothing will use it",
      "    const _beforeTop = _wasPinned ? elMessages.scrollTop : 0;\n",
@@ -6816,8 +6816,119 @@ CATCHUP_APP_MUTATIONS = [
      "        _catchUpTimer = setTimeout(_endCatchUp, CATCH_UP_MAX_MS);\n",
      ""),
 
+    ("a panel's tool is not shown out of its group",
+     "    const el = document.querySelector(`[data-tool-use-id=\"${toolUseId}\"]`);\n"
+     "    if (el) {\n"
+     "      Chat.reveal(el);\n",
+     "    const el = document.querySelector(`[data-tool-use-id=\"${toolUseId}\"]`);\n"
+     "    if (el) {\n"),
+
+    ("nor a panel's background task",
+     "    const el = all.length > 0 ? all[all.length - 1] : null;\n"
+     "    if (el) {\n"
+     "      Chat.reveal(el);\n",
+     "    const el = all.length > 0 ? all[all.length - 1] : null;\n"
+     "    if (el) {\n"),
+]
+
+# Chat.reveal, which a panel's item shows its block by (app.js).
+# tests/reconnect_on_show.test.js.
+REVEAL_CHAT_MUTATIONS = [
     ("a group opened to show a tool leaves the thinking it hid unfitted",
-     "      Chat.fitThinking(group);\n",
+     "      fitThinking(group);\n",
+     ""),
+
+    ("a group opened to show a block stays shut",
+     "      _setGroupOpen(group, true);\n",
+     ""),
+
+    ("the block shown from a panel stays shut",
+     "    if (el._expand) _setOpen(el, true);\n",
+     ""),
+]
+
+# A run of activity collapses, but not what the user is reading; a question is
+# never collapsed, and reads as waiting for its reply.
+# tests/activity_collapse.test.js.
+ACTIVITY_COLLAPSE_MUTATIONS = [
+    ("a run holding a block the user opened collapses anyway -- the report",
+     "    const open = activityEls.some((el) => el.dataset.userOpen);\n",
+     "    const open = false;\n"),
+
+    ("opening a block is not remembered",
+     "    if (open) el.dataset.userOpen = '1';\n"
+     "    else delete el.dataset.userOpen;\n",
+     "    delete el.dataset.userOpen;\n"),
+
+    ("closing it again is not remembered either",
+     "    else delete el.dataset.userOpen;\n",
+     ""),
+
+    ("a thinking block drawn open by --show-thinking counts as opened",
+     "    _expandable(el, el.querySelector('.thinking-header'), body, icon);\n",
+     "    _expandable(el, el.querySelector('.thinking-header'), body, icon);\n"
+     "    if (_showThinking) el.dataset.userOpen = '1';\n"),
+
+    ("a block shown from a panel does not count as opened",
+     "    if (el._expand) _setOpen(el, true);\n",
+     "    if (el._expand) el._expand.body.classList.add('open');\n"),
+
+    ("a group left open says it is shut",
+     "    toggle.textContent = (open ? '\\u25BC ' : '\\u25B6 ') + toggle.dataset.summary;\n",
+     "    toggle.textContent = '\\u25B6 ' + toggle.dataset.summary;\n"),
+
+    ("a group's header no longer folds it",
+     "      const opening = group.classList.contains('collapsed');\n",
+     "      const opening = true;\n"),
+
+    ("what ran before a question is left out of every group",
+     "    if (isAsk) _collapseActivity();\n",
+     ""),
+
+    ("a question waiting for its reply reads as a failed tool",
+     "    if (el && msg.awaiting_reply) {\n",
+     "    if (false) {\n"),
+
+    ("it is marked as failed",
+     "        iconEl.className = 'tool-status-icon asking';\n",
+     "        iconEl.className = 'tool-status-icon error';\n"),
+
+    ("nothing says where to answer it",
+     "        detail.appendChild(hint);\n",
+     ""),
+
+    ("a question is collapsed with the rest",
+     "    el.className = 'msg msg-tool' + (isAsk ? ' msg-ask activity-boundary' : '');\n",
+     "    el.className = 'msg msg-tool' + (isAsk ? ' msg-ask' : '');\n"),
+]
+
+# The hub shows a question once, by its own block, and marks its denial.
+# tests/test_ask_user_question.py.
+ASK_BRIDGE_MUTATIONS = [
+    ("the question is shown twice again, once as a notice that collapses",
+     "            return PermissionResultDeny(message=ASK_DENIAL)\n",
+     "            await self.broadcast({\"type\": \"system_msg\", \"subtype\": \"info\",\n"
+     "                                  \"data\": {\"message\": \"Claude has a question\"}})\n"
+     "            return PermissionResultDeny(message=ASK_DENIAL)\n"),
+]
+
+ASK_TOOLS_MUTATIONS = [
+    ("a result that is no error is taken for the denial",
+     "    return bool(is_error) and (text or \"\").lstrip().startswith(ASK_DENIAL_LEAD)\n",
+     "    return (text or \"\").lstrip().startswith(ASK_DENIAL_LEAD)\n"),
+
+    ("only the current wording is known",
+     "    return bool(is_error) and (text or \"\").lstrip().startswith(ASK_DENIAL_LEAD)\n",
+     "    return bool(is_error) and (text or \"\").strip() == ASK_DENIAL\n"),
+
+    ("a live result does not say it waits for a reply",
+     "        \"awaiting_reply\": awaits_reply(text, is_error),\n",
+     ""),
+]
+
+ASK_HISTORY_MUTATIONS = [
+    ("a result from history does not say it waits for a reply",
+     "                            \"awaiting_reply\": awaits_reply(text, is_error),\n",
      ""),
 ]
 
@@ -9346,6 +9457,16 @@ TARGETS = {
                       COLLAPSE_VIEW_MUTATIONS, "node"),
     "catchup-app": ("static/app.js", "tests/reconnect_on_show.test.js",
                     CATCHUP_APP_MUTATIONS, "node"),
+    "reveal-chat": ("static/chat.js", "tests/reconnect_on_show.test.js",
+                    REVEAL_CHAT_MUTATIONS, "node"),
+    "activity-collapse": ("static/chat.js", "tests/activity_collapse.test.js",
+                          ACTIVITY_COLLAPSE_MUTATIONS, "node"),
+    "ask-bridge": ("sdk_bridge.py", "tests/test_ask_user_question.py",
+                   ASK_BRIDGE_MUTATIONS, "pytest"),
+    "ask-tools": ("tool_manager.py", "tests/test_ask_user_question.py",
+                  ASK_TOOLS_MUTATIONS, "pytest"),
+    "ask-history": ("session.py", "tests/test_ask_user_question.py",
+                    ASK_HISTORY_MUTATIONS, "pytest"),
     "apikey-state": ("state.py", "tests/test_api_key_billing.py",
                      APIKEY_STATE_MUTATIONS, "pytest"),
     "apikey-bridge": ("sdk_bridge.py", "tests/test_api_key_billing.py",

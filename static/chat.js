@@ -93,6 +93,52 @@ const Chat = (() => {
     elMessages.appendChild(el);
   }
 
+  // --- Blocks that open ---
+  // A tool's detail, a thinking block's text, a background task's output, an
+  // injected prompt's body: each opens and closes at a click on its header.
+  // One the user has open carries data-user-open, and a run of activity
+  // holding one is grouped open rather than collapsed out from under them
+  // (_collapseActivity).  A block drawn open (--show-thinking, a question) is
+  // not one the user opened.
+
+  /** Make *el* open and close at a click on *header*: *body* is what shows
+   *  when open, *icon* the arrow that turns, *onOpen* (optional) runs on each
+   *  opening. */
+  function _expandable(el, header, body, icon, onOpen) {
+    el._expand = { body, icon, onOpen };
+    header.addEventListener('click', () => {
+      _setOpen(el, !body.classList.contains('open'));
+      _scrollToBottom();
+    });
+  }
+
+  /** Open or close *el*, an _expandable block, as the user's doing. */
+  function _setOpen(el, open) {
+    const x = el._expand;
+    x.body.classList.toggle('open', open);
+    if (x.icon) x.icon.classList.toggle('open', open);
+    if (open) el.dataset.userOpen = '1';
+    else delete el.dataset.userOpen;
+    if (open && x.onOpen) x.onOpen();
+  }
+
+  /** Show *el*, a block the user asked to see from elsewhere (a panel's
+   *  item): the group it was collapsed into opens, and so does the block. */
+  function reveal(el) {
+    const group = el.closest('.activity-group.collapsed');
+    if (group) {
+      _setGroupOpen(group, true);
+      fitThinking(group);
+    }
+    if (el._expand) _setOpen(el, true);
+  }
+
+  function _setGroupOpen(group, open) {
+    group.classList.toggle('collapsed', !open);
+    const toggle = group.querySelector('.activity-group-toggle');
+    toggle.textContent = (open ? '\u25BC ' : '\u25B6 ') + toggle.dataset.summary;
+  }
+
   // --- Activity-group collapsing ---
   // Wraps all non-text elements (tools, thinking, turn markers, system msgs)
   // between Claude's text messages into a single collapsible summary line.
@@ -158,12 +204,18 @@ const Chat = (() => {
     const summary = _activitySummary(counts);
     if (!summary) return;
 
+    // A run holding a block the user has open is grouped open: collapsed, it
+    // would vanish while they read it.  Its header still folds it away.
+    const open = activityEls.some((el) => el.dataset.userOpen);
+
     // Snapshot scroll state *before* the DOM shrinks so we can anchor it.
     // Only engage the gap when the user is following at the bottom and we're
     // not bulk-replaying history (where a live gap would just churn) -- and
     // only in a window that is shown: a gap holds a reading position steady,
-    // a hidden window shows none, and hiding closes the gaps anyway.
-    const _wasPinned = _autoScroll && !_replayInProgress && !_drawingInBulk && !_hidden();
+    // a hidden window shows none, and hiding closes the gaps anyway.  A group
+    // left open frees no space, and needs none.
+    const _wasPinned = !open && _autoScroll && !_replayInProgress && !_drawingInBulk
+      && !_hidden();
     // Read only for that gap: each read forces a layout of the whole list, and
     // a catch-up or a history collapses hundreds of times in a row.
     const _beforeTop = _wasPinned ? elMessages.scrollTop : 0;
@@ -178,11 +230,11 @@ const Chat = (() => {
 
     // Create collapsible group.
     const group = document.createElement('div');
-    group.className = 'activity-group collapsed';
+    group.className = 'activity-group';
 
     const toggle = document.createElement('div');
     toggle.className = 'activity-group-toggle';
-    toggle.textContent = '\u25B6 ' + summary;
+    toggle.dataset.summary = summary;
 
     const content = document.createElement('div');
     content.className = 'activity-group-content';
@@ -194,16 +246,16 @@ const Chat = (() => {
     }
     group.appendChild(toggle);
     group.appendChild(content);
+    _setGroupOpen(group, open);
 
     toggle.addEventListener('click', () => {
-      group.classList.toggle('collapsed');
-      if (group.classList.contains('collapsed')) {
-        toggle.textContent = '\u25B6 ' + summary;
-        _scrollToBottom();
-      } else {
-        toggle.textContent = '\u25BC ' + summary;
+      const opening = group.classList.contains('collapsed');
+      _setGroupOpen(group, opening);
+      if (opening) {
         fitThinking(content);
         toggle.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } else {
+        _scrollToBottom();
       }
     });
 
@@ -708,8 +760,8 @@ const Chat = (() => {
   }
 
   // Fit the summaries inside *root* that were hidden when the rest were
-  // fitted: a collapsed group, on being opened (app.js opens one to show a
-  // tool the panel was asked for).
+  // fitted: a collapsed group, on being opened (at its header, or by reveal
+  // to show a block a panel was asked for).
   function fitThinking(root) {
     _fitThinking(Array.from(root.querySelectorAll('.thinking-summary[data-fit]')));
   }
@@ -858,14 +910,8 @@ const Chat = (() => {
 
     el.querySelector('.injected-summary').textContent = firstLine;
 
-    const header = el.querySelector('.injected-header');
-    const body = el.querySelector('.injected-body');
-    const icon = el.querySelector('.tool-expand-icon');
-    header.addEventListener('click', () => {
-      body.classList.toggle('open');
-      icon.classList.toggle('open');
-      _scrollToBottom();
-    });
+    _expandable(el, el.querySelector('.injected-header'), el.querySelector('.injected-body'),
+                el.querySelector('.tool-expand-icon'));
 
     elMessages.appendChild(el);
     _scrollToBottom();
@@ -968,8 +1014,11 @@ const Chat = (() => {
     const name = msg.name || h.name || '?';
     // AskUserQuestion needs the user's attention: render it expanded and keep
     // it out of the collapsed activity group (mark it an activity boundary so
-    // _collapseActivity never sweeps it in with the other tools).
+    // _collapseActivity never sweeps it in with the other tools).  As before
+    // any boundary, what ran before it collapses first: no later collapse
+    // reaches back past it.
     const isAsk = name === 'AskUserQuestion';
+    if (isAsk) _collapseActivity();
 
     const el = document.createElement('div');
     el.className = 'msg msg-tool' + (isAsk ? ' msg-ask activity-boundary' : '');
@@ -993,19 +1042,13 @@ const Chat = (() => {
         ${_toolDetailHtml(name, msg.input || {}, msg)}
       </div>`;
 
-    // Click to toggle expand.
-    const header = el.querySelector('.tool-header');
     const detail = el.querySelector('.tool-detail');
-    const expandIcon = el.querySelector('.tool-expand-icon');
-    header.addEventListener('click', () => {
-      detail.classList.toggle('open');
-      expandIcon.classList.toggle('open');
-      // Wire up synchronized scrolling for diff viewers on first open.
-      if (detail.classList.contains('open') && !detail._diffWired) {
-        detail._diffWired = true;
-        detail.querySelectorAll('.diff-viewer').forEach(dv => Diff.syncScroll(dv));
-      }
-      _scrollToBottom();
+    _expandable(el, el.querySelector('.tool-header'), detail,
+                el.querySelector('.tool-expand-icon'), () => {
+      // Synchronized scrolling for diff viewers, wired on first open.
+      if (detail._diffWired) return;
+      detail._diffWired = true;
+      detail.querySelectorAll('.diff-viewer').forEach(dv => Diff.syncScroll(dv));
     });
 
     _trackToolBlock(el);
@@ -1016,7 +1059,23 @@ const Chat = (() => {
   function _addToolResult(msg) {
     const isErr = msg.is_error || msg.status === 'error';
     const el = _toolBlocks.get(msg.tool_use_id);
-    if (el) {
+    if (el && msg.awaiting_reply) {
+      // The hub's answer to Claude for a question it cannot run (tool_manager
+      // .awaits_reply): not a failure, the question asked and waiting.
+      const iconEl = el.querySelector('.tool-status-icon');
+      if (iconEl) {
+        iconEl.textContent = '?';
+        iconEl.className = 'tool-status-icon asking';
+      }
+      const detail = el.querySelector('.tool-detail');
+      if (detail) {
+        const hint = document.createElement('div');
+        hint.className = 'ask-reply-hint';
+        hint.textContent = 'Answer in the message box: name an option, or say it '
+                         + 'in your own words.';
+        detail.appendChild(hint);
+      }
+    } else if (el) {
       // Update status icon (▶ → ✓ or ✗).
       const iconEl = el.querySelector('.tool-status-icon');
       if (iconEl) {
@@ -1106,7 +1165,6 @@ const Chat = (() => {
       </div>
       <div class="thinking-body">${_esc(text)}</div>`;
 
-    const header = el.querySelector('.thinking-header');
     const body = el.querySelector('.thinking-body');
     const icon = el.querySelector('.tool-expand-icon');
     const summaryEl = el.querySelector('.thinking-summary');
@@ -1114,11 +1172,7 @@ const Chat = (() => {
       body.classList.add('open');
       icon.classList.add('open');
     }
-    header.addEventListener('click', () => {
-      body.classList.toggle('open');
-      icon.classList.toggle('open');
-      _scrollToBottom();
-    });
+    _expandable(el, el.querySelector('.thinking-header'), body, icon);
 
     _trackThinkingBlock(el);
 
@@ -1169,14 +1223,8 @@ const Chat = (() => {
       </div>
       ${detailHtml ? `<div class="tool-detail">${detailHtml}</div>` : ''}`;
     if (detailHtml) {
-      const header = el.querySelector('.tool-header');
-      const detail = el.querySelector('.tool-detail');
-      const expandIcon = el.querySelector('.tool-expand-icon');
-      header.addEventListener('click', () => {
-        detail.classList.toggle('open');
-        expandIcon.classList.toggle('open');
-        _scrollToBottom();
-      });
+      _expandable(el, el.querySelector('.tool-header'), el.querySelector('.tool-detail'),
+                  el.querySelector('.tool-expand-icon'));
     }
 
     if (msg.task_id) el.dataset.bgTaskId = msg.task_id;
@@ -1231,14 +1279,8 @@ const Chat = (() => {
       </div>
       ${detailHtml ? `<div class="tool-detail">${detailHtml}</div>` : ''}`;
     if (detailHtml) {
-      const header = el.querySelector('.tool-header');
-      const detail = el.querySelector('.tool-detail');
-      const expandIcon = el.querySelector('.tool-expand-icon');
-      header.addEventListener('click', () => {
-        detail.classList.toggle('open');
-        expandIcon.classList.toggle('open');
-        _scrollToBottom();
-      });
+      _expandable(el, el.querySelector('.tool-header'), el.querySelector('.tool-detail'),
+                  el.querySelector('.tool-expand-icon'));
     }
     if (isErr) el.style.borderColor = 'var(--red)';
     if (msg.task_id) el.dataset.bgTaskId = msg.task_id;
@@ -2160,5 +2202,5 @@ const Chat = (() => {
 
   return { init, clear, handleMessage, setCollapseTools, getCollapseTools,
            setShowThinking, getShowThinking, setMaxDomMessages, forceScrollToBottom,
-           beginCatchUp, endCatchUp, fitThinking };
+           beginCatchUp, endCatchUp, reveal };
 })();
