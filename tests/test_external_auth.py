@@ -11,7 +11,11 @@ tests drive the ASGI middleware directly (no real HTTP stack) to verify:
   examined), with the lockout window growing exponentially.
 * The lockout is *global* (shared across source IPs, not per-IP) so a botnet
   can't get a fresh budget per address.
-* A successful auth clears the failure counter.
+* A correct password clears the failure counter.
+* The count wears off, one failure per capped window: a scan that stopped
+  stops costing the owner, a slow trickle never builds up, a steady guesser
+  stays at the cap, and no way of guessing beats one try per capped window.
+* The count stops where the window reaches its cap, so it cannot overflow.
 * Password/token comparisons use ``hmac.compare_digest`` (constant time).
 * A refused socket is accepted and then closed with a ``WS_CLOSE_*`` code and a
   short reason, so the page can say why rather than wait for ever.
@@ -165,63 +169,99 @@ def test_success_clears_failures(mw):
         assert status == 401
 
 
-def test_failures_are_forgotten_after_a_quiet_spell(mw):
-    # A count a scan ran up must not turn the owner's typo, later, into a
-    # lockout.
-    for _ in range(mw._FREE_ATTEMPTS):
-        _drive(mw, headers=_basic("nope"))
-    mw._last_failure -= mw._FORGET_AFTER
-    status, _, _ = _drive(mw, headers=_basic("nope"))
-    assert status == 401
-    assert mw._fails == 1, "the old failures were still counted"
-    assert mw._lockout_remaining() == 0, "a first failure locked the hub"
+@pytest.fixture
+def clock(monkeypatch):
+    """time.monotonic(), moved by hand: [seconds], from a machine up for days."""
+    now = [1e6]
+    monkeypatch.setattr(server.time, "monotonic", lambda: now[0])
+    return now
 
 
-def test_failures_short_of_the_quiet_spell_are_kept(mw):
-    for _ in range(mw._FREE_ATTEMPTS):
-        _drive(mw, headers=_basic("nope"))
-    mw._last_failure -= mw._FORGET_AFTER - 60
-    _drive(mw, headers=_basic("nope"))
-    assert mw._lockout_remaining() > 0, "failures were forgotten too soon"
-
-
-def test_each_failure_restarts_the_quiet_spell(mw):
-    # A guesser who keeps at it is never quiet for long, however slowly.
-    for _ in range(mw._FREE_ATTEMPTS):
-        _drive(mw, headers=_basic("nope"))
-        mw._last_failure -= mw._FORGET_AFTER * 0.9
-    _drive(mw, headers=_basic("nope"))
-    assert mw._fails == mw._FREE_ATTEMPTS + 1
-    assert mw._lockout_remaining() > 0
-
-
-def test_waiting_out_the_decay_gains_a_guesser_nothing(monkeypatch):
-    # Two ways to guess: steadily, one try per lockout once it is at its cap;
-    # or in bursts -- the free tries and the escalation -- each followed by
-    # the wait that has the count forgotten.  If bursts were the faster, the
-    # decay would be a gift to whoever waits for it.
-    start = 1e6                                      # a machine up for days
-    clock = [start]
-    monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
-    mw = _ExternalAuthMiddleware(_inner_app, password="secret")
-    for guesses in range(1, 100):
-        clock[0] += mw._lockout_remaining()          # wait out any lockout
-        mw._record_failure()
-        if mw._lockout_remaining() >= mw._MAX_LOCKOUT:
-            break                                    # at the cap: steady from here
-    else:
-        pytest.fail("the lockout never reached its cap")
-    burst = clock[0] - start
-    # The wait does have the count forgotten, so bursts can repeat...
-    clock[0] += mw._FORGET_AFTER
+def _guess(mw, clock):
+    """One wrong password, as soon as the lockout allows it."""
+    clock[0] += mw._lockout_remaining()
     mw._record_failure()
-    assert mw._fails == 1 and mw._lockout_remaining() == 0
-    # ...and repeating them is no faster than guessing steadily.
-    per_burst = guesses / (burst + mw._FORGET_AFTER)
-    steady = 1 / mw._MAX_LOCKOUT
-    assert per_burst <= steady, (
-        f"{guesses} guesses every {burst + mw._FORGET_AFTER:.0f}s beats one "
-        f"every {mw._MAX_LOCKOUT:.0f}s")
+
+
+def _run_up(mw, clock):
+    """Guess until the lockout is at its cap: what a scan leaves behind."""
+    for _ in range(100):
+        _guess(mw, clock)
+        if mw._lockout_remaining() >= mw._MAX_LOCKOUT:
+            return
+    pytest.fail("the lockout never reached its cap")
+
+
+def test_a_scan_that_stopped_wears_off(clock):
+    # The owner's typo must not pay for a count somebody else ran up.  One
+    # failure goes per capped window, so the typo is free once enough have
+    # gone that it is among the free attempts again -- and not a window before.
+    M = _ExternalAuthMiddleware
+    free_after = M._MAX_FAILS - M._FREE_ATTEMPTS + 1
+    for windows, locks in ((free_after - 1, True), (free_after, False)):
+        mw = M(_inner_app, password="secret")
+        _run_up(mw, clock)
+        clock[0] += windows * mw._MAX_LOCKOUT
+        mw._record_failure()                         # the owner's typo
+        assert (mw._lockout_remaining() > 0) == locks, (windows, mw._fails)
+
+
+def test_a_slow_trickle_of_guesses_never_builds_up(clock):
+    # Slower than one per capped window, a guesser is forgotten as fast as
+    # they guess: the count never leaves the free attempts.
+    mw = _ExternalAuthMiddleware(_inner_app, password="secret")
+    for _ in range(200):
+        clock[0] += mw._MAX_LOCKOUT + 1
+        mw._record_failure()
+    mw._record_failure()                             # and the owner's typo
+    assert mw._lockout_remaining() == 0, mw._fails
+
+
+def test_a_guesser_at_the_cap_stays_at_the_cap(clock):
+    # Forgetting must not let a steady guesser back under the cap.
+    mw = _ExternalAuthMiddleware(_inner_app, password="secret")
+    _run_up(mw, clock)
+    for i in range(200):
+        _guess(mw, clock)
+        assert mw._lockout_remaining() == mw._MAX_LOCKOUT, (i, mw._fails)
+
+
+def test_no_way_of_guessing_beats_one_try_per_capped_window(clock):
+    # Steadily, or in bursts with any pause between them: over a week, no more
+    # tries than one per capped window, plus the burst a fresh count allows.
+    M = _ExternalAuthMiddleware
+    week = 7 * 86400
+    allowed = week / M._MAX_LOCKOUT + M._MAX_FAILS
+    for pause in (0, 300, 600, 1500, 2700, 3000, 3300, 4200, 7200, 86400):
+        mw = M(_inner_app, password="secret")
+        start, guesses = clock[0], 0
+        while clock[0] - start < week:
+            _guess(mw, clock)
+            guesses += 1
+            if pause and mw._lockout_remaining() >= mw._MAX_LOCKOUT:
+                clock[0] += pause
+        assert guesses <= allowed, f"pausing {pause}s: {guesses} > {allowed:.0f}"
+
+
+def test_the_count_stops_at_the_cap(clock):
+    # Counting on would lock no longer, only take longer to wear off -- and
+    # past about a thousand, 2.0 * 2**1024 does not fit a float, and the
+    # OverflowError left every later guess unthrottled.
+    mw = _ExternalAuthMiddleware(_inner_app, password="secret")
+    for _ in range(2000):                            # however they arrive
+        mw._record_failure()
+    assert mw._fails == mw._MAX_FAILS
+    assert mw._lockout_remaining() == mw._MAX_LOCKOUT
+
+
+def test_the_count_cap_is_where_the_window_reaches_its_own(clock):
+    # Any lower, and the lockout would stop escalating short of its cap.
+    mw = _ExternalAuthMiddleware(_inner_app, password="secret")
+    for _ in range(mw._MAX_FAILS - 1):
+        mw._record_failure()
+    assert mw._lockout_remaining() < mw._MAX_LOCKOUT
+    mw._record_failure()
+    assert mw._lockout_remaining() == mw._MAX_LOCKOUT
 
 
 def test_lockout_window_grows(mw):

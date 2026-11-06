@@ -4845,24 +4845,39 @@ clear both, as a success, and then every request the owner's browser made
 (each page, asset and socket) handed a guesser five fresh free tries. Only a
 correct password clears them.
 
-**The escalation's exponent is bounded** (`min(over - 1, 60)`), long past the
-cap. At `2**1024` the product no longer fits a float. The `OverflowError`
-left `_locked_until` unset, so past about a thousand failures every later
-guess went unthrottled. A guesser who keeps at it reaches that in about
-85 hours, and the decay below never forgets one who does.
+**The count wears off, one failure per `_MAX_LOCKOUT`.** It used to fall only
+on a correct password or a restart, so a scan that ran it up left the owner's
+next typo, however much later, the full five-minute lockout. `_record_failure`
+now forgets one failure for each `_MAX_LOCKOUT` since the last, before
+counting the new one:
 
-**Failures are forgotten after `_FORGET_AFTER` (two hours) with none.** The
-count used to fall only on a correct password or a restart. A scan that ran
-it up therefore left the owner's next typo, however much later, the full
-five-minute lockout. `_record_failure` now zeroes the count first when the
-previous failure is that old, and each failure restarts the spell, so a
-guesser who keeps at it, however slowly, is never forgotten. The length is
-set by what waiting buys a guesser: a burst (five free tries, then one per
-doubling window up to the cap, 14 tries in 510s) followed by the wait must be
-fewer tries an hour than one try per `_MAX_LOCKOUT`. One hour fails that, at
-12.3 an hour against 12. Two hours gives 6.5.
-`test_waiting_out_the_decay_gains_a_guesser_nothing` drives the real methods on
-a fake clock and holds the constants to it.
+- A scan that stopped stops costing the owner once enough windows have passed
+  to bring the count back among the free attempts: ten of them, 50 minutes.
+- Guesses slower than one per window never build up a count at all.
+- A guesser at the cap stays there. Each try comes a full window after the
+  last, forgets one, and adds one.
+- No way of guessing averages more than one try per window, the rate the cap
+  already allows. Each try adds one to a count that cannot go below zero, and
+  one is forgotten per window, so tries number at most the windows elapsed
+  plus one burst's worth. Waiting therefore gains a guesser nothing, by
+  construction rather than by tuning.
+
+An earlier version of the decay, written on 2026-11-06, zeroed the count after
+two silent hours, and every failure restarted the two hours. That shielded
+the owner from a scan only once it fell silent: one guess every 90 minutes was
+never forgotten, held the count at the cap for good, and left the owner's typo
+the full lockout.
+
+**The count stops at `_MAX_FAILS`** (14), the first count whose window is the
+cap. Counting on would lock no longer, only take longer to wear off. It also
+keeps the window's power of two small: unbounded, `2.0 * 2**1024` did not fit
+a float past about a thousand failures, and the `OverflowError` left
+`_locked_until` unset, so every later guess went unthrottled.
+
+`test_external_auth.py` drives the real methods on a hand-moved clock: a
+stopped scan wearing off on time and not a window sooner, a slow trickle, a
+steady guesser held at the cap, every way of pausing over a week against the
+bound, and the count's cap and where it sits.
 
 ### A refusal says why, to the page and to the log
 

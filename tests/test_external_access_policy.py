@@ -295,18 +295,6 @@ def test_a_correct_password_still_clears_the_throttle():
     assert mw._fails == 0
 
 
-def test_the_lockout_holds_however_many_failures_there_have_been():
-    """2.0 * 2**1024 does not fit a float: past about a thousand failures the
-    window's OverflowError left every later guess unthrottled."""
-    import time
-    mw = _mw()
-    mw._fails = 5000
-    mw._last_failure = time.monotonic()           # a guesser still at it
-    status, _, _ = _drive(mw, ip="1.2.3.4", headers=_basic("nope"))
-    assert status == 401
-    assert mw._lockout_remaining() > mw._MAX_LOCKOUT - 5, mw._lockout_remaining()
-
-
 def test_a_wrong_cookie_is_not_a_free_pass():
     mw = _mw()
     status, _, ran = _drive(

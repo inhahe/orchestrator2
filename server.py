@@ -35,6 +35,7 @@ import ipaddress
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import socket as _socket
@@ -3124,8 +3125,9 @@ class _ExternalAuthMiddleware:
     which every external request is refused with ``429`` *before* the password is
     even examined — so the whole hub allows only a handful of guesses per
     escalating window no matter how many machines are trying.  A correct
-    password clears the counter, and so does ``_FORGET_AFTER`` with no
-    failure at all; a sign-in cookie does not, being no new success.
+    password clears the counter, and it wears off by itself, one failure per
+    ``_MAX_LOCKOUT`` (``_record_failure``); a sign-in cookie does not clear
+    it, being no new success.
     (Trade-off: an attacker can keep the
     lockout armed and lock out the owner's *remote* access — but LAN/loopback
     always bypasses the throttle, and the cap keeps any single lockout ≤5 min.)
@@ -3143,12 +3145,10 @@ class _ExternalAuthMiddleware:
     _FREE_ATTEMPTS = 5          # failures allowed before lockouts begin
     _BASE_LOCKOUT = 2.0         # seconds for the first lockout past the threshold
     _MAX_LOCKOUT = 300.0        # cap on the lockout window (5 min)
-    # Failures are forgotten after this long with none, so a count a scan ran
-    # up does not turn the owner's typo, days later, into the longest
-    # lockout.  Long enough that waiting it out gains a guesser nothing: the
-    # free attempts and the escalation, then this wait, are fewer tries an
-    # hour than one per _MAX_LOCKOUT (test_waiting_out_the_decay_gains_a_guesser_nothing).
-    _FORGET_AFTER = 7200.0
+    # The count stops where the window reaches its cap: more would lock for
+    # no longer, only take longer to wear off -- and past about a thousand,
+    # the window's power of two no longer fits a float.
+    _MAX_FAILS = _FREE_ATTEMPTS + 1 + math.ceil(math.log2(_MAX_LOCKOUT / _BASE_LOCKOUT))
 
     def __init__(self, app: Any, *, password: str | None,
                  disabled_message: str | None = None) -> None:
@@ -3255,11 +3255,11 @@ class _ExternalAuthMiddleware:
                     return
                 # Authenticated — forgive all prior failures.
                 self._record_success()
-                # If this HTTP request proved the password via the Basic header
-                # or ?password= (i.e. not already via cookie), plant the auth
-                # cookie so the follow-up WebSocket upgrade — on which the
-                # browser won't resend Basic credentials — carries it.
-                if scope["type"] == "http" and not cookie_ok:
+                # This HTTP request proved the password via the Basic header or
+                # ?password= (a valid cookie returned above), so plant the auth
+                # cookie: the follow-up WebSocket upgrade, on which the
+                # browser won't resend Basic credentials, carries it.
+                if scope["type"] == "http":
                     send = self._send_with_cookie(scope, send)
         await self.app(scope, receive, send)
 
@@ -3269,21 +3269,22 @@ class _ExternalAuthMiddleware:
         return remaining if remaining > 0 else 0.0
 
     def _record_failure(self) -> None:
-        """Count a failed attempt and (past the threshold) arm the lockout,
-        first forgetting the failures before a quiet spell of
-        ``_FORGET_AFTER``."""
+        """Count a failed attempt and (past the threshold) arm the lockout.
+
+        One failure is forgotten for each ``_MAX_LOCKOUT`` since the last, so
+        the count wears off however it was run up -- by a scan that stopped,
+        or by guesses slower than that -- and the owner's typo is not made to
+        pay for it.  A guesser can therefore never average more than one try
+        per ``_MAX_LOCKOUT``, which the cap allows anyway: waiting gains
+        nothing.
+        """
         now = time.monotonic()
-        if now - self._last_failure >= self._FORGET_AFTER:
-            self._fails = 0
+        forgotten = int((now - self._last_failure) // self._MAX_LOCKOUT)
+        self._fails = min(max(0, self._fails - forgotten) + 1, self._MAX_FAILS)
         self._last_failure = now
-        self._fails += 1
         over = self._fails - self._FREE_ATTEMPTS
         if over > 0:
-            # The exponent stops long after the window reaches its cap: at
-            # 2**1024 the product no longer fits a float, and the
-            # OverflowError would leave every later guess unthrottled.
-            window = min(self._BASE_LOCKOUT * (2 ** min(over - 1, 60)),
-                         self._MAX_LOCKOUT)
+            window = min(self._BASE_LOCKOUT * (2 ** (over - 1)), self._MAX_LOCKOUT)
             self._locked_until = now + window
 
     def _record_success(self) -> None:

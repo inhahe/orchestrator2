@@ -591,26 +591,33 @@ EXTAUTH_MUTATIONS = [
      "                self._record_success()\n",
      ""),
 
-    ("the escalation's exponent is unbounded, and overflows",
-     "(2 ** min(over - 1, 60))",
-     "(2 ** (over - 1))"),
+    ("the count is not capped, and overflows",
+     "        self._fails = min(max(0, self._fails - forgotten) + 1, self._MAX_FAILS)",
+     "        self._fails = max(0, self._fails - forgotten) + 1"),
+
+    ("the count is capped before the window reaches its own cap",
+     "    _MAX_FAILS = _FREE_ATTEMPTS + 1 + math.ceil(",
+     "    _MAX_FAILS = _FREE_ATTEMPTS + math.ceil("),
 
     ("a forged cookie is accepted",
      "                cookie_ok = self._cookie_ok(headers.get(b\"cookie\", b\"\"))",
      "                cookie_ok = bool(headers.get(b\"cookie\"))"),
 
     ("failures are never forgotten",
-     "        if now - self._last_failure >= self._FORGET_AFTER:\n"
-     "            self._fails = 0\n",
-     ""),
+     "        forgotten = int((now - self._last_failure) // self._MAX_LOCKOUT)",
+     "        forgotten = 0"),
 
-    ("a failure does not restart the quiet spell",
+    ("forgetting counts from before the latest failure",
      "        self._last_failure = now\n",
      ""),
 
-    ("the quiet spell is short enough to be worth waiting out",
-     "    _FORGET_AFTER = 7200.0",
-     "    _FORGET_AFTER = 3600.0"),
+    ("failures are forgotten faster than the cap lets a guesser try",
+     "        forgotten = int((now - self._last_failure) // self._MAX_LOCKOUT)",
+     "        forgotten = int((now - self._last_failure) // (self._MAX_LOCKOUT / 5))"),
+
+    ("a long quiet spell banks free tries",
+     "max(0, self._fails - forgotten)",
+     "(self._fails - forgotten)"),
 
     ("wrong passwords stop being counted at all",
      "                    if auth or pw_param is not None:\n"
