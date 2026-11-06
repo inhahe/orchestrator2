@@ -592,8 +592,12 @@ EXTAUTH_MUTATIONS = [
      ""),
 
     ("the count is not capped, and overflows",
-     "        self._fails = min(max(0, self._fails - forgotten) + 1, self._MAX_FAILS)",
-     "        self._fails = max(0, self._fails - forgotten) + 1"),
+     "        self._fails = min(level + 1, self._MAX_FAILS)",
+     "        self._fails = level + 1"),
+
+    ("a non-ASCII credential crashes the check",
+     '    return hmac.compare_digest(given.encode("utf-8"), secret.encode("utf-8"))',
+     "    return hmac.compare_digest(given, secret)"),
 
     ("the count is capped before the window reaches its own cap",
      "    _MAX_FAILS = _FREE_ATTEMPTS + 1 + math.ceil(",
@@ -604,20 +608,24 @@ EXTAUTH_MUTATIONS = [
      "                cookie_ok = bool(headers.get(b\"cookie\"))"),
 
     ("failures are never forgotten",
-     "        forgotten = int((now - self._last_failure) // self._MAX_LOCKOUT)",
+     "        forgotten = int((now - self._forget_from) // self._MAX_LOCKOUT)",
      "        forgotten = 0"),
 
-    ("forgetting counts from before the latest failure",
-     "        self._last_failure = now\n",
-     ""),
+    ("the part of a window that passed is thrown away at every failure",
+     "            self._forget_from += forgotten * self._MAX_LOCKOUT",
+     "            self._forget_from = now"),
 
     ("failures are forgotten faster than the cap lets a guesser try",
-     "        forgotten = int((now - self._last_failure) // self._MAX_LOCKOUT)",
-     "        forgotten = int((now - self._last_failure) // (self._MAX_LOCKOUT / 5))"),
+     "        forgotten = int((now - self._forget_from) // self._MAX_LOCKOUT)",
+     "        forgotten = int((now - self._forget_from) // (self._MAX_LOCKOUT / 5))"),
 
-    ("a long quiet spell banks free tries",
-     "max(0, self._fails - forgotten)",
-     "(self._fails - forgotten)"),
+    ("an empty count banks the time it was empty",
+     "            level = 0\n            self._forget_from = now\n",
+     "            level = 0\n"),
+
+    ("a count forgotten below zero banks free tries",
+     "            level = 0\n            self._forget_from = now\n",
+     "            self._forget_from = now\n"),
 
     ("wrong passwords stop being counted at all",
      "                    if auth or pw_param is not None:\n"

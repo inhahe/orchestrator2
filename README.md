@@ -291,10 +291,11 @@ for an exponentially growing window (2 s, doubling each further failure up to
 password is even checked — so the whole hub allows only a handful of guesses per
 escalating window no matter how many machines are trying. A single correct
 password clears the counter, and it also wears off by itself: one wrong
-password is forgotten for every 5 minutes that pass. A scan that has stopped
-stops costing you within about 50 minutes, and guesses slower than one every 5
-minutes never build up at all, so neither can turn your own typo into a
-5-minute lockout. No way of guessing gets more than one try per 5 minutes on
+password is forgotten for every 5 minutes that pass. After a scan stops, your
+first typo is free again within about 50 minutes, and all five free tries are
+back within 70. A typo sooner than that can still cost a lockout of up to 5
+minutes. Guesses that average slower than one every 5 minutes can't build the
+count up over time. No way of guessing gets more than one try per 5 minutes on
 average, which the lockout's cap allows anyway, so waiting gains a guesser
 nothing. (LAN/loopback always bypasses the throttle, so a
 lockout only affects remote access, and the 5-min cap bounds it.)
@@ -308,7 +309,8 @@ during a lockout, so a stranger guessing from elsewhere can't shut the owner
 out of their own remote session. Using the cookie doesn't reset the counter,
 so your own browsing gives a guesser no fresh tries. Password and
 cookie-token comparisons run in constant time (`hmac.compare_digest`) so the
-secret can't be recovered by response-timing analysis.
+secret can't be recovered by response-timing analysis. The password may contain
+any characters, not only ASCII.
 
 **When the page can't connect, it says so.** The session list and everything
 live arrive over the page's WebSocket, so a page can load while that

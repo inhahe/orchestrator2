@@ -16,7 +16,8 @@ tests drive the ASGI middleware directly (no real HTTP stack) to verify:
   stops costing the owner, a slow trickle never builds up, a steady guesser
   stays at the cap, and no way of guessing beats one try per capped window.
 * The count stops where the window reaches its cap, so it cannot overflow.
-* Password/token comparisons use ``hmac.compare_digest`` (constant time).
+* Password/token comparisons use ``hmac.compare_digest`` (constant time), on
+  bytes, so a non-ASCII credential is refused rather than crashing the check.
 * A refused socket is accepted and then closed with a ``WS_CLOSE_*`` code and a
   short reason, so the page can say why rather than wait for ever.
 * Refusals are logged: each address's first, within a cap across addresses,
@@ -31,6 +32,7 @@ import hashlib
 import logging
 import os
 import pathlib
+import random
 import re
 import sys
 
@@ -217,6 +219,24 @@ def test_a_slow_trickle_of_guesses_never_builds_up(clock):
     assert mw._lockout_remaining() == 0, mw._fails
 
 
+def test_uneven_guesses_slower_on_average_never_build_up(clock):
+    # The part of a window that has passed must count towards the next, or
+    # gaps of 150s then 460s -- slower than one per window on average --
+    # build the count up a little at every pair.  The random gaps are well
+    # slower on average: ones barely so are a random walk with no drift to
+    # speak of, which wanders a few failures up and back whatever the rule.
+    for gaps in ([150, 460] * 200,
+                 random.Random(7).choices(range(150, 601), k=400)):
+        assert sum(gaps) / len(gaps) > _ExternalAuthMiddleware._MAX_LOCKOUT
+        mw = _ExternalAuthMiddleware(_inner_app, password="secret")
+        worst = 0
+        for gap in gaps:
+            clock[0] += gap
+            mw._record_failure()
+            worst = max(worst, mw._fails)
+        assert worst <= mw._FREE_ATTEMPTS, f"the count reached {worst}"
+
+
 def test_a_guesser_at_the_cap_stays_at_the_cap(clock):
     # Forgetting must not let a steady guesser back under the cap.
     mw = _ExternalAuthMiddleware(_inner_app, password="secret")
@@ -238,15 +258,18 @@ def test_no_way_of_guessing_beats_one_try_per_capped_window(clock):
         while clock[0] - start < week:
             _guess(mw, clock)
             guesses += 1
+            # Inside the loop: a lockout that never arms never moves the
+            # clock, and the loop would never end.
+            assert guesses <= allowed, f"pausing {pause}s: {guesses} > {allowed:.0f}"
             if pause and mw._lockout_remaining() >= mw._MAX_LOCKOUT:
                 clock[0] += pause
-        assert guesses <= allowed, f"pausing {pause}s: {guesses} > {allowed:.0f}"
 
 
 def test_the_count_stops_at_the_cap(clock):
-    # Counting on would lock no longer, only take longer to wear off -- and
-    # past about a thousand, 2.0 * 2**1024 does not fit a float, and the
-    # OverflowError left every later guess unthrottled.
+    # Counting on would lock no longer, only take longer to wear off; and past
+    # about a thousand, the window's 2**n would not fit a float.  The request
+    # path cannot get here -- the lockout spaces failures a window apart --
+    # but nothing else should be able to either.
     mw = _ExternalAuthMiddleware(_inner_app, password="secret")
     for _ in range(2000):                            # however they arrive
         mw._record_failure()
@@ -286,6 +309,46 @@ def test_valid_cookie_authenticates(mw):
     assert status == 200 and ran
     # Already authed by cookie → no need to re-plant one.
     assert b"set-cookie" not in resp_hdrs
+
+
+# --- Credentials that are not ASCII --------------------------------------------
+#
+# hmac.compare_digest refuses a str with any non-ASCII character.  A request
+# carrying one -- which anyone can send -- must be refused like any other
+# wrong credential, not crash the check: a crash skips the throttle and the
+# refusal log's cap, and a password with an umlaut could never be used.
+
+def test_a_non_ascii_cookie_is_refused(mw):
+    status, _, ran = _drive(mw, headers=[(b"cookie", b"orch2_auth=\xff\xfe")])
+    assert status == 401 and not ran
+
+
+def test_a_non_ascii_cookie_on_a_socket_is_refused(mw):
+    sent, ran = _drive_ws(mw, headers=[(b"cookie", "orch2_auth=é".encode())])
+    assert not ran and _closed_with(sent)[0] == server.WS_CLOSE_SIGN_IN
+
+
+def test_a_non_ascii_basic_password_is_a_wrong_one(mw):
+    status, _, ran = _drive(mw, headers=_basic("café"))
+    assert status == 401 and not ran
+    assert mw._fails == 1, "not counted as an attempt"
+
+
+def test_a_non_ascii_query_password_is_a_wrong_one(mw):
+    status, _, ran = _drive(mw, query=b"password=caf%C3%A9")
+    assert status == 401 and not ran
+    assert mw._fails == 1, "not counted as an attempt"
+
+
+def test_a_non_ascii_password_can_be_used():
+    mw = _ExternalAuthMiddleware(_inner_app, password="Passwört")
+    status, hdrs, ran = _drive(mw, headers=_basic("Passwört"))
+    assert status == 200 and ran
+    status, _, ran = _drive(mw, query=b"password=Passw%C3%B6rt")
+    assert status == 200 and ran
+    cookie = hdrs[b"set-cookie"].split(b";")[0]
+    status, _, ran = _drive(mw, headers=[(b"cookie", cookie)])
+    assert status == 200 and ran
 
 
 # --- A refused socket is told why --------------------------------------------

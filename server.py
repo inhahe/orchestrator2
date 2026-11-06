@@ -3007,6 +3007,17 @@ WS_CLOSE_DISABLED = 4403     # external access is off, or on with no password
 WS_CLOSE_LOCKED_OUT = 4429   # the brute-force throttle's lockout
 
 
+def _secret_matches(given: str, secret: str) -> bool:
+    """Whether *given*, from a request, is *secret*, in constant time.
+
+    Compared as UTF-8 bytes: ``hmac.compare_digest`` refuses a ``str`` with
+    any non-ASCII character, with a TypeError that would turn a request
+    carrying one -- which anyone can send -- into a server error that skips
+    the throttle, and would make a non-ASCII password unusable.
+    """
+    return hmac.compare_digest(given.encode("utf-8"), secret.encode("utf-8"))
+
+
 def _ws_close_reason(text: str) -> str:
     """*text*'s first paragraph, cut to the 123 bytes a close frame's reason
     can hold (a longer one makes the close itself fail)."""
@@ -3147,7 +3158,7 @@ class _ExternalAuthMiddleware:
     _MAX_LOCKOUT = 300.0        # cap on the lockout window (5 min)
     # The count stops where the window reaches its cap: more would lock for
     # no longer, only take longer to wear off -- and past about a thousand,
-    # the window's power of two no longer fits a float.
+    # the window's power of two would no longer fit a float.
     _MAX_FAILS = _FREE_ATTEMPTS + 1 + math.ceil(math.log2(_MAX_LOCKOUT / _BASE_LOCKOUT))
 
     def __init__(self, app: Any, *, password: str | None,
@@ -3171,7 +3182,7 @@ class _ExternalAuthMiddleware:
         # brute-force note above).  In-process only; a restart forgives.
         self._fails = 0
         self._locked_until = 0.0    # time.monotonic() deadline
-        self._last_failure = 0.0    # time.monotonic() of the latest failure
+        self._forget_from = 0.0     # time.monotonic() forgetting is counted from
         self._refusals = _RefusalLog()
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
@@ -3228,7 +3239,7 @@ class _ExternalAuthMiddleware:
                     return
 
                 header_ok = self._check_basic_auth(auth)
-                param_ok = pw_param is not None and hmac.compare_digest(
+                param_ok = pw_param is not None and _secret_matches(
                     pw_param, self.password)
                 if not (header_ok or param_ok):
                     # **Only a wrong credential counts as an attempt.**  A
@@ -3271,17 +3282,33 @@ class _ExternalAuthMiddleware:
     def _record_failure(self) -> None:
         """Count a failed attempt and (past the threshold) arm the lockout.
 
-        One failure is forgotten for each ``_MAX_LOCKOUT`` since the last, so
-        the count wears off however it was run up -- by a scan that stopped,
-        or by guesses slower than that -- and the owner's typo is not made to
-        pay for it.  A guesser can therefore never average more than one try
-        per ``_MAX_LOCKOUT``, which the cap allows anyway: waiting gains
-        nothing.
+        One failure is forgotten for each ``_MAX_LOCKOUT`` that passes, so the
+        count wears off however it was run up: a scan that stopped stops
+        costing the owner, and guesses that average slower than one per
+        window never build it up.  A guesser can therefore never average more
+        than one try per ``_MAX_LOCKOUT``, which the cap allows anyway:
+        waiting gains nothing.
+
+        Only whole windows are forgotten, and ``_forget_from`` moves on by
+        just those, so the part of a window that has passed counts towards
+        the next.  Moving it to *now* would throw that part away at every
+        failure, and uneven gaps -- 150s, then 460s -- would build the count
+        up while averaging slower than one per window.  An empty count banks
+        nothing: forgetting starts afresh from its next failure.
+
+        On the request path the count cannot pass ``_MAX_FAILS``: there the
+        lockout is the cap, so the next counted failure comes a full window
+        later and forgets one.  The ``min`` makes that hold for any caller.
         """
         now = time.monotonic()
-        forgotten = int((now - self._last_failure) // self._MAX_LOCKOUT)
-        self._fails = min(max(0, self._fails - forgotten) + 1, self._MAX_FAILS)
-        self._last_failure = now
+        forgotten = int((now - self._forget_from) // self._MAX_LOCKOUT)
+        level = self._fails - forgotten
+        if level > 0:
+            self._forget_from += forgotten * self._MAX_LOCKOUT
+        else:
+            level = 0
+            self._forget_from = now
+        self._fails = min(level + 1, self._MAX_FAILS)
         over = self._fails - self._FREE_ATTEMPTS
         if over > 0:
             window = min(self._BASE_LOCKOUT * (2 ** (over - 1)), self._MAX_LOCKOUT)
@@ -3302,7 +3329,7 @@ class _ExternalAuthMiddleware:
             return False
         # Accept any username; only the password matters.
         parts = decoded.split(":", 1)
-        return len(parts) == 2 and hmac.compare_digest(parts[1], self.password)
+        return len(parts) == 2 and _secret_matches(parts[1], self.password)
 
     def _cookie_ok(self, cookie_header: bytes) -> bool:
         """True when the request carries a valid ``orch2_auth`` cookie."""
@@ -3311,7 +3338,7 @@ class _ExternalAuthMiddleware:
         raw = cookie_header.decode("utf-8", "replace")
         for part in raw.split(";"):
             name, _, value = part.strip().partition("=")
-            if name == _AUTH_COOKIE and hmac.compare_digest(value, self.token):
+            if name == _AUTH_COOKIE and _secret_matches(value, self.token):
                 return True
         return False
 

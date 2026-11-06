@@ -4848,19 +4848,30 @@ correct password clears them.
 **The count wears off, one failure per `_MAX_LOCKOUT`.** It used to fall only
 on a correct password or a restart, so a scan that ran it up left the owner's
 next typo, however much later, the full five-minute lockout. `_record_failure`
-now forgets one failure for each `_MAX_LOCKOUT` since the last, before
+now forgets one failure for each `_MAX_LOCKOUT` that has passed, before
 counting the new one:
 
-- A scan that stopped stops costing the owner once enough windows have passed
-  to bring the count back among the free attempts: ten of them, 50 minutes.
-- Guesses slower than one per window never build up a count at all.
+- After a scan stops, the owner's first typo is free once ten windows have
+  passed (50 minutes), and all five free attempts are back after fourteen
+  (70 minutes). A typo sooner than that can still cost up to the full
+  lockout.
+- Guesses that average slower than one per window cannot build the count up
+  over time. Only whole windows are forgotten, so `_forget_from`, the moment
+  forgetting is counted from, moves on by just the windows forgotten, and the
+  part of a window that has passed counts toward the next. Moving it to the
+  time of each failure would throw that part away every time. Gaps of 150s
+  then 460s, averaging slower than a window, would then climb to the cap.
+  Gaps that average only barely slower are a random walk with almost no
+  drift, and wander a few failures up and back down under any rule.
+- An empty count banks nothing: forgetting starts afresh from its next
+  failure. Otherwise a long silence would buy that many free tries.
 - A guesser at the cap stays there. Each try comes a full window after the
   last, forgets one, and adds one.
 - No way of guessing averages more than one try per window, the rate the cap
   already allows. Each try adds one to a count that cannot go below zero, and
-  one is forgotten per window, so tries number at most the windows elapsed
-  plus one burst's worth. Waiting therefore gains a guesser nothing, by
-  construction rather than by tuning.
+  at most one is forgotten per window, so tries number at most the windows
+  elapsed plus one burst's worth. Waiting therefore gains a guesser nothing,
+  by construction rather than by tuning.
 
 An earlier version of the decay, written on 2026-11-06, zeroed the count after
 two silent hours, and every failure restarted the two hours. That shielded
@@ -4869,15 +4880,27 @@ never forgotten, held the count at the cap for good, and left the owner's typo
 the full lockout.
 
 **The count stops at `_MAX_FAILS`** (14), the first count whose window is the
-cap. Counting on would lock no longer, only take longer to wear off. It also
-keeps the window's power of two small: unbounded, `2.0 * 2**1024` did not fit
-a float past about a thousand failures, and the `OverflowError` left
-`_locked_until` unset, so every later guess went unthrottled.
+cap. On the request path the decay already keeps it there. At 14 the lockout
+is the cap, so the next counted failure comes a full window later and forgets
+one. The `min` is the guard that makes this hold for any caller. Counting on
+would lock no longer, only take longer to wear off, and past about a thousand
+the window's `2.0 * 2**n` would not fit a float. With no decay that once
+happened: the `OverflowError` left `_locked_until` unset, and every later
+guess went unthrottled.
 
 `test_external_auth.py` drives the real methods on a hand-moved clock: a
-stopped scan wearing off on time and not a window sooner, a slow trickle, a
-steady guesser held at the cap, every way of pausing over a week against the
-bound, and the count's cap and where it sits.
+stopped scan wearing off on time and not a window sooner, a slow trickle,
+uneven gaps (alternating, and seeded random), a steady guesser held at the
+cap, every way of pausing over a week against the bound, and the count's cap
+and where it sits.
+
+**Secrets are compared as bytes** (`_secret_matches`). `hmac.compare_digest`
+refuses a `str` with any non-ASCII character by raising `TypeError`. A
+request carrying one, which anyone can send, then got a server error and a
+traceback instead of a refusal, outside both the throttle and the refusal
+log's cap. A non-ASCII password could never be used at all. The password, the
+`?password=` value and the cookie are each encoded as UTF-8 first, and a
+non-ASCII one is then simply a wrong credential.
 
 ### A refusal says why, to the page and to the log
 
