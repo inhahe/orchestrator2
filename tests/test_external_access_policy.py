@@ -270,6 +270,43 @@ def test_an_authenticated_cookie_survives_someone_elses_lockout():
     assert status == 200 and ran, "the owner was locked out by a stranger"
 
 
+def test_the_owners_cookie_does_not_reset_the_throttle():
+    """A cookie is no new success.  Had it cleared the count, every request
+    the owner's browser made would hand a guesser five fresh free tries."""
+    mw = _mw()
+    cookie = [(b"cookie", ("orch2_auth=" + mw.token).encode())]
+    for _ in range(mw._FREE_ATTEMPTS + 2):        # attacker, elsewhere
+        _drive(mw, ip="1.2.3.4", headers=_basic("nope"))
+    fails, locked = mw._fails, mw._lockout_remaining()
+    assert locked > 0, "test did not actually arm a lockout"
+    status, _, ran = _drive(mw, ip="8.8.8.8", headers=cookie)
+    assert status == 200 and ran
+    assert mw._fails == fails, "the owner's request cleared the count"
+    assert mw._lockout_remaining() > 0, "the owner's request lifted the lockout"
+    status, _, _ = _drive(mw, ip="1.2.3.4", headers=_basic("guess"))
+    assert status == 429, "the guesser got a free try"
+
+
+def test_a_correct_password_still_clears_the_throttle():
+    mw = _mw()
+    for _ in range(mw._FREE_ATTEMPTS - 1):
+        _drive(mw, ip="1.2.3.4", headers=_basic("nope"))
+    _drive(mw, ip="8.8.8.8", headers=_basic("secret"))
+    assert mw._fails == 0
+
+
+def test_the_lockout_holds_however_many_failures_there_have_been():
+    """2.0 * 2**1024 does not fit a float: past about a thousand failures the
+    window's OverflowError left every later guess unthrottled."""
+    import time
+    mw = _mw()
+    mw._fails = 5000
+    mw._last_failure = time.monotonic()           # a guesser still at it
+    status, _, _ = _drive(mw, ip="1.2.3.4", headers=_basic("nope"))
+    assert status == 401
+    assert mw._lockout_remaining() > mw._MAX_LOCKOUT - 5, mw._lockout_remaining()
+
+
 def test_a_wrong_cookie_is_not_a_free_pass():
     mw = _mw()
     status, _, ran = _drive(

@@ -4840,7 +4840,16 @@ A **valid cookie is also honoured during a lockout**. It proves a past success
 rather than a guess, so accepting it gives an attacker nothing, and it removes
 the one real bite of a global counter: a stranger guessing from anywhere could
 otherwise lock the owner out of their own remote session for up to five
-minutes.
+minutes. It **leaves the count and the lockout alone**, though. It used to
+clear both, as a success, and then every request the owner's browser made
+(each page, asset and socket) handed a guesser five fresh free tries. Only a
+correct password clears them.
+
+**The escalation's exponent is bounded** (`min(over - 1, 60)`), long past the
+cap. At `2**1024` the product no longer fits a float. The `OverflowError`
+left `_locked_until` unset, so past about a thousand failures every later
+guess went unthrottled. A guesser who keeps at it reaches that in about
+85 hours, and the decay below never forgets one who does.
 
 **Failures are forgotten after `_FORGET_AFTER` (two hours) with none.** The
 count used to fall only on a correct password or a restart. A scan that ran

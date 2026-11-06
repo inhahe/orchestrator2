@@ -302,7 +302,8 @@ WebSocket retry — is not a guess and costs nothing; counting those used to mak
 an ordinary first visit report "too many failed attempts" while the *correct*
 password was being typed. An already-authenticated cookie is also honoured
 during a lockout, so a stranger guessing from elsewhere can't shut the owner
-out of their own remote session. Password and
+out of their own remote session. Using the cookie doesn't reset the counter,
+so your own browsing gives a guesser no fresh tries. Password and
 cookie-token comparisons run in constant time (`hmac.compare_digest`) so the
 secret can't be recovered by response-timing analysis.
 

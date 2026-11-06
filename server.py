@@ -3123,9 +3123,10 @@ class _ExternalAuthMiddleware:
     (``_BASE_LOCKOUT * 2**(n-1)`` seconds, capped at ``_MAX_LOCKOUT``) during
     which every external request is refused with ``429`` *before* the password is
     even examined — so the whole hub allows only a handful of guesses per
-    escalating window no matter how many machines are trying.  A single
-    successful auth clears the counter, and so does ``_FORGET_AFTER`` with no
-    failure at all.  (Trade-off: an attacker can keep the
+    escalating window no matter how many machines are trying.  A correct
+    password clears the counter, and so does ``_FORGET_AFTER`` with no
+    failure at all; a sign-in cookie does not, being no new success.
+    (Trade-off: an attacker can keep the
     lockout armed and lock out the owner's *remote* access — but LAN/loopback
     always bypasses the throttle, and the cap keeps any single lockout ≤5 min.)
     Password / token comparisons use ``hmac.compare_digest`` so a network
@@ -3204,9 +3205,11 @@ class _ExternalAuthMiddleware:
                 # guess, so honouring it costs an attacker nothing — and it
                 # removes the one real bite of a global counter: a stranger
                 # guessing from anywhere could otherwise lock the owner out of
-                # their own remote session for up to five minutes.
+                # their own remote session for up to five minutes.  It leaves
+                # the count and the lockout alone: being no new success, it
+                # must not hand a guesser fresh free attempts every time the
+                # owner's browser makes a request.
                 if cookie_ok:
-                    self._record_success()
                     await self.app(scope, receive, send)
                     return
 
@@ -3276,7 +3279,11 @@ class _ExternalAuthMiddleware:
         self._fails += 1
         over = self._fails - self._FREE_ATTEMPTS
         if over > 0:
-            window = min(self._BASE_LOCKOUT * (2 ** (over - 1)), self._MAX_LOCKOUT)
+            # The exponent stops long after the window reaches its cap: at
+            # 2**1024 the product no longer fits a float, and the
+            # OverflowError would leave every later guess unthrottled.
+            window = min(self._BASE_LOCKOUT * (2 ** min(over - 1, 60)),
+                         self._MAX_LOCKOUT)
             self._locked_until = now + window
 
     def _record_success(self) -> None:

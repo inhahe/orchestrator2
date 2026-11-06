@@ -575,10 +575,25 @@ EXTAUTH_MUTATIONS = [
 
     ("a valid cookie no longer survives someone else's lockout",
      "                if cookie_ok:\n"
-     "                    self._record_success()\n"
      "                    await self.app(scope, receive, send)\n"
      "                    return\n",
      ""),
+
+    ("the owner's every request hands a guesser fresh free tries",
+     "                if cookie_ok:\n"
+     "                    await self.app(scope, receive, send)\n",
+     "                if cookie_ok:\n"
+     "                    self._record_success()\n"
+     "                    await self.app(scope, receive, send)\n"),
+
+    ("a correct password no longer clears the throttle",
+     "                # Authenticated — forgive all prior failures.\n"
+     "                self._record_success()\n",
+     ""),
+
+    ("the escalation's exponent is unbounded, and overflows",
+     "(2 ** min(over - 1, 60))",
+     "(2 ** (over - 1))"),
 
     ("a forged cookie is accepted",
      "                cookie_ok = self._cookie_ok(headers.get(b\"cookie\", b\"\"))",
