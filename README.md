@@ -290,7 +290,10 @@ for an exponentially growing window (2 s, doubling each further failure up to
 5 min) during which every external request is refused with `429` before the
 password is even checked — so the whole hub allows only a handful of guesses per
 escalating window no matter how many machines are trying. A single correct
-password clears the counter. (LAN/loopback always bypasses the throttle, so a
+password clears the counter, and so do two hours without a wrong one, so a
+count a scan ran up can't turn your own typo, later, into a 5-minute lockout.
+Two hours, because a guesser who waits for the count to clear gets fewer tries
+an hour than one who keeps at it. (LAN/loopback always bypasses the throttle, so a
 lockout only affects remote access, and the 5-min cap bounds it.)
 
 Only a password that is **presented and wrong** counts as an attempt. A request

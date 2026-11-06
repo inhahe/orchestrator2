@@ -4842,6 +4842,19 @@ the one real bite of a global counter: a stranger guessing from anywhere could
 otherwise lock the owner out of their own remote session for up to five
 minutes.
 
+**Failures are forgotten after `_FORGET_AFTER` (two hours) with none.** The
+count used to fall only on a correct password or a restart. A scan that ran
+it up therefore left the owner's next typo, however much later, the full
+five-minute lockout. `_record_failure` now zeroes the count first when the
+previous failure is that old, and each failure restarts the spell, so a
+guesser who keeps at it, however slowly, is never forgotten. The length is
+set by what waiting buys a guesser: a burst (five free tries, then one per
+doubling window up to the cap, 14 tries in 510s) followed by the wait must be
+fewer tries an hour than one try per `_MAX_LOCKOUT`. One hour fails that, at
+12.3 an hour against 12. Two hours gives 6.5.
+`test_waiting_out_the_decay_gains_a_guesser_nothing` drives the real methods on
+a fake clock and holds the constants to it.
+
 ### A refusal says why, to the page and to the log
 
 The session list, and everything live, arrive over the page's WebSocket, so a

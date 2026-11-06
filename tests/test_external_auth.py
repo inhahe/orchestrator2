@@ -165,6 +165,65 @@ def test_success_clears_failures(mw):
         assert status == 401
 
 
+def test_failures_are_forgotten_after_a_quiet_spell(mw):
+    # A count a scan ran up must not turn the owner's typo, later, into a
+    # lockout.
+    for _ in range(mw._FREE_ATTEMPTS):
+        _drive(mw, headers=_basic("nope"))
+    mw._last_failure -= mw._FORGET_AFTER
+    status, _, _ = _drive(mw, headers=_basic("nope"))
+    assert status == 401
+    assert mw._fails == 1, "the old failures were still counted"
+    assert mw._lockout_remaining() == 0, "a first failure locked the hub"
+
+
+def test_failures_short_of_the_quiet_spell_are_kept(mw):
+    for _ in range(mw._FREE_ATTEMPTS):
+        _drive(mw, headers=_basic("nope"))
+    mw._last_failure -= mw._FORGET_AFTER - 60
+    _drive(mw, headers=_basic("nope"))
+    assert mw._lockout_remaining() > 0, "failures were forgotten too soon"
+
+
+def test_each_failure_restarts_the_quiet_spell(mw):
+    # A guesser who keeps at it is never quiet for long, however slowly.
+    for _ in range(mw._FREE_ATTEMPTS):
+        _drive(mw, headers=_basic("nope"))
+        mw._last_failure -= mw._FORGET_AFTER * 0.9
+    _drive(mw, headers=_basic("nope"))
+    assert mw._fails == mw._FREE_ATTEMPTS + 1
+    assert mw._lockout_remaining() > 0
+
+
+def test_waiting_out_the_decay_gains_a_guesser_nothing(monkeypatch):
+    # Two ways to guess: steadily, one try per lockout once it is at its cap;
+    # or in bursts -- the free tries and the escalation -- each followed by
+    # the wait that has the count forgotten.  If bursts were the faster, the
+    # decay would be a gift to whoever waits for it.
+    start = 1e6                                      # a machine up for days
+    clock = [start]
+    monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
+    mw = _ExternalAuthMiddleware(_inner_app, password="secret")
+    for guesses in range(1, 100):
+        clock[0] += mw._lockout_remaining()          # wait out any lockout
+        mw._record_failure()
+        if mw._lockout_remaining() >= mw._MAX_LOCKOUT:
+            break                                    # at the cap: steady from here
+    else:
+        pytest.fail("the lockout never reached its cap")
+    burst = clock[0] - start
+    # The wait does have the count forgotten, so bursts can repeat...
+    clock[0] += mw._FORGET_AFTER
+    mw._record_failure()
+    assert mw._fails == 1 and mw._lockout_remaining() == 0
+    # ...and repeating them is no faster than guessing steadily.
+    per_burst = guesses / (burst + mw._FORGET_AFTER)
+    steady = 1 / mw._MAX_LOCKOUT
+    assert per_burst <= steady, (
+        f"{guesses} guesses every {burst + mw._FORGET_AFTER:.0f}s beats one "
+        f"every {mw._MAX_LOCKOUT:.0f}s")
+
+
 def test_lockout_window_grows(mw):
     for _ in range(mw._FREE_ATTEMPTS):
         _drive(mw, headers=_basic("nope"))

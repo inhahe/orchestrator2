@@ -584,6 +584,19 @@ EXTAUTH_MUTATIONS = [
      "                cookie_ok = self._cookie_ok(headers.get(b\"cookie\", b\"\"))",
      "                cookie_ok = bool(headers.get(b\"cookie\"))"),
 
+    ("failures are never forgotten",
+     "        if now - self._last_failure >= self._FORGET_AFTER:\n"
+     "            self._fails = 0\n",
+     ""),
+
+    ("a failure does not restart the quiet spell",
+     "        self._last_failure = now\n",
+     ""),
+
+    ("the quiet spell is short enough to be worth waiting out",
+     "    _FORGET_AFTER = 7200.0",
+     "    _FORGET_AFTER = 3600.0"),
+
     ("wrong passwords stop being counted at all",
      "                    if auth or pw_param is not None:\n"
      "                        self._record_failure()",

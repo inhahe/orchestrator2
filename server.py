@@ -3124,7 +3124,8 @@ class _ExternalAuthMiddleware:
     which every external request is refused with ``429`` *before* the password is
     even examined — so the whole hub allows only a handful of guesses per
     escalating window no matter how many machines are trying.  A single
-    successful auth clears the counter.  (Trade-off: an attacker can keep the
+    successful auth clears the counter, and so does ``_FORGET_AFTER`` with no
+    failure at all.  (Trade-off: an attacker can keep the
     lockout armed and lock out the owner's *remote* access — but LAN/loopback
     always bypasses the throttle, and the cap keeps any single lockout ≤5 min.)
     Password / token comparisons use ``hmac.compare_digest`` so a network
@@ -3141,6 +3142,12 @@ class _ExternalAuthMiddleware:
     _FREE_ATTEMPTS = 5          # failures allowed before lockouts begin
     _BASE_LOCKOUT = 2.0         # seconds for the first lockout past the threshold
     _MAX_LOCKOUT = 300.0        # cap on the lockout window (5 min)
+    # Failures are forgotten after this long with none, so a count a scan ran
+    # up does not turn the owner's typo, days later, into the longest
+    # lockout.  Long enough that waiting it out gains a guesser nothing: the
+    # free attempts and the escalation, then this wait, are fewer tries an
+    # hour than one per _MAX_LOCKOUT (test_waiting_out_the_decay_gains_a_guesser_nothing).
+    _FORGET_AFTER = 7200.0
 
     def __init__(self, app: Any, *, password: str | None,
                  disabled_message: str | None = None) -> None:
@@ -3163,6 +3170,7 @@ class _ExternalAuthMiddleware:
         # brute-force note above).  In-process only; a restart forgives.
         self._fails = 0
         self._locked_until = 0.0    # time.monotonic() deadline
+        self._last_failure = 0.0    # time.monotonic() of the latest failure
         self._refusals = _RefusalLog()
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
@@ -3258,12 +3266,18 @@ class _ExternalAuthMiddleware:
         return remaining if remaining > 0 else 0.0
 
     def _record_failure(self) -> None:
-        """Count a failed attempt and (past the threshold) arm the lockout."""
+        """Count a failed attempt and (past the threshold) arm the lockout,
+        first forgetting the failures before a quiet spell of
+        ``_FORGET_AFTER``."""
+        now = time.monotonic()
+        if now - self._last_failure >= self._FORGET_AFTER:
+            self._fails = 0
+        self._last_failure = now
         self._fails += 1
         over = self._fails - self._FREE_ATTEMPTS
         if over > 0:
             window = min(self._BASE_LOCKOUT * (2 ** (over - 1)), self._MAX_LOCKOUT)
-            self._locked_until = time.monotonic() + window
+            self._locked_until = now + window
 
     def _record_success(self) -> None:
         """Clear the failure history after a valid credential."""
