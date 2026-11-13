@@ -174,14 +174,15 @@ def test_callback_finishes_the_one_sign_in_in_progress(hub):
         await _send(FakeWS(), "/mcp auth wpcom-mcp")
         watcher = _watcher(hub)
         await _send(FakeWS(), f"/mcp callback {CALLBACK}")
-        await asyncio.sleep(0)
-        return watcher
+        # Time for a watcher left running to poll and say it all again;
+        # asserted here, since asyncio.run cancels whatever is left.
+        await asyncio.sleep(server.MCP_SIGNIN_POLL_S * 5)
+        assert watcher.cancelled()
 
-    watcher = asyncio.run(go())
+    asyncio.run(go())
     # The CLI leaves the reconnect to whoever pasted the address.
     assert hub.bridge.calls[-2:] == [("callback", "wpcom-mcp", CALLBACK),
                                      ("reconnect", "wpcom-mcp")]
-    assert watcher.cancelled()
     # Said once, by the callback, not again by the watcher.
     assert _texts(hub.said) == ["MCP server 'wpcom-mcp' is signed in and connected "
                                 "(2 tools). The next turn can use them."]

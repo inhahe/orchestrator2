@@ -61,6 +61,10 @@ Targets:
              environment agent-comms reads
   mcpconfig  sdk_bridge.py x tests/test_agent_comms_surfacing.py (pytest)
              the halt tools go beside the servers a --mcp-config gives
+  mcp-signin server.py x tests/test_mcp_signin.py  (pytest)
+             /mcp auth and /mcp callback: what the watcher counts as the
+             sign-in, the CLI that holds the flow, the reconnect the CLI
+             leaves to a pasted address (design.md section 6i)
              (The agent-comms package -- identity, registry, messaging, halt,
              its command line and halt tools -- has its own sweep and its own
              mutants: tools/mutate.py there.)
@@ -9239,6 +9243,58 @@ OFFLOOP_BRIDGE_MUTATIONS = [
      ""),
 ]
 
+# Signing an MCP server in (design.md section 6i).  tests/test_mcp_signin.py.
+MCP_SIGNIN_MUTATIONS = [
+    ("a status the server had already counts as the sign-in",
+     "        moved = moved or status != before\n",
+     "        moved = True\n"),
+
+    ("a reading without the server ends the watch",
+     "        server = await _mcp_server_status(bridge, name)\n"
+     "        if server is None:\n"
+     "            continue\n",
+     "        server = await _mcp_server_status(bridge, name)\n"
+     "        if server is None:\n"
+     "            return\n"),
+
+    ("a reconnect while the flow starts goes unnoticed",
+     "    if rt.bridge is not bridge or bridge.client is not client:\n"
+     "        await _say(ws, f\"The session reconnected while the sign-in for '{name}' was \"\n",
+     "    if False:\n"
+     "        await _say(ws, f\"The session reconnected while the sign-in for '{name}' was \"\n"),
+
+    ("a connected server is signed in again",
+     "    if before == \"connected\":\n",
+     "    if False:\n"),
+
+    ("the flag, not the address, decides on a browser step",
+     "    if not isinstance(url, str) or not url:\n",
+     "    if not resp.get(\"requiresUserAction\") or not isinstance(url, str):\n"),
+
+    ("an address the page cannot link is dropped",
+     "        data[\"message\"] = f\"{message}\\n\\n{url}\"\n",
+     "        pass\n"),
+
+    ("a pasted address leaves the server on needs-auth",
+     "    try:\n"
+     "        await bridge.reconnect_mcp_server(name)\n"
+     "    except Exception as exc:  # noqa: BLE001 -- the CLI's wording is the explanation\n"
+     "        await rt.broadcast(_mcp_signin_notice(",
+     "    try:\n"
+     "        pass\n"
+     "    except Exception as exc:  # noqa: BLE001 -- the CLI's wording is the explanation\n"
+     "        await rt.broadcast(_mcp_signin_notice("),
+
+    ("a callback's watcher reports the sign-in a second time",
+     "    if watcher is not None:\n"
+     "        watcher.cancel()\n",
+     ""),
+
+    ("/mcp auth holds up the tab's next messages",
+     "            _run_mcp_signin_step(_start_mcp_signin(ws, rt, bridge, name))\n",
+     "            await _start_mcp_signin(ws, rt, bridge, name)\n"),
+]
+
 
 TARGETS = {
     "chat": ("static/chat.js", "tests/hidden_window.test.js",
@@ -9673,6 +9729,8 @@ TARGETS = {
                      ACCTENV_AUTH_MUTATIONS, "pytest"),
     "acctenv-server": ("server.py", "tests/test_account.py",
                        ACCTENV_SERVER_MUTATIONS, "pytest"),
+    "mcp-signin": ("server.py", "tests/test_mcp_signin.py",
+                   MCP_SIGNIN_MUTATIONS, "pytest"),
 }
 
 

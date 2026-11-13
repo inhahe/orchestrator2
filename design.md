@@ -2937,7 +2937,8 @@ the CLI's own explanation. The browser half needs a person. Pinned by
 `tests/test_mcp_signin.py` (the requests, the link and instructions, the
 watcher's endings and what it does not count, the refused cases, the steps
 off the message loop, the callback with and without a server) and
-`tests/test_mcp_command.py` (the hints in `/mcp`'s list, `/help`).
+`tests/test_mcp_command.py` (the hints in `/mcp`'s list, `/help`); mutation
+target `mcp-signin`.
 
 ## 6b. Subprocess ownership (`proc_guard.py`)
 
