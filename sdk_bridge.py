@@ -7769,6 +7769,53 @@ class SDKBridge:
             raise RuntimeError("this SDK version has no MCP toggle API")
         await self.client.toggle_mcp_server(name, enabled)
 
+    async def _mcp_control(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Send a control request the SDK has no method for, and return the
+        CLI's answer.
+
+        The CLI takes ``mcp_authenticate`` and ``mcp_oauth_callback_url``
+        (tried against the bundled 2.1.321), but the Python SDK's public
+        client has methods only for status, reconnect and toggle.  So this
+        reaches the private ``_send_control_request`` those three use.  A CLI
+        error comes back as an exception in the CLI's own words.
+        """
+        if self.client is None:
+            raise RuntimeError("SDK not connected")
+        send = getattr(getattr(self.client, "_query", None), "_send_control_request", None)
+        if send is None:
+            raise RuntimeError("this SDK version cannot send MCP sign-in requests")
+        resp = await send(request)
+        return resp if isinstance(resp, dict) else {}
+
+    async def authenticate_mcp_server(self, name: str) -> dict[str, Any]:
+        """Start an MCP server's OAuth sign-in, and return the CLI's answer:
+        ``authUrl`` and ``requiresUserAction`` (and, in 2.1.321,
+        ``callbackPort``).
+
+        The CLI listens on ``http://localhost:<callbackPort>/callback`` for the
+        browser coming back.  When that lands, it stores the tokens in this
+        account's credentials and reconnects the server, whose tools reach the
+        next turn.  A browser on another machine cannot reach that address, so
+        ``submit_mcp_oauth_callback`` is the other way to finish.  A second
+        call for the same server abandons the first flow.
+        """
+        return await self._mcp_control(
+            {"subtype": "mcp_authenticate", "serverName": name})
+
+    async def submit_mcp_oauth_callback(self, name: str, callback_url: str) -> None:
+        """Finish *name*'s sign-in with *callback_url*, the address the
+        browser was sent back to.
+
+        The CLI refuses an address with no ``code`` or ``error``, or one from
+        another attempt, and otherwise returns once the tokens are exchanged.
+        **The caller must then reconnect the server** (``reconnect_mcp_server``).
+        On this path the CLI leaves that to whoever pasted the address, and
+        without it the server stays on "needs auth", with good tokens, until
+        the session reconnects.
+        """
+        await self._mcp_control({"subtype": "mcp_oauth_callback_url",
+                                 "serverName": name, "callbackUrl": callback_url})
+
     async def start(self) -> None:
         """Launch the worker loop as a background task."""
         # Mark "connecting" immediately so the browser's very first status

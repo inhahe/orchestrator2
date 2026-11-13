@@ -21,6 +21,7 @@ def test_classify_mcp():
     assert classify("/mcp tools") == ("mcp", "tools")
     assert classify("/mcp reconnect github") == ("mcp", "reconnect github")
     assert classify("/mcp disable  sentry") == ("mcp", "disable  sentry")
+    assert classify("/mcp auth wpcom-mcp") == ("mcp", "auth wpcom-mcp")
 
 
 def test_format_empty():
@@ -70,10 +71,11 @@ def test_format_list():
     assert "transport: http" in out
     # Errors and auth hints.
     assert "error: connection refused" in out
-    assert "run /mcp reconnect sentry to authenticate" in out
+    assert "run /mcp auth sentry to sign in" in out
     # Tool summary (not full list in default mode).
     assert "2 tools: create_issue, list_repos" in out
     # Management footer.
+    assert "/mcp auth <server>" in out
     assert "/mcp reconnect <server>" in out
 
 

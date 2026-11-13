@@ -476,6 +476,16 @@ You can see which a session uses. The status bar's plan field reads **`API $1.23
 | `--append-system-prompt TEXT` | -- | Extra instructions appended to the system prompt |
 | `--mcp-config PATH_OR_JSON` | -- | MCP servers config — a JSON file path or inline JSON string. Lets the orchestrator act as an MCP client. Every session also gets the halt tools (`agent-halt`) beside these. Use the `/mcp` command at runtime to inspect and manage the configured servers |
 
+Sessions also see the MCP servers their account has at user scope (`claude mcp add --scope user …`, with `CLAUDE_CONFIG_DIR` set to the account's config dir, or unset for the default account). Each account has its own servers and sign-ins, so add a server to each account you run it on. A session picks up a new server when it next connects (`/connect`, or opening it again).
+
+**Remote servers that need a sign-in.** A server reached over HTTP that uses OAuth, such as WordPress.com's (`https://public-api.wordpress.com/wpcom/v2/mcp/v1`), shows as *needs auth* in `/mcp` until you sign in:
+
+1. `/mcp auth <server>` puts a sign-in link in the session. Open it and approve access.
+2. If that browser is on the hub's machine, that is all: the session says when the server is connected, and the next turn can use its tools.
+3. If the browser is on another device (a phone, another computer), it ends on a `localhost:<port>` page that won't load. Copy that page's address and send `/mcp callback <server> <address>`. The server can be left out when only one sign-in is in progress.
+
+The link expires after 5 minutes. The sign-in is kept in the account's credentials, so later sessions on that account connect without it.
+
 ### Display
 
 | Flag | Default | Description |
@@ -754,7 +764,9 @@ both directions of every rule).
 | `/bell +<event>` / `/bell -<event>` | Add or remove a single event from the current set |
 | `/mcp` | List configured MCP servers with connection status and tool counts |
 | `/mcp tools [server]` | List the tools each MCP server provides (optionally one server) |
-| `/mcp reconnect <server>` | Reconnect a failed / disconnected server (also re-triggers auth) |
+| `/mcp auth <server>` | Sign in a remote server that shows *needs auth*: posts a sign-in link, then says when the server is connected (see *Remote servers that need a sign-in*) |
+| `/mcp callback [server] <address>` | Finish that sign-in from a browser on another device: the address of the `localhost` page it ended on |
+| `/mcp reconnect <server>` | Reconnect a failed / disconnected server. It also picks up a sign-in made elsewhere, such as in a plain `claude` on the same account |
 | `/mcp enable <server>` / `/mcp disable <server>` | Enable (reconnect) or disable (disconnect) a server |
 | `/queue [N\|send\|drop N\|clear]` | Manage queued prompts |
 

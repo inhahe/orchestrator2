@@ -367,7 +367,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         ("/resume-after-limit [on|off]", "carry on by itself once a usage limit that stopped it resets"),
         ("/recycle [now|off|<GiB>]",     "swap the CLI subprocess for a fresh one (reclaims its memory leak)"),
         ("/bell ...",                    "ring on these events (see /bell for details)"),
-        ("/mcp [reconnect|enable|disable <server>]", "list/manage MCP servers"),
+        ("/mcp [auth|reconnect|enable|disable <server>]", "list/manage MCP servers; auth signs one in"),
         ("/queue [N|send|drop N|clear]", "manage queued prompts"),
         ("/quit, /exit",                 "graceful exit"),
         ("/quit!, /exit!",                "force exit"),
@@ -1048,8 +1048,9 @@ def format_mcp_status(
     if not servers:
         return (
             "No MCP servers configured.\n\n"
-            "Start the orchestrator with --mcp-config <file-or-json> to "
-            "connect MCP servers."
+            "Add one to this account with `claude mcp add --scope user ...` "
+            "(the session sees it once it reconnects), or start the "
+            "orchestrator with --mcp-config <file-or-json>."
         )
 
     if filter_name:
@@ -1093,7 +1094,7 @@ def format_mcp_status(
         if status == "failed" and s.get("error"):
             lines.append(f"    error: {s['error']}")
         if status == "needs-auth":
-            lines.append(f"    run /mcp reconnect {name} to authenticate")
+            lines.append(f"    run /mcp auth {name} to sign in")
 
         tools = s.get("tools") or []
         if tools:
@@ -1120,8 +1121,8 @@ def format_mcp_status(
 
     if not tools_mode:
         lines.append(
-            "Manage: /mcp reconnect <server> · /mcp enable <server> · "
-            "/mcp disable <server>"
+            "Manage: /mcp auth <server> · /mcp reconnect <server> · "
+            "/mcp enable <server> · /mcp disable <server>"
         )
         lines.append("Tools:  /mcp tools [server]")
     return "\n".join(lines).rstrip()

@@ -2840,6 +2840,85 @@ Tests: `tests/test_resume_after_limit.py`, `tests/test_cut_off_turn.py` (through
 a real connect); mutation targets `limitresume`, `limitresume-server`,
 `limitresume-module`, `recstore`.
 
+## 6i. Signing an MCP server in: `/mcp auth`, `/mcp callback`
+
+Asked for 2026-11-13: get WordPress.com's MCP server working. It is a remote
+HTTP server (`https://public-api.wordpress.com/wpcom/v2/mcp/v1`) whose only
+sign-in is OAuth 2.1 with PKCE and dynamic client registration. It answers
+401 until then, so the CLI lists it as `needs-auth`. Its docs say to
+`claude mcp add --transport http wpcom-mcp <url>` and then authenticate from
+Claude Code's `/mcp` menu. That menu is the TUI's, and a CLI under the SDK has
+none. Before this, our `/mcp` told the user to run `/mcp reconnect`, which only
+connects again and gets another 401.
+
+**The CLI already runs the flow when asked.** Its control channel takes
+`mcp_authenticate {serverName}` (`cli/print.ts`). The CLI does discovery and
+client registration, starts a listener on `http://localhost:<port>/callback`,
+and answers at once with `authUrl` and `requiresUserAction`. The bundled
+2.1.321 also sends `callbackPort`, `callbackExpected`, `redirectScheme` and
+`state`, and we use only `callbackPort`. When the browser comes back to the
+listener, the CLI exchanges the code, stores the tokens in the account's
+secure storage, and reconnects the server. On Windows that storage is
+`<config-dir>/.credentials.json`, under `mcpOAuth`. The reconnect updates
+`dynamicMcpState`, which is what the next turn reads. It gives up after 5
+minutes (`auth.ts`). A second request for the same server aborts the first
+flow.
+
+**A browser elsewhere cannot reach that listener.** With external access on,
+the tab may be on a phone, whose `localhost` is the phone. For that the CLI
+takes `mcp_oauth_callback_url {serverName, callbackUrl}`. It refuses an
+address without `code`/`error`, and in 2.1.321 one whose `state` belongs to
+another attempt. Otherwise it answers once the tokens are exchanged. It
+**leaves the reconnect to the caller** (VS Code's extension follows with
+`mcp_reconnect`). So `server._finish_mcp_signin` reconnects next. Without
+that, the server would stay on `needs-auth` with good tokens until the session
+reconnected. The two steps are reported apart: a reconnect that fails comes
+after a sign-in that worked, and it says *failed to connect after signing in*,
+not *sign-in failed*.
+
+**The SDK has no method for either request.** `claude_agent_sdk` 0.2.180 has
+only status, reconnect and toggle. `SDKBridge._mcp_control` reaches the
+private `client._query._send_control_request` those three use, and says so
+plainly when an SDK lacks it.
+
+**Nothing reports the end of the flow**, so `server._await_mcp_signin` polls
+`get_mcp_status` every 3 s for 330 s (the CLI's 5 minutes plus the exchange
+and reconnect). It broadcasts *signed in and connected (N tools)* or *failed
+to connect*, or after the deadline a hint to retry. It takes the bridge's
+client when it is created, not when it first runs, and goes quietly if that
+client is replaced: the flow lived in the CLI that went. The watchers, by
+(runtime, server), are also the sign-ins `/mcp callback` may finish without
+a server name. A callback that succeeds cancels its watcher and reports
+itself, so the session hears once.
+
+**The link is an anchor, not text.** The authorize address runs to several
+hundred characters, and system messages were `textContent` only. A
+`system_msg` may now carry `data.link {url, label}`, which `chat.js` appends
+as an `<a target=_blank rel=noopener>` for `https:` addresses only. It goes to
+the asking tab alone, like `/usage`'s report. It is not logged, though it is
+only a PKCE challenge and a state.
+
+**Servers are per account.** User-scope servers live in the account's global
+config (§2: `~/.claude.json` for the default, `<dir>/.claude.json` for the
+others), and so do the tokens. So each account needs its own `claude mcp add`
+and its own sign-in. A plain `claude` signed in on the same account shares
+them, and `/mcp reconnect` picks them up.
+
+**A side effect left alone:** writing the tokens changes
+`.credentials.json`'s mtime, which is `_watch_login`'s signal that a `/login`
+finished (§6g). An MCP sign-in within 5 minutes of a `/login` that never
+finished would therefore read as that login finishing. The CLI's own refresh
+of a Claude token already does the same, and the window is that one watch.
+
+Tried against the bundled 2.1.321 and the real server, from a throwaway
+config dir: the server at user scope shows `needs-auth`; `mcp_authenticate`
+returns a `public-api.wordpress.com/oauth2-1/authorize` address with a
+`localhost` redirect; a pasted address with the wrong state is refused with
+the CLI's own explanation. The browser half needs a person. Pinned by
+`tests/test_mcp_signin.py` (the requests, the link and instructions, the
+watcher's three endings, the callback with and without a server) and
+`tests/test_mcp_command.py` (the hint in `/mcp`'s list).
+
 ## 6b. Subprocess ownership (`proc_guard.py`)
 
 The SDK spawns `claude.exe` as a child process, and Windows does **not** tear
