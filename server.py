@@ -1216,7 +1216,9 @@ async def _watch_login(rt: "SessionRuntime", method: str = "claudeai") -> None:
     """After ``/login`` launches the browser OAuth, wait for it to finish.
 
     The interactive login runs in a separate console.  A subscription sign-in
-    rewrites ``<config-dir>/.credentials.json`` when it completes; a Console
+    writes a new login into ``<config-dir>/.credentials.json`` when it
+    completes (an MCP server's sign-in, written to the same file, is not
+    one); a Console
     sign-in (``method == "console"``) stores a new API key in ``.claude.json``
     instead.  We poll for either (``auth.login_completed``; reliable, unlike
     ``claude auth status``), then refresh ``state.account`` from the

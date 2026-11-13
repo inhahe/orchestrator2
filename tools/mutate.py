@@ -7165,8 +7165,8 @@ APIKEY_AUTH_MUTATIONS = [
      ""),
 
     ("the fingerprint leaves out the Console key",
-     "    return LoginFingerprint(credentials_mtime(config_dir), stamp, digest)\n",
-     "    return LoginFingerprint(credentials_mtime(config_dir), stamp, None)\n"),
+     "    return LoginFingerprint(_login_token_digest(config_dir), stamp, digest)\n",
+     "    return LoginFingerprint(_login_token_digest(config_dir), stamp, None)\n"),
 
     ("a Console sign-in is never seen to finish",
      "    return now.key_digest is not None and now.key_digest != before.key_digest\n",
@@ -7176,10 +7176,13 @@ APIKEY_AUTH_MUTATIONS = [
      "    return now.key_digest is not None and now.key_digest != before.key_digest\n",
      "    return now.key_digest != before.key_digest\n"),
 
-    ("the same token file counts as finishing",
-     "            before.credentials_mtime is None\n"
-     "            or now.credentials_mtime > before.credentials_mtime):\n",
-     "            True):\n"),
+    ("the same login counts as finishing",
+     "    if now.token_digest is not None and now.token_digest != before.token_digest:\n",
+     "    if now.token_digest is not None:\n"),
+
+    ("an MCP sign-in counts as finishing a Claude one",
+     '    login = data.get("claudeAiOauth") if isinstance(data, dict) else None\n',
+     '    login = data if isinstance(data, dict) else None\n'),
 
     ("an unchanged config file is parsed on every reading",
      "    if previous is not None and stamp is not None and stamp == previous.config_stamp:\n",

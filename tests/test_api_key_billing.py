@@ -414,7 +414,7 @@ def test_login_refuses_a_flow_it_does_not_know(monkeypatch):
 def test_the_fingerprint_digests_the_console_key_never_holds_it(tmp_path):
     cfg_dir = _account(tmp_path, api_key=FAKE_KEY)
     fp = auth.login_fingerprint(cfg_dir)
-    assert fp.credentials_mtime is not None
+    assert fp.token_digest and "sk-ant-oat01-fake" not in fp.token_digest
     assert fp.key_digest and FAKE_KEY not in fp.key_digest
     assert len(fp.key_digest) == 64
 
@@ -482,17 +482,31 @@ def _fp(cred, digest):
 
 @pytest.mark.parametrize("before, now, done", [
     ((None, None), (None, None), False),           # nothing yet
-    ((10.0, None), (10.0, None), False),           # still the old token file
-    ((10.0, None), (20.0, None), True),            # subscription sign-in
-    ((None, None), (5.0, None), True),             # first subscription sign-in
-    ((10.0, None), (None, "k1"), True),            # Console sign-in
+    (("t1", None), ("t1", None), False),           # still the old login
+    (("t1", None), ("t2", None), True),            # subscription sign-in
+    ((None, None), ("t1", None), True),            # first subscription sign-in
+    (("t1", None), (None, "k1"), True),            # Console sign-in
     ((None, "k1"), (None, "k2"), True),            # Console again: a new key
     ((None, "k1"), (None, "k1"), False),           # the same key
-    ((10.0, None), (None, None), False),           # signed out on the way
+    (("t1", None), (None, None), False),           # signed out on the way
     ((None, "k1"), (None, None), False),           # key removed on the way
 ])
 def test_what_counts_as_a_finished_sign_in(before, now, done):
     assert auth.login_completed(_fp(*before), _fp(*now)) is done
+
+
+def test_an_mcp_sign_in_is_not_a_claude_sign_in(tmp_path):
+    # The CLI keeps an MCP server's OAuth tokens in .credentials.json too.
+    cfg_dir = _account(tmp_path)
+    before = auth.login_fingerprint(cfg_dir)
+    creds = Path(cfg_dir, ".credentials.json")
+    data = json.loads(creds.read_text(encoding="utf-8"))
+    data["mcpOAuth"] = {"wpcom-mcp|abc": {"accessToken": "mcp-token"}}
+    creds.write_text(json.dumps(data), encoding="utf-8")
+    assert not auth.login_completed(before, auth.login_fingerprint(cfg_dir))
+    data["claudeAiOauth"]["accessToken"] = "sk-ant-oat01-new"
+    creds.write_text(json.dumps(data), encoding="utf-8")
+    assert auth.login_completed(before, auth.login_fingerprint(cfg_dir))
 
 
 # --------------------------------------------------------------------------

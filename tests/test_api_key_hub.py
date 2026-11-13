@@ -66,7 +66,7 @@ def test_usage_for_a_subscription_session_still_fetches(hub, monkeypatch):
 def _watch(hub, monkeypatch, readings, method, previous=None):
     # The last reading repeats: a sign-in never seen to finish times out
     # (quickly, here) rather than running out of readings.  Each is
-    # (credentials mtime, key digest); *previous* collects what each reading
+    # (login token digest, key digest); *previous* collects what each reading
     # was handed as the one before it.
     seen = iter([auth.LoginFingerprint(c, None, k) for c, k in readings])
     last = [None]
@@ -95,13 +95,13 @@ def _watch(hub, monkeypatch, readings, method, previous=None):
 
 def test_a_console_sign_in_is_seen_to_finish(hub, monkeypatch):
     # No subscription token file is written: the new key is what appears.
-    text = _watch(hub, monkeypatch, [(10.0, None), (None, "k1")], "console")
+    text = _watch(hub, monkeypatch, [("t1", None), (None, "k1")], "console")
     assert "Signed in to Claude as me@example.com." in text
     assert "billed per token" in text
 
 
 def test_a_subscription_sign_in_says_nothing_about_a_key(hub, monkeypatch):
-    text = _watch(hub, monkeypatch, [(10.0, None), (20.0, None)], "claudeai")
+    text = _watch(hub, monkeypatch, [("t1", None), ("t2", None)], "claudeai")
     assert "Signed in to Claude as me@example.com." in text
     assert "billed per token" not in text
 
@@ -120,10 +120,10 @@ def test_the_move_picker_names_an_account_from_the_file_its_cli_reads(monkeypatc
 def test_each_reading_is_handed_the_one_before(hub, monkeypatch):
     # So an unchanged config file is not parsed again (auth.login_fingerprint).
     previous = []
-    _watch(hub, monkeypatch, [(10.0, None), (10.0, None), (20.0, None)],
+    _watch(hub, monkeypatch, [("t1", None), ("t1", None), ("t2", None)],
            "claudeai", previous)
     assert previous[0] is None
-    assert [p.credentials_mtime for p in previous[1:]] == [10.0, 10.0]
+    assert [p.token_digest for p in previous[1:]] == ["t1", "t1"]
 
 
 def test_typing_login_console_watches_for_a_console_sign_in(hub, monkeypatch):

@@ -2541,10 +2541,14 @@ completes. Words `/login` does not know are refused, because a mistyped
 are not repeated back, since one may be a key pasted in hope. Completion
 can't be seen as a new `.credentials.json`, because the Console flow writes no
 subscription token. So `_watch_login` compares `auth.login_fingerprint`
-readings: that file's mtime, and a digest of `primaryApiKey`. The key is read
-only to be digested. A newer token file, or a key that differs from before,
-counts as completion. A file or key removed on the way, when the sign-in signs
-out the old login, does not. Each reading is handed the one before, and
+readings: a digest of that file's Claude login (its `claudeAiOauth` entry),
+and a digest of `primaryApiKey`. Both are read only to be digested. A login or
+a key that differs from before counts as completion. A login or key removed on
+the way, when the sign-in signs out the old login, does not. The file's mtime
+was the signal until 2026-11-13, but the CLI keeps MCP servers' OAuth tokens
+in that file too (`mcpOAuth`, §6i), so an MCP sign-in read as a Claude one. It
+cleared the session's auth error and usage-limit state, and told every
+sibling session it was signed in. Each reading is handed the one before, and
 parses the CLI's config file only when its mtime or size has moved: the file
 holds every project's history, and the watcher reads every two seconds.
 
@@ -2921,11 +2925,9 @@ others), and so do the tokens. So each account needs its own `claude mcp add`
 and its own sign-in. A plain `claude` signed in on the same account shares
 them, and `/mcp reconnect` picks them up.
 
-**A side effect left alone:** writing the tokens changes
-`.credentials.json`'s mtime, which is `_watch_login`'s signal that a `/login`
-finished (§6g). An MCP sign-in within 5 minutes of a `/login` that never
-finished would therefore read as that login finishing. The CLI's own refresh
-of a Claude token already does the same, and the window is that one watch.
+**The tokens share a file with the Claude login.** Writing them rewrites
+`.credentials.json`, which `_watch_login` once took, by its mtime, for a
+`/login` finishing. It now compares the file's Claude login alone (§6g).
 
 Tried against the bundled 2.1.321 and the real server, from a throwaway
 config dir: the server at user scope shows `needs-auth`; `mcp_authenticate`

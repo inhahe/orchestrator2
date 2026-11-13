@@ -90,12 +90,15 @@ def _has_credentials_file(config_dir: str | None = None) -> bool:
 class LoginFingerprint(NamedTuple):
     """What a completed sign-in changes, as ``login_fingerprint`` read it.
 
-    ``credentials_mtime``: the subscription token file's mtime.
+    ``token_digest``: a digest of the subscription login in
+    ``.credentials.json`` (its ``claudeAiOauth`` entry).  Not that file's
+    mtime: the CLI keeps MCP servers' OAuth tokens in it too (``mcpOAuth``),
+    and signing one of those in rewrites the file with no Claude sign-in.
     ``config_stamp``: the CLI config file's ``(mtime_ns, size)`` when read.
     ``key_digest``: a digest of the Console API key kept in that file.
     Each None when absent.
     """
-    credentials_mtime: float | None
+    token_digest: str | None
     config_stamp: tuple[int, int] | None
     key_digest: str | None
 
@@ -104,10 +107,11 @@ def login_fingerprint(config_dir: str | None = None,
                       previous: LoginFingerprint | None = None) -> LoginFingerprint:
     """What a completed sign-in changes, for watching one finish.
 
-    A subscription sign-in rewrites ``.credentials.json``.  A Console sign-in
-    writes no subscription token: the CLI creates an API key and keeps it in
-    its config file (``state.global_config_path``) as ``primaryApiKey``, read
-    only to be digested.  *previous*, the last reading, spares parsing that
+    A subscription sign-in writes a new login into ``.credentials.json``, a
+    small file read whole.  A Console sign-in writes no subscription token:
+    the CLI creates an API key and keeps it in its config file
+    (``state.global_config_path``) as ``primaryApiKey``.  Both are read only
+    to be digested.  *previous*, the last reading, spares parsing that
     file again while it is unchanged: it holds every project's history, can
     run to megabytes, and a watcher reads every couple of seconds.
     """
@@ -121,7 +125,21 @@ def login_fingerprint(config_dir: str | None = None,
         digest = previous.key_digest
     else:
         digest = _primary_key_digest(path)
-    return LoginFingerprint(credentials_mtime(config_dir), stamp, digest)
+    return LoginFingerprint(_login_token_digest(config_dir), stamp, digest)
+
+
+def _login_token_digest(config_dir: str | None) -> str | None:
+    """A digest of the subscription login account *config_dir* (None: the
+    hub's) keeps in ``.credentials.json``; None if it keeps none there."""
+    try:
+        with open(credentials_path(config_dir), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    login = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(login, dict) or not login:
+        return None
+    return hashlib.sha256(json.dumps(login, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _primary_key_digest(path: Path) -> str | None:
@@ -139,30 +157,15 @@ def _primary_key_digest(path: Path) -> str | None:
 def login_completed(before: LoginFingerprint, now: LoginFingerprint) -> bool:
     """Whether a sign-in finished between two ``login_fingerprint`` readings.
 
-    Either kind writes something new: a subscription token file newer than
+    Either kind writes something new: a subscription login that differs from
     before, or a Console API key that differs from before.  What a sign-in
     removes on its way (it signs the old login out first) is not completion.
+    Watching the files is more reliable than ``claude auth status``, which
+    reports ``loggedIn:true`` even for a dead session.
     """
-    if now.credentials_mtime is not None and (
-            before.credentials_mtime is None
-            or now.credentials_mtime > before.credentials_mtime):
+    if now.token_digest is not None and now.token_digest != before.token_digest:
         return True
     return now.key_digest is not None and now.key_digest != before.key_digest
-
-
-def credentials_mtime(config_dir: str | None = None) -> float | None:
-    """Return the mtime of ``<config-dir>/.credentials.json``, or None.
-
-    The interactive login flow rewrites this file when OAuth completes, so a
-    watcher can poll for the mtime advancing to know sign-in finished — more
-    reliable than ``claude auth status``, which reports ``loggedIn:true`` even
-    for a dead session.
-    """
-    path = credentials_path(config_dir)
-    try:
-        return path.stat().st_mtime
-    except OSError:
-        return None
 
 
 def is_logged_in(config_dir: str | None = None) -> bool:
