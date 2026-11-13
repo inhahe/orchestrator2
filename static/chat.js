@@ -1364,10 +1364,11 @@ const Chat = (() => {
     el.textContent = text;
 
     // A link sent with the message (an MCP server's sign-in page): an anchor
-    // of its own after the text, which stays text. https only, so a message
-    // can never carry a javascript: or data: address.
+    // of its own after the text, which stays text. Web addresses only, so a
+    // message can never carry a javascript: or data: one; the hub shows any
+    // other kind in the text instead.
     const link = data.link;
-    if (link && typeof link.url === 'string' && /^https:\/\//i.test(link.url)) {
+    if (link && typeof link.url === 'string' && /^https?:\/\//i.test(link.url)) {
       const a = document.createElement('a');
       a.href = link.url;
       a.target = '_blank';

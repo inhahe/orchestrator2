@@ -484,7 +484,7 @@ Sessions also see the MCP servers their account has at user scope (`claude mcp a
 2. If that browser is on the hub's machine, that is all: the session says when the server is connected, and the next turn can use its tools.
 3. If the browser is on another device (a phone, another computer), it ends on a `localhost:<port>` page that won't load. Copy that page's address and send `/mcp callback <server> <address>`. The server can be left out when only one sign-in is in progress.
 
-The link expires after 5 minutes. The sign-in is kept in the account's credentials, so later sessions on that account connect without it.
+The link expires after 5 minutes. While a sign-in is in progress, `/mcp` shows how to finish it, in case the message with the link is gone from a reloaded tab. A server that is already connected needs no sign-in, and a disabled one must be enabled first (`/mcp enable`). The sign-in is kept in the account's credentials, so later sessions on that account connect without it.
 
 ### Display
 

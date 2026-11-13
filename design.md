@@ -2882,20 +2882,37 @@ private `client._query._send_control_request` those three use, and says so
 plainly when an SDK lacks it.
 
 **Nothing reports the end of the flow**, so `server._await_mcp_signin` polls
-`get_mcp_status` every 3 s for 330 s (the CLI's 5 minutes plus the exchange
+`get_mcp_status` every 5 s for 330 s (the CLI's 5 minutes plus the exchange
 and reconnect). It broadcasts *signed in and connected (N tools)* or *failed
-to connect*, or after the deadline a hint to retry. It takes the bridge's
-client when it is created, not when it first runs, and goes quietly if that
-client is replaced: the flow lived in the CLI that went. The watchers, by
-(runtime, server), are also the sign-ins `/mcp callback` may finish without
-a server name. A callback that succeeds cancels its watcher and reports
-itself, so the session hears once.
+to connect*, or after the deadline its last status and a hint to retry. A
+status counts only once it has moved from the one `/mcp auth` read before
+starting. A server failing already is still failing until the browser step,
+and that says nothing about the sign-in. That reading is also why `/mcp auth`
+refuses two cases. A connected server would never show the sign-in finishing.
+A disabled one the CLI does not reconnect after it. A reading that fails, or
+leaves the server out, is tried again. The CLI that holds the flow is taken
+before `/mcp auth` awaits anything. If the session reconnects while the flow
+starts, the user is told to run it again. If it reconnects later, the watcher
+goes quietly, since the flow lived in the CLI that went. The watchers, by
+(runtime, server), are also the sign-ins `/mcp callback` may finish without a
+server name. A callback that succeeds cancels its watcher and reports itself,
+so the session hears once.
+
+**Both commands run beside the tab's message loop** (`_run_mcp_signin_step`).
+A tab's messages are handled one after another. Each step waits on the CLI,
+which waits on a remote server, for up to the SDK's 60 s a request, and an
+interrupt or a permission answer sent meanwhile must not queue behind it.
 
 **The link is an anchor, not text.** The authorize address runs to several
 hundred characters, and system messages were `textContent` only. A
 `system_msg` may now carry `data.link {url, label}`, which `chat.js` appends
-as an `<a target=_blank rel=noopener>` for `https:` addresses only. It goes to
-the asking tab alone, like `/usage`'s report. It is not logged, though it is
+as an `<a target=_blank rel=noopener>` for `http:`/`https:` addresses only.
+A loopback authorization server may be plain `http:`. An address of any other
+kind the hub puts in the text instead, so it is never dropped. It goes to the
+asking tab alone, like `/usage`'s report. That message is not part of the
+transcript, so a reloaded tab loses it. So while a sign-in is in progress,
+`/mcp`'s list gives the `/mcp callback` line in place of the *run /mcp auth*
+hint (`format_mcp_status(signing_in=...)`). It is not logged, though it is
 only a PKCE challenge and a state.
 
 **Servers are per account.** User-scope servers live in the account's global
@@ -2916,8 +2933,9 @@ returns a `public-api.wordpress.com/oauth2-1/authorize` address with a
 `localhost` redirect; a pasted address with the wrong state is refused with
 the CLI's own explanation. The browser half needs a person. Pinned by
 `tests/test_mcp_signin.py` (the requests, the link and instructions, the
-watcher's three endings, the callback with and without a server) and
-`tests/test_mcp_command.py` (the hint in `/mcp`'s list).
+watcher's endings and what it does not count, the refused cases, the steps
+off the message loop, the callback with and without a server) and
+`tests/test_mcp_command.py` (the hints in `/mcp`'s list, `/help`).
 
 ## 6b. Subprocess ownership (`proc_guard.py`)
 

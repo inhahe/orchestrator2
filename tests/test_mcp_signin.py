@@ -41,11 +41,16 @@ class McpBridge(hubkit.FakeBridge):
                             "callbackPort": 39279}
         self.auth_error = None
         self.reconnect_error = None
+        self.during_auth = None
+        # Read once by /mcp auth before it starts, then by the watcher. None:
+        # a reading that leaves the server out.
         self.statuses = ["needs-auth"]
         self.calls = []
 
     async def authenticate_mcp_server(self, name):
         self.calls.append(("auth", name))
+        if self.during_auth is not None:
+            await self.during_auth()
         if self.auth_error:
             raise Exception(self.auth_error)
         return self.auth_answer
@@ -61,6 +66,8 @@ class McpBridge(hubkit.FakeBridge):
 
     async def get_mcp_status(self):
         status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+        if status is None:
+            return []
         tools = [{"name": "wpcom-mcp-posts"}, {"name": "wpcom-mcp-media"}]
         return [{"name": "wpcom-mcp", "status": status,
                  "tools": tools if status == "connected" else []}]
@@ -87,7 +94,10 @@ def _texts(msgs):
 
 
 async def _send(ws, text):
+    """Send *text* as the tab would, and wait for the sign-in step it
+    started, which runs beside the tab's message loop."""
     await server._handle_ws_message(ws, {"type": "message", "text": text})
+    await asyncio.gather(*list(server._mcp_signin_steps))
 
 
 def _watcher(hub, name="wpcom-mcp"):
@@ -133,7 +143,7 @@ def test_a_sign_in_never_finished_is_said_to_have_timed_out(hub, monkeypatch):
 
     asyncio.run(go())
     [text] = _texts(hub.said)
-    assert "not signed in within 5 minutes" in text
+    assert "not seen to finish signing in within 5 minutes (its status: needs-auth)" in text
     assert "/mcp auth wpcom-mcp" in text
 
 
@@ -187,6 +197,142 @@ def test_a_reconnect_that_fails_after_the_sign_in_is_not_called_a_failed_sign_in
     asyncio.run(go())
     assert _texts(hub.said) == ["MCP server 'wpcom-mcp' failed to connect after "
                                 "signing in: HTTP 503. Try /mcp reconnect wpcom-mcp."]
+
+
+def test_the_steps_run_beside_the_tabs_message_loop(hub):
+    # The tab's next message (an interrupt, a permission answer) is not held
+    # up by a remote server that is slow to answer.
+    release = None
+
+    async def slow():
+        await release.wait()
+
+    async def go():
+        nonlocal release
+        release = asyncio.Event()
+        hub.bridge.during_auth = slow
+        # Inline, the handler would wait on the slow server: a timeout, not a hang.
+        await asyncio.wait_for(server._handle_ws_message(
+            FakeWS(), {"type": "message", "text": "/mcp auth wpcom-mcp"}), 1)
+        for _ in range(5):          # let the step run up to the slow server
+            await asyncio.sleep(0)
+        assert hub.bridge.calls == [("auth", "wpcom-mcp")]   # started, not finished
+        assert server._mcp_signin_watchers == {}
+        release.set()
+        await asyncio.gather(*list(server._mcp_signin_steps))
+        _watcher(hub).cancel()
+
+    asyncio.run(go())
+
+
+def test_a_connected_server_is_not_signed_in_again(hub):
+    # Its status would never show the sign-in finishing.
+    hub.bridge.statuses = ["connected"]
+    ws = FakeWS()
+    asyncio.run(_send(ws, "/mcp auth wpcom-mcp"))
+    assert _texts(ws.sent) == ["MCP server 'wpcom-mcp' is already signed in and connected."]
+    assert hub.bridge.calls == []
+
+
+def test_a_disabled_server_is_enabled_first(hub):
+    # The CLI does not reconnect a disabled server after a sign-in.
+    hub.bridge.statuses = ["disabled"]
+    ws = FakeWS()
+    asyncio.run(_send(ws, "/mcp auth wpcom-mcp"))
+    assert _texts(ws.sent) == ["MCP server 'wpcom-mcp' is disabled: run /mcp enable "
+                               "wpcom-mcp first."]
+    assert hub.bridge.calls == []
+
+
+def test_a_server_failing_already_is_not_reported_failed_by_the_sign_in(hub, monkeypatch):
+    # Before the browser step, a failing server is still failing: no news.
+    monkeypatch.setattr(server, "MCP_SIGNIN_WATCH_S", 0.05)
+    hub.bridge.statuses = ["failed"]
+
+    async def go():
+        await _send(FakeWS(), "/mcp auth wpcom-mcp")
+        await asyncio.wait_for(_watcher(hub), 2)
+
+    asyncio.run(go())
+    [text] = _texts(hub.said)
+    assert "not seen to finish signing in within 5 minutes (its status: failed)" in text
+
+
+def test_a_server_failing_already_is_reported_once_its_status_moves(hub):
+    hub.bridge.statuses = ["failed", "failed", "pending", "failed"]
+
+    async def go():
+        await _send(FakeWS(), "/mcp auth wpcom-mcp")
+        await asyncio.wait_for(_watcher(hub), 2)
+
+    asyncio.run(go())
+    assert _texts(hub.said) == ["MCP server 'wpcom-mcp' failed to connect after "
+                                "signing in. Try /mcp reconnect wpcom-mcp."]
+
+
+def test_a_reading_without_the_server_is_tried_again(hub):
+    hub.bridge.statuses = ["needs-auth", None, "connected"]
+
+    async def go():
+        await _send(FakeWS(), "/mcp auth wpcom-mcp")
+        await asyncio.wait_for(_watcher(hub), 2)
+
+    asyncio.run(go())
+    assert "is signed in and connected" in _texts(hub.said)[0]
+
+
+def test_a_reconnect_while_the_sign_in_starts_is_said(hub):
+    # The flow went with the CLI it was started in.
+    async def reconnect():
+        hub.bridge.client = object()
+
+    hub.bridge.during_auth = reconnect
+    ws = FakeWS()
+    asyncio.run(_send(ws, "/mcp auth wpcom-mcp"))
+    assert _texts(ws.sent) == ["The session reconnected while the sign-in for "
+                               "'wpcom-mcp' was starting. Run /mcp auth wpcom-mcp again."]
+    assert server._mcp_signin_watchers == {}
+
+
+def test_an_address_comes_with_or_without_the_flag(hub):
+    # The address is what says a browser step is needed.
+    hub.bridge.auth_answer = {"authUrl": AUTH_URL}
+    ws = FakeWS()
+
+    async def go():
+        await _send(ws, "/mcp auth wpcom-mcp")
+        _watcher(hub).cancel()
+
+    asyncio.run(go())
+    assert ws.sent[-1]["data"]["link"]["url"] == AUTH_URL
+
+
+def test_an_address_the_page_cannot_link_is_shown_in_the_text(hub):
+    hub.bridge.auth_answer = {"authUrl": "myapp://authorize?x=1", "requiresUserAction": True}
+    ws = FakeWS()
+
+    async def go():
+        await _send(ws, "/mcp auth wpcom-mcp")
+        _watcher(hub).cancel()
+
+    asyncio.run(go())
+    data = ws.sent[-1]["data"]
+    assert "link" not in data
+    assert data["message"].endswith("\n\nmyapp://authorize?x=1")
+
+
+def test_the_list_says_how_to_finish_a_sign_in_in_progress(hub):
+    # The message with the link may be gone from a tab reloaded meanwhile.
+    ws = FakeWS()
+
+    async def go():
+        await _send(FakeWS(), "/mcp auth wpcom-mcp")
+        await _send(ws, "/mcp")
+        _watcher(hub).cancel()
+
+    asyncio.run(go())
+    [modal] = [m for m in ws.sent if m.get("type") == "modal"]
+    assert "/mcp callback wpcom-mcp <address>" in modal["content"]
 
 
 def test_callback_without_a_sign_in_says_how_to_start_one(hub):
@@ -243,7 +389,13 @@ def test_the_bridge_submits_a_pasted_address():
 
 
 def test_an_sdk_without_the_private_channel_is_said_plainly():
-    bridge = SDKBridge.__new__(SDKBridge)
-    bridge.client = object()
+    bridge = _bridge(object())
     with pytest.raises(RuntimeError, match="cannot send MCP sign-in requests"):
+        asyncio.run(bridge.authenticate_mcp_server("wpcom-mcp"))
+
+
+def test_a_client_still_connecting_is_not_taken_for_an_old_sdk():
+    # The bridge's client exists before its connect() has made the query.
+    bridge = _bridge(None)
+    with pytest.raises(RuntimeError, match="SDK not connected yet"):
         asyncio.run(bridge.authenticate_mcp_server("wpcom-mcp"))

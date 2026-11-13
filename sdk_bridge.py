@@ -7779,9 +7779,11 @@ class SDKBridge:
         reaches the private ``_send_control_request`` those three use.  A CLI
         error comes back as an exception in the CLI's own words.
         """
-        if self.client is None:
-            raise RuntimeError("SDK not connected")
-        send = getattr(getattr(self.client, "_query", None), "_send_control_request", None)
+        # The client is set before its connect() finishes, and _query after.
+        query = getattr(self.client, "_query", None) if self.client is not None else None
+        if query is None:
+            raise RuntimeError("SDK not connected yet")
+        send = getattr(query, "_send_control_request", None)
         if send is None:
             raise RuntimeError("this SDK version cannot send MCP sign-in requests")
         resp = await send(request)

@@ -94,6 +94,22 @@ def test_format_unknown_filter():
     assert "No MCP server named 'nope'" in out
 
 
+def test_format_a_sign_in_in_progress_says_how_to_finish_it():
+    out = format_mcp_status(SERVERS, signing_in={"sentry"})
+    assert "sign-in in progress" in out
+    assert "/mcp callback sentry <address>" in out
+    assert "run /mcp auth sentry" not in out
+
+
+def test_help_names_the_way_back_from_another_device():
+    from commands import _cmd_help
+    from config import parse_args
+    from state import State
+    [modal] = _cmd_help("", State(), parse_args([])).messages
+    text = modal["content"]
+    assert "/mcp callback [server] <address>" in text
+
+
 def test_format_connected_no_tools():
     out = format_mcp_status([{"name": "bare", "status": "connected"}])
     assert "bare — connected" in out

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import time
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -368,6 +369,7 @@ def _cmd_help(_payload: str, _state: State, _config: Config) -> CommandResult:
         ("/recycle [now|off|<GiB>]",     "swap the CLI subprocess for a fresh one (reclaims its memory leak)"),
         ("/bell ...",                    "ring on these events (see /bell for details)"),
         ("/mcp [auth|reconnect|enable|disable <server>]", "list/manage MCP servers; auth signs one in"),
+        ("/mcp callback [server] <address>", "finish an MCP sign-in from another device"),
         ("/queue [N|send|drop N|clear]", "manage queued prompts"),
         ("/quit, /exit",                 "graceful exit"),
         ("/quit!, /exit!",                "force exit"),
@@ -1038,19 +1040,22 @@ def format_mcp_status(
     *,
     tools_mode: bool = False,
     filter_name: str = "",
+    signing_in: Collection[str] = (),
 ) -> str:
     """Render ``client.get_mcp_status()`` output as plain text for the modal.
 
     Mirrors Claude Code's ``/mcp`` view: each configured MCP server with its
     connection status, handshake info, transport, tool count (or full tool
-    list in ``tools_mode``), and any error / auth hint.
+    list in ``tools_mode``), and any error / auth hint.  *signing_in* names
+    the servers with a ``/mcp auth`` in progress, whose hint is how to finish
+    it: the message that said so may be gone from a tab reloaded meanwhile.
     """
     if not servers:
         return (
             "No MCP servers configured.\n\n"
-            "Add one to this account with `claude mcp add --scope user ...` "
-            "(the session sees it once it reconnects), or start the "
-            "orchestrator with --mcp-config <file-or-json>."
+            "Add one to this account with: claude mcp add --scope user ... "
+            "and then /connect this session. Or start the orchestrator with "
+            "--mcp-config <file-or-json>."
         )
 
     if filter_name:
@@ -1094,7 +1099,11 @@ def format_mcp_status(
         if status == "failed" and s.get("error"):
             lines.append(f"    error: {s['error']}")
         if status == "needs-auth":
-            lines.append(f"    run /mcp auth {name} to sign in")
+            if name in signing_in:
+                lines.append("    sign-in in progress: finish it in the browser, or from "
+                             f"another device send /mcp callback {name} <address>")
+            else:
+                lines.append(f"    run /mcp auth {name} to sign in")
 
         tools = s.get("tools") or []
         if tools:

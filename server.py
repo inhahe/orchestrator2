@@ -6812,24 +6812,17 @@ async def _handle_mcp(ws: WebSocket, rt: "SessionRuntime", payload: str) -> None
     parts = payload.split()
     sub = parts[0].lower() if parts else ""
 
-    if sub in ("auth", "login"):
-        name = " ".join(parts[1:]).strip()
-        if not name:
-            await send_to(ws, {"type": "system_msg", "subtype": "error",
-                               "data": {"message": "usage: /mcp auth <server>"}})
-            return
-        await _start_mcp_signin(ws, rt, bridge, name)
-        return
-
     if sub == "callback":
-        await _finish_mcp_signin(ws, rt, bridge, parts[1:])
+        _run_mcp_signin_step(_finish_mcp_signin(ws, rt, bridge, parts[1:]))
         return
 
-    if sub in ("reconnect", "enable", "disable"):
+    if sub in ("auth", "reconnect", "enable", "disable"):
         name = " ".join(parts[1:]).strip()
         if not name:
-            await send_to(ws, {"type": "system_msg", "subtype": "error",
-                               "data": {"message": f"usage: /mcp {sub} <server>"}})
+            await _say(ws, f"usage: /mcp {sub} <server>", "error")
+            return
+        if sub == "auth":
+            _run_mcp_signin_step(_start_mcp_signin(ws, rt, bridge, name))
             return
         try:
             if sub == "reconnect":
@@ -6857,6 +6850,7 @@ async def _handle_mcp(ws: WebSocket, rt: "SessionRuntime", payload: str) -> None
 
     content = format_mcp_status(
         servers, tools_mode=tools_mode, filter_name=filter_name,
+        signing_in=_mcp_signins_in(rt),
     )
     await send_to(ws, {"type": "modal", "title": "MCP Servers", "content": content})
 
@@ -6871,35 +6865,81 @@ async def _handle_mcp(ws: WebSocket, rt: "SessionRuntime", payload: str) -> None
 # the server by itself (for an address pasted with ``/mcp callback``, we
 # reconnect it). Nothing tells us when the browser comes back, so a watcher
 # polls the server's status and says so in the session.
+#
+# Both commands run beside the tab's message loop, not in it: each waits on the
+# CLI, which waits on the remote server, up to a minute a request, and the
+# tab's next messages (an interrupt, a permission answer) must not queue behind.
 
 #: How long a sign-in is watched: the CLI's own 5 minutes, plus time for the
 #: token exchange and the reconnect after it.
 MCP_SIGNIN_WATCH_S = 330.0
-MCP_SIGNIN_POLL_S = 3.0
+MCP_SIGNIN_POLL_S = 5.0
 
 #: Each sign-in being watched, by (runtime id, server name). A second
 #: ``/mcp auth`` for a server replaces its watcher, as the CLI replaces its
 #: flow. The keys are also the sign-ins ``/mcp callback`` can finish.
 _mcp_signin_watchers: dict[tuple[str, str], asyncio.Task] = {}
 
+#: The ``/mcp auth`` and ``/mcp callback`` commands running, held so that none
+#: is collected half done.
+_mcp_signin_steps: set[asyncio.Task] = set()
+
+
+def _run_mcp_signin_step(step: Any) -> None:
+    """Run coroutine *step* as a task of its own, off the tab's message loop."""
+    task = asyncio.create_task(step)
+    _mcp_signin_steps.add(task)
+    task.add_done_callback(_mcp_signin_steps.discard)
+
+
+def _mcp_signins_in(rt: "SessionRuntime") -> list[str]:
+    """The servers whose sign-in is in progress in session *rt*."""
+    return [n for (rid, n) in _mcp_signin_watchers if rid == rt.rid]
+
+
+async def _mcp_server_status(bridge: Any, name: str) -> dict[str, Any] | None:
+    """Server *name*'s entry in the CLI's MCP status, or None when the status
+    cannot be read or does not list it."""
+    try:
+        servers = await bridge.get_mcp_status()
+    except Exception:  # noqa: BLE001 -- a busy or restarting CLI
+        return None
+    return next((s for s in servers if s.get("name") == name), None)
+
 
 async def _start_mcp_signin(ws: WebSocket, rt: "SessionRuntime", bridge: Any,
                             name: str) -> None:
     """``/mcp auth <server>``: start the sign-in, give the asking tab its link."""
+    # The CLI that will hold the flow, taken before anything is awaited: if the
+    # session reconnects meanwhile, the flow goes with the CLI it was in.
+    client = bridge.client
+    before = (await _mcp_server_status(bridge, name) or {}).get("status")
+    # Nothing in a status reading would show a sign-in finishing on these: a
+    # connected server stays connected, and the CLI does not reconnect a
+    # disabled one after it.
+    if before == "connected":
+        await _say(ws, f"MCP server '{name}' is already signed in and connected.")
+        return
+    if before == "disabled":
+        await _say(ws, f"MCP server '{name}' is disabled: run /mcp enable {name} first.",
+                   "error")
+        return
     try:
         resp = await bridge.authenticate_mcp_server(name)
     except Exception as exc:  # noqa: BLE001 -- the CLI's wording is the explanation
-        await send_to(ws, {"type": "system_msg", "subtype": "error",
-                           "data": {"message": f"MCP sign-in failed for '{name}': {exc}"}})
+        await _say(ws, f"MCP sign-in failed for '{name}': {exc}", "error")
         return
-    log.info("MCP sign-in started for %r (rt=%s, needs the browser: %s)",
-             name, rt.rid, bool(resp.get("requiresUserAction")))
+    if rt.bridge is not bridge or bridge.client is not client:
+        await _say(ws, f"The session reconnected while the sign-in for '{name}' was "
+                       f"starting. Run /mcp auth {name} again.", "error")
+        return
     url = resp.get("authUrl")
-    if not resp.get("requiresUserAction") or not isinstance(url, str):
-        await send_to(ws, {"type": "system_msg", "subtype": "info",
-                           "data": {"message": f"MCP server '{name}' signed in "
-                                               "without a browser step; reconnecting it."}})
-        _watch_mcp_signin(rt, bridge, name)
+    log.info("MCP sign-in started for %r (rt=%s, needs the browser: %s)",
+             name, rt.rid, bool(url))
+    if not isinstance(url, str) or not url:
+        await _say(ws, f"MCP server '{name}' signed in without a browser step; "
+                       "reconnecting it.")
+        _watch_mcp_signin(rt, bridge, client, name, before)
         return
     port = resp.get("callbackPort")
     page = f"localhost:{port}" if port else "localhost"
@@ -6912,38 +6952,41 @@ async def _start_mcp_signin(ws: WebSocket, rt: "SessionRuntime", bridge: Any,
         f"/mcp callback {name} <address>\n\n"
         "The link stops working after 5 minutes."
     )
-    await send_to(ws, {"type": "system_msg", "subtype": "info",
-                       "data": {"message": message,
-                                "link": {"url": url, "label": f"Sign in {name}"}}})
-    _watch_mcp_signin(rt, bridge, name)
+    data: dict[str, Any] = {"message": message}
+    if url.lower().startswith(("https://", "http://")):
+        data["link"] = {"url": url, "label": f"Sign in {name}"}
+    else:
+        # The page makes anchors of web addresses only; anything else is shown.
+        data["message"] = f"{message}\n\n{url}"
+    await send_to(ws, {"type": "system_msg", "subtype": "info", "data": data})
+    _watch_mcp_signin(rt, bridge, client, name, before)
 
 
 async def _finish_mcp_signin(ws: WebSocket, rt: "SessionRuntime", bridge: Any,
                              args: list[str]) -> None:
     """``/mcp callback [server] <address>``: finish a sign-in whose browser
-    could not reach the hub's ``localhost``. The server can be left out when
-    this session has only one sign-in in progress."""
-    async def error(text: str) -> None:
-        await send_to(ws, {"type": "system_msg", "subtype": "error",
-                           "data": {"message": text}})
-
+    could not reach the hub's ``localhost``. *args* are the words after
+    ``callback``; the server can be left out when this session has only one
+    sign-in in progress."""
     if not args or not args[-1].lower().startswith(("http://", "https://")):
-        await error("usage: /mcp callback [server] <address the browser ended on>")
+        await _say(ws, "usage: /mcp callback [server] <address the browser ended on>",
+                   "error")
         return
     address = args[-1]
     name = " ".join(args[:-1]).strip()
     if not name:
-        pending = [n for (rid, n) in _mcp_signin_watchers if rid == rt.rid]
+        pending = _mcp_signins_in(rt)
         if len(pending) != 1:
-            await error("usage: /mcp callback <server> <address>"
-                        + (f" (sign-ins in progress: {', '.join(pending)})" if pending
-                           else " (no sign-in is in progress: run /mcp auth <server> first)"))
+            await _say(ws, "usage: /mcp callback <server> <address>"
+                       + (f" (sign-ins in progress: {', '.join(pending)})" if pending
+                          else " (no sign-in is in progress: run /mcp auth <server> first)"),
+                       "error")
             return
         name = pending[0]
     try:
         await bridge.submit_mcp_oauth_callback(name, address)
     except Exception as exc:  # noqa: BLE001 -- the CLI's wording is the explanation
-        await error(f"MCP sign-in failed for '{name}': {exc}")
+        await _say(ws, f"MCP sign-in failed for '{name}': {exc}", "error")
         return
     # Reported from here on, not by the watcher: the outcome is known now.
     watcher = _mcp_signin_watchers.pop((rt.rid, name), None)
@@ -6954,19 +6997,18 @@ async def _finish_mcp_signin(ws: WebSocket, rt: "SessionRuntime", bridge: Any,
     except Exception as exc:  # noqa: BLE001 -- the CLI's wording is the explanation
         await rt.broadcast(_mcp_signin_notice(name, {"status": "failed", "error": str(exc)}))
         return
-    try:
-        servers = await bridge.get_mcp_status()
-    except Exception:  # noqa: BLE001
-        servers = []
-    server = next((s for s in servers if s.get("name") == name), None)
-    await rt.broadcast(_mcp_signin_notice(name, server)
+    # The reconnect raises unless the server came up, so an unreadable status
+    # here still means connected.
+    await rt.broadcast(_mcp_signin_notice(name, await _mcp_server_status(bridge, name))
                        or {"type": "system_msg", "subtype": "info",
-                           "data": {"message": f"MCP server '{name}' is signed in."}})
+                           "data": {"message": f"MCP server '{name}' is signed in "
+                                               "and reconnected."}})
 
 
 def _mcp_signin_notice(name: str, server: dict[str, Any] | None) -> dict[str, Any] | None:
-    """What to tell the session about *server* after a sign-in, or None while
-    the sign-in is still in progress (or the server's status says nothing new)."""
+    """What to tell the session about *server*, its status entry, once a
+    sign-in has moved it, or None while its status (or its absence) does not
+    settle the sign-in."""
     status = (server or {}).get("status")
     if status == "connected":
         n = len(server.get("tools") or [])
@@ -6982,14 +7024,15 @@ def _mcp_signin_notice(name: str, server: dict[str, Any] | None) -> dict[str, An
     return None
 
 
-def _watch_mcp_signin(rt: "SessionRuntime", bridge: Any, name: str) -> None:
+def _watch_mcp_signin(rt: "SessionRuntime", bridge: Any, client: Any, name: str,
+                      before: str | None) -> None:
+    """Start watching *name*'s sign-in in session *rt*, held by *client*;
+    *before* is the server's status when it started."""
     key = (rt.rid, name)
     old = _mcp_signin_watchers.pop(key, None)
     if old is not None:
         old.cancel()
-    # The client is taken now, not when the task first runs: a reconnect in
-    # between would otherwise be mistaken for the CLI that holds the flow.
-    task = asyncio.create_task(_await_mcp_signin(rt, bridge, bridge.client, name),
+    task = asyncio.create_task(_await_mcp_signin(rt, bridge, client, name, before),
                                name=f"mcp-signin-{name}")
     _mcp_signin_watchers[key] = task
 
@@ -7000,33 +7043,37 @@ def _watch_mcp_signin(rt: "SessionRuntime", bridge: Any, name: str) -> None:
 
 
 async def _await_mcp_signin(rt: "SessionRuntime", bridge: Any, client: Any,
-                            name: str) -> None:
+                            name: str, before: str | None) -> None:
     """Poll *name*'s status until the sign-in shows, then say so in the session.
 
-    Stops without a word if the session reconnects meanwhile: the flow lived in
-    the CLI that just went, and the new CLI reports the server's state anew.
+    A reading counts only once the status has moved from *before*: a server
+    that was failing already is still failing until the sign-in lands, which
+    says nothing about it. A reading that cannot be had, or that leaves the
+    server out, is tried again. Stops without a word if the session reconnects
+    meanwhile: the flow lived in the CLI that went, and the new CLI reports the
+    server's state anew.
     """
+    status, moved = before, False
     deadline = time.monotonic() + MCP_SIGNIN_WATCH_S
     while time.monotonic() < deadline:
         await asyncio.sleep(MCP_SIGNIN_POLL_S)
         if rt.bridge is not bridge or bridge.client is not client:
             return
-        try:
-            servers = await bridge.get_mcp_status()
-        except Exception:  # noqa: BLE001 -- a busy or restarting CLI; try again
-            continue
-        server = next((s for s in servers if s.get("name") == name), None)
+        server = await _mcp_server_status(bridge, name)
         if server is None:
-            return
-        notice = _mcp_signin_notice(name, server)
+            continue
+        status = server.get("status")
+        moved = moved or status != before
+        notice = _mcp_signin_notice(name, server) if moved else None
         if notice is not None:
             await rt.broadcast(notice)
             return
+    now = f" (its status: {status})" if status else ""
     await rt.broadcast({"type": "system_msg", "subtype": "warning",
-                        "data": {"message": f"MCP server '{name}' was not signed in "
-                                            "within 5 minutes. If you finished in a "
-                                            f"browser, try /mcp reconnect {name}; "
-                                            f"otherwise /mcp auth {name} again."}})
+                        "data": {"message": f"MCP server '{name}' was not seen to finish "
+                                            f"signing in within 5 minutes{now}. If you "
+                                            "finished in a browser, try /mcp reconnect "
+                                            f"{name}; otherwise /mcp auth {name} again."}})
 
 
 async def _handle_apikey(ws: WebSocket, rt: "SessionRuntime", payload: str) -> None:
