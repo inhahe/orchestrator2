@@ -24,12 +24,14 @@ of the environment; each test starts un-adopted, with the variable as the
 suite found it, so the environment is the account, as for a tool.
 
 **No test writes the hub's files into a real account.**  That account is
-whichever one the shell running the suite is on, and a test whose bridge is
+whichever one the shell running the suite is on, wherever it lives (any
+account dir outside pytest's temporary directory), and a test whose bridge is
 told a session id saved that session's cost under its ``orchestrator2``
 folder, where the hub would read it back as a real session's -- and a
 wakeup filed there would be armed by the real hub, as a session waiting on a
-usage limit would be reopened by it.  A test that names an account of its own
-(a ``tmp_path``) still gets that one.
+usage limit would be reopened by it.  Nor does the status ticker's peer mirror
+copy the machine's live sessions into one.  A test that names an account of
+its own (a ``tmp_path``) still gets that one.
 """
 
 from __future__ import annotations
@@ -80,21 +82,22 @@ def _unadopted_account(monkeypatch):
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", _SUITE_ACCOUNT)
 
 
-#: The user's home, read before any test patches ``Path.home``.
-_HOME = Path.home().resolve()
-
-
-def _is_real_account(path: Path) -> bool:
-    """Whether *path* is one of this user's accounts (``~/.claude*``)."""
+def _is_real_account(path: Path, suite_temp: Path) -> bool:
+    """Whether account dir *path* is one no test made: anywhere outside
+    *suite_temp*, pytest's own temporary directory, where every ``tmp_path``
+    is.  ``~/.claude*`` is not the only such place: an account can be named
+    anywhere (``--config-dir``), and the shell running the suite may be on
+    one of those."""
     try:
         path = path.resolve()
     except OSError:
-        return False
-    return path.parent == _HOME and path.name.startswith(".claude")
+        path = path.absolute()
+    return not path.is_relative_to(suite_temp)
 
 
 @pytest.fixture(autouse=True)
 def _no_hub_state_in_a_real_account(monkeypatch, tmp_path_factory):
+    suite_temp = tmp_path_factory.getbasetemp().resolve()
     spare: list[Path] = []
 
     def spare_dir() -> Path:
@@ -107,7 +110,7 @@ def _no_hub_state_in_a_real_account(monkeypatch, tmp_path_factory):
 
     def state_dir(config_dir: str | None = None) -> Path:
         d = real_state(config_dir)
-        return spare_dir() if _is_real_account(d.parent) else d
+        return spare_dir() if _is_real_account(d.parent, suite_temp) else d
 
     monkeypatch.setattr(session, "_orch2_state_dir", state_dir)
 
@@ -116,7 +119,8 @@ def _no_hub_state_in_a_real_account(monkeypatch, tmp_path_factory):
 
     def wakeups_dir() -> Path:
         d = real_wakeups()
-        return spare_dir() / "wakeups" if _is_real_account(d.parent.parent) else d
+        return (spare_dir() / "wakeups"
+                if _is_real_account(d.parent.parent, suite_temp) else d)
 
     monkeypatch.setattr(wakeup_store, "_state_dir", wakeups_dir)
 
@@ -126,9 +130,22 @@ def _no_hub_state_in_a_real_account(monkeypatch, tmp_path_factory):
     def limits_dir() -> Path:
         d = real_limits()
         return (spare_dir() / "limit-resumes"
-                if _is_real_account(d.parent.parent) else d)
+                if _is_real_account(d.parent.parent, suite_temp) else d)
 
     monkeypatch.setattr(limit_resume, "_state_dir", limits_dir)
+
+    # Live sessions' registry entries, which the status ticker copies into
+    # every account (agent-comms' mirror).  A copy is removed only by the
+    # registry that recorded it, and a test's registry is its own, so a copy
+    # a test made in a real account would outlive its session there.
+    real_mirror = agent_comms.mirror_peer_registries
+
+    def mirror(dirs=None):
+        dirs = agent_comms.config_dirs() if dirs is None else list(dirs)
+        return real_mirror([d for d in dirs
+                            if not _is_real_account(Path(d), suite_temp)])
+
+    monkeypatch.setattr(agent_comms, "mirror_peer_registries", mirror)
 
 
 @pytest.fixture
