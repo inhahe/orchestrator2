@@ -52,6 +52,25 @@ which took 2 h 20 min.
   investigated: 53 s is far beyond any load, so this may be a real defect in
   the budget rather than in the test.
 
+## ⟳ Restart restarted nothing for three weeks — FIXED (2026-11-14)
+
+From 1f013a6 (2026-10-21) to f2acf42 (2026-11-14), POST `/api/restart` was
+handled by `_with_launch_cwd`, a helper written between the route's decorator
+and `api_restart`. Every request got a 422 for the helper's missing
+arguments. The lobby counted anything but `ok: false` as success, so it
+showed "restarting…", polled `/api/ready`, got an answer at once from the hub
+that never stopped, and reloaded. Every "restart to pick up the change" in
+those weeks kept the old code running, and the stale-code band in the lobby
+said so to nobody who believed it. Found by a code review of the `--resume`
+picker work.
+
+Fixed in three places. The decorator is back on `api_restart`.
+`_check_handler` makes `_route` and `_ws_route` refuse a handler that is not a
+public `async def`, which is what a helper is, at import. And the lobby takes
+only `ok: true` from a 2xx as a restart under way, reporting anything else,
+the status included (`tests/lobby_restart.test.js`, mutation target
+`lobbyrestart`).
+
 ## A halt nobody was left to lift told every new session to stop — FIXED (2026-10-21)
 
 Lane-F raised a machine halt for a PC migration on 2026-10-17 and moved with

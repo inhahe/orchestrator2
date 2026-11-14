@@ -467,10 +467,17 @@ const Lobby = (() => {
     }
     let data = null;
     try { data = await resp.json(); } catch (e) {}
-    if (data && data.ok === false) {
-      // Replacement failed to start; the server stayed alive.
-      const detail = data.detail ? '\n\n' + data.detail : '';
-      window.alert('Restart failed: ' + (data.error || 'unknown error') + detail);
+    // Failed unless the hub said it is going: an error status means the
+    // request never reached the restart (it answered 422 for three weeks),
+    // and a hub that stayed up answers the poll at once, which reads as done.
+    if (!resp.ok || !data || data.ok !== true) {
+      // Replacement failed to start, or the restart never ran; the server
+      // stayed alive.
+      const detail = data && data.detail
+        ? '\n\n' + (typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail))
+        : '';
+      const why = (data && data.error) || (resp.ok ? 'unknown error' : 'HTTP ' + resp.status);
+      window.alert('Restart failed: ' + why + detail);
       if (elRestart) { elRestart.disabled = false; elRestart.textContent = '\u21bb Restart server'; }
       if (elShutdown) elShutdown.disabled = false;
       return;

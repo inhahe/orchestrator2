@@ -6060,21 +6060,33 @@ RESUMEPICKER_SERVER_MUTATIONS = [
 
     ("a picker with nothing to pick does not say why",
      "            if result.get(\"message\"):\n"
-     "                _tell_launch(result[\"message\"])\n"
+     "                _tell_launch(result[\"message\"], dialog=own_console)\n"
      "            else:\n",
      "            if False:\n"
-     "                _tell_launch(result[\"message\"])\n"
+     "                _tell_launch(result[\"message\"], dialog=own_console)\n"
      "            else:\n"),
 
-    ("what a launch says from a hidden console is said nowhere",
-     "    if _console_is_hidden() and not os.environ.get(\"ORCH2_NO_DIALOG\"):\n"
-     "        _show_error_dialog(\"orchestrator2\", message)\n",
-     ""),
+    ("what the picker would have said, in a console of its own, is said nowhere",
+     "    if dialog and not os.environ.get(\"ORCH2_NO_DIALOG\"):\n",
+     "    if False:\n"),
+
+    ("only a hidden console, not a missing one, gets the dialog",
+     "        own_console = not _console_is_visible()\n",
+     "        own_console = _console_is_hidden()\n"),
 
     ("a failed copy says nothing",
      "            if isinstance(result, dict) and result.get(\"message\"):\n"
-     "                _tell_launch(result[\"message\"])\n",
+     "                _tell_launch(result[\"message\"], dialog=own_console)\n",
      ""),
+
+    ("the browser picker opens unexplained",
+     "            _tell_launch(\"The terminal session picker could not run, so it opens \"\n"
+     "                         \"in the browser instead.\", dialog=False)\n",
+     ""),
+
+    ("a picker that gave no answer is not logged",
+     "            log.warning(\"the %s picker gave no answer (exit code %s)\", mode, code)\n",
+     "            pass\n"),
 
     ("a launch with no terminal picker does not mark its child",
      "            config = dataclasses.replace(config, browser_picker=True)\n",
@@ -6101,22 +6113,74 @@ RESUMEPICKER_SERVER_MUTATIONS = [
      '            "message": None,\n'),
 
     ("a picker window closed with X opens the browser picker",
-     "        if result is None and code in _CONSOLE_CLOSED:\n",
+     "        if result is None and code == _CONSOLE_CLOSED:\n",
      "        if False:\n"),
 
     ("the session still to be picked dead-ends its tab",
+     '    if _picker_mode and rt is _default_runtime:\n'
      '        await send_to(ws, {"type": "navigate", "url": _THE_PICKER})\n',
+     '    if _picker_mode and rt is _default_runtime:\n'
      '        await send_to(ws, {"type": "system_msg", "subtype": "info",\n'
      '                           "data": {"message": "Select a session to resume."}})\n'),
+
+    ("a joined session's tab is sent to the picker too",
+     "    if _picker_mode and rt is _default_runtime:\n",
+     "    if _picker_mode:\n"),
+
+    ("the address a picking hub printed lands in the lobby",
+     "        elif _picker_mode and _default_runtime is not None:\n",
+     "        elif False:\n"),
 
     ("a session switched to is shown in the lobby",
      '_THE_HUBS_SESSION = "/?rid=default"\n',
      '_THE_HUBS_SESSION = "/"\n'),
 
     ("the browser picker cannot resume outside picker mode",
-     "    if not _picker_mode:\n        ok, err = await _reconfigure(resume=session_id)\n",
+     "    if not _picker_mode:\n        # Open in another session of this hub",
      "    if not _picker_mode:\n        return {\"ok\": False, \"error\": \"Not in picker mode\"}\n"
-     "        ok, err = await _reconfigure(resume=session_id)\n"),
+     "        # Open in another session of this hub"),
+
+    ("the picker switches to a session open elsewhere in the hub instead of going to it",
+     "        if live is not None and live is not _default_runtime:\n"
+     "            return {\"ok\": True, \"session_id\": session_id, \"url\": f\"/?rid={live.rid}\"}\n",
+     ""),
+
+    ("a picking hub takes a session open elsewhere in it",
+     "    why = await _why_not_resumable(session_id)\n    if why:\n"
+     "        return {\"ok\": False, \"error\": why}\n",
+     ""),
+
+    ("two picks at once both start the session",
+     "    async with _PICK_LOCK:\n        return await _resume_picked(session_id)\n",
+     "    return await _resume_picked(session_id)\n"),
+
+    ("the session already shown is torn down and started again",
+     "        if not _picker_mode and target == getattr(state, \"session_id\", None):\n"
+     "            return True, None\n",
+     ""),
+
+    ("a switch puts a second CLI on a session",
+     "        why = await _why_not_resumable(target)\n        if why:\n"
+     "            return False, why\n",
+     ""),
+
+    ("a session open elsewhere in the hub is resumable",
+     "    if live is not None and live is not _default_runtime:\n        return (f\"that session",
+     "    if False:\n        return (f\"that session"),
+
+    ("a session a move is deleting is resumable",
+     "    if sid in _trashing_sids:\n        return (\"that session is being sent",
+     "    if False:\n        return (\"that session is being sent"),
+
+    ("a session another process holds is resumable",
+     "    if holder is not None and not (config and getattr(config, \"allow_duplicate_session\", False)):\n"
+     "        return f\"another process",
+     "    if False:\n"
+     "        return f\"another process"),
+
+    ("only the tab that asked is shown the switch",
+     "        for viewer in list(_default_runtime.clients):\n",
+     "        for viewer in []:\n"),
 
     ("the browser picker is not told whose sessions it lists",
      '    return {"projects": result, "account": account_label()}\n',
@@ -6127,8 +6191,18 @@ RESUMEPICKER_SERVER_MUTATIONS = [
      'async def api_restart() -> dict[str, Any]:\n'),
 
     ("a route takes whatever function its decorator lands on",
-     "    if not inspect.iscoroutinefunction(fn):\n",
+     "    if fn.__name__.startswith(\"_\") or not inspect.iscoroutinefunction(fn):\n",
      "    if False:\n"),
+
+    ("a route takes an async helper its decorator lands on",
+     "    if fn.__name__.startswith(\"_\") or not inspect.iscoroutinefunction(fn):\n",
+     "    if not inspect.iscoroutinefunction(fn):\n"),
+]
+
+LOBBYRESTART_MUTATIONS = [
+    ("a restart that never ran reads as done (the three weeks)",
+     "    if (!resp.ok || !data || data.ok !== true) {\n",
+     "    if (data && data.ok === false) {\n"),
 ]
 
 # The lobby says when its connection is down, and a socket the hub refused is
@@ -9712,6 +9786,8 @@ TARGETS = {
                       ONESOCKET_APP_MUTATIONS, "node"),
     "resumepicker-server": ("server.py", "tests/test_resume_picker.py",
                             RESUMEPICKER_SERVER_MUTATIONS, "pytest"),
+    "lobbyrestart": ("static/lobby.js", "tests/lobby_restart.test.js",
+                     LOBBYRESTART_MUTATIONS, "node"),
     "connband-app": ("static/app.js", "tests/reconnect_on_show.test.js",
                      CONNBAND_APP_MUTATIONS, "node"),
     "connband-lobby": ("static/lobby.js", "tests/reconnect_on_show.test.js",

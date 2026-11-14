@@ -412,11 +412,15 @@ without a choice answers `session_id: null`, with a `message` when it was not
 the user's choice ("No sessions found in …"). Its window closed with X counts
 the same: Windows ends the process with STATUS_CONTROL_C_EXIT
 (`_CONSOLE_CLOSED`) before it can answer. The launch says the message
-(`_tell_launch`: console, log, and a dialog when its own console is hidden,
-the picker's having closed) and ends with nothing started. A picker that could
-not run, or crashed, writes nothing: Textual returns from a crash with a
-non-zero `return_code` rather than raising, and `pick_session_for_launch`
-returns None for it. Only then does the browser picker take over. The launch
+(`_tell_launch`) and ends with nothing started. It says it in its console and
+the log, and in a dialog when the picker had a console of its own, which
+closed with it: whenever the launch's own is not visible, hidden or absent,
+the same test `_run_launch_picker` uses. A picker that could not run, or
+crashed, writes nothing: Textual returns from a crash with a non-zero
+`return_code` rather than raising, and `pick_session_for_launch` returns None
+for it. The launch logs its exit code, since its traceback was in its own
+window. Only then does the browser picker take over, and the launch says so.
+The launch
 sets `browser_picker`, its `--detach` child is given `--browser-picker`, and
 `_launch_picker_mode` shows that child no terminal picker. Before, a cancelled
 picker left the sentinel and went on. The detach child then ran the terminal
@@ -433,26 +437,50 @@ in picker mode as at any other time, and the picker only at bare `/?resume`
 (`_THE_PICKER`). A tab whose socket attaches to the hub's own session, the one
 still to be picked, is sent there by `_send_initial_state` (`navigate`). That
 covers every way of reaching it: the launch's `/?rid=default`, the lobby's
-card, a phone attaching in place. Serving the picker to every page request
+card, a phone attaching in place, and bare `/`, the address the hub prints,
+whose socket a picking hub attaches to its own session rather than the lobby.
+A joined session's tab is not sent: only the hub's own session is still to be
+picked. Serving the picker to every page request
 had a joined session open another picker instead of itself. Once a session is
 picked (`/api/resume`), or switched to by `?resume=` / `?cwd=`, the tab goes
 to `/?rid=default` (`_THE_HUBS_SESSION`), not to `/`, because a tab at `/`
 lands in the lobby, a list of sessions that reads as another picker.
 `/api/resume` answers with that address, and resumes outside picker mode too,
-as `/?resume=<id>` does, which is what `/resume` opens. Both pickers list only
+as `/?resume=<id>` does, which is what `/resume` opens. A session open in
+another of the hub's sessions is gone to (`/?rid=sN`), as `/resume <id>` goes
+to it. Picks are serialised (`_PICK_LOCK`): two tabs picking while the bridge
+is still being built would both pass the picker-mode check and start it twice.
+Both pickers list only
 the launch's account (the hub's). `/api/sessions` names it for the browser
 picker's heading, as the terminal picker's already did, and reads the session
 files in a thread, since a hub waiting in its picker may be running other
 sessions meanwhile.
 
-**A route's handler is an `async def`, and `_route` refuses anything else.**
-On 2026-10-21 a helper, `_with_launch_cwd`, was written between
+**Every way of switching the hub's own session makes the same checks.**
+`/resume <id>`, `/?resume=`, `/?cwd=` and the picker all switch it through
+`_reconfigure`, so the checks are there, before anything is torn down. The
+session already shown is left running (`(True, None)`), not stopped
+mid-turn and started again. A session open in another of this hub's
+sessions, held by another process, or being deleted by a move
+(`_why_not_resumable`) is refused, since any of those would put a second CLI
+on one session file. `_handle_resume` still checks the first two itself, to
+go to the session or to offer the window that holds it. A hub still in its
+picker has no session shown, but may have others open, and is checked too.
+Once switched, every tab viewing the hub's session is sent its new state, not
+only the tab that asked: one left showing the old session would send its
+prompts to the new one.
+
+**A route's handler is a public `async def`, and `_route` refuses anything
+else.** On 2026-10-21 a helper, `_with_launch_cwd`, was written between
 `@_route("post", "/api/restart")` and `api_restart`. The decorator took the
 helper, and POST `/api/restart` answered every request with a 422 for the
-helper's missing arguments. The lobby reads only `ok: false` as a failure, so
-it showed "restarting…", found the hub that never stopped answering, and
-reloaded. ⟳ Restart restarted nothing for three weeks. `_check_handler` makes
-the mistake an import-time error.
+helper's missing arguments. The lobby then read only `ok: false` as a failure,
+so it showed "restarting…", found the hub that never stopped answering, and
+reloaded. ⟳ Restart restarted nothing for three weeks (known-issues.md).
+`_check_handler` makes the mistake an import-time error, by refusing a handler
+that is private (helpers are) or not async. The lobby now takes only `ok:
+true` from a 2xx as a restart under way, so a bad route, an error status or a
+500 page is reported instead.
 
 **A session on another account is opened in that account by name, never
 through the hub's environment.** The hub has no `CLAUDE_CONFIG_DIR` in its

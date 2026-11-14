@@ -2031,6 +2031,26 @@ async def _deferred_bridge_startup(*, start: bool) -> None:
 # Runtime lifecycle — spin up / tear down live sessions on demand
 # ---------------------------------------------------------------------------
 
+async def _why_not_resumable(sid: str) -> str | None:
+    """Why the hub's own session cannot switch to session *sid*, or None.
+
+    Open in another of this hub's sessions; held by another process (another
+    hub, a stray ``claude --resume``); or being deleted by a move.  Each would
+    leave two CLIs on one session file, or one on a file going away.
+    """
+    live = _live_runtime_for(sid)
+    if live is not None and live is not _default_runtime:
+        return (f"that session is already open in this hub ({live.rid}); "
+                "go to it from Sessions")
+    if sid in _trashing_sids:
+        return ("that session is being sent to the Recycle Bin, having been "
+                "moved -- open its copy instead")
+    holder = await asyncio.to_thread(proc_guard.find_foreign_session_holder, sid)
+    if holder is not None and not (config and getattr(config, "allow_duplicate_session", False)):
+        return f"another process (pid {holder.holder_pid}) has that session open"
+    return None
+
+
 def _refuse_if_trashing(sid: str | None) -> None:
     """Raise if session *sid* is being sent to the Recycle Bin by a move
     (_trashing_sids): a runtime must not open it meanwhile."""
@@ -2983,17 +3003,18 @@ def _ws_route(path: str):
 
 
 def _check_handler(fn: Any, route: str) -> None:
-    """Refuse *fn* as *route*'s handler unless it is an ``async def``.
+    """Refuse *fn* as *route*'s handler unless it is a public ``async def``.
 
     Every handler is one, and a helper written between a route's decorator
-    and its handler is not: the decorator then takes the helper, and the
-    route answers every request with a validation error for the helper's
-    arguments -- silently, to a caller that ignores the status.
+    and its handler is not -- it is private, and usually not async: the
+    decorator then takes the helper, and the route answers every request
+    with a validation error for the helper's arguments, silently to a caller
+    that ignores the status.
     """
-    if not inspect.iscoroutinefunction(fn):
+    if fn.__name__.startswith("_") or not inspect.iscoroutinefunction(fn):
         raise TypeError(f"{route} would be handled by {fn.__name__}, which is "
-                        "not an async def: is its decorator above the wrong "
-                        "function?")
+                        "not a public async def: is its decorator above the "
+                        "wrong function?")
 
 
 # ---------------------------------------------------------------------------
@@ -3621,7 +3642,7 @@ async def index(request: Request):
             # here, in the page that drives the sessions.
             return HTMLResponse(
                 f"<h1>Resume failed</h1><p>{html_escape(err)}</p>"
-                f"<p><a href='/?resume'>Pick another</a></p>",
+                f"<p><a href='{_THE_PICKER}'>Pick another</a></p>",
                 status_code=400,
             )
         return RedirectResponse(_THE_HUBS_SESSION, status_code=303)
@@ -3724,6 +3745,18 @@ async def _reconfigure(
     target = _session_to_open(new_resume, new_cwd, config.config_dir,
                               continue_recent=bool(cwd) and not config.no_continue)
 
+    # Before anything is torn down, for every way in -- /resume, ?resume=,
+    # ?cwd=, the picker: the session already shown is left running rather
+    # than cut off mid-turn, and one that another CLI has, or that a move is
+    # deleting, is refused.  Two CLIs on one session would both append to it.
+    # A hub still in its picker shows none yet, but may have others open.
+    if target is not None:
+        if not _picker_mode and target == getattr(state, "session_id", None):
+            return True, None
+        why = await _why_not_resumable(target)
+        if why:
+            return False, why
+
     # Into the new directory before anything is torn down: one that has gone
     # (the tab's own, which a session that cannot be followed resumes in) is
     # an error while the tab still has a working session, not a dead tab.
@@ -3802,6 +3835,15 @@ async def _reconfigure(
     _picker_mode = False
     await bridge.start()
     log.info("reconfigured: resume=%s cwd=%s", new_resume, new_cwd)
+    # Every tab on the hub's own session is shown the one it is on now -- not
+    # only the one that asked: one left showing the old would send its
+    # prompts to the new.
+    if _default_runtime is not None:
+        for viewer in list(_default_runtime.clients):
+            try:
+                await _send_initial_state(viewer)
+            except Exception:
+                log.debug("could not refresh a tab after reconfigure", exc_info=True)
     return True, None
 
 
@@ -4559,17 +4601,37 @@ async def api_resume(body: dict[str, Any]) -> dict[str, Any]:
     running hub's own session; the latter switches that session, as
     ``/?resume=<id>`` does.  Answers ``url``, where the tab is to go.
     """
-    global _picker_mode
-
     session_id = (body.get("session_id") or "").strip()
     if not session_id:
         return {"ok": False, "error": "No session_id provided"}
+    # One pick at a time: two tabs picking while the bridge is still being
+    # built would both pass the picker-mode check, and start it twice.
+    async with _PICK_LOCK:
+        return await _resume_picked(session_id)
+
+
+#: Serialises ``api_resume``.
+_PICK_LOCK = asyncio.Lock()
+
+
+async def _resume_picked(session_id: str) -> dict[str, Any]:
+    """``api_resume``'s work, under ``_PICK_LOCK``."""
+    global _picker_mode
 
     if not _picker_mode:
+        # Open in another session of this hub: that one's tab, as /resume
+        # goes to it.
+        live = _live_runtime_for(session_id)
+        if live is not None and live is not _default_runtime:
+            return {"ok": True, "session_id": session_id, "url": f"/?rid={live.rid}"}
         ok, err = await _reconfigure(resume=session_id)
         if not ok:
             return {"ok": False, "error": err}
         return {"ok": True, "session_id": session_id, "url": _THE_HUBS_SESSION}
+
+    why = await _why_not_resumable(session_id)
+    if why:
+        return {"ok": False, "error": why}
 
     # In picker mode the bridge is built off the hot path — wait for it.
     if bridge is None:
@@ -5291,6 +5353,11 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                     requested_rid))
         elif force_lobby:
             await _enter_lobby(ws)
+        elif _picker_mode and _default_runtime is not None:
+            # A hub waiting in its picker: the address it printed is bare, and
+            # its session still to be picked is what that tab is for.  Its
+            # initial state sends it on to the picker.
+            await _attach_ws(ws, _default_runtime)
         else:
             # No ?rid= — always land in the lobby.  A bare
             # ``localhost:8420`` (typed manually, or opened in a new tab)
@@ -6480,7 +6547,6 @@ async def _handle_resume(ws: WebSocket, rt: SessionRuntime, ref: str) -> None:
         if not ok:
             await say("error", f"Resume failed: {why}")
             return
-        await _send_initial_state(ws)
     else:
         try:
             # found.cwd is the session's own directory: the resolver follows
@@ -6654,16 +6720,14 @@ async def _dispatch_ws_message(ws: WebSocket, msg: dict[str, Any]) -> None:
             await send_to(ws, {"type": "system_msg", "subtype": "info",
                                "data": {"message": f"Switching to {payload} ..."}})
             ok, err = await _reconfigure(cwd=payload)
-            if ok:
-                await _send_initial_state(ws)
-            else:
+            if not ok:
                 await send_to(ws, {"type": "system_msg", "subtype": "error",
                                    "data": {"message": f"Move failed: {err}"}})
             return
 
         if kind == "resume-pick":
             # Open the session picker in the browser.
-            await send_to(ws, {"type": "navigate", "url": "/?resume"})
+            await send_to(ws, {"type": "navigate", "url": _THE_PICKER})
             return
 
         if kind == "resume":
@@ -8180,9 +8244,9 @@ def _console_is_visible() -> bool:
         return False
 
 
-#: Exit codes of a process whose console window was closed under it
-#: (STATUS_CONTROL_C_EXIT, unsigned and signed).
-_CONSOLE_CLOSED = frozenset({0xC000013A, 0xC000013A - (1 << 32)})
+#: The exit code of a process whose console window was closed under it,
+#: STATUS_CONTROL_C_EXIT, as ``Popen.wait`` gives it (an unsigned DWORD).
+_CONSOLE_CLOSED = 0xC000013A
 
 
 def _run_launch_picker(mode: str, launch_cwd: str | None = None) -> dict | None:
@@ -8284,8 +8348,11 @@ def _run_launch_picker(mode: str, launch_cwd: str | None = None) -> dict | None:
         result = _read_result(out_path)
         # Its window closed with X: Windows ends the process with this code,
         # before it could answer.  The user left it, as with Esc.
-        if result is None and code in _CONSOLE_CLOSED:
+        if result is None and code == _CONSOLE_CLOSED:
             return {"session_id": None, "cwd": None, "message": None}
+        if result is None:
+            # Its traceback, if any, was in its window, gone with it.
+            log.warning("the %s picker gave no answer (exit code %s)", mode, code)
         return result
     finally:
         try:
@@ -8333,13 +8400,13 @@ def _report_launch_failure(message: str, *, dialog: bool = False) -> None:
         _show_error_dialog("orchestrator2 — launch failed", body)
 
 
-def _tell_launch(message: str) -> None:
+def _tell_launch(message: str, *, dialog: bool) -> None:
     """Say *message* about this launch where it will be read: its console,
-    the ``--log-file``, and a dialog when that console is hidden (a tray
-    launch), as for a launch that stops (``_report_launch_failure``)."""
+    the ``--log-file``, and a dialog if *dialog* -- for what a terminal
+    picker that had a console of its own, gone with it, would have shown."""
     print(message)
     _file_log(logging.INFO, "launch: %s", message)
-    if _console_is_hidden() and not os.environ.get("ORCH2_NO_DIALOG"):
+    if dialog and not os.environ.get("ORCH2_NO_DIALOG"):
         _show_error_dialog("orchestrator2", message)
 
 
@@ -8489,6 +8556,10 @@ def main() -> None:
     # --detach child skips this (its resume id is already concrete).
     picker_mode = _launch_picker_mode(config)
     if picker_mode:
+        # The picker gets a console of its own when ours is not visible
+        # (_run_launch_picker); what it would have said is then said here
+        # in a dialog, its console having closed with it.
+        own_console = not _console_is_visible()
         result = _run_launch_picker(picker_mode, config.cwd)
         chosen = result.get("session_id") if isinstance(result, dict) else None
         chosen_cwd = result.get("cwd") if isinstance(result, dict) else None
@@ -8510,7 +8581,7 @@ def main() -> None:
             # (which is unrelated to the copy the user was doing).  A copy
             # that failed says so, its own console being gone.
             if isinstance(result, dict) and result.get("message"):
-                _tell_launch(result["message"])
+                _tell_launch(result["message"], dialog=own_console)
             config = dataclasses.replace(
                 config, copy=False, resume=None, no_continue=True
             )
@@ -8520,7 +8591,7 @@ def main() -> None:
             # so it ends here, with nothing started.  Any other picker would
             # show the list the user has just left.
             if result.get("message"):
-                _tell_launch(result["message"])
+                _tell_launch(result["message"], dialog=own_console)
             else:
                 print("No session was picked, so nothing was started.")
                 _file_log(logging.INFO, "launch: no session was picked")
@@ -8528,6 +8599,8 @@ def main() -> None:
         else:
             # No terminal picker could run at all: the in-browser one is left,
             # and a --detach child must go straight to it.
+            _tell_launch("The terminal session picker could not run, so it opens "
+                         "in the browser instead.", dialog=False)
             config = dataclasses.replace(config, browser_picker=True)
 
     # --- Settle --resume before anything is started or joined --------------
