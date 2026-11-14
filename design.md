@@ -409,28 +409,50 @@ resume. Changing the hub process's directory alone left the CLI where it was.
 `main()` runs the terminal picker (`_run_launch_picker`, a `copy_session.py
 --pick` process that answers in a file). A picker that was shown and left
 without a choice answers `session_id: null`, with a `message` when it was not
-the user's choice ("No sessions found in …"). The launch prints that and ends
-with nothing started. A picker that could not run writes nothing, and only
-then does the browser picker take over: the launch sets `browser_picker`, and
-its `--detach` child gets `--resume --browser-picker`, so `_launch_picker_mode`
-shows it no terminal picker. Before, a cancelled picker left the sentinel and
-went on. The detach child then ran the terminal picker itself in a new console
-window, and after a second Esc waited in the browser one, three pickers for
-one launch. With a hub already running, that also left a picker-mode server
-on a port of its own (a picker never joins a hub). The restart replacement
-drops the marker. It shows its picker in the tabs it takes over (`--wait-port`).
+the user's choice ("No sessions found in …"). Its window closed with X counts
+the same: Windows ends the process with STATUS_CONTROL_C_EXIT
+(`_CONSOLE_CLOSED`) before it can answer. The launch says the message
+(`_tell_launch`: console, log, and a dialog when its own console is hidden,
+the picker's having closed) and ends with nothing started. A picker that could
+not run, or crashed, writes nothing: Textual returns from a crash with a
+non-zero `return_code` rather than raising, and `pick_session_for_launch`
+returns None for it. Only then does the browser picker take over. The launch
+sets `browser_picker`, its `--detach` child is given `--browser-picker`, and
+`_launch_picker_mode` shows that child no terminal picker. Before, a cancelled
+picker left the sentinel and went on. The detach child then ran the terminal
+picker itself in a new console window, and after a second Esc waited in the
+browser one, three pickers for one launch. With a hub already running, that
+also left a picker-mode server on a port of its own, since a picker never
+joins a hub. The restart replacement drops the marker. It shows its picker in
+the tabs it takes over (`--wait-port`). A `--copy` whose copy failed says so
+in the same way, then starts a new conversation as before.
 
 **A hub waiting in its picker still opens other sessions.** Launches join it,
-and their tabs ask for `/?rid=sN`. `index()` serves `resume.html` only to the
-hub's own session, the one to pick (`_is_for_the_session_to_pick`: `/`,
-`?rid=default` or the primary's rid), and the chat page to every other tab,
-the lobby's and `?open=` / `?new` included. Serving the picker to all of them
+and their tabs ask for `/?rid=sN`. `index()` serves the chat page to every tab
+in picker mode as at any other time, and the picker only at bare `/?resume`
+(`_THE_PICKER`). A tab whose socket attaches to the hub's own session, the one
+still to be picked, is sent there by `_send_initial_state` (`navigate`). That
+covers every way of reaching it: the launch's `/?rid=default`, the lobby's
+card, a phone attaching in place. Serving the picker to every page request
 had a joined session open another picker instead of itself. Once a session is
 picked (`/api/resume`), or switched to by `?resume=` / `?cwd=`, the tab goes
-to `/?rid=default` (`_THE_HUBS_SESSION`), not to `/`: a tab at `/` lands in the
-lobby, a list of sessions that reads as another picker. Both pickers list only
-the launch's account (the hub's), and `/api/sessions` names it for the
-browser picker's heading, as the terminal picker's already did.
+to `/?rid=default` (`_THE_HUBS_SESSION`), not to `/`, because a tab at `/`
+lands in the lobby, a list of sessions that reads as another picker.
+`/api/resume` answers with that address, and resumes outside picker mode too,
+as `/?resume=<id>` does, which is what `/resume` opens. Both pickers list only
+the launch's account (the hub's). `/api/sessions` names it for the browser
+picker's heading, as the terminal picker's already did, and reads the session
+files in a thread, since a hub waiting in its picker may be running other
+sessions meanwhile.
+
+**A route's handler is an `async def`, and `_route` refuses anything else.**
+On 2026-10-21 a helper, `_with_launch_cwd`, was written between
+`@_route("post", "/api/restart")` and `api_restart`. The decorator took the
+helper, and POST `/api/restart` answered every request with a 422 for the
+helper's missing arguments. The lobby reads only `ok: false` as a failure, so
+it showed "restarting…", found the hub that never stopped answering, and
+reloaded. ⟳ Restart restarted nothing for three weeks. `_check_handler` makes
+the mistake an import-time error.
 
 **A session on another account is opened in that account by name, never
 through the hub's environment.** The hub has no `CLAUDE_CONFIG_DIR` in its

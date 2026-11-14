@@ -699,7 +699,7 @@ class LaunchPickerApp(App):
 
 def pick_session_for_launch(
     mode: str, launch_cwd: str | None = None
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Run the launch-time picker TUI and return the chosen result.
 
     *mode* is ``"resume"`` or ``"copy"``.  Returns ``{"session_id": str |
@@ -708,16 +708,18 @@ def pick_session_for_launch(
     server then starts empty).  ``cwd`` is the chosen session's working
     directory so the server can resume it under the correct (cwd-scoped)
     project.  ``message`` says why nothing was chosen when it was not the
-    user's choice (no sessions to pick, a failed copy): the picker may have
-    had a console of its own, which closes with it.  *launch_cwd* is the
-    server's working directory, used to offer its most-recent session as the
-    default in the "what to open?" fallback.  Requires an interactive
+    user's choice (no sessions to pick, a failed copy), for the server to
+    say: the picker may have had a console of its own, which closes with it.
+    Returns None when the picker crashed, which is not the user leaving it:
+    Textual prints the error and returns rather than raising.  *launch_cwd* is
+    the server's working directory, used to offer its most-recent session as
+    the default in the "what to open?" fallback.  Requires an interactive
     terminal.
     """
     app = LaunchPickerApp(mode, account_dir(), launch_cwd)
     app.run()
-    if app.status_message:
-        print(app.status_message)
+    if app.return_code:
+        return None
     return {"session_id": app.chosen_id, "cwd": app.chosen_cwd,
             "message": app.status_message}
 
@@ -743,7 +745,8 @@ def main() -> int:
         metavar="FILE",
         help=(
             "Where --pick writes its result as JSON "
-            "({\"session_id\": ..., \"cwd\": ...})."
+            "({\"session_id\": ..., \"cwd\": ..., \"message\": ...}); "
+            "nothing when the picker crashed."
         ),
     )
     ap.add_argument(
@@ -758,6 +761,8 @@ def main() -> int:
 
     if args.pick:
         result = pick_session_for_launch(args.pick, args.cwd)
+        if result is None:
+            return 1                # no answer: the server reads "could not run"
         if args.out:
             try:
                 with open(args.out, "w", encoding="utf-8") as f:

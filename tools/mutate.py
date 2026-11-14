@@ -6059,16 +6059,34 @@ RESUMEPICKER_SERVER_MUTATIONS = [
      "            # A resume picker shown and left with Esc"),
 
     ("a picker with nothing to pick does not say why",
-     '            said = result.get("message") or "No session was picked, so nothing was started."\n',
-     '            said = "No session was picked, so nothing was started."\n'),
+     "            if result.get(\"message\"):\n"
+     "                _tell_launch(result[\"message\"])\n"
+     "            else:\n",
+     "            if False:\n"
+     "                _tell_launch(result[\"message\"])\n"
+     "            else:\n"),
+
+    ("what a launch says from a hidden console is said nowhere",
+     "    if _console_is_hidden() and not os.environ.get(\"ORCH2_NO_DIALOG\"):\n"
+     "        _show_error_dialog(\"orchestrator2\", message)\n",
+     ""),
+
+    ("a failed copy says nothing",
+     "            if isinstance(result, dict) and result.get(\"message\"):\n"
+     "                _tell_launch(result[\"message\"])\n",
+     ""),
 
     ("a launch with no terminal picker does not mark its child",
      "            config = dataclasses.replace(config, browser_picker=True)\n",
      "            pass\n"),
 
+    ("every detach child goes straight to the browser picker",
+     "        if cfg.browser_picker:\n            child_argv.append(\"--browser-picker\")\n",
+     "        child_argv.append(\"--browser-picker\")\n"),
+
     ("the detach child shows the terminal picker again",
-     '        child_argv.extend(["--resume", "--browser-picker"])\n',
-     '        child_argv.append("--resume")\n'),
+     "        if cfg.browser_picker:\n            child_argv.append(\"--browser-picker\")\n",
+     ""),
 
     ("the marked child shows the terminal picker anyway",
      "    if cfg.resume == _PICKER_SENTINEL and not cfg.wait_port and not cfg.browser_picker:\n",
@@ -6082,25 +6100,35 @@ RESUMEPICKER_SERVER_MUTATIONS = [
      '            "message": message if isinstance(message, str) and message else None,\n',
      '            "message": None,\n'),
 
-    ("a hub waiting in its picker serves it to every tab",
-     "    if _picker_mode and _is_for_the_session_to_pick(request):\n",
-     "    if _picker_mode:\n"),
+    ("a picker window closed with X opens the browser picker",
+     "        if result is None and code in _CONSOLE_CLOSED:\n",
+     "        if False:\n"),
 
-    ("the lobby, in a hub waiting in its picker, is the picker",
-     '    if any(q.get(k) is not None for k in ("open", "new", "lobby")):\n',
-     '    if any(q.get(k) is not None for k in ("open", "new")):\n'),
-
-    ("the hub's own session, by name, is not the one to pick",
-     '    return (not rid or rid == "default"\n',
-     "    return (not rid\n"),
+    ("the session still to be picked dead-ends its tab",
+     '        await send_to(ws, {"type": "navigate", "url": _THE_PICKER})\n',
+     '        await send_to(ws, {"type": "system_msg", "subtype": "info",\n'
+     '                           "data": {"message": "Select a session to resume."}})\n'),
 
     ("a session switched to is shown in the lobby",
      '_THE_HUBS_SESSION = "/?rid=default"\n',
      '_THE_HUBS_SESSION = "/"\n'),
 
+    ("the browser picker cannot resume outside picker mode",
+     "    if not _picker_mode:\n        ok, err = await _reconfigure(resume=session_id)\n",
+     "    if not _picker_mode:\n        return {\"ok\": False, \"error\": \"Not in picker mode\"}\n"
+     "        ok, err = await _reconfigure(resume=session_id)\n"),
+
     ("the browser picker is not told whose sessions it lists",
      '    return {"projects": result, "account": account_label()}\n',
      '    return {"projects": result}\n'),
+
+    ("restart is handled by a helper again",
+     '@_route("post", "/api/restart")\nasync def api_restart() -> dict[str, Any]:\n',
+     'async def api_restart() -> dict[str, Any]:\n'),
+
+    ("a route takes whatever function its decorator lands on",
+     "    if not inspect.iscoroutinefunction(fn):\n",
+     "    if False:\n"),
 ]
 
 # The lobby says when its connection is down, and a socket the hub refused is
@@ -8678,8 +8706,8 @@ SESSIONKEY_SERVER_MUTATIONS = [
      "                             ))\n"),
 
     ("a restart's replacement still to choose shows a console picker",
-     "    if cfg.resume == _PICKER_SENTINEL and not cfg.wait_port:\n",
-     "    if cfg.resume == _PICKER_SENTINEL:\n"),
+     "    if cfg.resume == _PICKER_SENTINEL and not cfg.wait_port and not cfg.browser_picker:\n",
+     "    if cfg.resume == _PICKER_SENTINEL and not cfg.browser_picker:\n"),
 
     ("the new hub leaves the handed-over keys in its environment",
      "    raw = os.environ.pop(HANDOVER_KEYS_ENV, None)",

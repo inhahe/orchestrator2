@@ -441,9 +441,8 @@
         });
         const result = await resp.json();
         if (result.ok) {
-          // To the session just picked, the hub's own.  Not '/': a tab there
-          // lands in the lobby, a list of sessions that reads as another picker.
-          window.location.href = '/?rid=default';
+          // To the session just picked, where the hub says it is.
+          window.location.href = result.url;
         } else {
           alert('Failed to resume: ' + (result.error || 'unknown error'));
           resuming = false;

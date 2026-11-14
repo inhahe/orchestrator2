@@ -30,6 +30,7 @@ import hashlib
 import hmac
 import datetime
 import functools
+import inspect
 import io
 import ipaddress
 import json
@@ -2966,6 +2967,7 @@ app: Any = None
 def _route(method: str, path: str, **kwargs: Any):
     """Record an HTTP route without importing fastapi."""
     def deco(fn):
+        _check_handler(fn, f"{method.upper()} {path}")
         _HTTP_ROUTES.append((method, path, kwargs, fn))
         return fn
     return deco
@@ -2974,9 +2976,24 @@ def _route(method: str, path: str, **kwargs: Any):
 def _ws_route(path: str):
     """Record a WebSocket route without importing fastapi."""
     def deco(fn):
+        _check_handler(fn, f"WebSocket {path}")
         _WS_ROUTES.append((path, fn))
         return fn
     return deco
+
+
+def _check_handler(fn: Any, route: str) -> None:
+    """Refuse *fn* as *route*'s handler unless it is an ``async def``.
+
+    Every handler is one, and a helper written between a route's decorator
+    and its handler is not: the decorator then takes the helper, and the
+    route answers every request with a validation error for the helper's
+    arguments -- silently, to a caller that ignores the status.
+    """
+    if not inspect.iscoroutinefunction(fn):
+        raise TypeError(f"{route} would be handled by {fn.__name__}, which is "
+                        "not an async def: is its decorator above the wrong "
+                        "function?")
 
 
 # ---------------------------------------------------------------------------
@@ -3569,8 +3586,11 @@ async def index(request: Request):
     - ``/?cwd=<path>``       — set the working directory
     - ``/?continue``         — continue most recent session in cwd (default)
 
-    After handling a reconfiguration param the client is redirected to
-    ``/`` so the URL stays clean and refreshing won't re-trigger.
+    After handling a reconfiguration param the client is redirected to the
+    hub's own session (``_THE_HUBS_SESSION``) so the URL stays clean and
+    refreshing won't re-trigger.  A hub waiting in its picker serves the chat
+    page here like any other; a tab that attaches to the session still to be
+    picked is sent to the picker over its socket (``_send_initial_state``).
     """
     # --- URL query-param driven reconfiguration ---
     resume_param = request.query_params.get("resume")
@@ -3613,10 +3633,6 @@ async def index(request: Request):
                                 status_code=400)
         return RedirectResponse(_THE_HUBS_SESSION, status_code=303)
 
-    # --- Normal page serve ---
-    if _picker_mode and _is_for_the_session_to_pick(request):
-        return _serve_page("resume.html", fallback="<h1>Session Picker</h1>")
-
     return _serve_page("index.html", fallback="<h1>orchestrator2</h1><p>No index.html yet.</p>",
                        csp=CHAT_PAGE_CSP)
 
@@ -3626,22 +3642,8 @@ async def index(request: Request):
 #: the lobby, a session list that reads as one more picker.
 _THE_HUBS_SESSION = "/?rid=default"
 
-
-def _is_for_the_session_to_pick(request: Request) -> bool:
-    """Whether a page request is for the hub's own session, the one its
-    ``--resume`` picker is still to choose, rather than for another.
-
-    A hub waiting in its picker still opens the sessions launches bring it,
-    and the lobby: a tab for one of those (``?rid=s2``, ``?open=``, ``?new``,
-    ``?lobby=1``) is not the picked session's, and given the picker it could
-    never reach its own.
-    """
-    q = request.query_params
-    if any(q.get(k) is not None for k in ("open", "new", "lobby")):
-        return False
-    rid = q.get("rid")
-    return (not rid or rid == "default"
-            or (_default_runtime is not None and rid == _default_runtime.rid))
+#: The ``--resume`` picker, where a tab for a session still to be picked goes.
+_THE_PICKER = "/?resume"
 
 
 #: The chat page runs only its own script files: no inline script, no
@@ -3871,7 +3873,6 @@ async def api_shutdown() -> dict[str, Any]:
     return {"ok": True, "message": "shutting down"}
 
 
-@_route("post", "/api/restart")
 def _with_launch_cwd(argv: list[str], cwd: str) -> list[str]:
     """*argv*, the launch command, with its ``--cwd`` value replaced by *cwd*,
     the absolute directory it resolved to at launch.  ``api_restart`` copies
@@ -3890,6 +3891,7 @@ def _with_launch_cwd(argv: list[str], cwd: str) -> list[str]:
     return out
 
 
+@_route("post", "/api/restart")
 async def api_restart() -> dict[str, Any]:
     """Restart the whole server process in place (kill + relaunch).
 
@@ -4511,7 +4513,16 @@ def _truncate(s: str | None, max_len: int) -> str:
 
 @_route("get", "/api/sessions")
 async def api_sessions() -> dict[str, Any]:
-    """Return all projects and their sessions for the picker UI."""
+    """Return all projects and their sessions for the picker UI.
+
+    In a thread: it reads every session file of the account, and a hub
+    waiting in its picker may be running other sessions meanwhile.
+    """
+    return await asyncio.to_thread(_sessions_payload)
+
+
+def _sessions_payload() -> dict[str, Any]:
+    """``/api/sessions``'s answer.  **Blocking.**"""
     projects = list_projects()
     result: list[dict[str, Any]] = []
     for proj in projects:
@@ -4542,15 +4553,23 @@ async def api_sessions() -> dict[str, Any]:
 
 @_route("post", "/api/resume")
 async def api_resume(body: dict[str, Any]) -> dict[str, Any]:
-    """Select a session from the picker and start the SDK bridge."""
-    global _picker_mode
+    """Select a session from the picker and start the SDK bridge.
 
-    if not _picker_mode:
-        return {"ok": False, "error": "Not in picker mode"}
+    The picker in a hub waiting in it, or the one ``/resume`` opens in a
+    running hub's own session; the latter switches that session, as
+    ``/?resume=<id>`` does.  Answers ``url``, where the tab is to go.
+    """
+    global _picker_mode
 
     session_id = (body.get("session_id") or "").strip()
     if not session_id:
         return {"ok": False, "error": "No session_id provided"}
+
+    if not _picker_mode:
+        ok, err = await _reconfigure(resume=session_id)
+        if not ok:
+            return {"ok": False, "error": err}
+        return {"ok": True, "session_id": session_id, "url": _THE_HUBS_SESSION}
 
     # In picker mode the bridge is built off the hot path — wait for it.
     if bridge is None:
@@ -4589,7 +4608,8 @@ async def api_resume(body: dict[str, Any]) -> dict[str, Any]:
     await bridge.start()
 
     log.info("resumed session %s", session_id[:8])
-    return {"ok": True, "session_id": session_id, "title": title}
+    return {"ok": True, "session_id": session_id, "title": title,
+            "url": _THE_HUBS_SESSION}
 
 
 # ---------------------------------------------------------------------------
@@ -5585,13 +5605,11 @@ async def _send_initial_state(ws: WebSocket) -> None:
     state = rt.state
     config = rt.config
 
-    # In picker mode the default runtime's chat UI isn't active yet.
+    # A hub waiting in its picker: its own session is still to be picked, and
+    # a tab that reaches it -- the launch's, the lobby's, one attached in place
+    # on a phone -- is sent to the picker.
     if _picker_mode and rt is _default_runtime:
-        await send_to(ws, {
-            "type": "system_msg",
-            "subtype": "info",
-            "data": {"message": "Select a session to resume."},
-        })
+        await send_to(ws, {"type": "navigate", "url": _THE_PICKER})
         return
 
     # Tell the tab which session it's now viewing (rid + meta), and where in
@@ -7764,9 +7782,11 @@ def _detach_child_argv(argv: list[str], cfg: Config, actual_port: int) -> list[s
                        "--skip-auto-login", "--cwd", cfg.cwd])
     # Re-add the (possibly picker-resolved) resume target for the child.
     if cfg.resume == _PICKER_SENTINEL:
-        # Bare: the child shows the browser picker -- and not the terminal
-        # one, which this launch could not run (main).
-        child_argv.extend(["--resume", "--browser-picker"])
+        # Bare: the child is still to choose.  Its picker is the browser's
+        # when this launch's terminal one could not run (main).
+        child_argv.append("--resume")
+        if cfg.browser_picker:
+            child_argv.append("--browser-picker")
     elif cfg.resume:
         child_argv.extend(["--resume", cfg.resume])
     # The name this launch resolved, which is not always on the command line:
@@ -8160,13 +8180,18 @@ def _console_is_visible() -> bool:
         return False
 
 
+#: Exit codes of a process whose console window was closed under it
+#: (STATUS_CONTROL_C_EXIT, unsigned and signed).
+_CONSOLE_CLOSED = frozenset({0xC000013A, 0xC000013A - (1 << 32)})
+
+
 def _run_launch_picker(mode: str, launch_cwd: str | None = None) -> dict | None:
     """Run the `--resume` / `--copy` TUI picker and return its result.
 
     Returns ``{"session_id": str | None, "cwd": str | None, "message": str |
-    None}``, or ``None`` when no picker could run.  ``session_id`` None is a
-    picker shown and left without a choice (Esc, or nothing to pick, which
-    ``message`` says).  ``cwd`` is the picked session's working directory —
+    None}``, or ``None`` when no picker could run, or it crashed.
+    ``session_id`` None is a picker shown and left without a choice (Esc, its
+    window closed, or nothing to pick, which ``message`` says).  ``cwd`` is the picked session's working directory —
     the server adopts it because resume is cwd-scoped (the CLI only finds a
     session under its own project directory).
 
@@ -8246,7 +8271,7 @@ def _run_launch_picker(mode: str, launch_cwd: str | None = None) -> dict | None:
             cwd=os.path.dirname(script) or None,
             env=child_env(),
         )
-        proc.wait()
+        code = proc.wait()
     except Exception:
         log.exception("failed to launch picker process")
         try:
@@ -8256,7 +8281,12 @@ def _run_launch_picker(mode: str, launch_cwd: str | None = None) -> dict | None:
         return None
 
     try:
-        return _read_result(out_path)
+        result = _read_result(out_path)
+        # Its window closed with X: Windows ends the process with this code,
+        # before it could answer.  The user left it, as with Esc.
+        if result is None and code in _CONSOLE_CLOSED:
+            return {"session_id": None, "cwd": None, "message": None}
+        return result
     finally:
         try:
             os.unlink(out_path)
@@ -8301,6 +8331,16 @@ def _report_launch_failure(message: str, *, dialog: bool = False) -> None:
               text.replace("\n", "\n    "), " ".join(sys.argv))
     if (dialog or _console_is_hidden()) and not os.environ.get("ORCH2_NO_DIALOG"):
         _show_error_dialog("orchestrator2 — launch failed", body)
+
+
+def _tell_launch(message: str) -> None:
+    """Say *message* about this launch where it will be read: its console,
+    the ``--log-file``, and a dialog when that console is hidden (a tray
+    launch), as for a launch that stops (``_report_launch_failure``)."""
+    print(message)
+    _file_log(logging.INFO, "launch: %s", message)
+    if _console_is_hidden() and not os.environ.get("ORCH2_NO_DIALOG"):
+        _show_error_dialog("orchestrator2", message)
 
 
 def _stop_launch(message: str, *, dialog: bool) -> NoReturn:
@@ -8467,18 +8507,23 @@ def main() -> None:
             # different account (unresumable here).  In every case nothing was
             # chosen to open, so start a FRESH empty session rather than
             # silently auto-continuing the launch cwd's most-recent session
-            # (which is unrelated to the copy the user was doing).
+            # (which is unrelated to the copy the user was doing).  A copy
+            # that failed says so, its own console being gone.
+            if isinstance(result, dict) and result.get("message"):
+                _tell_launch(result["message"])
             config = dataclasses.replace(
                 config, copy=False, resume=None, no_continue=True
             )
         elif result is not None:
-            # A resume picker shown and left with Esc, or with nothing to
-            # pick: the launch was for opening a session, so it ends here.
-            # Going on to the in-browser picker showed the same list a third
-            # time -- the --detach child's terminal picker, then the browser's.
-            said = result.get("message") or "No session was picked, so nothing was started."
-            print(said)
-            _file_log(logging.INFO, "launch: %s", said)
+            # A resume picker shown and left with Esc (or its window closed),
+            # or with nothing to pick: the launch was for opening a session,
+            # so it ends here, with nothing started.  Any other picker would
+            # show the list the user has just left.
+            if result.get("message"):
+                _tell_launch(result["message"])
+            else:
+                print("No session was picked, so nothing was started.")
+                _file_log(logging.INFO, "launch: no session was picked")
             sys.exit(0)
         else:
             # No terminal picker could run at all: the in-browser one is left,
