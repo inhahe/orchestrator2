@@ -71,43 +71,79 @@ def adopt_from_environment(given: str | None = None) -> str | None:
     -- or None when none was.  Called once, at startup, before any CLI or
     session lookup.
 
-    Raises ValueError, saying why, for an account given as a relative path.
-    It would be read against the directory the launch ran in, and there a
-    ``.claude`` is the project's own settings folder: the hub would quietly
-    make it a new, empty account, start its sessions there, and offer it in
-    ``/move`` under the name of the real one.  A hub's CLIs run in many
-    directories, so a relative account is never what was meant.
+    Raises ValueError, saying why, for the account chosen given as a
+    relative path, or wrapped in quotes.  A relative one is read against the
+    directory the launch ran in, where ``.claude`` is the project's own
+    settings folder, which would quietly become an account.  A hub's CLIs
+    run in many directories, so a relative account is never what was meant.
     """
     inherited = (os.environ.pop("CLAUDE_CONFIG_DIR", None) or "").strip() or None
     chosen = given or inherited
-    if chosen and not Path(chosen).expanduser().is_absolute():
-        raise ValueError(_relative_account_message(
-            chosen, "--config-dir" if given else "CLAUDE_CONFIG_DIR"))
-    if chosen:
-        try:
-            chosen = str(Path(chosen).expanduser().resolve())
-        except OSError:
-            chosen = str(Path(chosen).expanduser().absolute())
-    set_hub_account(chosen)
-    return chosen
+    if not chosen:
+        set_hub_account(None)
+        return None
+    source = "--config-dir" if given else "CLAUDE_CONFIG_DIR"
+    if chosen[0] in "\"'" or chosen[-1] in "\"'":
+        raise ValueError(
+            f"{source} is {chosen}, quotes included, so it names no folder. "
+            "Give it without the quotes"
+            + (' (in cmd, put them around the whole assignment: '
+               'set "CLAUDE_CONFIG_DIR=C:\\path").'
+               if source == "CLAUDE_CONFIG_DIR" else "."))
+    path = Path(chosen).expanduser()
+    if not path.is_absolute():
+        raise ValueError(_relative_account_message(chosen, path, source))
+    try:
+        path = path.resolve()
+    except OSError:
+        pass
+    set_hub_account(str(path))
+    return str(path)
 
 
-def _relative_account_message(chosen: str, source: str) -> str:
-    """Why the relative account *chosen*, from *source* (``--config-dir`` or
-    ``CLAUDE_CONFIG_DIR``), is refused, and what was probably meant."""
-    here = Path.cwd()
+def _is_account(path: Path) -> bool:
+    """Whether *path* holds a Claude account: sessions, or a sign-in."""
+    return (path / "projects").is_dir() or (path / ".credentials.json").is_file()
+
+
+def _relative_account_message(chosen: str, path: Path, source: str) -> str:
+    """Why the relative account *chosen* (*path*, expanded), from *source*
+    (``--config-dir`` or ``CLAUDE_CONFIG_DIR``), is refused, and what was
+    probably meant."""
+    meant = path.absolute()
     lines = [
-        f"{source} is {chosen!r}, a relative path. Read against the directory "
-        f"this launch ran in, that is {here / chosen}, which would become a "
-        "new, empty Claude account. Give the account's full path."]
-    in_home = Path.home() / chosen
-    if in_home.is_dir():
+        f"{source} is {chosen}, a relative path. Read against the directory "
+        f"this launch ran in, that is {meant}, "
+        + ("an account, but from another directory the same path would name "
+           "another folder." if _is_account(meant) else
+           "which is not a Claude account and would become a new, empty one.")
+        + " Give the account's full path."]
+    # The same name in the home directory: the anchor of a root-relative
+    # path (\.claude) would put it at the drive's root instead.
+    in_home = Path.home().joinpath(*path.parts[1:] if path.anchor else path.parts)
+    if in_home.is_dir() and not _same_path(in_home, meant):
         lines.append(f"Did you mean {in_home}?")
-    if source == "CLAUDE_CONFIG_DIR":
-        lines.append("CLAUDE_CONFIG_DIR came from this shell's environment; "
-                     "if it was not meant to be set, clear it with "
-                     "'set CLAUDE_CONFIG_DIR=' and launch again.")
-    return "\n".join(lines)
+    return "\n".join(lines) + _clear_hint(source)
+
+
+def _clear_hint(source: str) -> str:
+    """For an account that came from the environment: how to take it out."""
+    if source != "CLAUDE_CONFIG_DIR":
+        return ""
+    return ("\nCLAUDE_CONFIG_DIR came from the environment orchestrator2 was "
+            "started with. If it should not be set, remove it there: "
+            "'set CLAUDE_CONFIG_DIR=' in cmd, "
+            "'Remove-Item Env:CLAUDE_CONFIG_DIR' in PowerShell, or, if it is "
+            "set for your user, under Environment Variables in the System "
+            "settings.")
+
+
+def account_label(config_dir: str | None = None) -> str:
+    """Account *config_dir* (None: the hub's) as a person is shown it: its
+    folder's name when it is in the home directory, and its whole path
+    anywhere else, where it may well be called ``.claude`` too."""
+    d = account_dir(config_dir)
+    return d.name if _same_path(d.parent, Path.home()) else str(d)
 
 
 def set_hub_account(config_dir: str | None) -> None:

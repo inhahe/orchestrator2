@@ -456,17 +456,31 @@ credentials in the project. `/move` then listed the folder as ".claude" beside
 the real one. A session moved to the wrong one vanished from the account it
 was meant for, and the original had gone to the Recycle Bin. A hub's CLIs run
 in many directories, so no relative account is ever what was meant, whether it
-names an existing folder or not. The refusal says what the path would have
-meant, names a home-directory account of the same name if one exists, and,
-when the value came from the environment, how to clear it. A path written with
-`~` is absolute once expanded, and is taken. `normalize` still makes a
-per-session account absolute, for a child that runs elsewhere.
+names an existing folder or not. The refusal names the folder the path would
+have meant, and says whether it is an account or would become a new, empty
+one. It suggests the home-directory folder of that name, the anchor of a
+root-relative `\.claude` dropped, unless that is the same folder. When the
+value came from the environment, it says how to remove it in cmd, in
+PowerShell, and from the user's environment variables. A value wrapped in
+quotes (cmd's `set CLAUDE_CONFIG_DIR="C:\..."` keeps them) is refused for its
+quotes rather than called relative. A path written with `~` is absolute once
+expanded, and is taken. Only the account chosen is checked: with
+`--config-dir` given, an inherited `CLAUDE_CONFIG_DIR` is removed unread.
+`normalize` still makes a per-session account absolute, for a child that runs
+elsewhere. ⟳ Restart drops `--config-dir` from the replacement's command line
+and hands over the account it resolved, in the environment as before. The
+flag as typed could be relative, which the replacement would now refuse, and
+it would override that environment.
 
-`/move`'s picker (`_move_accounts_payload`) names an account by its folder
-name only when it is in the home directory, and by its whole path otherwise.
-The hub's own account is offered wherever it is, and one elsewhere may well be
-called `.claude` too. The "server started" log line names the hub's account,
-which would have shown the stray one in a single line.
+**An account is named to a person by `account_label`**: its folder's name in
+the home directory, and its whole path anywhere else. The hub's own account
+is offered by `/move` wherever it is, and one elsewhere may well be called
+`.claude` too. The picker, a move's result and its note to the model, the log,
+and `--resume`'s "on account …" all use it. It compares the account's parent
+with the home directory resolved on both sides, since the listing's paths are
+resolved and `Path.home()` may come through a junction. The "server started"
+log line names the hub's account, which would have shown the stray one in a
+single line.
 
 ### Connecting
 

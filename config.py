@@ -1070,7 +1070,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
         metavar="PATH",
         help=(
             "Override CLAUDE_CONFIG_DIR (where sessions and credentials are stored). "
-            "Use this to run an instance under a different Claude account."
+            "Use this to run an instance under a different Claude account. "
+            "Give the full path, or one starting with ~: a relative path, here "
+            "or in CLAUDE_CONFIG_DIR when this is not given, stops the launch."
         ),
     )
 

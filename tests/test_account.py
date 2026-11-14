@@ -177,14 +177,20 @@ def test_a_relative_session_account_reaches_a_child_whole(home, monkeypatch):
     assert account.normalize("acct-b") == str((home / "acct-b").absolute())
 
 
+def test_an_account_written_with_a_tilde_is_the_home_one(home, monkeypatch):
+    # expanduser reads the environment, not Path.home.
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    assert account.account_dir("~/acct-b") == home / "acct-b"
+
+
 # --------------------------------------------------------------------------
 # A relative account is refused at launch
 # --------------------------------------------------------------------------
 #
 # Read against the launch's directory, CLAUDE_CONFIG_DIR=.claude in a project
-# is the project's own settings folder.  Two launches from such a shell made
-# two such folders into new, empty accounts: their sessions went there, and
-# /move offered one under the real account's name.
+# names the project's own settings folder, which would become an account.  A
+# hub's CLIs run in many directories, so no relative account is meant.
 
 @pytest.fixture
 def project(home, monkeypatch):
@@ -202,23 +208,47 @@ def test_a_relative_account_from_the_environment_is_refused(project, monkeypatch
     with pytest.raises(ValueError) as exc:
         account.adopt_from_environment()
     message = str(exc.value)
-    assert f"CLAUDE_CONFIG_DIR is {value!r}, a relative path" in message
-    assert "set CLAUDE_CONFIG_DIR=" in message
+    assert f"CLAUDE_CONFIG_DIR is {value}, a relative path" in message
+    assert "'set CLAUDE_CONFIG_DIR=' in cmd" in message
+    assert "'Remove-Item Env:CLAUDE_CONFIG_DIR' in PowerShell" in message
     assert "CLAUDE_CONFIG_DIR" not in os.environ, "a CLI could still inherit it"
-    assert not (project / ".claude" / "projects").exists()
 
 
 def test_a_relative_config_dir_is_refused(project):
-    with pytest.raises(ValueError, match=r"--config-dir is '\.claude', a relative path"):
+    with pytest.raises(ValueError) as exc:
         account.adopt_from_environment(".claude")
+    message = str(exc.value)
+    assert message.startswith("--config-dir is .claude, a relative path")
+    assert "Remove-Item" not in message, "how to clear a variable nobody set"
 
 
 def test_the_refusal_names_the_folder_and_the_account_meant(project, home):
     with pytest.raises(ValueError) as exc:
         account.adopt_from_environment(".claude")
     message = str(exc.value)
-    assert str(project / ".claude") in message
+    assert (f"that is {project / '.claude'}, which is not a Claude account and "
+            "would become a new, empty one.") in message
     assert f"Did you mean {home / '.claude'}?" in message
+
+
+def test_a_root_relative_account_suggests_the_home_one(project, home):
+    # \.claude is the drive's root, not the home directory.
+    with pytest.raises(ValueError) as exc:
+        account.adopt_from_environment(r"\.claude")
+    assert f"Did you mean {home / '.claude'}?" in str(exc.value)
+
+
+def test_a_relative_path_to_an_existing_account_says_it_is_one(home, monkeypatch):
+    # From the home directory, .claude-account-b is the real account: the
+    # refusal must not call it empty, nor suggest the same folder back.
+    (home / "acct-b" / "projects").mkdir()
+    monkeypatch.chdir(home)
+    with pytest.raises(ValueError) as exc:
+        account.adopt_from_environment("acct-b")
+    message = str(exc.value)
+    assert "an account, but from another directory" in message
+    assert "new, empty" not in message
+    assert "Did you mean" not in message
 
 
 def test_no_account_is_suggested_when_home_has_none_of_that_name(project):
@@ -227,15 +257,37 @@ def test_no_account_is_suggested_when_home_has_none_of_that_name(project):
     assert "Did you mean" not in str(exc.value)
 
 
+@pytest.mark.parametrize("value", ['"C:\\Users\\me\\.claude-b"', "'C:\\x'"])
+def test_an_account_in_quotes_is_refused_for_the_quotes(project, monkeypatch, value):
+    # cmd's  set CLAUDE_CONFIG_DIR="C:\..."  keeps the quotes.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", value)
+    with pytest.raises(ValueError) as exc:
+        account.adopt_from_environment()
+    message = str(exc.value)
+    assert "quotes included" in message and "relative" not in message
+    assert 'set "CLAUDE_CONFIG_DIR=C:\\path"' in message
+
+
 def test_an_account_given_whole_is_still_taken(project, home, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / "acct-b"))
     assert account.adopt_from_environment() == str((home / "acct-b").resolve())
-    assert account.adopt_from_environment("~/acct-b") is not None
+
+
+def test_an_account_given_with_a_tilde_is_taken_from_home(project, home, monkeypatch):
+    # expanduser reads the environment, not Path.home.
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    assert account.adopt_from_environment("~/acct-b") == str((home / "acct-b").resolve())
 
 
 def test_a_launch_given_a_relative_account_stops_before_anything_starts(project, monkeypatch):
     import server
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", ".claude")
+    # main() takes these out of the environment, and rebinds its config.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv(server.HANDOVER_KEYS_ENV, raising=False)
+    monkeypatch.setattr(server, "config", None)
+    monkeypatch.setattr(server, "_session_api_keys", {})
     stopped = []
 
     def fake_stop(message, *, dialog):
@@ -255,11 +307,32 @@ def test_a_launch_given_a_relative_account_stops_before_anything_starts(project,
     assert stopped and "a relative path" in stopped[0]
 
 
-def test_an_account_written_with_a_tilde_is_the_home_one(home, monkeypatch):
-    # expanduser reads the environment, not Path.home.
-    monkeypatch.setenv("USERPROFILE", str(home))
-    monkeypatch.setenv("HOME", str(home))
-    assert account.account_dir("~/acct-b") == home / "acct-b"
+# --------------------------------------------------------------------------
+# How an account is named to a person
+# --------------------------------------------------------------------------
+
+def test_an_account_in_home_is_named_by_its_folder(home):
+    assert account.account_label(str(home / "acct-b")) == "acct-b"
+    assert account.account_label(None) == ".claude"
+
+
+def test_an_account_elsewhere_is_named_by_its_path(home):
+    elsewhere = home / "work" / "proj" / ".claude"
+    assert account.account_label(str(elsewhere)) == str(elsewhere)
+
+
+def test_a_home_reached_another_way_is_still_home(home, monkeypatch):
+    # The listing's paths are resolved and Path.home() may not be: a
+    # junction, a short name.  Both sides are resolved before comparing.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home / "." / "work" / ".."))
+    assert account.account_label(str(home.resolve() / "acct-b")) == "acct-b"
+
+
+def test_where_a_move_went_names_an_account_elsewhere_by_its_path(home):
+    import server
+    elsewhere = home / "work" / "proj" / ".claude"
+    assert server._move_where(None, str(elsewhere)) == f"into the {elsewhere} account"
+    assert server._move_where(None, str(home / "acct-b")) == "into the acct-b account"
 
 
 # --------------------------------------------------------------------------
@@ -333,6 +406,36 @@ def test_the_restart_replacement_is_handed_the_account(home, monkeypatch):
     given = account.adopt_from_environment()
     cfg = dataclasses.replace(parse_args([]), config_dir=given)
     assert _restart_env(monkeypatch, cfg)["CLAUDE_CONFIG_DIR"] == given
+
+
+def test_a_restart_hands_over_the_account_resolved_not_as_typed(home, monkeypatch):
+    # A --config-dir typed relative before relative ones were refused would
+    # stop the replacement; and the flag beats the environment the account
+    # is handed over in.
+    import asyncio
+    import subprocess
+    import server
+    seen = {}
+
+    def fake_popen(args, **kw):
+        seen["args"], seen["env"] = args, kw.get("env")
+        raise OSError("not really")
+
+    given = str((home / "acct-b").resolve())
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(sys, "argv", ["server.py", "--config-dir", "acct-b",
+                                      "--config-dir=acct-b", "--effort", "high"])
+    monkeypatch.setattr(server, "config",
+                        dataclasses.replace(parse_args([]), config_dir=given))
+    st = State()
+    st.session_id = "sid-1"
+    monkeypatch.setattr(server, "state", st)
+    monkeypatch.setattr(server, "_picker_mode", False)
+    account.adopt_from_environment(given)
+    asyncio.run(server.api_restart())
+    assert not any(a.startswith("--config-dir") for a in seen["args"]), seen["args"]
+    assert "--effort" in seen["args"]
+    assert seen["env"]["CLAUDE_CONFIG_DIR"] == given
 
 
 def test_move_knows_the_default_account_by_either_name(home, monkeypatch):

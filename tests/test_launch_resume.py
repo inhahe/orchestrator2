@@ -875,6 +875,32 @@ def test_resume_from_any_tab_finds_a_title_in_another_directory(machine, monkeyp
     assert "Use Sessions" not in _said(got)
 
 
+def _account_elsewhere(machine, monkeypatch, tmp_path):
+    """A third account outside the home directory, called .claude too, as a
+    project's own folder made into one would be."""
+    stray = tmp_path / "proj" / ".claude"
+    (stray / "projects").mkdir(parents=True)
+    monkeypatch.setattr(copy_session, "discover_claude_dirs",
+                        lambda: [machine.default, machine.other, stray])
+    return stray
+
+
+def test_a_launch_following_a_session_elsewhere_names_its_account_whole(
+        machine, monkeypatch, tmp_path):
+    stray = _account_elsewhere(machine, monkeypatch, tmp_path)
+    _session(stray, machine.os, OTHER, "Stray one")
+    cfg, note, err = _settle(_cfg(machine, machine.orch, "Stray one"))
+    assert err is None and cfg.config_dir == str(stray)
+    assert f"on account {stray}:" in note, note
+
+
+def test_a_listed_session_elsewhere_names_its_account_whole(machine, monkeypatch, tmp_path):
+    stray = _account_elsewhere(machine, monkeypatch, tmp_path)
+    line = server._session_line({"session_id": OTHER, "config_dir": str(stray),
+                                 "mtime": 0}, str(machine.default))
+    assert line.endswith(f"on account {stray}"), line
+
+
 def test_resume_follows_a_session_into_another_account(machine, monkeypatch):
     _session(machine.other, machine.os, OTHER, "Work thing")
     rt, got = _tab(machine, monkeypatch, primary=False)

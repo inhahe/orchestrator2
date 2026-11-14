@@ -348,7 +348,7 @@ orchestrator2 uses the config dir given by `CLAUDE_CONFIG_DIR` (or `~/.claude` w
 orch --config-dir "C:\Users\me\.claude-alt"
 ```
 
-Give the account's full path (or `~\.claude-alt`). A relative one, in `--config-dir` or in `CLAUDE_CONFIG_DIR`, stops the launch with an explanation: it would be read against the directory you launched from, where `.claude` is a project's own settings folder, and that folder would quietly become a new, empty account.
+Give the account's full path (or `~\.claude-alt`). A relative one in `--config-dir`, or in `CLAUDE_CONFIG_DIR` when no `--config-dir` is given, stops the launch with an explanation (as does one wrapped in quotes): it would be read against the directory you launched from, where `.claude` is a project's own settings folder, and that folder would quietly become a new, empty account.
 
 A session on the default account runs its `claude` with `CLAUDE_CONFIG_DIR` unset, however it was named (`--config-dir ~/.claude` included), so it sees the same user-level MCP servers, trusted projects and settings in `~/.claude.json` as a plain `claude` does. Named outright, the CLI would read a separate `~/.claude/.claude.json` instead.
 
@@ -573,7 +573,7 @@ The status bar grows a `cli` field once memory approaches the threshold.
 | `--standalone` | off | Start a separate server instead of joining a running hub on the same port/account |
 | `--session-idle-timeout SECS` | 300 | Seconds a session with zero viewers lingers before teardown (`0` disables) |
 | `--mobile-idle-timeout SECONDS` | `0` | Idle teardown when the last viewer was put to sleep by its browser: a phone or tablet, or a tab whose connection ended without it saying it was leaving (Chrome freezing or discarding it, the computer sleeping, the network dropping). `0` = never — a sleeping viewer is not one who left |
-| `--config-dir PATH` | -- | Override `CLAUDE_CONFIG_DIR` (session/credential storage). Use to run under a different Claude account. Give the full path, or one starting with `~`. A relative path, here or in `CLAUDE_CONFIG_DIR`, stops the launch: inside a project, `.claude` is the project's settings folder, which would quietly become a new, empty account |
+| `--config-dir PATH` | -- | Override `CLAUDE_CONFIG_DIR` (session/credential storage). Use to run under a different Claude account. Give the full path, or one starting with `~`. A relative path, here or in `CLAUDE_CONFIG_DIR` when this is not given, stops the launch: inside a project, `.claude` is the project's settings folder, which would quietly become a new, empty account |
 | `--debug` | off | Print extra diagnostic messages |
 
 ## Slash Commands

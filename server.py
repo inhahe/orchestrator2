@@ -76,6 +76,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 from account import (
     account_dir,
+    account_label,
     adopt_from_environment,
     child_env,
     default_dir,
@@ -1285,18 +1286,16 @@ def _move_accounts_payload(current_cfg: str | None) -> list[dict[str, Any]]:
     ``.claude*`` directories the copy TUI discovers, reusing
     ``copy_session.discover_claude_dirs``.
 
-    *name* is the folder's name for an account in the home directory and
-    its whole path for any other -- the hub's own, say, when it was started
-    on one elsewhere -- which may well be called ``.claude`` too, and two
-    buttons saying ".claude" cannot be told apart.
+    *name* is ``account_label``'s: the whole path of an account outside the
+    home directory -- the hub's own, say, when it was started on one
+    elsewhere -- since two buttons saying ".claude" cannot be told apart.
     """
     from copy_session import discover_claude_dirs
-    home = Path.home()
     accounts: list[dict[str, Any]] = []
     for d in discover_claude_dirs():
         accounts.append({
             "config_dir": str(d),
-            "name": d.name if _same_path(str(d.parent), str(home)) else str(d),
+            "name": account_label(str(d)),
             "email": _account_email_for(d),
             "is_current": same_account(str(d), current_cfg),
         })
@@ -3939,6 +3938,15 @@ async def api_restart() -> dict[str, Any]:
         if a.startswith(("--agent-name=", "--agent-label=")):
             i += 1
             continue
+        # The account goes over in the environment, as this process resolved
+        # it (below): the flag as typed could be relative, which the
+        # replacement refuses, and it would override the environment.
+        if a == "--config-dir":
+            i += 2
+            continue
+        if a.startswith("--config-dir="):
+            i += 1
+            continue
         # The launch's one-shot inputs.  Its prompt went to the session it
         # opened, once; a restart is not that launch again, and kept, it sent
         # the prompt to the primary session after every restart.
@@ -5815,7 +5823,7 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
         if dir_changed:
             parts.append(f"from {cwd} to {dest_cwd}")
         if account_changed:
-            parts.append(f"into the {Path(target_cfg).name} account")
+            parts.append(f"into the {account_label(target_cfg)} account")
         note = (
             "This session was copied " + " and ".join(parts) + ". "
             "Absolute paths earlier in this transcript refer to the old "
@@ -5873,7 +5881,7 @@ async def _do_move(ws: WebSocket, msg: dict[str, Any]) -> None:
         await asyncio.to_thread(save_persisted_queue, cwd, [], sid, src_cfg)
     loop_moved = _rearm_carried_wakeup(new_rt, carry["wakeup"])
     log.info("switch: %s → %s (account %s, cwd %s)", sid[:8], new_id[:8],
-             Path(target_cfg).name, dest_cwd)
+             account_label(target_cfg), dest_cwd)
 
     # Reflect the just-written title immediately (the background title read in
     # _create_runtime may not have completed the JSONL scan yet).
@@ -6107,7 +6115,7 @@ def _move_where(dest_cwd: str | None, target_cfg: str | None) -> str:
     if dest_cwd:
         parts.append(f"to {dest_cwd}")
     if target_cfg:
-        parts.append(f"into the {Path(target_cfg).name} account")
+        parts.append(f"into the {account_label(target_cfg)} account")
     return " and ".join(parts) or "to a new session"
 
 
@@ -7477,7 +7485,7 @@ def _session_line(s: dict[str, Any], account: str, *, title: bool = False) -> st
     if s.get("cwd"):
         line += f"  in {s['cwd']}"
     if s.get("config_dir") and not _same_path(s["config_dir"], account):
-        line += f"  on account {Path(s['config_dir']).name}"
+        line += f"  on account {account_label(s['config_dir'])}"
     return line
 
 
@@ -7549,7 +7557,7 @@ def _settle_launch_resume(cfg: Config, *, how: str = "--resume"
             moved.append(f"in {where}")
         if not _same_path(s.get("config_dir"), account):
             new = dataclasses.replace(new, config_dir=s["config_dir"])
-            moved.append(f"on account {Path(s['config_dir']).name}")
+            moved.append(f"on account {account_label(s['config_dir'])}")
         if not moved:
             return new, None, None
         what = f"'{s['title']}'" if s.get("title") else f"Session {s['session_id']}"
