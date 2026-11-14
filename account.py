@@ -70,9 +70,19 @@ def adopt_from_environment(given: str | None = None) -> str | None:
     account as it was given, resolved -- the default named outright included
     -- or None when none was.  Called once, at startup, before any CLI or
     session lookup.
+
+    Raises ValueError, saying why, for an account given as a relative path.
+    It would be read against the directory the launch ran in, and there a
+    ``.claude`` is the project's own settings folder: the hub would quietly
+    make it a new, empty account, start its sessions there, and offer it in
+    ``/move`` under the name of the real one.  A hub's CLIs run in many
+    directories, so a relative account is never what was meant.
     """
     inherited = (os.environ.pop("CLAUDE_CONFIG_DIR", None) or "").strip() or None
     chosen = given or inherited
+    if chosen and not Path(chosen).expanduser().is_absolute():
+        raise ValueError(_relative_account_message(
+            chosen, "--config-dir" if given else "CLAUDE_CONFIG_DIR"))
     if chosen:
         try:
             chosen = str(Path(chosen).expanduser().resolve())
@@ -80,6 +90,24 @@ def adopt_from_environment(given: str | None = None) -> str | None:
             chosen = str(Path(chosen).expanduser().absolute())
     set_hub_account(chosen)
     return chosen
+
+
+def _relative_account_message(chosen: str, source: str) -> str:
+    """Why the relative account *chosen*, from *source* (``--config-dir`` or
+    ``CLAUDE_CONFIG_DIR``), is refused, and what was probably meant."""
+    here = Path.cwd()
+    lines = [
+        f"{source} is {chosen!r}, a relative path. Read against the directory "
+        f"this launch ran in, that is {here / chosen}, which would become a "
+        "new, empty Claude account. Give the account's full path."]
+    in_home = Path.home() / chosen
+    if in_home.is_dir():
+        lines.append(f"Did you mean {in_home}?")
+    if source == "CLAUDE_CONFIG_DIR":
+        lines.append("CLAUDE_CONFIG_DIR came from this shell's environment; "
+                     "if it was not meant to be set, clear it with "
+                     "'set CLAUDE_CONFIG_DIR=' and launch again.")
+    return "\n".join(lines)
 
 
 def set_hub_account(config_dir: str | None) -> None:

@@ -445,6 +445,29 @@ default, because the hub may run on another one; the name only becomes
 "unset" where a CLI is started. Before `adopt_from_environment` runs -- a
 tool, a test -- the environment is the account, as for the CLI.
 
+**A launch given a relative account stops** (`adopt_from_environment` raises,
+`main()` calls `_stop_launch`). The CLI reads a relative `CLAUDE_CONFIG_DIR`
+against its own directory. Inside a project, `.claude` is then the project's
+settings folder, which nearly every project has. On 2026-11-13 a shell with
+`CLAUDE_CONFIG_DIR=.claude` launched from `forward raytracer`, and later from
+`D:\visual studio projects`. Each launch made that folder a new, empty account
+without a word: the hub's sessions started there, and a sign-in put
+credentials in the project. `/move` then listed the folder as ".claude" beside
+the real one. A session moved to the wrong one vanished from the account it
+was meant for, and the original had gone to the Recycle Bin. A hub's CLIs run
+in many directories, so no relative account is ever what was meant, whether it
+names an existing folder or not. The refusal says what the path would have
+meant, names a home-directory account of the same name if one exists, and,
+when the value came from the environment, how to clear it. A path written with
+`~` is absolute once expanded, and is taken. `normalize` still makes a
+per-session account absolute, for a child that runs elsewhere.
+
+`/move`'s picker (`_move_accounts_payload`) names an account by its folder
+name only when it is in the home directory, and by its whole path otherwise.
+The hub's own account is offered wherever it is, and one elsewhere may well be
+called `.claude` too. The "server started" log line names the hub's account,
+which would have shown the stray one in a single line.
+
 ### Connecting
 
 `connect()` wraps the SDK handshake in `asyncio.wait_for(..., CONNECT_TIMEOUT)`.

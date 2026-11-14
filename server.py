@@ -1284,13 +1284,19 @@ def _move_accounts_payload(current_cfg: str | None) -> list[dict[str, Any]]:
     Each entry: ``{config_dir, name, email, is_current}``.  Scans the same
     ``.claude*`` directories the copy TUI discovers, reusing
     ``copy_session.discover_claude_dirs``.
+
+    *name* is the folder's name for an account in the home directory and
+    its whole path for any other -- the hub's own, say, when it was started
+    on one elsewhere -- which may well be called ``.claude`` too, and two
+    buttons saying ".claude" cannot be told apart.
     """
     from copy_session import discover_claude_dirs
+    home = Path.home()
     accounts: list[dict[str, Any]] = []
     for d in discover_claude_dirs():
         accounts.append({
             "config_dir": str(d),
-            "name": d.name,
+            "name": d.name if _same_path(str(d.parent), str(home)) else str(d),
             "email": _account_email_for(d),
             "is_current": same_account(str(d), current_cfg),
         })
@@ -2003,8 +2009,9 @@ async def _deferred_bridge_startup(*, start: bool) -> None:
             bridge._initial_resume_id = _pending_resume_id
         if start:
             await bridge.start()
-            log.info("server started on port %s, cwd=%s",
-                     getattr(config, "port", "?"), getattr(config, "cwd", "?"))
+            log.info("server started on port %s, cwd=%s, account=%s",
+                     getattr(config, "port", "?"), getattr(config, "cwd", "?"),
+                     account_dir())
     except Exception:
         log.exception("deferred bridge startup failed")
     finally:
@@ -8372,8 +8379,11 @@ def main() -> None:
     # CLAUDE_CONFIG_DIR inherited, which comes out of the environment here so
     # that no CLI inherits it (see account.py).  The primary session carries
     # it in its Config from now on.
-    config = dataclasses.replace(
-        config, config_dir=adopt_from_environment(config.config_dir))
+    try:
+        adopted = adopt_from_environment(config.config_dir)
+    except ValueError as exc:
+        _stop_launch(str(exc), dialog=config.open_browser)
+    config = dataclasses.replace(config, config_dir=adopted)
 
     # Console: keep the short, PID-less format.  File: prefix every
     # record with the PID so concurrent orchestrator2 instances

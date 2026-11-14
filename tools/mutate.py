@@ -5703,8 +5703,8 @@ LAUNCHRESUME_SERVER_MUTATIONS = [
      "            pass\n"),
 
     ("the environment's account is not a choice",
-     "        config, config_dir=adopt_from_environment(config.config_dir))\n",
-     "        config, config_dir=(adopt_from_environment(config.config_dir) and None)"
+     "    config = dataclasses.replace(config, config_dir=adopted)\n",
+     "    config = dataclasses.replace(config, config_dir=(adopted and None)"
      " or config.config_dir)\n"),
 
     ("the title elsewhere must match its case",
@@ -7252,6 +7252,21 @@ ACCTENV_MODULE_MUTATIONS = [
     ("accounts are compared as named",
      "    return _same_path(account_dir(a), account_dir(b))\n",
      "    return a == b\n"),
+    ("a relative account is taken, and a project's .claude made an account",
+     "    if chosen and not Path(chosen).expanduser().is_absolute():\n",
+     "    if False:\n"),
+    ("a relative account is refused, but only when it came from the environment",
+     "    if chosen and not Path(chosen).expanduser().is_absolute():\n",
+     "    if inherited and not given and not Path(chosen).expanduser().is_absolute():\n"),
+    ("the refusal blames the wrong source",
+     '            chosen, "--config-dir" if given else "CLAUDE_CONFIG_DIR"))\n',
+     '            chosen, "CLAUDE_CONFIG_DIR"))\n'),
+    ("the refusal does not say which account was probably meant",
+     "    if in_home.is_dir():\n",
+     "    if False:\n"),
+    ("the refusal does not say how to clear the variable",
+     '    if source == "CLAUDE_CONFIG_DIR":\n',
+     "    if False:\n"),
 ]
 
 ACCTENV_STATE_MUTATIONS = [
@@ -7292,6 +7307,16 @@ ACCTENV_SERVER_MUTATIONS = [
     ("/move takes the default account by name for another",
      '            "is_current": same_account(str(d), current_cfg),\n',
      '            "is_current": str(d) == current_cfg,\n'),
+    ("/move names an account elsewhere as if it were the home one of its name",
+     '            "name": d.name if _same_path(str(d.parent), str(home)) else str(d),\n',
+     '            "name": d.name,\n'),
+    ("a launch refused its account goes on anyway",
+     "        adopted = adopt_from_environment(config.config_dir)\n"
+     "    except ValueError as exc:\n"
+     "        _stop_launch(str(exc), dialog=config.open_browser)\n",
+     "        adopted = adopt_from_environment(config.config_dir)\n"
+     "    except ValueError as exc:\n"
+     "        adopted = config.config_dir\n"),
 ]
 
 APIKEY_RESOLVER_SERVER_MUTATIONS = [
