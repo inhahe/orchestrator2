@@ -702,20 +702,24 @@ def pick_session_for_launch(
 ) -> dict[str, Any]:
     """Run the launch-time picker TUI and return the chosen result.
 
-    *mode* is ``"resume"`` or ``"copy"``.  Returns
-    ``{"session_id": str | None, "cwd": str | None}`` — ``session_id`` is
-    ``None`` when the user cancels and chooses a fresh session (the server then
-    starts empty).  ``cwd`` is the chosen session's working directory so the
-    server can resume it under the correct (cwd-scoped) project.  *launch_cwd*
-    is the server's working directory, used to offer its most-recent session as
-    the default in the "what to open?" fallback.  Requires an interactive
+    *mode* is ``"resume"`` or ``"copy"``.  Returns ``{"session_id": str |
+    None, "cwd": str | None, "message": str | None}`` — ``session_id`` is
+    ``None`` when the user cancels, or for a copy chooses a fresh session (the
+    server then starts empty).  ``cwd`` is the chosen session's working
+    directory so the server can resume it under the correct (cwd-scoped)
+    project.  ``message`` says why nothing was chosen when it was not the
+    user's choice (no sessions to pick, a failed copy): the picker may have
+    had a console of its own, which closes with it.  *launch_cwd* is the
+    server's working directory, used to offer its most-recent session as the
+    default in the "what to open?" fallback.  Requires an interactive
     terminal.
     """
     app = LaunchPickerApp(mode, account_dir(), launch_cwd)
     app.run()
     if app.status_message:
         print(app.status_message)
-    return {"session_id": app.chosen_id, "cwd": app.chosen_cwd}
+    return {"session_id": app.chosen_id, "cwd": app.chosen_cwd,
+            "message": app.status_message}
 
 
 def main() -> int:

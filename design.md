@@ -405,6 +405,33 @@ browser picker's choice (`/api/resume`) set that cwd to the directory the
 session ran in (`find_session_cwd`), unless a directory was given with the
 resume. Changing the hub process's directory alone left the CLI where it was.
 
+**`--resume` with no session shows one picker, and Esc ends the launch.**
+`main()` runs the terminal picker (`_run_launch_picker`, a `copy_session.py
+--pick` process that answers in a file). A picker that was shown and left
+without a choice answers `session_id: null`, with a `message` when it was not
+the user's choice ("No sessions found in …"). The launch prints that and ends
+with nothing started. A picker that could not run writes nothing, and only
+then does the browser picker take over: the launch sets `browser_picker`, and
+its `--detach` child gets `--resume --browser-picker`, so `_launch_picker_mode`
+shows it no terminal picker. Before, a cancelled picker left the sentinel and
+went on. The detach child then ran the terminal picker itself in a new console
+window, and after a second Esc waited in the browser one, three pickers for
+one launch. With a hub already running, that also left a picker-mode server
+on a port of its own (a picker never joins a hub). The restart replacement
+drops the marker. It shows its picker in the tabs it takes over (`--wait-port`).
+
+**A hub waiting in its picker still opens other sessions.** Launches join it,
+and their tabs ask for `/?rid=sN`. `index()` serves `resume.html` only to the
+hub's own session, the one to pick (`_is_for_the_session_to_pick`: `/`,
+`?rid=default` or the primary's rid), and the chat page to every other tab,
+the lobby's and `?open=` / `?new` included. Serving the picker to all of them
+had a joined session open another picker instead of itself. Once a session is
+picked (`/api/resume`), or switched to by `?resume=` / `?cwd=`, the tab goes
+to `/?rid=default` (`_THE_HUBS_SESSION`), not to `/`: a tab at `/` lands in the
+lobby, a list of sessions that reads as another picker. Both pickers list only
+the launch's account (the hub's), and `/api/sessions` names it for the
+browser picker's heading, as the terminal picker's already did.
+
 **A session on another account is opened in that account by name, never
 through the hub's environment.** The hub has no `CLAUDE_CONFIG_DIR` in its
 environment at all (below); its own account is fixed at launch

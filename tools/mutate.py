@@ -6048,6 +6048,61 @@ SHUTSTATUS_APP_MUTATIONS = [
      "    _retriesExhausted = false;\n    reconnectAttempt = 0;\n"),
 ]
 
+# --resume with no session: Esc in the terminal picker ends the launch, the
+# detach child goes straight to the browser picker, and a hub waiting in its
+# picker serves it only to its own session's tab.  tests/test_resume_picker.py.
+RESUMEPICKER_SERVER_MUTATIONS = [
+    ("Esc in the terminal picker goes on to the browser picker",
+     "        elif result is not None:\n"
+     "            # A resume picker shown and left with Esc",
+     "        elif False:\n"
+     "            # A resume picker shown and left with Esc"),
+
+    ("a picker with nothing to pick does not say why",
+     '            said = result.get("message") or "No session was picked, so nothing was started."\n',
+     '            said = "No session was picked, so nothing was started."\n'),
+
+    ("a launch with no terminal picker does not mark its child",
+     "            config = dataclasses.replace(config, browser_picker=True)\n",
+     "            pass\n"),
+
+    ("the detach child shows the terminal picker again",
+     '        child_argv.extend(["--resume", "--browser-picker"])\n',
+     '        child_argv.append("--resume")\n'),
+
+    ("the marked child shows the terminal picker anyway",
+     "    if cfg.resume == _PICKER_SENTINEL and not cfg.wait_port and not cfg.browser_picker:\n",
+     "    if cfg.resume == _PICKER_SENTINEL and not cfg.wait_port:\n"),
+
+    ("a restart carries the marker",
+     '                 "--browser-picker",\n',
+     ""),
+
+    ("the picker's message is lost on its way back",
+     '            "message": message if isinstance(message, str) and message else None,\n',
+     '            "message": None,\n'),
+
+    ("a hub waiting in its picker serves it to every tab",
+     "    if _picker_mode and _is_for_the_session_to_pick(request):\n",
+     "    if _picker_mode:\n"),
+
+    ("the lobby, in a hub waiting in its picker, is the picker",
+     '    if any(q.get(k) is not None for k in ("open", "new", "lobby")):\n',
+     '    if any(q.get(k) is not None for k in ("open", "new")):\n'),
+
+    ("the hub's own session, by name, is not the one to pick",
+     '    return (not rid or rid == "default"\n',
+     "    return (not rid\n"),
+
+    ("a session switched to is shown in the lobby",
+     '_THE_HUBS_SESSION = "/?rid=default"\n',
+     '_THE_HUBS_SESSION = "/"\n'),
+
+    ("the browser picker is not told whose sessions it lists",
+     '    return {"projects": result, "account": account_label()}\n',
+     '    return {"projects": result}\n'),
+]
+
 # The lobby says when its connection is down, and a socket the hub refused is
 # not retried with the same missing credential.  tests/reconnect_on_show.test.js,
 # "the lobby says when its connection is down".
@@ -9627,6 +9682,8 @@ TARGETS = {
                        SHUTSTATUS_APP_MUTATIONS, "node"),
     "onesocket-app": ("static/app.js", "tests/reconnect_on_show.test.js",
                       ONESOCKET_APP_MUTATIONS, "node"),
+    "resumepicker-server": ("server.py", "tests/test_resume_picker.py",
+                            RESUMEPICKER_SERVER_MUTATIONS, "pytest"),
     "connband-app": ("static/app.js", "tests/reconnect_on_show.test.js",
                      CONNBAND_APP_MUTATIONS, "node"),
     "connband-lobby": ("static/lobby.js", "tests/reconnect_on_show.test.js",

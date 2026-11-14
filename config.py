@@ -678,6 +678,7 @@ class Config:
     skip_auto_login: bool = False      # internal: child skips the login check
     wait_port: bool = False            # internal: retry binding --port while an old instance releases it (restart)
     start_fresh: bool = False          # internal: open a new conversation, as --no-continue does, but only at startup (restart)
+    browser_picker: bool = False       # internal: --resume's picker in the browser, the terminal one having failed (--detach child)
 
 
 # ---------------------------------------------------------------------------
@@ -1295,6 +1296,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
         action="store_true",
         help=argparse.SUPPRESS,  # internal: restart child replacing a new conversation
     )
+    ap.add_argument(
+        "--browser-picker",
+        action="store_true",
+        help=argparse.SUPPRESS,  # internal: --detach child of a launch whose terminal picker could not run
+    )
 
     args = ap.parse_args(argv)
 
@@ -1391,4 +1397,5 @@ def parse_args(argv: list[str] | None = None) -> Config:
         skip_auto_login=args.skip_auto_login,
         wait_port=args.wait_port,
         start_fresh=args.start_fresh,
+        browser_picker=args.browser_picker,
     )

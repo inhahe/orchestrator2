@@ -1826,11 +1826,14 @@ def _launch_picker_mode(cfg: Config) -> str | None:
     ``--copy``, "resume" for ``--resume`` with no id, else None.
 
     A restart's replacement (``--wait-port``) still to choose shows none: it
-    goes straight to the picker in the tabs it takes over.
+    goes straight to the picker in the tabs it takes over.  Nor does the
+    ``--detach`` child of a launch whose own terminal picker could not run
+    (``--browser-picker``): it would fail the same way, and a picker that was
+    shown, and cancelled, ends its launch instead (``main``).
     """
     if cfg.copy:
         return "copy"
-    if cfg.resume == _PICKER_SENTINEL and not cfg.wait_port:
+    if cfg.resume == _PICKER_SENTINEL and not cfg.wait_port and not cfg.browser_picker:
         return "resume"
     return None
 
@@ -3601,21 +3604,44 @@ async def index(request: Request):
                 f"<p><a href='/?resume'>Pick another</a></p>",
                 status_code=400,
             )
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse(_THE_HUBS_SESSION, status_code=303)
 
     if not _client_launch and cwd_param is not None:
         ok, err = await _reconfigure(cwd=cwd_param)
         if not ok:
             return HTMLResponse(f"<h1>Error</h1><p>{html_escape(err)}</p>",
                                 status_code=400)
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse(_THE_HUBS_SESSION, status_code=303)
 
     # --- Normal page serve ---
-    if _picker_mode:
+    if _picker_mode and _is_for_the_session_to_pick(request):
         return _serve_page("resume.html", fallback="<h1>Session Picker</h1>")
 
     return _serve_page("index.html", fallback="<h1>orchestrator2</h1><p>No index.html yet.</p>",
                        csp=CHAT_PAGE_CSP)
+
+
+#: Where a tab is sent to see the hub's own session -- the one ``?resume=``,
+#: ``?cwd=`` or the picker has just switched.  Not ``/``: a tab there lands in
+#: the lobby, a session list that reads as one more picker.
+_THE_HUBS_SESSION = "/?rid=default"
+
+
+def _is_for_the_session_to_pick(request: Request) -> bool:
+    """Whether a page request is for the hub's own session, the one its
+    ``--resume`` picker is still to choose, rather than for another.
+
+    A hub waiting in its picker still opens the sessions launches bring it,
+    and the lobby: a tab for one of those (``?rid=s2``, ``?open=``, ``?new``,
+    ``?lobby=1``) is not the picked session's, and given the picker it could
+    never reach its own.
+    """
+    q = request.query_params
+    if any(q.get(k) is not None for k in ("open", "new", "lobby")):
+        return False
+    rid = q.get("rid")
+    return (not rid or rid == "default"
+            or (_default_runtime is not None and rid == _default_runtime.rid))
 
 
 #: The chat page runs only its own script files: no inline script, no
@@ -3915,6 +3941,7 @@ async def api_restart() -> dict[str, Any]:
             i += 1
             continue
         if a in ("--detach", "--open", "--copy", "--wait-port", "--start-fresh",
+                 "--browser-picker",
                  "--skip-auto-login", "--no-continue", "--continue"):
             i += 1
             continue
@@ -4509,7 +4536,8 @@ async def api_sessions() -> dict[str, Any]:
             "age": _format_age(proj["newest_mtime"]),
             "sessions": formatted,
         })
-    return {"projects": result}
+    # The picker says whose sessions these are: the hub's account only.
+    return {"projects": result, "account": account_label()}
 
 
 @_route("post", "/api/resume")
@@ -7736,7 +7764,9 @@ def _detach_child_argv(argv: list[str], cfg: Config, actual_port: int) -> list[s
                        "--skip-auto-login", "--cwd", cfg.cwd])
     # Re-add the (possibly picker-resolved) resume target for the child.
     if cfg.resume == _PICKER_SENTINEL:
-        child_argv.append("--resume")  # bare → child shows browser picker
+        # Bare: the child shows the browser picker -- and not the terminal
+        # one, which this launch could not run (main).
+        child_argv.extend(["--resume", "--browser-picker"])
     elif cfg.resume:
         child_argv.extend(["--resume", cfg.resume])
     # The name this launch resolved, which is not always on the command line:
@@ -8133,8 +8163,10 @@ def _console_is_visible() -> bool:
 def _run_launch_picker(mode: str, launch_cwd: str | None = None) -> dict | None:
     """Run the `--resume` / `--copy` TUI picker and return its result.
 
-    Returns ``{"session_id": str | None, "cwd": str | None}`` (or ``None`` when
-    no picker could run).  ``cwd`` is the picked session's working directory —
+    Returns ``{"session_id": str | None, "cwd": str | None, "message": str |
+    None}``, or ``None`` when no picker could run.  ``session_id`` None is a
+    picker shown and left without a choice (Esc, or nothing to pick, which
+    ``message`` says).  ``cwd`` is the picked session's working directory —
     the server adopts it because resume is cwd-scoped (the CLI only finds a
     session under its own project directory).
 
@@ -8186,9 +8218,11 @@ def _run_launch_picker(mode: str, launch_cwd: str | None = None) -> dict | None:
             return None
         sid = data.get("session_id")
         cwd = data.get("cwd")
+        message = data.get("message")
         return {
             "session_id": sid if isinstance(sid, str) and sid else None,
             "cwd": cwd if isinstance(cwd, str) and cwd else None,
+            "message": message if isinstance(message, str) and message else None,
         }
 
     tmp = tempfile.NamedTemporaryFile(
@@ -8437,8 +8471,19 @@ def main() -> None:
             config = dataclasses.replace(
                 config, copy=False, resume=None, no_continue=True
             )
-        # A cancelled resume picker leaves the sentinel in place, so the
-        # in-browser picker still appears.
+        elif result is not None:
+            # A resume picker shown and left with Esc, or with nothing to
+            # pick: the launch was for opening a session, so it ends here.
+            # Going on to the in-browser picker showed the same list a third
+            # time -- the --detach child's terminal picker, then the browser's.
+            said = result.get("message") or "No session was picked, so nothing was started."
+            print(said)
+            _file_log(logging.INFO, "launch: %s", said)
+            sys.exit(0)
+        else:
+            # No terminal picker could run at all: the in-browser one is left,
+            # and a --detach child must go straight to it.
+            config = dataclasses.replace(config, browser_picker=True)
 
     # --- Settle --resume before anything is started or joined --------------
     # A title that names no session here, or several, used to reach the CLI

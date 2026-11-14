@@ -217,7 +217,7 @@
 <body>
   <div class="picker-header">
     <h1>Resume Session</h1>
-    <p class="subtitle">Select a session to resume &mdash; <code>--resume</code> picker</p>
+    <p class="subtitle">Select a session to resume &mdash; <code>--resume</code> picker<span id="account"></span></p>
   </div>
 
   <div class="search-bar">
@@ -252,6 +252,12 @@
         const resp = await fetch('/api/sessions');
         const data = await resp.json();
         allProjects = data.projects || [];
+        // The account listed: only this hub's, so a session on another one
+        // is not here, and the heading says which it is.
+        if (data.account) {
+          document.getElementById('account').innerHTML =
+            ' &mdash; sessions on <code>' + esc(data.account) + '</code>';
+        }
         render();
       } catch (err) {
         document.getElementById('picker-body').innerHTML =
@@ -435,8 +441,9 @@
         });
         const result = await resp.json();
         if (result.ok) {
-          // Redirect to main chat UI.
-          window.location.href = '/';
+          // To the session just picked, the hub's own.  Not '/': a tab there
+          // lands in the lobby, a list of sessions that reads as another picker.
+          window.location.href = '/?rid=default';
         } else {
           alert('Failed to resume: ' + (result.error || 'unknown error'));
           resuming = false;
